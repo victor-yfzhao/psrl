@@ -135,3 +135,31 @@ class VllmGemmaParameterMapping(ParameterMapping):
             "head_size": self.config.hidden_size // self.config.num_attention_heads,
             "intermediate_size": self.config.intermediate_size,
         }
+
+# OLMoE
+vllm_olmoe_classes = []
+try:
+    from vllm.model_executor.models.olmoe import OlmoeForCausalLM
+    vllm_olmoe_classes = [OlmoeForCausalLM]
+except ImportError as e:
+    warnings.warn(f"Could not import OLMoE classes: {e}")
+@register_model(vllm_olmoe_classes)
+class VllmOLMoEParameterMapping(ParameterMapping):
+    """Parameter mapping for OLMoE model."""
+    def __init__(self, config_path: str):
+        self.config = AutoConfig.from_pretrained(config_path)
+    def get_mappings(self):
+        return [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+    def get_model_info(self):
+        return {
+            "num_heads": self.config.num_attention_heads,
+            "num_kv_heads": getattr(self.config, 'num_key_value_heads', self.config.num_attention_heads),
+            "head_size": self.config.hidden_size // self.config.num_attention_heads,
+            "intermediate_size": self.config.intermediate_size,
+        }

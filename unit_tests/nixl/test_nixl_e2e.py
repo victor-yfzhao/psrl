@@ -18,7 +18,9 @@ from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLS
 from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
-QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/Qwen2.5-0.5B-Instruct"
+# QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/Qwen2.5-0.5B-Instruct"
+
+QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/OLMoE-1B-7B-0924"
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -115,6 +117,12 @@ class TrainClientActor:
     def protocol(self):
         self.print("step0: convert_fsdp_inplace")
         state_dict, sharding = convert_fsdp_inplace("fsdp", self.model)
+        # wlf did this
+        # self.print("state_dict")
+        # self.print(state_dict)
+        # self.print("sharding")
+        # self.print(sharding)
+        # 
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -199,6 +207,10 @@ class GenClientActor:
 
     def protocol(self):
         self.print("step0: convert_vllm_inplace")
+        # wlf did this
+        self.print("mapping registry")
+        self.print(type(self.model))
+        # 
         param_mapping = create_parameter_mapping(type(self.model), copy_to_local(QWEN_MODEL_PATH))
         state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.rank)
         self.state_dict = state_dict
@@ -261,7 +273,7 @@ def test_nixl_e2e():
     log_dir = "/apdcephfs_fsgm/share_303760348/lhy/psrl/unit_tests/nixl/log"
     os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
-    listen_ip = "28.12.131.133"
+    listen_ip = "28.12.131.41"
     listen_port = 23459
     server_name = GLOBAL_META_SERVER_NAME
     backend = "nccl"
