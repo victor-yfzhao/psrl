@@ -222,6 +222,8 @@ class NIXLMetaServer:
         # We first need to guarantee that all client shardings have the same keys
         all_keys = set()
         for client_name, sharding_dict in self.client_sharding_dicts.items():
+            # print(f"Client {client_name}'s sharding:")
+            # print(sharding_dict.keys())
             all_keys.update(sharding_dict.keys())
         # Then we can make the unified sharding for each client
         # That is, for each key, we need to find the new representation of (shard_dim, shard_mesh, shard_indices) for the mutual slice of all clients

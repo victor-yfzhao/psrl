@@ -1,9 +1,10 @@
 #!/bin/bash
-env_file="${PSRL_WORKSPACE}/env/psrl.sh"
+echo "PSRL_WORKSPACE: ${PSRL_WORKSPACE}"
+env_file="${PSRL_WORKSPACE}/env/psrl_wlf.sh"
 source ${env_file}
 
 HOSTFILE=${1:-"${PSRL_WORKSPACE}/hosts/node0123"}
-PORT=8888                # Ray节点通信端口
+PORT=23333                # Ray节点通信端口
 DASHBOARD_PORT=8265      # Ray Dashboard端口
 
 # 读取hostfile

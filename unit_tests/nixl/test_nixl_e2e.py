@@ -15,12 +15,12 @@ from omegaconf import OmegaConf
 from verl.utils.fs import copy_to_local
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
-from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
+from psrl.utils.converter import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
-# QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/Qwen2.5-0.5B-Instruct"
+# QWEN_MODEL_PATH = "/apdcephfs_zwfy2/share_303541817/pkuhetu/lhy/models/Qwen2.5-0.5B-Instruct"
 
-QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/OLMoE-1B-7B-0924"
+QWEN_MODEL_PATH = "/apdcephfs_zwfy2/share_303541817/pkuhetu/lhy/models/OLMoE-1B-7B-0924"
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -270,17 +270,17 @@ def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXL
     return ps_wg
 
 def test_nixl_e2e():
-    log_dir = "/apdcephfs_fsgm/share_303760348/lhy/psrl/unit_tests/nixl/log"
+    log_dir = "/apdcephfs_zwfy2/share_303541817/pkuhetu/lhy/psrl/unit_tests/nixl/log"
     os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
-    listen_ip = "28.12.131.41"
+    listen_ip = "28.49.19.150"
     listen_port = 23459
     server_name = GLOBAL_META_SERVER_NAME
     backend = "nccl"
     torch_port_train = 29502
     torch_port_gen = 29503
     num_train = 4
-    num_gen = 2
+    num_gen = 1
     num_ps = 2
     
     psrl_config = OmegaConf.create({
@@ -302,7 +302,7 @@ def test_nixl_e2e():
     
     start_time = time.time()
     ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
-    assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
+    assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes {ip_to_node_id}"
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(
             node_id=ip_to_node_id[listen_ip],

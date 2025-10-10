@@ -6,6 +6,7 @@ from vllm.model_executor.layers.linear import set_weight_attrs
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 )
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from psrl.utils.state_dict.model_mappings import ParameterMapping
