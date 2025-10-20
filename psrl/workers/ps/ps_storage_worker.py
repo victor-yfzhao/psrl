@@ -94,6 +94,7 @@ class PSStorageWorker:
         self.nixl_multi_storage_clients.send_local_sharding(multi_local_sharding_dicts)
         psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
         unified_multi_sharding_dicts = self.nixl_multi_storage_clients.wait_for_server_sharding()
+        # psrl_logger.info("unified_multi_sharding_dicts:", unified_multi_sharding_dicts)
         for client_name, sharding_dict in unified_multi_sharding_dicts.items():
             assert sharding_dict is not None, f"Sharding dict for client {client_name} is None"
         return unified_multi_meta_state_dicts, unified_multi_sharding_dicts

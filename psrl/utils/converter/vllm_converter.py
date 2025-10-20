@@ -8,7 +8,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from psrl.utils.converter.model_mappings import ParameterMapping, slice_gate_up_proj, slice_qkv_proj, MappingType
+from psrl.utils.converter.model_mappings import ParameterMapping, slice_gate_up_proj, slice_qkv_proj, slice_fused_moe_w13_weight, slice_fused_moe_w2_weight, MappingType
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -28,7 +28,6 @@ class VllmConverter(BaseConverter):
         self.model_info = parameter_mapping.get_model_info()
         self.mappings = parameter_mapping.get_mappings()
         self.fused_mappings: dict[str, tuple[MappingType, list[tuple[str, int]]]] = {}
-        print(self.mappings)
         for vllm_name, hf_name, mapping_type, shard_id in self.mappings:
             if vllm_name not in self.fused_mappings:
                 self.fused_mappings[vllm_name] = (mapping_type, [])
@@ -36,7 +35,6 @@ class VllmConverter(BaseConverter):
                 assert mapping_type != MappingType.DIRECT, f"Mapping type should not be DIRECT for {vllm_name}"
                 assert mapping_type == self.fused_mappings[vllm_name][0], f"Mapping type for {vllm_name} must be the same, but got {mapping_type} and {self.fused_mappings[vllm_name][0]}"
             self.fused_mappings[vllm_name][1].append((hf_name, shard_id))
-        print(self.fused_mappings)
         
     def convert_state_and_sharding_dict(self, model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
         """
@@ -132,10 +130,45 @@ class VllmConverter(BaseConverter):
                         out[new_param_name] = new_param
                     return out
                 elif mapping_type == MappingType.FUSED_MOE_W13_SPLIT:
+                    try :
+                        sliced_params = slice_fused_moe_w13_weight(
+                            fused_param=param,
+                        )
+                    except Exception as e:
+                        raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}")
                     out = {}
+                    for hf_name, shard_id in mappings:
+                        assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
+                        new_param = sliced_params[shard_id]
+                        new_param_name = full_name.replace(vllm_name, hf_name)
+                        out[new_param_name] = new_param
+                    # for expert_id in range(param.shape[0]):
+                    #     expert = param[expert_id]
+                    #     shard_size = expert.shape[0] // 2
+                    #     w1 = expert.narrow(0, 0, shard_size)
+                    #     w3 = expert.narrow(0, shard_size, shard_size)
+                    #     w1_name = full_name.replace(vllm_name, f"{expert_id}.gate_proj.weight")
+                    #     w3_name = full_name.replace(vllm_name, f"{expert_id}.down_proj.weight")
+                    #     out[w1_name] = w1
+                    #     out[w3_name] = w3
                     return out
-                elif mapping_type = MappingType.FUSED_MOE_W2_SPLIT:
+                elif mapping_type == MappingType.FUSED_MOE_W2_SPLIT:
+                    try :
+                        sliced_params = slice_fused_moe_w2_weight(
+                            fused_param=param,
+                        )
+                    except Exception as e:
+                        raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}")
                     out = {}
+                    for hf_name, shard_id in mappings:
+                        assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
+                        new_param = sliced_params[shard_id]
+                        new_param_name = full_name.replace(vllm_name, hf_name)
+                        out[new_param_name] = new_param
+                    # for expert_id in range(param.shape[0]):
+                    #     w2 = param[expert_id]
+                    #     w2_name = full_name.replace(vllm_name, f"{expert_id}.up_proj.weight")
+                    #     out[w2_name] = w2
                     return out
                 else:
                     raise ValueError(f"Unsupported mapping type: {mapping_type}")

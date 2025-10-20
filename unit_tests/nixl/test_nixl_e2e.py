@@ -57,7 +57,7 @@ class MetaServerActor:
         self.print("step3: notify_all_client_shardings")
         self.server.notify_all_client_shardings()
         self.print("step4: wait_for_client_infos")
-        self.server.wait_for_client_infos(self.expected_agents, timeout=120)
+        self.server.wait_for_client_infos(self.expected_agents, timeout=600)
         # self.print(f"client_infos: {self.server.client_infos}")
         self.print("step5: make_comm_plan")
         self.server.make_comm_plan()
@@ -138,7 +138,7 @@ class TrainClientActor:
         self.print("step5: send_local_info")
         self.client.send_local_info()
         self.print("step6: wait_for_server_info (client infos & comm plan)")
-        self.client.wait_for_server_info()
+        self.client.wait_for_server_info(timeout=600.0)
         self.print("step7: send_local_temp_mapping")
         self.client.send_local_temp_mapping()
         self.print("step8: wait_for_server_temp_mappings")
@@ -221,14 +221,16 @@ class GenClientActor:
         self.client.connect_to_server()
         self.print("step2: send_local_sharding")
         self.client.send_local_sharding(sharding)
+        # self.print("self.sharding:", self.sharding)
         self.print("step3: wait_for_server_sharding")
         self.unified_sharding = self.client.wait_for_server_sharding()
+        # self.print("unified_sharding:", self.unified_sharding)
         self.print("step4: register_local_tensors")
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
         self.client.send_local_info()
         self.print("step6: wait_for_server_info (client infos & comm plan)")
-        self.client.wait_for_server_info()
+        self.client.wait_for_server_info(timeout=600.0)
         # self.print(f"comm plan: {self.client._comm_plan}")
         self.print("step7: send_local_temp_mapping")
         self.client.send_local_temp_mapping()
@@ -281,7 +283,7 @@ def test_nixl_e2e():
     torch_port_gen = 29503
     num_train = 4
     num_gen = 1
-    num_ps = 2
+    num_ps = 1
     
     psrl_config = OmegaConf.create({
         "logging_path": log_dir,

@@ -123,6 +123,29 @@ def slice_qkv_proj(
         qkv_params.append(make_slice_parameter(data, fused_param))
     return qkv_params
 
+def slice_fused_moe_w13_weight(
+    fused_param: Parameter,
+) -> List[Parameter]:
+    expert_params: List[Parameter] = []
+    expert_num = fused_param.shape[0]
+    shard_size = fused_param.shape[1] // 2
+    for expert_id in range(expert_num):
+        expert = fused_param.data[expert_id]
+        gate = expert.narrow(0, 0, shard_size)
+        up = expert.narrow(0, shard_size, shard_size)
+        expert_params.append(make_slice_parameter(gate, fused_param))
+        expert_params.append(make_slice_parameter(up, fused_param))
+    return expert_params
+
+def slice_fused_moe_w2_weight(
+    fused_param: Parameter,
+) -> List[Parameter]:
+    expert_params: List[Parameter] = []
+    expert_num = fused_param.shape[0]
+    for expert_id in range(expert_num):
+        down = fused_param.data[expert_id]
+        expert_params.append(make_slice_parameter(down, fused_param))
+    return expert_params
 
 class MappingType(Enum):
     """Enum for mapping prototypes."""

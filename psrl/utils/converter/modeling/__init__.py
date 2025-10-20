@@ -8,4 +8,5 @@ __all__ = [
     "VllmPhiParameterMapping",
     "VllmGemmaParameterMapping",
     "BridgedMegatronParameterMapping",
+    "VllmOLMoEParameterMapping"
 ]

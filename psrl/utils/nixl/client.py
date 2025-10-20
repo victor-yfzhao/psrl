@@ -227,6 +227,7 @@ class NIXLStorageClient:
             desc_bytes_list = []
             shard_meta_info_list = []
             local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+            # print(f"{self.client_name}: key {key}, local tensor {tensor.shape}, sharding {sharding}")
             
             for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
                 # Store the original tensor mapping

@@ -163,16 +163,35 @@ class VllmOLMoEParameterMapping(ParameterMapping):
     def __init__(self, config_path: str):
         self.config = AutoConfig.from_pretrained(config_path)
     def get_mappings(self):
-        return [
+        mapping = [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
             ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
             ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
-            ("w13_weight", "gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 0)
-            ("w13_weight", "down_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 1)
-            ("w2_weight", "up_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, 0)
         ]
+        expert_num = 64
+        for expert_id in range(expert_num):
+            mapping.append((
+                "w13_weight",
+                f"{expert_id}.gate_proj.weight",
+                MappingType.FUSED_MOE_W13_SPLIT,
+                2 * expert_id
+            ))
+            mapping.append((
+                "w13_weight",
+                f"{expert_id}.up_proj.weight",
+                MappingType.FUSED_MOE_W13_SPLIT,
+                2 * expert_id + 1
+            ))
+            mapping.append((
+                "w2_weight",
+                f"{expert_id}.down_proj.weight",
+                MappingType.FUSED_MOE_W2_SPLIT,
+                expert_id
+            ))
+        return mapping
+
     def get_model_info(self):
         return {
             "num_heads": self.config.num_attention_heads,
