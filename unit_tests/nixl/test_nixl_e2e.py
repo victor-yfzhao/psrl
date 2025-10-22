@@ -282,7 +282,7 @@ def test_nixl_e2e():
     torch_port_train = 29502
     torch_port_gen = 29503
     num_train = 4
-    num_gen = 1
+    num_gen = 2
     num_ps = 1
     
     psrl_config = OmegaConf.create({

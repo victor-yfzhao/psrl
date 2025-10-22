@@ -6,6 +6,7 @@ from vllm.model_executor.layers.linear import set_weight_attrs
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 )
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from psrl.utils.converter.model_mappings import ParameterMapping, slice_gate_up_proj, slice_qkv_proj, slice_fused_moe_w13_weight, slice_fused_moe_w2_weight, MappingType
@@ -62,7 +63,7 @@ class VllmConverter(BaseConverter):
                 if full_name.startswith("."):
                     full_name = full_name[1:]
                 new_params = self.convert_parameter(full_name, param, module)
-                sharding = self.get_sharding_for_param(module)
+                sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding
@@ -142,15 +143,6 @@ class VllmConverter(BaseConverter):
                         new_param = sliced_params[shard_id]
                         new_param_name = full_name.replace(vllm_name, hf_name)
                         out[new_param_name] = new_param
-                    # for expert_id in range(param.shape[0]):
-                    #     expert = param[expert_id]
-                    #     shard_size = expert.shape[0] // 2
-                    #     w1 = expert.narrow(0, 0, shard_size)
-                    #     w3 = expert.narrow(0, shard_size, shard_size)
-                    #     w1_name = full_name.replace(vllm_name, f"{expert_id}.gate_proj.weight")
-                    #     w3_name = full_name.replace(vllm_name, f"{expert_id}.down_proj.weight")
-                    #     out[w1_name] = w1
-                    #     out[w3_name] = w3
                     return out
                 elif mapping_type == MappingType.FUSED_MOE_W2_SPLIT:
                     try :
@@ -165,17 +157,13 @@ class VllmConverter(BaseConverter):
                         new_param = sliced_params[shard_id]
                         new_param_name = full_name.replace(vllm_name, hf_name)
                         out[new_param_name] = new_param
-                    # for expert_id in range(param.shape[0]):
-                    #     w2 = param[expert_id]
-                    #     w2_name = full_name.replace(vllm_name, f"{expert_id}.up_proj.weight")
-                    #     out[w2_name] = w2
                     return out
                 else:
                     raise ValueError(f"Unsupported mapping type: {mapping_type}")
         # Default: No conversion needed
         return {full_name: param}
 
-    def get_sharding_for_param(self, module) -> NIXLSharding:
+    def get_sharding_for_param(self, module, param_name) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
         Returns a NIXLSharding object.
@@ -188,6 +176,12 @@ class VllmConverter(BaseConverter):
                 shard_dim = 0
             elif isinstance(module, RowParallelLinear):
                 shard_dim = 1
+            elif isinstance(module, FusedMoE):
+                if "w13" in param_name:
+                    shard_dim = 0
+                else:
+                    assert "w2" in param_name, f"FusedMoE can only be w13 and w2, but get{param_name}"
+                    shard_dim = 1
             else:
                 raise ValueError(f"Unsupported module type for sharding: {type(module)}")
         else:
