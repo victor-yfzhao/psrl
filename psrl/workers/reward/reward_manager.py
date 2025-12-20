@@ -25,7 +25,6 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-# TODO(linsh): reward_model_router is prepared for generative reward models in the future.
 class RewardManager(CommandExtension):
     def __init__(
         self,
@@ -34,6 +33,8 @@ class RewardManager(CommandExtension):
         processor,
         ps_manager_handle,
         reward_model_router=None,
+        reward_model_replica_handles: list | None = None,
+        reward_model_tokenizer=None,
     ):
         """Initialize the reward manager for processing rollout data and computing rewards.
 
@@ -46,7 +47,9 @@ class RewardManager(CommandExtension):
             tokenizer: Tokenizer for processing text data and converting tokens
             processor: Processor for processing multi-modal data
             ps_manager_handle: Handle to the parameter server for status updates and communication
-            reward_model_router: Optional address of the reward model router for distributed reward computation
+            reward_model_router: Optional router handle for distributed reward computation
+            reward_model_replica_handles: Optional list of direct reward model replica handles
+            reward_model_tokenizer: Optional tokenizer object for the reward model
         """
         super().__init__()
 
@@ -54,6 +57,8 @@ class RewardManager(CommandExtension):
         self.tokenizer = tokenizer
         self.processor = processor
         self.reward_model_router = reward_model_router
+        self.reward_model_replica_handles = reward_model_replica_handles or []
+        self._external_reward_model_tokenizer = reward_model_tokenizer
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
@@ -97,13 +102,20 @@ class RewardManager(CommandExtension):
         self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
         self.reward_model_tokenizer = None
         if self.config.reward_model.enable:
-            reward_model_tokenizer_local_path = copy_to_local(self.config.reward_model.model.path)
-            self.reward_model_tokenizer = hf_tokenizer(reward_model_tokenizer_local_path, trust_remote_code=True)
+            if self._external_reward_model_tokenizer is not None:
+                self.reward_model_tokenizer = self._external_reward_model_tokenizer
+            else:
+                reward_model_tokenizer_local_path = copy_to_local(self.config.reward_model.model.path)
+                self.reward_model_tokenizer = hf_tokenizer(
+                    reward_model_tokenizer_local_path, trust_remote_code=True
+                )
         self.reward_loop = load_reward_loop_manager(
             self.config,
             self.input_tokenizer,
-            self.reward_model_router,
-            self.reward_model_tokenizer,
+            reward_model_manager=None,
+            reward_model_router=self.reward_model_router,
+            reward_model_tokenizer=self.reward_model_tokenizer,
+            reward_model_replica_handles=self.reward_model_replica_handles,
         )
 
     def add_requests(self, sample_id_to_request_data: dict[int, DataProto]):

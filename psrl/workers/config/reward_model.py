@@ -80,6 +80,7 @@ class RewardModelConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields
 
     enable: bool = False
+    use_reward_loop: bool = False
     model_type: str = "discriminative"
     name: str = "sglang"
     enable_resource_pool: bool = False

@@ -5,6 +5,7 @@
 # For RLHF alignment example using full_hh_rlhf, we utilize reward model to assess the responses.
 # If False, the following parameters are not effective
 enable: False
+use_reward_loop: False
 
 # Whether to deploy the model to a separate resource pool.
 # If true, n_gpus_per_node & nnodes will be used to determine the resource node.
@@ -34,6 +35,53 @@ model:
   # Whether to enable loading a remote code model, default to False
   trust_remote_code: False
 
+# Rollout engine config applied when reward_model.use_reward_loop is True
+rollout:
+
+  # Target class providing rollout runtime settings
+  _target_: psrl.workers.config.RolloutConfig
+
+  # Engine name, currently only vLLM is supported for RM loop
+  name: vllm
+
+  # Reward loop uses async inference to avoid blocking PPO workers
+  mode: psrl_async
+
+  # RM rollout typically reuses the RM tokenizer, so keep attention enabled
+  disable_attn: False
+
+  # Default precision follows reward_model.dtype
+  dtype: ${reward_model.dtype}
+
+  # GPU memory fraction allocated to RM rollout engines
+  gpu_memory_utilization: ${reward_model.gpu_memory_utilization}
+
+  # Parallelism defaults for reward model replicas
+  tensor_model_parallel_size: ${reward_model.tensor_model_parallel_size}
+
+  pipeline_model_parallel_size: 1
+
+  data_parallel_size: 1
+
+  expert_parallel_size: 1
+
+  # Batch/token limits for RM inference
+  max_num_batched_tokens: 4096
+
+  prompt_length: ${oc.select:data.max_prompt_length,2048}
+
+  response_length: ${oc.select:data.max_response_length,2048}
+
+  # Enable inference optimizations by default
+  enable_chunked_prefill: True
+
+  enable_prefix_caching: True
+
+  # Keep stats disabled to reduce logging overhead
+  disable_log_stats: True
+
+  skip_tokenizer_init: False
+
 # [Deprecated] Global micro batch size
 # will be deprecated, use micro_batch_size_per_gpu
 micro_batch_size: null
@@ -57,7 +105,7 @@ reward_manager: naive
 
 # Whether to launch custom reward function asynchronously during log_prob
 # custom reward function executed async on CPU, during log_prob
-launch_reward_fn_async: False
+launch_reward_fn_async: True
 
 # Cloud/local sandbox fusion configuration for custom reward logic
 sandbox_fusion:

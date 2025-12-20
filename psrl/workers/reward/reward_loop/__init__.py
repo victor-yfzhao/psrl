@@ -3,12 +3,14 @@ from .registry import get_reward_loop_manager_cls, register, load_reward_loop_ma
 from .dapo import DAPORewardLoopManager
 from .naive import NaiveRewardLoopManager
 from .prime import PrimeRewardLoopManager
+from .gen import GenRewardLoopManager
 
 __all__ = [
     "DAPORewardLoopManager",
     "NaiveRewardLoopManager",
     "PrimeRewardLoopManager",
     "register",
+    "GenRewardLoopManager",
     "get_reward_loop_manager_cls",
     "load_reward_loop_manager",
 ]

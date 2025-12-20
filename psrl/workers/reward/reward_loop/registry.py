@@ -9,6 +9,7 @@ from verl.trainer.ppo.reward import get_custom_reward_fn
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
+from psrl.workers.reward.reward_model.gen_reward_function import DefaultGenRewardFunction
 
 __all__ = ["register", "get_reward_loop_manager_cls", "load_reward_loop_manager"]
 
@@ -55,8 +56,10 @@ def get_reward_loop_manager_cls(name: str) -> type[RewardLoopManagerBase]:
 def load_reward_loop_manager(
     config: DictConfig,
     input_tokenizer: Any,
-    reward_model_router: Any,
-    reward_model_tokenizer: Any,
+    reward_model_manager: Any = None,
+    reward_model_router: Any = None,
+    reward_model_tokenizer: Any = None,
+    reward_model_replica_handles: list | None = None,
     **reward_kwargs: Any,
 ) -> RewardLoopManagerBase:
     """Load the reward loop manager based on the configuration.
@@ -82,7 +85,8 @@ def load_reward_loop_manager(
     reward_loop_manager_name = config.reward_model.get("reward_manager", "naive")
     reward_loop_manager_cls = get_reward_loop_manager_cls(reward_loop_manager_name)
 
-    if compute_score is None:
+    final_compute_score = compute_score
+    if final_compute_score is None:
         sandbox_config = config.reward_model.get("sandbox_fusion")
         sandbox_url = sandbox_config.get("url") if sandbox_config else None
         memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
@@ -100,6 +104,19 @@ def load_reward_loop_manager(
             )
         else:
             final_compute_score = default_compute_score_async
+
+    if reward_loop_manager_name == "gen":
+        reward_function = reward_kwargs.pop("reward_function", DefaultGenRewardFunction())
+        return reward_loop_manager_cls(
+            config,
+            input_tokenizer,
+            reward_model_manager=reward_model_manager,
+            reward_function=reward_function,
+            router_process=reward_model_router,
+            replica_handles=reward_model_replica_handles or [],
+            reward_model_tokenizer=reward_model_tokenizer,
+            **reward_kwargs,
+        )
 
     return reward_loop_manager_cls(
         config,
