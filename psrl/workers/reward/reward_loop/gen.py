@@ -89,23 +89,18 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         assert len(data) == 1, "Only support single data item in run_single"
         data_item = data[0]
         request_uid = self._format_request_uid(data_item.non_tensor_batch.get("uid"))
-
+        
+        # Extract prompt
+        prompt_ids = data_item.batch["prompts"]
+        prompt_str = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.decode(prompt_ids, skip_special_tokens=True),
+        )
         # Extract agent response
         response_ids = data_item.batch["responses"]
-        raw_response_ids = data_item.non_tensor_batch.get("raw_response_ids")
-        if raw_response_ids is not None:
-            candidate = raw_response_ids
-            if isinstance(candidate, np.ndarray) and candidate.dtype == object:
-                candidate = candidate.tolist()
-            if isinstance(candidate, list) and len(candidate) == 1 and isinstance(candidate[0], (list, np.ndarray)):
-                candidate = candidate[0]
-            if isinstance(candidate, np.ndarray):
-                candidate = candidate.tolist()
-            valid_response_ids = torch.as_tensor(candidate, dtype=response_ids.dtype)
-        else:
-            response_length = response_ids.shape[-1]
-            valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
+        response_length = response_ids.shape[-1]
+        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+        valid_response_ids = response_ids[:valid_response_length]
 
         # Decode agent response
         response_str = await self.loop.run_in_executor(
@@ -120,7 +115,7 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         psrl_logger.info("Reward loop received uid=%s source=%s", request_uid, data_source)
 
         # Construct RM prompt (e.g., "Question: ... Answer: ..." or custom template)
-        rm_prompt = self.reward_function.prompt_constructor(data_item, response_str, self.tokenizer)
+        rm_prompt = self.reward_function.prompt_constructor(prompt_str=prompt_str, response_str=response_str)
 
         # Tokenize RM prompt
         rm_inputs = await self.loop.run_in_executor(
@@ -205,18 +200,34 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         if pad_token_id is None:
             pad_token_id = self.reward_model_tokenizer.eos_token_id
         if pad_token_id is None:
-            # If both pad_token_id and eos_token_id are None, use 0 as fallback
             pad_token_id = 0
         raw_prompt_ids = [
             _pre_process_inputs(pad_token_id, input_ids[i]) for i in range(batch_size)
         ]
         
         # Add raw_prompt_ids and raw_response_ids (empty) for vllm pre-processing
+        raw_response_ids = [[] for _ in range(batch_size)]
+
+        raw_prompt_ids_array = np.empty(len(raw_prompt_ids), dtype=object)
+        for i, prompt_list in enumerate(raw_prompt_ids):
+            if isinstance(prompt_list, np.ndarray):
+                raw_prompt_ids_array[i] = prompt_list.tolist()
+            else:
+                raw_prompt_ids_array[i] = list(prompt_list)
+        
+        raw_response_ids_array = np.empty(len(raw_response_ids), dtype=object)
+        for i, response_list in enumerate(raw_response_ids):
+            if isinstance(response_list, np.ndarray):
+                raw_response_ids_array[i] = response_list.tolist()
+            else:
+                raw_response_ids_array[i] = list(response_list)
+        
         non_tensor_batch = {
             "uid": np.array([uid_value], dtype=object),
-            "raw_prompt_ids": np.array(raw_prompt_ids, dtype=object),
-            "raw_response_ids": np.array([[] for _ in range(batch_size)], dtype=object),
+            "raw_prompt_ids": raw_prompt_ids_array,
+            "raw_response_ids": raw_response_ids_array,
         }
+        
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
     async def _query_reward_model(self, rm_data_proto: DataProto, request_uid: str | None) -> str:
@@ -238,17 +249,23 @@ class GenRewardLoopManager(RewardLoopManagerBase):
             psrl_logger.warning("Reward model returned empty output")
             return ""
 
-        generated_ids = rm_outputs.batch.get("response_ids", rm_outputs.batch.get("responses"))
-        if generated_ids is None:
-            psrl_logger.error("No response_ids or responses in RM output")
+        if "raw_response_ids" not in rm_outputs.non_tensor_batch:
+            psrl_logger.error("No raw_response_ids in RM output non_tensor_batch")
             return ""
+        
+        raw_response_ids = rm_outputs.non_tensor_batch["raw_response_ids"]
+        if len(raw_response_ids) == 0:
+            psrl_logger.warning("raw_response_ids is empty")
+            return ""
+
+        generated_ids = raw_response_ids[0]
 
         generated_str = await self.loop.run_in_executor(
             None,
-            lambda: self.reward_model_tokenizer.decode(generated_ids[0], skip_special_tokens=True),
+            lambda: self.reward_model_tokenizer.decode(generated_ids, skip_special_tokens=True),
         )
         psrl_logger.info(
-            "Reward model response ready uid=%s tokens=%d", request_uid, len(generated_ids[0])
+            "Reward model response ready uid=%s tokens=%d", request_uid, len(generated_ids)
         )
         return generated_str
 

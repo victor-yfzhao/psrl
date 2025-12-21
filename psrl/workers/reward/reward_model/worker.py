@@ -320,14 +320,12 @@ class PSRL_RewardModelWorker(Worker):
 
         # Start the generation
         with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
-            vllm_outputs = await self.rollout.raw_generate_sequences_async(request)
+            result = await self.rollout.generate_sequences_async(request)
 
-            vllm_output = vllm_outputs[0][1] if isinstance(vllm_outputs, list) else vllm_outputs[1]
-            assert len(vllm_output.outputs) == 1, (
-                f"Expected no repeat in generation, got {len(vllm_output.outputs)} outputs."
+            assert len(result) == 1, (
+                f"Expected 1 output for single request, got {len(result)} outputs."
             )
-
-            result = self.rollout.post_process_outputs(request, vllm_output)
+            
         return result
     
     def _create_task_done_callback(self, request_id: int):

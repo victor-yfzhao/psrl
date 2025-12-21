@@ -39,14 +39,12 @@ class GenRewardFunctionBase(ABC):
         raise NotImplementedError
     
     @abstractmethod
-    def prompt_constructor(self, data_item: DataProto, response_str: str, tokenizer) -> str:
+    def prompt_constructor(self, **kwargs) -> str:
         """
         Prompt constructor for reward function.
 
         Args:
-            data_item: Data item.
-            response_str: Agent's solution string.
-            tokenizer: Tokenizer (Rollout's tokenizer, ** NOT Reward Model's tokenizer **).
+            **kwargs: Keyword arguments. Self-defined.
 
         Returns:
             str: Prompt.
@@ -75,22 +73,9 @@ class DefaultGenRewardFunction(GenRewardFunctionBase):
     def __init__(self):
         self.prompt_template = DEFAULT_GENRM_PROMPT_TEMPLATE
     
-    def prompt_constructor(self, data_item: DataProto, response_str: str, tokenizer) -> str:
-        # Extract problem/question
-        problem = data_item.non_tensor_batch["reward_model"].get("question", "")
-        if not problem:
-            # Fallback: try to get from extra_info
-            extra_info = data_item.non_tensor_batch.get("extra_info", {})
-            problem = extra_info.get("question", "")
-        
-        if not problem:
-            # Final fallback: decode input_ids as question
-            input_ids = data_item.batch.get("input_ids", torch.tensor([]))
-            if len(input_ids) > 0:
-                problem = tokenizer.decode(input_ids, skip_special_tokens=True)
-        
+    def prompt_constructor(self, prompt_str: str, response_str: str) -> str:      
         # Use template to construct prompt (default: GENRM_PROMPT_TEMPLATE format)
-        rm_prompt = DEFAULT_GENRM_PROMPT_TEMPLATE.format(problem=problem, solution=response_str)
+        rm_prompt = DEFAULT_GENRM_PROMPT_TEMPLATE.format(problem=prompt_str, solution=response_str)
         return rm_prompt
 
     def compute_score(
