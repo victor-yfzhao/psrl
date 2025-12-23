@@ -5,7 +5,11 @@ import ray
 import torch
 from omegaconf import DictConfig
 from verl import DataProto
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    register,
+)
 from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -15,7 +19,12 @@ from verl.utils.fsdp_utils import (
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
-from psrl.utils.logger import DualOutputHandler, EventType, get_worker_info, log_dual_events
+from psrl.utils.logger import (
+    DualOutputHandler,
+    EventType,
+    get_worker_info,
+    log_dual_events,
+)
 from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_TRAIN_CLIENT_NAME,
@@ -56,10 +65,15 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
             state_dict = model.state_dict()
         return state_dict
     elif fsdp_version(model) == 2:
-        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_model_state_dict,
+        )
 
         state_dict_config = StateDictOptions(
-            full_state_dict=True, cpu_offload=offload_to_cpu, broadcast_from_rank0=not rank0_only
+            full_state_dict=True,
+            cpu_offload=offload_to_cpu,
+            broadcast_from_rank0=not rank0_only,
         )
         state_dict = get_model_state_dict(model, options=state_dict_config)
         return state_dict
@@ -77,7 +91,14 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         nixl_interface: NIXLInterface,
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
-        PSRL_BaseTrainWorker.__init__(self, self.rank, self.world_size, psrl_config, train_interface, nixl_interface)
+        PSRL_BaseTrainWorker.__init__(
+            self,
+            self.rank,
+            self.world_size,
+            psrl_config,
+            train_interface,
+            nixl_interface,
+        )
 
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"

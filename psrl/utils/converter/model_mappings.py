@@ -139,7 +139,12 @@ def slice_qkv_proj(
 
 
 def slice_qkv_proj_megatron(
-    fused_param: Parameter, num_heads: int, num_kv_heads: int, head_size: int, tp_size: int = 1, output_dim: int = 1
+    fused_param: Parameter,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    tp_size: int = 1,
+    output_dim: int = 1,
 ) -> list[Parameter]:
     """
     Split a fused qkv_proj parameter into three shards according to Megatron-style:

@@ -71,12 +71,29 @@ class VllmQwen2MoeParameterMapping(ParameterMapping):
         expert_num = self.config.num_experts
         for expert_id in range(expert_num):
             mapping.append(
-                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+                (
+                    "w13_weight",
+                    f"{expert_id}.gate_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
             )
             mapping.append(
-                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+                (
+                    "w13_weight",
+                    f"{expert_id}.up_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
             )
-            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.down_proj.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
         return mapping
 
     def get_model_info(self):
@@ -117,12 +134,29 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
         expert_num = self.config.num_experts
         for expert_id in range(expert_num):
             mapping.append(
-                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+                (
+                    "w13_weight",
+                    f"{expert_id}.gate_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
             )
             mapping.append(
-                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+                (
+                    "w13_weight",
+                    f"{expert_id}.up_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
             )
-            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.down_proj.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
         return mapping
 
     def get_model_info(self):
@@ -131,7 +165,11 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
         return {
             "num_heads": self.config.num_attention_heads,
             "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads),
+            "head_size": getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            ),
             "intermediate_size": self.config.intermediate_size,
             "num_experts": self.config.num_experts,
         }
@@ -312,12 +350,29 @@ class VllmOLMoEParameterMapping(ParameterMapping):
         expert_num = 64
         for expert_id in range(expert_num):
             mapping.append(
-                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+                (
+                    "w13_weight",
+                    f"{expert_id}.gate_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
             )
             mapping.append(
-                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+                (
+                    "w13_weight",
+                    f"{expert_id}.up_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
             )
-            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.down_proj.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
         return mapping
 
     def get_model_info(self):

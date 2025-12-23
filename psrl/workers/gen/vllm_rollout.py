@@ -14,12 +14,22 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel
+from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+
+try:
+    # https://github.com/vllm-project/vllm/commit/96b9aa5aa076e64c68765232aec343e4d0006e2a
+    from vllm.config import CompilationMode
+
+    _use_compilation_mode = True
+except ImportError:
+    from vllm.config import CompilationLevel
+
+    _use_compilation_mode = False
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import deprecated
@@ -76,7 +86,11 @@ class PSRL_vLLMRollout:
         model_hf_config = model_config.hf_config
         trust_remote_code = model_config.trust_remote_code
         lora_kwargs = (
-            {"enable_lora": True, "max_loras": 1, "max_lora_rank": model_config.lora_rank}
+            {
+                "enable_lora": True,
+                "max_loras": 1,
+                "max_lora_rank": model_config.lora_rank,
+            }
             if model_config.lora_rank > 0
             else {}
         )
@@ -128,7 +142,11 @@ class PSRL_vLLMRollout:
 
         # LoRA configuration
         lora_kwargs = (
-            {"enable_lora": True, "max_loras": 1, "max_lora_rank": model_config.lora_rank}
+            {
+                "enable_lora": True,
+                "max_loras": 1,
+                "max_lora_rank": model_config.lora_rank,
+            }
             if model_config.lora_rank > 0
             else {}
         )
@@ -149,9 +167,12 @@ class PSRL_vLLMRollout:
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
             if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
-                )
+                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                if _use_compilation_mode:
+                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
+                else:
+                    compilation_args["level"] = CompilationLevel.PIECEWISE
+                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
             else:
                 psrl_logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
@@ -188,6 +209,7 @@ class PSRL_vLLMRollout:
             logprobs_mode=config.logprobs_mode,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
+            **compilation_config,
             **lora_kwargs,
             **engine_kwargs,
         )
@@ -365,7 +387,8 @@ class PSRL_vLLMRollout:
         if "raw_prompt_ids" not in non_tensor_batch:
             # Remove the left padding in the prompt token_id
             non_tensor_batch["raw_prompt_ids"] = np.array(
-                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
+                dtype=object,
             )
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
@@ -386,7 +409,10 @@ class PSRL_vLLMRollout:
                 raw_prompt_ids, raw_response_ids, non_tensor_batch["multi_modal_data"]
             ):
                 vllm_inputs.append(
-                    {"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_, "multi_modal_data": multi_modal_data}
+                    {
+                        "prompt_token_ids": raw_prompt_ids_ + raw_response_ids_,
+                        "multi_modal_data": multi_modal_data,
+                    }
                 )
         else:
             vllm_inputs = [
@@ -426,7 +452,7 @@ class PSRL_vLLMRollout:
         else:
             kwargs = {
                 "n": 1,  # we repeat the request manually to support partial rollout
-                "prompt_logprobs": 0 if self.psrl_config.partial_rollout.interrupt_as_prompt else None,
+                "prompt_logprobs": (0 if self.psrl_config.partial_rollout.interrupt_as_prompt else None),
             }
 
         return vllm_inputs, kwargs
@@ -434,7 +460,7 @@ class PSRL_vLLMRollout:
     def post_process_outputs(
         self,
         prompts: DataProto,
-        outputs: RequestOutput | PoolingRequestOutput | list[RequestOutput | PoolingRequestOutput],
+        outputs: (RequestOutput | PoolingRequestOutput | list[RequestOutput | PoolingRequestOutput]),
     ) -> DataProto:
         """
         Post-process vLLM outputs to convert them back into DataProto format.

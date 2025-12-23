@@ -220,7 +220,10 @@ class PSRL_AgentLoopWorker:
             assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
             request_ids = requests.non_tensor_batch["uid"]
             with log_dual_events(
-                "Update request status", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER
+                "Update request status",
+                psrl_logger,
+                level=logging.DEBUG,
+                event_type=EventType.OTHER,
             ):
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(
                     request_ids.tolist(),
@@ -256,11 +259,14 @@ class PSRL_AgentLoopWorker:
             **kwargs: Keyword arguments for the update.
         """
         await self.rollout_router.update_instance_status(instance_to_engine_status, **kwargs)
-        # May log some stats here
-        # psrl_logger.debug(
-        #     f"Updated instance to engine status: {len(instance_to_engine_status)} instances, "
-        #     f"total queue size: {total_queue_size}"
-        # )
+
+    async def check_should_migrate(self) -> list[int]:
+        """Check if the instance should migrate to another instance.
+
+        Returns:
+            List[int]: The instance IDs that should be migrated.
+        """
+        return await self.rollout_router.check_should_migrate()
 
     async def check_should_sync(self, instance_id: int, ps_model_version: int) -> bool:
         """Check if the instance should synchronize with PS.
@@ -282,6 +288,14 @@ class PSRL_AgentLoopWorker:
             ps_model_version (int): The version of the PS model to update.
         """
         await self.rollout_router.update_currently_syncing_instances(instance_ids, ps_model_version)
+
+    async def abort_requests(self, instance_to_uids: dict[int, list[int] | set[int]]):
+        """Abort the requests in the router.
+
+        Args:
+            instance_to_uids (Dict[int, Union[List[int], Set[int]]]): The instance IDs to abort.
+        """
+        await self.rollout_router.abort_requests(instance_to_uids)
 
     async def wait_interrupted_partial_requests_loop_back(self, instance_ids: list[int]):
         """Wait for the interrupted partial requests to be looped back in the priority queue.
@@ -348,7 +362,10 @@ class PSRL_AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
-        prompt_ids, prompt_attention_mask = prompt_output["input_ids"], prompt_output["attention_mask"]
+        prompt_ids, prompt_attention_mask = (
+            prompt_output["input_ids"],
+            prompt_output["attention_mask"],
+        )
 
         # responses
         raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
@@ -361,7 +378,10 @@ class PSRL_AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
-        response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
+        response_ids, response_attention_mask = (
+            outputs["input_ids"],
+            outputs["attention_mask"],
+        )
 
         # response_mask
         response_masks = inputs.non_tensor_batch.pop("response_mask", None)

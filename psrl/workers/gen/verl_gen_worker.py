@@ -138,12 +138,16 @@ class PSRL_VerlGenWorker(ActorRolloutRefWorker):
                 self.pull_model()
             prompts = prompts.to(get_device_id())
             meta_info = {
-                "eos_token_id": self.generation_config.eos_token_id
-                if self.generation_config is not None
-                else self.tokenizer.eos_token_id,
-                "pad_token_id": self.generation_config.pad_token_id
-                if self.generation_config is not None
-                else self.tokenizer.pad_token_id,
+                "eos_token_id": (
+                    self.generation_config.eos_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.eos_token_id
+                ),
+                "pad_token_id": (
+                    self.generation_config.pad_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.pad_token_id
+                ),
             }
             prompts.meta_info.update(meta_info)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
@@ -166,12 +170,16 @@ class PSRL_VerlGenWorker(ActorRolloutRefWorker):
             self.pull_model()
         prompts = prompts.to(get_device_id())
         meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
+            "eos_token_id": (
+                self.generation_config.eos_token_id
+                if self.generation_config is not None
+                else self.tokenizer.eos_token_id
+            ),
+            "pad_token_id": (
+                self.generation_config.pad_token_id
+                if self.generation_config is not None
+                else self.tokenizer.pad_token_id
+            ),
         }
         prompts.meta_info.update(meta_info)
         outputs = self.rollout.generate_sequences(prompts)

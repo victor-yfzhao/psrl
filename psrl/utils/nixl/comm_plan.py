@@ -118,7 +118,12 @@ class CommunicationPlanner:
 
         # Generate PULL_SIDE <- PS_FOR_PULL read plan
         if pull_client_groups and ps_for_pull_client_groups:
-            self._make_pull_from_ps_plan(clients, pull_client_groups, ps_for_pull_client_groups, pull_from_ps_plan)
+            self._make_pull_from_ps_plan(
+                clients,
+                pull_client_groups,
+                ps_for_pull_client_groups,
+                pull_from_ps_plan,
+            )
 
         return NIXLCommPlan(push_to_ps_plan=push_to_ps_plan, pull_from_ps_plan=pull_from_ps_plan)
 

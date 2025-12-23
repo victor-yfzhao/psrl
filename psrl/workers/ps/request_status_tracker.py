@@ -19,8 +19,9 @@ class PSRL_RequestStatus(Enum):
 
     PENDING: Request is queued in data queue, waiting for dispatch
     RUNNING: Request is running (generic running state)
-    ROLLOUT_DISPATCHED: Request is dispatched to a specific Gen Worker, but not yet in the engine request queue
-    ROLLOUT_RUNNING: Request is in the engine request queue and is being rolled out
+    ROLLOUT_ROUTING: Request is in the router and is waiting for a specific instance to be dispatched
+    ROLLOUT_DISPATCHED: Request is dispatched to the instance engine
+    ROLLOUT_RUNNING: Request is in the instance engine and is being rolled out
     ROLLOUT_INTERRUPTED: Rollout was interrupted by the user for Partial Rollout, put into replay buffer
     REWARD_RUNNING: Request is running in the reward manager
     REWARD_COMPLETED: Request is completed in the reward manager
@@ -29,10 +30,12 @@ class PSRL_RequestStatus(Enum):
 
     PENDING = enum.auto()
     RUNNING = enum.auto()
+    ROLLOUT_ROUTING = enum.auto()
     ROLLOUT_DISPATCHED = enum.auto()
     ROLLOUT_RUNNING = enum.auto()
     ROLLOUT_INTERRUPTED = enum.auto()
     ROLLOUT_INTERRUPTED_BY_SCHEDULER = enum.auto()
+    ROLLOUT_COMPLETED = enum.auto()
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()
     COMPLETED = enum.auto()
@@ -122,10 +125,8 @@ class RequestStatusTracker:
 
         for i, req_id in enumerate(request_id):
             # Check if the request is marked for abortion
-            if req_id in self._abort_request_ids:
+            if self._check_aborted_request(req_id, remove=True):
                 request_update_success[i] = False
-                self._abort_request_ids.remove(req_id)  # Remove from abort set
-                self.remove_request(req_id)  # Remove from status and info maps
                 continue
 
             # If the request is stale, we should not update its status
@@ -135,7 +136,7 @@ class RequestStatusTracker:
                 if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
                 request_version = self._request_infos[req_id].model_version
-                if request_version < self._running_min_version:
+                if request_version != -1 and request_version < self._running_min_version:
                     psrl_logger.warning(
                         "Request %d is stale (version %d < %d), cannot update status",
                         req_id,
@@ -155,11 +156,6 @@ class RequestStatusTracker:
                     # psrl_logger.info(f"Changed status of request {req_id}: {old_status.name} -> {new_status.name}")
                 self._status_to_request_ids[new_status].add(req_id)
                 self._request_id_to_status[req_id] = new_status
-                # Update the rollout instance ID if provided
-                if rollout_instance_id[i] != -1:
-                    self._request_infos[req_id].rollout_instance_id = rollout_instance_id[i]
-                if model_version[i] != -1:
-                    self._request_infos[req_id].model_version = model_version[i]
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
 
@@ -191,6 +187,7 @@ class RequestStatusTracker:
 
         This method removes completed requests from the tracking system
         after they have been processed by the reward manager.
+        It is a wrapper function for the `remove_request` method.
 
         Args:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s) to remove
@@ -208,18 +205,12 @@ class RequestStatusTracker:
             assert self._request_id_to_status[req_id] == PSRL_RequestStatus.COMPLETED, (
                 f"Request ID {req_id} is not in COMPLETED status."
             )
+            assert req_id not in self._abort_request_ids, (
+                f"Request ID {req_id} is marked for abortion but is being removed as train ready."
+            )
 
-            if req_id in self._abort_request_ids:
-                psrl_logger.warning(
-                    f"Request ID {req_id} is marked for abortion but is being removed as train ready, "
-                    f"we will remove it from abort set."
-                )
-                self._abort_request_ids.discard(req_id)
-
-            # Remove the request from the status map and request infos
-            del self._request_id_to_status[req_id]
-            del self._request_infos[req_id]
-            self._status_to_request_ids[PSRL_RequestStatus.COMPLETED].discard(req_id)
+        # Remove the request from the status tracker
+        self.remove_request(request_id)
 
     def get_all_request_statuses(self) -> dict:
         """Get the statuses of all requests currently being tracked.
@@ -246,7 +237,7 @@ class RequestStatusTracker:
         request_id: list[int] | int,
         rollout_instance_id: list[int] | int = -1,
         model_version: list[int] | int = -1,
-        status: list[PSRL_RequestStatus] | PSRL_RequestStatus = PSRL_RequestStatus.PENDING,
+        status: (list[PSRL_RequestStatus] | PSRL_RequestStatus) = PSRL_RequestStatus.PENDING,
     ):
         """
         Add new requests to the status manager.
@@ -283,6 +274,31 @@ class RequestStatusTracker:
             self._request_id_to_status[req_id] = status[i]
             self._status_to_request_ids[status[i]].add(req_id)
 
+    def _check_aborted_request(self, request_id: int, remove: bool = True) -> bool:
+        """Check if the request is aborted and remove it from the status tracker if needed.
+
+        Args:
+            request_id: The id of the request to check.
+            remove: Whether to remove the request from the status tracker if it is aborted.
+        Returns:
+            True if the request is aborted, False otherwise.
+        """
+        if request_id in self._abort_request_ids:
+            if remove:
+                self.remove_request(request_id)  # Remove from status and info maps
+            return True
+        if request_id not in self._request_id_to_status:
+            assert request_id not in self._request_infos, (
+                f"Request ID {request_id} should not be in request infos but is."
+            )
+            return True
+        if request_id not in self._request_infos:
+            assert request_id not in self._request_id_to_status, (
+                f"Request ID {request_id} should not be in status map but is."
+            )
+            return True
+        return False
+
     def _abort_requests(self, request_ids: list[int] | int, blocking: bool = False):
         """
         Mark requests for abortion.
@@ -307,6 +323,12 @@ class RequestStatusTracker:
         abort_requests_for_reward = set()
 
         for status, req_ids in status_to_req_ids.items():
+            psrl_logger.info(f"Classifying aborted requests in status {status}: {req_ids}")
+            # if status in {
+            #     PSRL_RequestStatus.ROLLOUT_ROUTING,
+            #     PSRL_RequestStatus.ROLLOUT_DISPATCHED,
+            #     PSRL_RequestStatus.ROLLOUT_RUNNING
+            # }:
             if status in {PSRL_RequestStatus.ROLLOUT_RUNNING}:
                 abort_requests_for_rollout.update(req_ids)
             elif status in {PSRL_RequestStatus.REWARD_RUNNING}:

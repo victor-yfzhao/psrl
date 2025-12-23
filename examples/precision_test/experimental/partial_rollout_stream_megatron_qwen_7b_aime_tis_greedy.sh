@@ -12,10 +12,10 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
-# HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
-# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/DeepSeek-R1-Distill-Qwen-7B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
+# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+# DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -105,12 +105,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.partial_rollout.enable=True \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_global_migration=False \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_strategy.method="greedy" \
+    psrl.sync_and_mig_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \

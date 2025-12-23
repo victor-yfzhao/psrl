@@ -107,9 +107,10 @@ class TaskRunner:
         from psrl.workers.gen.gen_worker import PSRL_GenWorker
 
         if config.train_actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            assert config.critic.strategy in ["fsdp", "fsdp2"], (
-                "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
-            )
+            assert config.critic.strategy in [
+                "fsdp",
+                "fsdp2",
+            ], "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
             from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
             from psrl.workers.train.fsdp_train_worker import (

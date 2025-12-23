@@ -549,7 +549,7 @@ class ClusterScanner:
                         NetworkInterfaceInfo(
                             name=pseudo_name,
                             is_up=is_up,
-                            speed_gbps=float(rate_gbps) if (rate_gbps is not None) else None,
+                            speed_gbps=(float(rate_gbps) if (rate_gbps is not None) else None),
                             link_type=link_type,
                             details=details,
                         )
@@ -581,15 +581,15 @@ class ClusterScanner:
 
                 cpu = CPUInfo(
                     model_name=lscpu.get("Model name"),
-                    sockets=int(lscpu.get("Socket(s)", "0")) if "Socket(s)" in lscpu else None,
-                    cores_per_socket=int(lscpu.get("Core(s) per socket", "0"))
-                    if "Core(s) per socket" in lscpu
-                    else None,
-                    threads_per_core=int(lscpu.get("Thread(s) per core", "0"))
-                    if "Thread(s) per core" in lscpu
-                    else None,
+                    sockets=(int(lscpu.get("Socket(s)", "0")) if "Socket(s)" in lscpu else None),
+                    cores_per_socket=(
+                        int(lscpu.get("Core(s) per socket", "0")) if "Core(s) per socket" in lscpu else None
+                    ),
+                    threads_per_core=(
+                        int(lscpu.get("Thread(s) per core", "0")) if "Thread(s) per core" in lscpu else None
+                    ),
                     cpus=int(lscpu.get("CPU(s)", "0")) if "CPU(s)" in lscpu else None,
-                    cpu_mhz=float(lscpu.get("CPU MHz", "0.0")) if "CPU MHz" in lscpu else None,
+                    cpu_mhz=(float(lscpu.get("CPU MHz", "0.0")) if "CPU MHz" in lscpu else None),
                     total_ram_bytes=total_mem,
                 )
 
@@ -612,7 +612,7 @@ class ClusterScanner:
                             name=e["name"],
                             uuid=e["uuid"],
                             pci_bus_id=e["pci_bus_id"],
-                            memory_total_bytes=(mem_mb * 1024 * 1024) if mem_mb else None,
+                            memory_total_bytes=((mem_mb * 1024 * 1024) if mem_mb else None),
                         )
                         gpus.append(g)
                 else:
@@ -708,7 +708,7 @@ class ClusterScanner:
                     nvlink=[],
                 )
                 return node
-        except Exception as e:
+        except Exception:
             return NodeInfo(
                 hostname=f"error-{ip}",
                 ip=ip,
@@ -761,7 +761,6 @@ class ClusterScanner:
 
         cpu_counter = Counter()
         gpu_counter = Counter()
-        _nvlink_counter = Counter()  # nvlink_counter unused
         netif_counter = Counter()
 
         def cpu_prototype_key(cpu: dict[str, Any]) -> str:

@@ -144,7 +144,10 @@ class MegatronConverter(BaseConverter):
                 else:
                     sliced_params = slice_gate_up_proj(
                         fused_param=param,
-                        output_sizes=[self.model_info["intermediate_size"], self.model_info["intermediate_size"]],
+                        output_sizes=[
+                            self.model_info["intermediate_size"],
+                            self.model_info["intermediate_size"],
+                        ],
                         tp_size=self.mpu.tp_size,
                     )
             except Exception as e:

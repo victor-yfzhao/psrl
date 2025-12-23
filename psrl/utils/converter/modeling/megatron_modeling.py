@@ -30,7 +30,11 @@ class BridgedMegatronParameterMapping(ParameterMapping):
         return {
             "num_heads": self.config.num_attention_heads,
             "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads),
+            "head_size": getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            ),
             "intermediate_size": self.config.intermediate_size,
             "moe_intermediate_size": getattr(self.config, "moe_intermediate_size", self.config.intermediate_size),
             "shared_expert_intermediate_size": getattr(self.config, "shared_expert_intermediate_size", None),

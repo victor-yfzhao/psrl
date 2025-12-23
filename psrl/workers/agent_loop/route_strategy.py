@@ -237,6 +237,7 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
         if len(candidates) == 0:
             return None
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
+
         self.logger.debug(
             f"Routing request {request.non_tensor_batch['uid']} among "
             f"candidates {candidates} with all instance workloads "
@@ -244,22 +245,25 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
             f"{candidates[idx]} with workload "
             f"{self.instance_request_counts[candidates[idx]]}"
         )
+
         """
         remaining_request_counts = [
-            self.instance_request_counts[i]
-            for i in range(self.n_instances)
-            if i != candidates[idx]
+            self.instance_request_counts[i] for i in range(self.n_instances) if i != candidates[idx]
         ]
+
         if len(remaining_request_counts) > 0:
             remaining_max_request_count = max(remaining_request_counts)
             if self.instance_request_counts[candidates[idx]] > remaining_max_request_count:
                 # Avoid overload, return None (currently not route to any instance)
                 return None
-        """
+
         if self.instance_request_counts[candidates[idx]] >= min(
             self.max_concurrent_seqs_per_instance,
             self.balanced_concurrent_seqs_per_instance,
         ):
+        """
+
+        if self.instance_request_counts[candidates[idx]] >= self.max_concurrent_seqs_per_instance:
             # if self.instance_request_counts[candidates[idx]] >= self.max_concurrent_seqs_per_instance:
             # Avoid overload, return None (currently not route to any instance)
             return None
@@ -524,6 +528,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
+            # self.logger.info(f"No candidates available for request {request.non_tensor_batch['uid'][0]}")
             return None
         instance_to_version_after_sync = route_kwargs["instance_to_version_after_sync"]
         candidates_group_by_priority = []
@@ -568,18 +573,18 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
             for indicator in sorted(indicator_to_candidates.keys()):
                 candidates_group_by_priority.append((indicator, indicator_to_candidates[indicator]))
 
-        # Process each group of candidates from highest priority to lowest
-        # priority
+        # Process each group of candidates
+        # from highest priority to lowest priority
         for indicator, candidates in candidates_group_by_priority:
-            # Calculate baseline threshold (use first candidate's baseline as
-            # reference)
+            # Calculate baseline threshold
+            # (use first candidate's baseline as reference)
             baseline_delta_throughput = self._estimate_baseline_delta_throughput(request, candidates[0])
             threshold = baseline_delta_throughput * self.delta_throughput_threshold
             best_candidate = None
             best_delta_throughput = float("-inf")
 
-            # Find the candidate with maximum delta_throughput in this version
-            # group
+            # Find the candidate with maximum delta_throughput
+            # in this version group
             for candidate in candidates:
                 if not self._can_run_directly(request, candidate):
                     continue
@@ -599,7 +604,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         if "version_tag" in request.non_tensor_batch
                         else "None (retry request)"
                     )
-                    self.logger.info(
+                    self.logger.debug(
                         f"No candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for request "
                         f"{request.non_tensor_batch['uid'][0]} from rollout "
@@ -616,7 +621,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         f"model len is {self.instance_to_max_model_len}"
                     )
                 else:
-                    self.logger.info(
+                    self.logger.debug(
                         f"No candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for request "
                         f"{request.non_tensor_batch['uid'][0]}, because none "
@@ -631,8 +636,8 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                     )
                 continue
 
-            # If this group's best delta_throughput meets the threshold, return
-            # it
+            # If this group's best delta_throughput meets the threshold
+            # Return it
             if (
                 best_delta_throughput >= threshold
                 and self.instance_to_request_num[best_candidate] < self.max_concurrent_seqs_per_instance
@@ -647,7 +652,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         if "version_tag" in request.non_tensor_batch
                         else "None (retry request)"
                     )
-                    self.logger.info(
+                    self.logger.debug(
                         f"Candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for partial "
                         f"rollout request "
@@ -664,7 +669,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         f"{self.instance_to_token_num[best_candidate]}"
                     )
                 else:
-                    self.logger.info(
+                    self.logger.debug(
                         f"Candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for request "
                         f"{request.non_tensor_batch['uid'][0]}, best "
@@ -684,7 +689,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         if "version_tag" in request.non_tensor_batch
                         else "None (retry request)"
                     )
-                    self.logger.info(
+                    self.logger.debug(
                         f"No candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for partial "
                         f"rollout request "
@@ -701,7 +706,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                         f"{self.instance_to_token_num[best_candidate]}"
                     )
                 else:
-                    self.logger.info(
+                    self.logger.debug(
                         f"No candidate in group {candidates} with indicator "
                         f"{indicator} meets the condition for request "
                         f"{request.non_tensor_batch['uid'][0]}, best "

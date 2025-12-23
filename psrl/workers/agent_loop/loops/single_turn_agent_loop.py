@@ -26,12 +26,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
         sampling_params = request.meta_info.get("sampling_params", None)
 
         prompt_ids = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+            None,
+            lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True),
         )
 
         with simple_timer("generate_sequences", metrics):
             response_ids = await self.rollout_router.generate(
-                request_ids=request_ids, prompt_ids=prompt_ids, sampling_params=sampling_params
+                request_ids=request_ids,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
             )
         response_mask = [1] * len(response_ids)
 

@@ -145,7 +145,8 @@ class PSRL_BaseTrainWorker:
                 for key in self.unified_state_dict:
                     wait_operations = []
                     for target_agent_name, target_client_name in zip(
-                        self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names
+                        self._cached_ps_nixl_agent_names,
+                        self._cached_ps_nixl_train_storage_client_names,
                     ):
                         if target_client_name not in self._cached_ps_worker_handles:
                             self._cached_ps_worker_handles[target_client_name] = ray.get(
@@ -156,7 +157,10 @@ class PSRL_BaseTrainWorker:
                         )
                         try:
                             shards_to_transfer = self.nixl_storage_client.client_write(
-                                target_agent_name, target_client_name, key, f"train_push_{next_ps_model_version}"
+                                target_agent_name,
+                                target_client_name,
+                                key,
+                                f"train_push_{next_ps_model_version}",
                             )
                             # shards_to_transfer = self.nixl_storage_client.client_write(
                             #     target_agent_name, target_client_name, key, "train_push"
@@ -176,7 +180,10 @@ class PSRL_BaseTrainWorker:
                     for key, target_client_name, shards_to_transfer in wait_operations:
                         try:
                             self.nixl_storage_client.wait(
-                                key, f"train_push_{next_ps_model_version}", "WRITE", target_client=target_client_name
+                                key,
+                                f"train_push_{next_ps_model_version}",
+                                "WRITE",
+                                target_client=target_client_name,
                             )
                             # self.nixl_storage_client.wait(
                             #     key, "train_push", "WRITE", target_client=target_client_name

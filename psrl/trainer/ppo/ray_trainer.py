@@ -24,12 +24,19 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_response_mask
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
+    apply_kl_penalty,
+    compute_response_mask,
+)
 from verl.trainer.ppo.utils import WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    get_seqlen_balanced_partitions,
+    log_seqlen_unbalance,
+)
 from verl.utils.tracking import ValidationGenerationsLogger
 
 from psrl.trainer.ppo.utils import (
@@ -41,7 +48,12 @@ from psrl.trainer.ppo.utils import (
     need_reward_model,
 )
 from psrl.utils.dataset import DataProcessor, DatasetType
-from psrl.utils.logger import DualOutputHandler, EventType, log_data_protocol, log_dual_events
+from psrl.utils.logger import (
+    DualOutputHandler,
+    EventType,
+    log_data_protocol,
+    log_dual_events,
+)
 from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.gen import GenInterface, RolloutCoordinator
@@ -291,13 +303,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.use_critic and not config.critic.use_dynamic_bsz:
             # Check for critic micro-batch size conflicts
             check_mutually_exclusive(
-                config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic"
+                config.critic.ppo_micro_batch_size,
+                config.critic.ppo_micro_batch_size_per_gpu,
+                "critic",
             )
 
         # Check for reward model micro-batch size conflicts
         if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
             check_mutually_exclusive(
-                config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
+                config.reward_model.micro_batch_size,
+                config.reward_model.micro_batch_size_per_gpu,
+                "reward_model",
             )
 
         # Actor training
@@ -576,7 +592,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.remote(RewardManager)
             .options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=ip_to_node_id[self.config.psrl.reward_service_ip], soft=False
+                    node_id=ip_to_node_id[self.config.psrl.reward_service_ip],
+                    soft=False,
                 )
             )
             .remote(
@@ -605,7 +622,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
 
     def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+        self,
+        batch: DataProto,
+        reward_extra_infos_dict: dict,
+        timing_raw: dict,
+        rollout_data_dir: str,
     ):
         """Log rollout data to disk.
         Args:
@@ -702,7 +723,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 batch_count += 1
             except RayTaskError as e:
                 if isinstance(e.cause, StopIteration):
-                    psrl_logger.debug("Reached end of validation dataset after %d batches", batch_count)
+                    psrl_logger.debug(
+                        "Reached end of validation dataset after %d batches",
+                        batch_count,
+                    )
                     break
                 else:
                     psrl_logger.error(f"Unknown exception happened during obtaining validation data: {type(e.cause)}")
@@ -711,12 +735,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             if "parent_id" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["parent_id"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))],
+                    dtype=object,
                 )
 
             # repeat test batch
             test_batch = test_batch.repeat(
-                repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+                repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n,
+                interleave=True,
             )
 
             # we only do validation on rule-based rm
@@ -902,11 +928,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # Only require nsight worker options when tool is nsys
             if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
                 assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    OmegaConf.select(
+                        self.config.global_profiler.global_tool_config.nsys,
+                        "worker_nsight_options",
+                    )
                     is not None
                 ), "worker_nsight_options must be set when using nsys with profile_steps"
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    OmegaConf.select(
+                        self.config.global_profiler.global_tool_config.nsys,
+                        "worker_nsight_options",
+                    )
                 )
         wg_kwargs["device_name"] = self.device_name
 
@@ -963,7 +995,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Critic)
             critic_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[PSRL_Role.Critic], config=self.config.critic
+                cls=self.role_worker_mapping[PSRL_Role.Critic],
+                config=self.config.critic,
             )
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
@@ -971,7 +1004,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[PSRL_Role.RefPolicy], config=self.config.train_actor_rollout_ref, role="ref"
+                self.role_worker_mapping[PSRL_Role.RefPolicy],
+                config=self.config.train_actor_rollout_ref,
+                role="ref",
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
@@ -1016,19 +1051,25 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 if "rollout" in role:
                     return {
                         role: RayWorkerGroup(
-                            resource_pool=resource_pool, ray_cls_with_init=class_dict[role], **wg_kwargs
+                            resource_pool=resource_pool,
+                            ray_cls_with_init=class_dict[role],
+                            **wg_kwargs,
                         )
                     }
                 return {
                     role: self.ray_worker_group_cls(
-                        resource_pool=resource_pool, ray_cls_with_init=class_dict[role], **wg_kwargs
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=class_dict[role],
+                        **wg_kwargs,
                     )
                 }
             # colocate
             else:
                 worker_dict_cls = create_colocated_worker_cls_fused(class_dict=class_dict)
                 wg_dict = self.ray_worker_group_cls(
-                    resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=worker_dict_cls,
+                    **wg_kwargs,
                 )
                 return wg_dict.spawn(prefix_set=class_dict.keys())
 
@@ -1150,7 +1191,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             torch.bfloat16 if self.config.train_actor_rollout_ref.actor.strategy == "megatron" else torch.float32
         )
         storage_plan = PSStoragePlan(
-            train_model_dtype=train_model_dtype, gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype
+            train_model_dtype=train_model_dtype,
+            gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype,
         )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict
@@ -1285,7 +1327,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+            else os.path.join(
+                self.config.trainer.default_hdfs_dir,
+                f"global_step_{self.global_steps}",
+                "actor",
+            )
         )
 
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
@@ -1302,17 +1348,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
 
         self.actor_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_ckpt_to_keep=max_actor_ckpt_to_keep,
         )
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, "critic")
             critic_remote_path = (
                 None
                 if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir,
+                    f"global_step_{self.global_steps}",
+                    "critic",
+                )
             )
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path,
+                critic_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
 
         # save dataloader
@@ -1368,12 +1424,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         # load actor (train only)
-        self.actor_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        self.actor_wg.load_checkpoint(
+            actor_path,
+            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+        )
 
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+                critic_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
 
         # TODO(lhy): push the actor model state dict to the PS worker (though it is not necessary to do so)
@@ -1427,7 +1487,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(
-            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
+            seqlen_list=global_seqlen_lst,
+            partitions=global_partition_lst,
+            prefix=logging_prefix,
         )
         metrics.update(global_balance_stats)
 
@@ -1522,7 +1584,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("All data pipeline components started successfully.")
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Training Progress",
+        )
 
         # we start from step 1
         self.global_steps += 1
@@ -1551,7 +1617,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         # will block until the training batch is ready
                         psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                         with log_dual_events(
-                            f"Wait for training batch {buffer_id}", psrl_logger, event_type=EventType.WAIT
+                            f"Wait for training batch {buffer_id}",
+                            psrl_logger,
+                            event_type=EventType.WAIT,
                         ):
                             batch = ray.get(self.agent_loop_manager.wait_for_training_batch.remote(buffer_id))
                         psrl_logger.debug(
@@ -1565,10 +1633,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         batch = ray.get(self.agent_loop_manager_handle.get_data.remote())
                         if batch is None:
                             psrl_logger.info(
-                                "No more data from agent loop manager, ending training at step %d", self.global_steps
+                                "No more data from agent loop manager, ending training at step %d",
+                                self.global_steps,
                             )
                             break
-                        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                        batch_keys_to_pop = [
+                            "input_ids",
+                            "attention_mask",
+                            "position_ids",
+                        ]
                         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                         if "multi_modal_data" in batch.non_tensor_batch:
                             non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -1632,14 +1705,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     # recompute log_probs in the training side
                     with marked_timer("recompute_log_prob", timing_raw, color="orange"):
                         with log_dual_events(
-                            "Recompute log_prob on training side", psrl_logger, event_type=EventType.OTHER
+                            "Recompute log_prob on training side",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
                         ):
                             recomputed_log_prob = self.actor_wg.compute_log_prob(batch)
                             entropys = recomputed_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.train_actor_rollout_ref.actor.loss_agg_mode
                             entropy_agg = agg_loss(
-                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
                             )
                             metrics.update({"actor/entropy": entropy_agg.detach().item()})
                             recomputed_log_prob.batch.pop("entropys")
@@ -1683,7 +1760,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 if self.use_reference_policy:
                     # compute reference log_prob
                     with marked_timer("ref", timing_raw, color="olive"):
-                        with log_dual_events("Compute reference log_prob", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events(
+                            "Compute reference log_prob",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
+                        ):
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
@@ -1693,7 +1774,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # compute values
                 if self.use_critic:
                     with marked_timer("values", timing_raw, color="cyan"):
-                        with log_dual_events("Compute critic values", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events(
+                            "Compute critic values",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
+                        ):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
@@ -1701,7 +1786,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # Legacy version
                 if self.use_rm and not self.use_reward_loop and "rm_scores" not in batch.batch.keys():
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        with log_dual_events("Compute reward model score", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events(
+                            "Compute reward model score",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
+                        ):
                             # compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
@@ -1710,7 +1799,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     # Overlap reward computation with log_prob computation in trainer
                     with marked_timer("async_reward_get", timing_raw, color="yellow"):
                         with log_dual_events(
-                            "Wait for async reward model score", psrl_logger, event_type=EventType.OTHER
+                            "Wait for async reward model score",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
                         ):
                             request_ids = batch.non_tensor_batch["uid"].tolist()
                             print(f"Waiting for reward of request_ids: {request_ids}")
@@ -1720,7 +1811,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             )
 
                         with log_dual_events(
-                            "Post process async reward model score", psrl_logger, event_type=EventType.OTHER
+                            "Post process async reward model score",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
                         ):
                             scores = []
                             reward_extra_infos_dict_list = []
@@ -1733,9 +1826,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             prompt_length = batch.batch["prompts"].size(1)
                             response_length = batch.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
                             rm_scores = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
-                            rm_scores[torch.arange(batch.batch["response_mask"].size(0)), response_length] = (
-                                torch.tensor(scores, dtype=torch.float32)
-                            )
+                            rm_scores[
+                                torch.arange(batch.batch["response_mask"].size(0)),
+                                response_length,
+                            ] = torch.tensor(scores, dtype=torch.float32)
                             reward_tensor = rm_scores  # [bsz, response_length]
 
                             # add reward_extra_info to non_tensor_batch
@@ -1756,7 +1850,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
                             )
                             metrics.update(kl_metrics)
                         else:
@@ -1769,7 +1865,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         )  # GRPO adv normalization factor
 
                         log_data_protocol(
-                            batch, psrl_logger, self.log_prefix + " before compute advantage", level=logging.DEBUG
+                            batch,
+                            psrl_logger,
+                            self.log_prefix + " before compute advantage",
+                            level=logging.DEBUG,
                         )
                         batch = PSRL_compute_advantage(
                             batch,
@@ -1815,7 +1914,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                 if rollout_data_dir:
                     with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                        with log_dual_events("Dump rollout generations", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events(
+                            "Dump rollout generations",
+                            psrl_logger,
+                            event_type=EventType.OTHER,
+                        ):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1899,7 +2002,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 and self.config.train_actor_rollout_ref.actor.profiler.tool == "torch_memory"
             ):
                 self.actor_wg.dump_memory_snapshot(
-                    tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                    tag=f"post_update_step{self.global_steps}",
+                    sub_dir=f"step{self.global_steps}",
                 )
 
             if is_last_step:

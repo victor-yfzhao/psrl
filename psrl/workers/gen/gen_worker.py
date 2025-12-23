@@ -234,7 +234,7 @@ class PSRL_GenWorker(Worker):
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             dist.init_process_group(
-                backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl",
+                backend=("cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl"),
                 rank=rank,
                 world_size=world_size,
             )
@@ -395,7 +395,11 @@ class PSRL_GenWorker(Worker):
             # If the current rank is not the representative rank,
             # we will receive the value from the representative rank
             val_tensor = torch.zeros(1, dtype=torch.int64).cuda()
-            dist.broadcast(val_tensor, src=self.get_instance_representative_rank(), group=self.instance_dist_group)
+            dist.broadcast(
+                val_tensor,
+                src=self.get_instance_representative_rank(),
+                group=self.instance_dist_group,
+            )
             return val_tensor.item()
 
     async def register_rollout_instance(self):
@@ -418,13 +422,17 @@ class PSRL_GenWorker(Worker):
         if self.is_instance_representative_rank:
             # Current rank is the representative rank, broadcast object to all instance ranks
             dist.broadcast_object_list(
-                obj_list, src=self.get_instance_representative_rank(), group=self.instance_dist_group
+                obj_list,
+                src=self.get_instance_representative_rank(),
+                group=self.instance_dist_group,
             )
             return val
         else:
             # Current rank is not the representative rank, receive object from representative rank
             dist.broadcast_object_list(
-                obj_list, src=self.get_instance_representative_rank(), group=self.instance_dist_group
+                obj_list,
+                src=self.get_instance_representative_rank(),
+                group=self.instance_dist_group,
             )
             return obj_list[0]
 
@@ -463,7 +471,9 @@ class PSRL_GenWorker(Worker):
 
         # Get the model config
         self.model_hf_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation="flash_attention_2",
         )
         # patch for kimi-vl
         if getattr(self.model_hf_config, "model_type", None) == "kimi_vl":
@@ -567,9 +577,11 @@ class PSRL_GenWorker(Worker):
                     (
                         (
                             name,
-                            param.to(device, non_blocking=True).full_tensor()
-                            if isinstance(param, DTensor)
-                            else param.to(device, non_blocking=True),
+                            (
+                                param.to(device, non_blocking=True).full_tensor()
+                                if isinstance(param, DTensor)
+                                else param.to(device, non_blocking=True)
+                            ),
                         )
                         for name, param in model_state_dict_cpu.items()
                     )
@@ -603,7 +615,10 @@ class PSRL_GenWorker(Worker):
             # sharding will be handled automatically inside vllm
             # NOTE(linsh): transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
             params_to_load = [
-                (name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param))
+                (
+                    name,
+                    (reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)),
+                )
                 for name, param in model_state_dict_cpu.items()
             ]
             if not self.psrl_config.profile.fix_weight:
@@ -635,7 +650,10 @@ class PSRL_GenWorker(Worker):
         if not self.psrl_config.profile.fix_weight:
             self.rollout.inference_engine.collective_rpc(
                 "nixl_pull_model_core",
-                args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names),
+                args=(
+                    self._cached_ps_nixl_agent_names,
+                    self._cached_ps_nixl_gen_storage_client_names,
+                ),
             )
         ray.get(
             ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id())
@@ -660,7 +678,10 @@ class PSRL_GenWorker(Worker):
         if not self.psrl_config.profile.fix_weight:
             await self.rollout.inference_engine.collective_rpc(
                 "nixl_pull_model_core",
-                args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names),
+                args=(
+                    self._cached_ps_nixl_agent_names,
+                    self._cached_ps_nixl_gen_storage_client_names,
+                ),
             )
         await ps_manager_handle.pull_model_state_dict_nixl.remote(
             self.get_instance_id()
@@ -874,6 +895,7 @@ class PSRL_GenWorker(Worker):
                 )
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
+        # Update the request status to ROLLOUT_RUNNING
         update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             PSRL_RequestStatus.ROLLOUT_RUNNING,
@@ -883,12 +905,16 @@ class PSRL_GenWorker(Worker):
         if update_status_success[0]:
             # Prepare the request for generation
             meta_info = {
-                "eos_token_id": self.generation_config.eos_token_id
-                if self.generation_config is not None
-                else self.tokenizer.eos_token_id,
-                "pad_token_id": self.generation_config.pad_token_id
-                if self.generation_config is not None
-                else self.tokenizer.pad_token_id,
+                "eos_token_id": (
+                    self.generation_config.eos_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.eos_token_id
+                ),
+                "pad_token_id": (
+                    self.generation_config.pad_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.pad_token_id
+                ),
             }
             request.meta_info.update(meta_info)
             request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id] * len(request.batch))
@@ -915,19 +941,28 @@ class PSRL_GenWorker(Worker):
             # Update the request status to ROLLOUT_INTERRUPTED_BY_SCHEDULER or ROLLOUT_INTERRUPTED or RUNNING,
             if interrupted_by_scheduler:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
+                psrl_logger.info(f"Request {request_ids[0]} is interrupted by scheduler (preemption)")
             elif interrupted:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
+                psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
             else:
-                update_status = PSRL_RequestStatus.RUNNING
+                update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
+                psrl_logger.info(f"Request {request_ids[0]} is completed (finished generation)")
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
             )
             if update_status_success[0]:
                 return result, update_status
+        # Means the request is aborted
         return None, None
 
-    def generate(self, requests: DataProto, consolidate: bool = True, return_only_on_representative_rank: bool = True):
+    def generate(
+        self,
+        requests: DataProto,
+        consolidate: bool = True,
+        return_only_on_representative_rank: bool = True,
+    ):
         """
         Generate sequences in batch mode.
         This method handles a batch of generation requests, managing model versioning
@@ -955,7 +990,9 @@ class PSRL_GenWorker(Worker):
         if needed_model_version >= curr_rollout_instance_model_version:
             if needed_model_version > curr_rollout_instance_model_version:
                 with log_dual_events(
-                    f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT
+                    f"Wait for model version {needed_model_version}",
+                    psrl_logger,
+                    event_type=EventType.WAIT,
                 ):
                     # Busy polling until the PS worker has the needed model version
                     while (
@@ -1001,12 +1038,16 @@ class PSRL_GenWorker(Worker):
                 filtered_requests = requests[filtered_request_idxs]
                 # Prepare the request for generation
                 meta_info = {
-                    "eos_token_id": self.generation_config.eos_token_id
-                    if self.generation_config is not None
-                    else self.tokenizer.eos_token_id,
-                    "pad_token_id": self.generation_config.pad_token_id
-                    if self.generation_config is not None
-                    else self.tokenizer.pad_token_id,
+                    "eos_token_id": (
+                        self.generation_config.eos_token_id
+                        if self.generation_config is not None
+                        else self.tokenizer.eos_token_id
+                    ),
+                    "pad_token_id": (
+                        self.generation_config.pad_token_id
+                        if self.generation_config is not None
+                        else self.tokenizer.pad_token_id
+                    ),
                 }
                 filtered_requests.meta_info.update(meta_info)
                 filtered_requests.non_tensor_batch["rollout_instance_id"] = np.array(
@@ -1030,9 +1071,11 @@ class PSRL_GenWorker(Worker):
                 # depending on `interrupted` field in the result
                 with log_dual_events("Update request status", psrl_logger, event_type=EventType.OTHER):
                     update_statuses = [
-                        PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-                        if vllm_outputs[i].outputs[0].finish_reason == "abort"
-                        else PSRL_RequestStatus.RUNNING
+                        (
+                            PSRL_RequestStatus.ROLLOUT_INTERRUPTED
+                            if vllm_outputs[i].outputs[0].finish_reason == "abort"
+                            else PSRL_RequestStatus.ROLLOUT_COMPLETED
+                        )
                         for i in range(len(vllm_outputs))
                     ]
                     update_status_success = ray.get(
@@ -1075,6 +1118,10 @@ class PSRL_GenWorker(Worker):
         )
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
+        psrl_logger.info(
+            f"Generating request {request.non_tensor_batch['uid'][0]} "
+            f"with needed model version {request.non_tensor_batch['version_tag'][0]}"
+        )
         # Wait for resuming if the generation is interrupted
         if self._async_interrupt_event and self._async_interrupt_event.is_set():
             psrl_logger.debug("Generation interrupted, waiting for resume...")

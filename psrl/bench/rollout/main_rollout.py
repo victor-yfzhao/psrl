@@ -292,7 +292,11 @@ class SimpleRolloutTester:
         warmup_iterations = self.config.rollout_test.warmup_iterations
         batch_size = self.config.rollout_test.batch_size
 
-        psrl_logger.info("Running %d warmup iterations + %d test iterations", warmup_iterations, num_iterations)
+        psrl_logger.info(
+            "Running %d warmup iterations + %d test iterations",
+            warmup_iterations,
+            num_iterations,
+        )
 
         # Warmup
         for i in range(warmup_iterations):

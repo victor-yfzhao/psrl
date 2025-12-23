@@ -155,7 +155,7 @@ async def compute_score(
         final_metadata = metadata_list if "metadata_list" in locals() else [{"error": f"Unhandled exception: {e}"}]
 
         # Ensure float and list are returned
-    return float(score), final_metadata if isinstance(final_metadata, list) else [final_metadata]
+    return float(score), (final_metadata if isinstance(final_metadata, list) else [final_metadata])
 
 
 async def call_sandbox_api(
@@ -273,7 +273,9 @@ async def call_sandbox_api(
     psrl_logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")
     # Return the error message without the prefix, as the caller doesn't need the internal ID
     # Ensure API call failure returns error message, leading to -1 in check_correctness
-    return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
+    return None, (
+        last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
+    )
 
 
 async def _process_single_case(
@@ -643,7 +645,7 @@ async def check_correctness(
             metadata_list[i] = {
                 "case_index": i,
                 "input": str(inputs[i]),
-                "expected_output": str(expected_outputs[i]) if expected_outputs[i] else None,
+                "expected_output": (str(expected_outputs[i]) if expected_outputs[i] else None),
                 "api_request_error": f"Internal execution error: {task_result}",
                 "status": "internal_error",
             }
@@ -671,7 +673,7 @@ async def check_correctness(
                     metadata_list[i] = {
                         "case_index": i,
                         "input": str(inputs[i]),
-                        "expected_output": str(expected_outputs[i]) if expected_outputs[i] else None,
+                        "expected_output": (str(expected_outputs[i]) if expected_outputs[i] else None),
                         "api_request_error": None,
                         "status": "compile_error_skipped",  # Indicate skipped due to prior compile error
                     }

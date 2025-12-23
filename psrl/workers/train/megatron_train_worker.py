@@ -6,7 +6,11 @@ import torch
 from omegaconf import DictConfig
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    register,
+)
 from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.utils.megatron_utils import (
@@ -20,7 +24,12 @@ from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
-from psrl.utils.logger import DualOutputHandler, EventType, get_worker_info, log_dual_events
+from psrl.utils.logger import (
+    DualOutputHandler,
+    EventType,
+    get_worker_info,
+    log_dual_events,
+)
 from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_TRAIN_CLIENT_NAME,
@@ -44,7 +53,14 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         nixl_interface: NIXLInterface,
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
-        PSRL_BaseTrainWorker.__init__(self, self.rank, self.world_size, psrl_config, train_interface, nixl_interface)
+        PSRL_BaseTrainWorker.__init__(
+            self,
+            self.rank,
+            self.world_size,
+            psrl_config,
+            train_interface,
+            nixl_interface,
+        )
 
         self.layer_name_mapping = {
             "qkv_layer_name": "self_attention.linear_qkv.",
@@ -185,7 +201,12 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="megatron actor", logger=psrl_logger, level=logging.INFO, log_only_rank_0=False)
+    @GPUMemoryLogger(
+        role="megatron actor",
+        logger=psrl_logger,
+        level=logging.INFO,
+        log_only_rank_0=False,
+    )
     def compute_log_prob(self, data: DataProto):
         with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
             assert self._is_actor
@@ -202,7 +223,12 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="megatron actor", logger=psrl_logger, level=logging.INFO, log_only_rank_0=False)
+    @GPUMemoryLogger(
+        role="megatron actor",
+        logger=psrl_logger,
+        level=logging.INFO,
+        log_only_rank_0=False,
+    )
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)

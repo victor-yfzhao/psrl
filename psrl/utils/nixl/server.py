@@ -55,7 +55,10 @@ class NIXLStorageServer:
                 raise RuntimeError(f"Memory registration failed for key {key}.")
             desc_bytes = self.agent.get_serialized_descs(desc)
             self.tensor_infos[key] = NIXLTensorInfo(
-                desc_bytes_list=[desc_bytes], shard_dim=-1, shard_mesh=1, shard_indices=[0]
+                desc_bytes_list=[desc_bytes],
+                shard_dim=-1,
+                shard_mesh=1,
+                shard_indices=[0],
             )
 
     def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 600.0):

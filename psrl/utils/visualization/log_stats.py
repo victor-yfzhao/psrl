@@ -38,7 +38,7 @@ def generate_event_stats(timeline_data_dict, output_file="event_stats.png"):
         ]
         sizes = [perc for _, perc in sorted_perc]
         colors = [
-            EventType[etype].value["color"] if etype in EventType.__members__ else "#6B7280"
+            (EventType[etype].value["color"] if etype in EventType.__members__ else "#6B7280")
             for etype, _ in sorted_perc
         ]
 

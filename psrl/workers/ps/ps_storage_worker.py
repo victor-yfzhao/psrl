@@ -98,10 +98,16 @@ class PSStorageWorker:
             self.client_for_pull_name = f"{self.agent_name}_for_pull"
             self.nixl_multi_storage_clients = NIXLMultiStorageClients(
                 agent_name=self.agent_name,
-                multi_client_names=[self.client_for_push_name, self.client_for_pull_name],
+                multi_client_names=[
+                    self.client_for_push_name,
+                    self.client_for_pull_name,
+                ],
                 server_name=GLOBAL_META_SERVER_NAME,
                 use_gpu=self.use_gpu,
-                multi_client_types=[NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL],
+                multi_client_types=[
+                    NIXLClientType.PS_FOR_PUSH,
+                    NIXLClientType.PS_FOR_PULL,
+                ],
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
                 # client_group_id=self.get_replica_id()
@@ -189,7 +195,8 @@ class PSStorageWorker:
         """Initialize the model."""
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=self.model_config.get("trust_remote_code", False)
+            local_path,
+            trust_remote_code=self.model_config.get("trust_remote_code", False),
         )
         if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
             model_class = AutoModelForVision2Seq

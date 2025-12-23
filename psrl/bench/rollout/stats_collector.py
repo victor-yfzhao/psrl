@@ -177,22 +177,24 @@ class StatCollector(StatLoggerBase):
                     "num_corrupted_reqs": getattr(scheduler_stats, "num_corrupted_reqs", 0),
                 },
                 "iteration_stats": {
-                    "num_prompt_tokens": getattr(iteration_stats, "num_prompt_tokens", 0) if iteration_stats else 0,
-                    "num_generation_tokens": getattr(iteration_stats, "num_generation_tokens", 0)
-                    if iteration_stats
-                    else 0,
-                    "num_preempted_reqs": getattr(iteration_stats, "num_preempted_reqs", 0) if iteration_stats else 0,
-                    "num_finished_requests": len(getattr(iteration_stats, "finished_requests", []))
-                    if iteration_stats
-                    else 0,
+                    "num_prompt_tokens": (getattr(iteration_stats, "num_prompt_tokens", 0) if iteration_stats else 0),
+                    "num_generation_tokens": (
+                        getattr(iteration_stats, "num_generation_tokens", 0) if iteration_stats else 0
+                    ),
+                    "num_preempted_reqs": (
+                        getattr(iteration_stats, "num_preempted_reqs", 0) if iteration_stats else 0
+                    ),
+                    "num_finished_requests": (
+                        len(getattr(iteration_stats, "finished_requests", [])) if iteration_stats else 0
+                    ),
                     # "time_to_first_tokens": getattr(iteration_stats, 'time_to_first_tokens_iter', [])
                     # if iteration_stats else [],
                     # "inter_token_latencies": getattr(iteration_stats, 'inter_token_latencies_iter', [])
                     # if iteration_stats else [],
-                    "time_to_first_tokens_avg": np.mean(time_to_first_tokens_iter) if iteration_stats else 0,
-                    "time_to_first_tokens_max": np.max(time_to_first_tokens_iter) if iteration_stats else 0,
-                    "inter_token_latencies_avg": np.mean(inter_token_latencies_iter) if iteration_stats else 0,
-                    "inter_token_latencies_max": np.max(inter_token_latencies_iter) if iteration_stats else 0,
+                    "time_to_first_tokens_avg": (np.mean(time_to_first_tokens_iter) if iteration_stats else 0),
+                    "time_to_first_tokens_max": (np.max(time_to_first_tokens_iter) if iteration_stats else 0),
+                    "inter_token_latencies_avg": (np.mean(inter_token_latencies_iter) if iteration_stats else 0),
+                    "inter_token_latencies_max": (np.max(inter_token_latencies_iter) if iteration_stats else 0),
                 },
                 "throughput_stats": {
                     "prompt_throughput": prompt_throughput,
@@ -257,10 +259,10 @@ class StatCollector(StatLoggerBase):
             "type": "engine_init",
             "engine_index": self.engine_index,
             "cache_config": {
-                "block_size": getattr(cache_config, "block_size", None) if cache_config else None,
-                "gpu_memory_utilization": getattr(cache_config, "gpu_memory_utilization", None)
-                if cache_config
-                else None,
+                "block_size": (getattr(cache_config, "block_size", None) if cache_config else None),
+                "gpu_memory_utilization": (
+                    getattr(cache_config, "gpu_memory_utilization", None) if cache_config else None
+                ),
             },
         }
 

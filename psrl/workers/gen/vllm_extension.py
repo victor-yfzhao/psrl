@@ -18,6 +18,7 @@ from verl.utils.device import get_device_id
 # from vllm.platforms import current_platform
 from verl.utils.fs import copy_to_local
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.converter import create_parameter_mapping
@@ -125,7 +126,10 @@ class vLLMWorkerExtension:
     def patch_vllm_moe_model_weight_loader(self) -> None:
         """Patch the vLLM model weight loader for MoE models."""
         try:
-            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+            vllm_model = self.model_runner.model
+            if isinstance(vllm_model, CUDAGraphWrapper):
+                vllm_model = vllm_model.unwrap()
+            patch_vllm_moe_model_weight_loader(vllm_model)
         except Exception as e:
             raise ValueError(f"Error in vLLMWorkerExtension.patch_vllm_moe_model_weight_loader: {e}") from e
         return None
@@ -174,6 +178,8 @@ class vLLMWorkerExtension:
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info("nixl client protocol step 0: convert_vllm_inplace")
         vllm_model = self.model_runner.model
+        if isinstance(vllm_model, CUDAGraphWrapper):
+            vllm_model = vllm_model.unwrap()
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
         unified_state_dict, local_sharding_dict = convert_vllm_inplace(
             param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
@@ -208,7 +214,10 @@ class vLLMWorkerExtension:
         for key in self.unified_state_dict:
             for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
                 shards_to_transfer = self.nixl_storage_client.client_read(
-                    target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}"
+                    target_agent_name,
+                    target_client_name,
+                    key,
+                    f"gen_pull_{self.pull_times}",
                 )
                 # shards_to_transfer = self.nixl_storage_client.client_read(
                 #     target_agent_name, target_client_name, key, "gen_pull", merge_and_cache_xfer=False
@@ -217,7 +226,12 @@ class vLLMWorkerExtension:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name, shards_to_transfer in wait_operations:
-            self.nixl_storage_client.wait(key, f"gen_pull_{self.pull_times}", "READ", target_client=target_client_name)
+            self.nixl_storage_client.wait(
+                key,
+                f"gen_pull_{self.pull_times}",
+                "READ",
+                target_client=target_client_name,
+            )
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         time_end = time.time()
@@ -235,7 +249,8 @@ class vLLMWorkerExtension:
         actual_max_model_len = self.vllm_config.model_config.max_model_len
         # Set the max model length to the upper limit of the estimation
         self.vllm_config.model_config.max_model_len = self.vllm_config.additional_config.get(
-            "max_model_len_used_in_estimation", self.vllm_config.model_config.max_model_len * 8192
+            "max_model_len_used_in_estimation",
+            self.vllm_config.model_config.max_model_len * 8192,
         )
         estimated_max_model_len = estimate_max_model_len(
             self.vllm_config, kv_cache_spec, self.available_kv_cache_memory_bytes

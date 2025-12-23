@@ -103,4 +103,7 @@ class FSDPEngineConfig(BaseConfig):
     strategy: str = "fsdp"
 
     def __post_init__(self):
-        assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+        assert self.strategy in [
+            "fsdp",
+            "fsdp2",
+        ], f"strategy {self.strategy} not supported"

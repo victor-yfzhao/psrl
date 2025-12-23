@@ -29,12 +29,15 @@ def get_priority_by_version(request: DataProto, staleness: int) -> int:
         raise AssertionError("Request must have either 'version_tag' or 'min_version_limit'")
 
 
-def get_priority_by_version_and_token_num(request: DataProto, staleness: int) -> int:
+def get_priority_by_version_and_token_num(
+    request: DataProto, staleness: int, short_request_first: bool = False
+) -> int:
     """Get the priority value for a request based on version tag and token number.
 
     Args:
         request (DataProto): The request to get priority for.
         staleness (int): The staleness tolerance for version.
+        short_request_first (bool): Whether to prioritize short requests.
 
     Returns:
         Tuple[int, int]: Priority value (lower is higher priority).
@@ -46,14 +49,17 @@ def get_priority_by_version_and_token_num(request: DataProto, staleness: int) ->
         response_token_num = request.non_tensor_batch["response_unpadded_len"][0]
     else:
         response_token_num = 0
-    token_num_priority = prompt_token_num + response_token_num
+    if short_request_first:
+        token_num_priority = prompt_token_num + response_token_num
+    else:
+        token_num_priority = -(prompt_token_num + response_token_num)
     return (version_priority, token_num_priority)
 
 
 class PriorityRequestQueue:
     """A priority queue for routing requests based on version tags."""
 
-    def __init__(self, staleness: int):
+    def __init__(self, staleness: int, short_request_first: bool = False):
         """Initialize the priority queue.
 
         Args:
@@ -61,6 +67,7 @@ class PriorityRequestQueue:
         """
         self._queue = []
         self._staleness = staleness
+        self._short_request_first = short_request_first
         self._counter = 0  # To ensure FIFO for same priority items
 
     def put(self, request: DataProto) -> None:
@@ -69,7 +76,7 @@ class PriorityRequestQueue:
         Args:
             request (DataProto): The request to enqueue.
         """
-        priority = get_priority_by_version_and_token_num(request, self._staleness)
+        priority = get_priority_by_version_and_token_num(request, self._staleness, self._short_request_first)
         # Use counter to maintain FIFO order for items with same priority
         heapq.heappush(self._queue, (priority, self._counter, request))
         self._counter += 1
@@ -173,6 +180,7 @@ class MultiPriorityRequestQueue:
         self,
         staleness: int,
         queue_selector: Callable[[DataProto, int], int] = get_priority_by_version,
+        short_request_first: bool = False,
     ) -> None:
         """Initialize the multi-priority queue.
 
@@ -180,9 +188,11 @@ class MultiPriorityRequestQueue:
             staleness (int): The staleness tolerance for version comparison.
             queue_selector (Callable[[DataProto, int], int]): A function that takes a request and staleness
                 and returns the queue ID (int) to which the request should be routed.
+            short_request_first (bool): Whether to prioritize short requests.
         """
         self._staleness = staleness
         self._queue_selector = queue_selector
+        self._short_request_first = short_request_first
         self._queues = SortedDict(lambda x: x)
 
     def put(self, request: DataProto) -> None:
@@ -196,7 +206,7 @@ class MultiPriorityRequestQueue:
         """
         queue_id = self._queue_selector(request, self._staleness)
         if queue_id not in self._queues:
-            self._queues[queue_id] = PriorityRequestQueue(self._staleness)
+            self._queues[queue_id] = PriorityRequestQueue(self._staleness, self._short_request_first)
         self._queues[queue_id].put(request)
 
     def get_queue(self, queue_id: int) -> PriorityRequestQueue | None:
@@ -209,6 +219,15 @@ class MultiPriorityRequestQueue:
             Optional[PriorityRequestQueue]: The queue if it exists, None otherwise.
         """
         return self._queues.get(queue_id)
+
+    def get_first_queue(self) -> PriorityRequestQueue:
+        """Get the first priority queue.
+
+        Returns:
+            PriorityRequestQueue: The first queue.
+        """
+        assert len(self._queues) > 0, "There are no queues in the multi-priority queue"
+        return list(self._queues.values())[0]
 
     def remove_queue(self, queue_id: int) -> bool:
         """Remove a queue by its ID.
