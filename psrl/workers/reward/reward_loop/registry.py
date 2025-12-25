@@ -1,5 +1,7 @@
 # Modified from verl/experimental/reward/reward_loop/registry.py
 import asyncio
+import logging
+import os
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -9,7 +11,10 @@ from verl.trainer.ppo.reward import get_custom_reward_fn
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
-from psrl.workers.reward.reward_model.gen_reward_function import DefaultGenRewardFunction
+from psrl.workers.reward.gen_reward_function import get_gen_reward_function_cls
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 __all__ = ["register", "get_reward_loop_manager_cls", "load_reward_loop_manager"]
 
@@ -106,12 +111,20 @@ def load_reward_loop_manager(
             final_compute_score = default_compute_score_async
 
     if reward_loop_manager_name == "gen":
-        reward_function = reward_kwargs.pop("reward_function", DefaultGenRewardFunction())
+        # Get gen_reward_function from config or reward_kwargs
+        gen_reward_function_name = reward_kwargs.pop(
+            "gen_reward_function", 
+            config.reward_model.get("gen_reward_function", "default")
+        )
+        psrl_logger.info(f"Loading gen reward function: {gen_reward_function_name}")
+        gen_reward_function_cls = get_gen_reward_function_cls(gen_reward_function_name)
+        psrl_logger.info(f"Loaded gen reward function class: {gen_reward_function_cls.__name__}")
+        
         return reward_loop_manager_cls(
             config,
             input_tokenizer,
             reward_model_manager=reward_model_manager,
-            reward_function=reward_function,
+            reward_function=gen_reward_function_cls(),
             router_process=reward_model_router,
             replica_handles=reward_model_replica_handles or [],
             reward_model_tokenizer=reward_model_tokenizer,

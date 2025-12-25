@@ -6,6 +6,7 @@ from verl.utils.profiler import ProfilerConfig
 
 __all__ = [
     "SamplingConfig",
+    "PoolingConfig",
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
@@ -22,6 +23,13 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+
+
+@dataclass
+class PoolingConfig(BaseConfig):
+    normalize: bool = True
+    use_activation: bool = False
+    task: str = "classify"
 
 
 @dataclass
@@ -113,6 +121,7 @@ class RolloutConfig(BaseConfig):
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
 
     val_kwargs: SamplingConfig = field(default_factory=SamplingConfig)
+    pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
 
     max_model_len: int | None = None
     max_num_seqs: int = 1024
@@ -164,3 +173,7 @@ class RolloutConfig(BaseConfig):
     limit_images: int | None = None
 
     skip_tokenizer_init: bool = False
+    
+    task: str = "generate"
+    
+    runner: str = "generate"

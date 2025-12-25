@@ -18,6 +18,7 @@ from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -185,6 +186,9 @@ class PSRL_vLLMRollout:
             distributed_executor_backend = "external_launcher"
         else:
             distributed_executor_backend = None  # auto detect
+            
+        runner = config.get("runner", "generate")
+        task = config.get("task", "generate")
 
         llm_kwargs = dict(
             model=model_path,
@@ -207,12 +211,17 @@ class PSRL_vLLMRollout:
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             logprobs_mode=config.logprobs_mode,
+            runner=runner,
+            task=task,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
             **compilation_config,
             **lora_kwargs,
             **engine_kwargs,
         )
+        
+        # Support for pooling models (e.g., reward models)
+        self.is_pooling_model = runner == "pooling"
 
         """
         if psrl_config.ps_mode == "nixl_cpu" or psrl_config.ps_mode == "nixl_gpu":
@@ -268,24 +277,49 @@ class PSRL_vLLMRollout:
             self.inference_engine.sleep(level=1)
         """
 
-        kwargs = dict(
-            n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
-            repetition_penalty=config.get("repetition_penalty", 1.0),
-            output_kind=RequestOutputKind.CUMULATIVE,
-        )
+        # Initialize parameters based on model type
+        if self.is_pooling_model:
+            # Convert PoolingConfig to PoolingParams
+            # Handle both dict (OmegaConf DictConfig) and object types
+            pooling_config = config.pooling_config
+            # Use getattr for objects/DictConfig, dict.get() for regular dicts
+            if isinstance(pooling_config, dict) and not isinstance(pooling_config, DictConfig):
+                normalize = pooling_config.get("normalize", True)
+                use_activation = pooling_config.get("use_activation", False)
+                task = pooling_config.get("task", "classify")
+            else:
+                # DictConfig and objects support attribute access
+                normalize = getattr(pooling_config, "normalize", True)
+                use_activation = getattr(pooling_config, "use_activation", False)
+                task = getattr(pooling_config, "task", "classify")
+            self.pooling_params = PoolingParams(
+                normalize=normalize,
+                use_activation=use_activation,
+                task=task,
+            )
+            self.sampling_params = None
+            psrl_logger.info(f"Initialized PoolingParams for pooling model")
+        else:
+            # For generative models, use SamplingParams
+            kwargs = dict(
+                n=1,
+                logprobs=0,  # can be set to 0 and let actor to recompute
+                max_tokens=config.response_length,
+                repetition_penalty=config.get("repetition_penalty", 1.0),
+                output_kind=RequestOutputKind.CUMULATIVE,
+            )
 
-        # we may detokenize the result all together later
-        kwargs["detokenize"] = False
+            # we may detokenize the result all together later
+            kwargs["detokenize"] = False
 
-        # supporting adding any sampling params from the config file
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
-                kwargs[k] = config.get(k)
-        kwargs["n"] = 1  # already repeat in ray_trainer
-        psrl_logger.info(f"kwargs: {kwargs}")
-        self.sampling_params = SamplingParams(**kwargs)
+            # supporting adding any sampling params from the config file
+            for k in config.keys():
+                if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
+                    kwargs[k] = config.get(k)
+            kwargs["n"] = 1  # already repeat in ray_trainer
+            psrl_logger.info(f"kwargs: {kwargs}")
+            self.sampling_params = SamplingParams(**kwargs)
+            self.pooling_params = None
 
         self.pad_token_id = tokenizer.pad_token_id
 
@@ -492,14 +526,37 @@ class PSRL_vLLMRollout:
         interrupted_list = []
         interrupted_by_scheduler_list = []
         all_log_prob_list = []
+        pooling_output_list = []
 
         for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
-            assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."
-
-            response_ids = vllm_output.outputs[0].token_ids
-            response_len = len(response_ids)
-            interrupted = vllm_output.outputs[0].finish_reason == "abort"
+            
+            # Handle PoolingRequestOutput differently from RequestOutput
+            if isinstance(vllm_output, PoolingRequestOutput):
+                # For pooling models, outputs is a PoolingOutput object, not a list
+                # Extract pooling output data
+                pooling_output_value = None
+                if hasattr(vllm_output, "outputs") and vllm_output.outputs is not None:
+                    if hasattr(vllm_output.outputs, "data"):
+                        # PoolingOutput has a data attribute (torch.Tensor)
+                        pooling_output_value = vllm_output.outputs.data
+                    else:
+                        # Some pooling models may have outputs as the data directly
+                        pooling_output_value = vllm_output.outputs
+                pooling_output_list.append(pooling_output_value)
+                
+                # Pooling models don't generate tokens, so use empty response
+                response_ids = []
+                response_len = 0
+                interrupted = False
+            else:
+                # For generative models, outputs is a list of CompletionOutput
+                assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."
+                pooling_output_list.append(None)
+                
+                response_ids = vllm_output.outputs[0].token_ids
+                response_len = len(response_ids)
+                interrupted = vllm_output.outputs[0].finish_reason == "abort"
 
             response_ids_list.append(response_ids)
             response_len_list.append(response_len)
@@ -518,7 +575,8 @@ class PSRL_vLLMRollout:
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
             if (
-                self.psrl_config.log_prob.enable_rollout_engine_log_prob
+                not isinstance(vllm_output, PoolingRequestOutput)
+                and self.psrl_config.log_prob.enable_rollout_engine_log_prob
                 and hasattr(vllm_output.outputs[0], "logprobs")
                 and vllm_output.outputs[0].logprobs is not None
             ):
@@ -568,6 +626,13 @@ class PSRL_vLLMRollout:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
             curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
             non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+
+        # Store pooling outputs if available (for reward models)
+        if any(x is not None for x in pooling_output_list):
+            pooling_output_array = np.empty(len(pooling_output_list), dtype=object)
+            for i, pooling_output_value in enumerate(pooling_output_list):
+                pooling_output_array[i] = pooling_output_value
+            non_tensor_batch["pooling_output"] = pooling_output_array
 
         batch = TensorDict(
             {
@@ -639,15 +704,31 @@ class PSRL_vLLMRollout:
             DataProto with generated sequences and updated metadata
         """
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
+        # For pooling models, use encode method with PoolingParams
+        if self.is_pooling_model:
+            # Convert vllm_inputs to prompt format for encode
+            if isinstance(vllm_inputs[0], dict):
+                prompts_list = [TokensPrompt(**inp) for inp in vllm_inputs]
+            else:
+                prompts_list = vllm_inputs
+            
+            outputs = self.inference_engine.encode(
+                prompts=prompts_list,
+                pooling_params=self.pooling_params,
             )
+            
             return self.post_process_outputs(prompts, outputs)
+        else:
+            # For generative models, use generate method with SamplingParams
+            # users can customize different sampling_params at different run
+            with self.update_sampling_params(**kwargs):
+                # the inference_engine will handle the request_id internally
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+                return self.post_process_outputs(prompts, outputs)
 
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
@@ -673,19 +754,20 @@ class PSRL_vLLMRollout:
         curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", [0] * len(vllm_inputs))
         assert sample_ids is not None, "sample_ids must be provided in the prompts.non_tensor_batch"
 
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
+        # For pooling models, use encode method with PoolingParams
+        if self.is_pooling_model:
             tasks = []
-            for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(
-                zip(vllm_inputs, sample_ids, curr_response_unpadded_len)
-            ):
+            for prompt_idx, (vllm_input, sample_id) in enumerate(zip(vllm_inputs, sample_ids)):
+                if isinstance(vllm_input, dict):
+                    prompt = TokensPrompt(**vllm_input)
+                else:
+                    prompt = vllm_input
                 tasks.append(
-                    self.generate_sequence_task(
+                    self.encode_sequence_task(
                         prompt_idx,
-                        vllm_input,
-                        sampling_params=self.sampling_params,
+                        prompt,
+                        pooling_params=self.pooling_params,
                         uid=str(sample_id),
-                        max_tokens=self.config.response_length - curr_response_len,
                     )
                 )
 
@@ -694,7 +776,31 @@ class PSRL_vLLMRollout:
                 prompt_idx, output = await completed_task
                 completed_rollout.append(self.post_process_outputs(prompts[prompt_idx : prompt_idx + 1], output))
 
-        return DataProto.concat(completed_rollout)
+            return DataProto.concat(completed_rollout)
+        else:
+            # For generative models, use generate method with SamplingParams
+            # users can customize different sampling_params at different run
+            with self.update_sampling_params(**kwargs):
+                tasks = []
+                for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(
+                    zip(vllm_inputs, sample_ids, curr_response_unpadded_len)
+                ):
+                    tasks.append(
+                        self.generate_sequence_task(
+                            prompt_idx,
+                            vllm_input,
+                            sampling_params=self.sampling_params,
+                            uid=str(sample_id),
+                            max_tokens=self.config.response_length - curr_response_len,
+                        )
+                    )
+
+                completed_rollout = []
+                for completed_task in asyncio.as_completed(tasks):
+                    prompt_idx, output = await completed_task
+                    completed_rollout.append(self.post_process_outputs(prompts[prompt_idx : prompt_idx + 1], output))
+
+            return DataProto.concat(completed_rollout)
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
     @torch.no_grad()
@@ -705,15 +811,36 @@ class PSRL_vLLMRollout:
         )
 
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
-            )
-            return outputs
+        # For pooling models, use encode method with PoolingParams
+        if self.is_pooling_model:
+            # Convert vllm_inputs to prompt format for encode
+            if isinstance(vllm_inputs[0], dict):
+                prompts_list = [TokensPrompt(**inp) for inp in vllm_inputs]
+            else:
+                prompts_list = vllm_inputs
+            
+            # Use encode for pooling models
+            outputs = []
+            for prompt in prompts_list:
+                request_id = str(uuid.uuid4())
+                # encode returns an async generator, but we need sync execution
+                # For sync mode, we'll need to handle this differently
+                # For now, raise an error as pooling models should use async mode
+                raise NotImplementedError(
+                    "raw_generate_sequences for pooling models is not supported in sync mode. "
+                    "Please use async mode (generate_sequences_async)."
+                )
+        else:
+            # For generative models, use generate method with SamplingParams
+            # users can customize different sampling_params at different run
+            with self.update_sampling_params(**kwargs):
+                # the inference_engine will handle the request_id internally
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+                return outputs
 
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
@@ -788,6 +915,43 @@ class PSRL_vLLMRollout:
         task = self.inference_engine.generate(
             prompt=TokensPrompt(**prompt_tokens),
             sampling_params=sampling_params,
+            request_id=request_id,
+        )
+        async for output in task:
+            last_output = output
+        return idx, last_output
+
+    async def encode_sequence_task(
+        self,
+        idx: int,
+        prompt: PromptType,
+        pooling_params: PoolingParams,
+        uid: str | None = None,
+    ) -> tuple[int, PoolingRequestOutput]:
+        """
+        Encode a single sequence asynchronously using vLLM for pooling models.
+
+        This method creates an async encoding task for a single prompt and
+        waits for completion, returning the final output.
+
+        Args:
+            idx: Index of the prompt in the batch
+            prompt: Prompt input (TokensPrompt or other PromptType)
+            pooling_params: Pooling parameters for encoding
+            uid: Unique identifier for the request (optional)
+
+        Returns:
+            Tuple of (prompt_idx, final_pooling_request_output)
+            prompt_idx is the index of the prompt in the batch
+        """
+        # Ensure all abort requests in the queue are processed before starting encoding
+        if self.scheduler_abort_queue is not None:
+            await self._wait_for_all_scheduler_abort_requests_processed()
+
+        request_id = str(uuid.uuid4()) if uid is None else uid
+        task = self.inference_engine.encode(
+            prompt=prompt,
+            pooling_params=pooling_params,
             request_id=request_id,
         )
         async for output in task:

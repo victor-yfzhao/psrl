@@ -7,7 +7,7 @@ from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
 from .model import HFModelConfig
-from .rollout import SamplingConfig, ServerConfig
+from .rollout import PoolingConfig, SamplingConfig, ServerConfig
 
 __all__ = ["SandboxFusionConfig", "RewardModelDataProcessorConfig", "RewardModelConfig"]
 
@@ -96,6 +96,7 @@ class RewardModelConfig(BaseConfig):
 
     # for generative reward model
     sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
+    pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
     data_processor_config: RewardModelDataProcessorConfig = field(default_factory=RewardModelDataProcessorConfig)
     max_new_tokens: int = 4096
 

@@ -8,8 +8,8 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
-from verl.trainer.ppo.reward import load_reward_manager
 
+from psrl.workers.reward.reward_loop import load_reward_loop_manager
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.post_processor import (
@@ -322,20 +322,19 @@ class TaskRunner:
 
         reward_fn = None
         val_reward_fn = None
-        if config.reward_model.enable and not config.reward_model.use_reward_loop:
-            reward_kwargs = config.reward_model.get("reward_kwargs", {})
-            reward_fn = load_reward_manager(
-                config,
-                tokenizer,
-                num_examine=0,
-                **reward_kwargs,
-            )
-            val_reward_fn = load_reward_manager(
-                config,
-                tokenizer,
-                num_examine=1,
-                **reward_kwargs,
-            )
+        # TODO(zyf): add reward loop manager support
+        # if config.reward_model.enable and not config.reward_model.use_reward_loop:
+        #     reward_kwargs = config.reward_model.get("reward_kwargs", {})
+        #     reward_fn = load_reward_loop_manager(
+        #         config,
+        #         tokenizer,
+        #         **reward_kwargs,
+        #     )
+        #     val_reward_fn = load_reward_loop_manager(
+        #         config,
+        #         tokenizer,
+        #         **reward_kwargs,
+        #     )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

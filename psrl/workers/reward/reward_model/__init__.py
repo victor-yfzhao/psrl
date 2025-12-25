@@ -11,7 +11,6 @@ from .manager import PSRL_RewardModelManager
 from .router import PSRL_RewardModelRouter, launch_router_process
 from .worker import PSRL_RewardModelWorker
 from .replica import PSRL_RewardModelReplica
-from .gen_reward_function import DefaultGenRewardFunction, GenRewardFunctionBase
 
 __all__ = [
     "PSRL_RewardModelWorker",
@@ -19,7 +18,5 @@ __all__ = [
     "PSRL_RewardModelManager",
     "PSRL_RewardModelRouter",
     "launch_router_process",
-    "DefaultGenRewardFunction",
-    "GenRewardFunctionBase",
 ]
 
