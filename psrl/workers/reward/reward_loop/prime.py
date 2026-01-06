@@ -47,14 +47,10 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
         config,
         tokenizer,
         compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
     ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
 
         # PRIME specific config
         self.num_examine = config.reward_model.get("reward_kwargs", {}).get("num_examine", 1)

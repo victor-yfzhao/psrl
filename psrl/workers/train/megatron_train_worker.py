@@ -127,6 +127,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     def nixl_protocol(self):
         lazy_import_to_globals("psrl.utils.converter.megatron_converter", "convert_megatron_inplace")
+        # Explicitly import to ensure availability
+        from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info("nixl client protocol step 0: convert_megatron_inplace")

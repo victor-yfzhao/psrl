@@ -3,8 +3,8 @@ set -xeuo pipefail
 
 PSRL_WORKSPACE=/jizhicfs/pkuhetu/yfzhao/psrl
 
-project_name='psrl_reward_model'
-experiment_name='RM-Qwen2.5-Math-7B-GenLoop-dapo-skywork'
+project_name='psrl_multi_reward_model'
+experiment_name='Qwen2.5-Math-7B-GenLoop-naive-dapo-gen-dis'
 
 source ${PSRL_WORKSPACE}/env/env_311.sh
 
@@ -25,16 +25,6 @@ ROLL_TP=1
 ROLL_PP=1
 ROLL_INSTANCES=2
 ROLL_NGPUS_PER_NODE_PER_INSTANCE=$((ROLL_TP * ROLL_PP))
-
-RM_MODEL_PATH=${PSRL_WORKSPACE}/models/Skywork-Reward-V2-Qwen3-8B
-# RM_MODEL_PATH=${PSRL_WORKSPACE}/../../qwen3-30B-A3B
-RM_GEN_REWARD_FUNCTION=skywork
-# RM_GEN_REWARD_FUNCTION=default
-RM_VLLM_TASK=classify
-RM_TP=1
-RM_PP=1
-RM_INSTANCES=2
-RM_NGPUS_PER_NODE_PER_INSTANCE=$((RM_TP * RM_PP))
 
 # training settings
 TRAIN_TP=2
@@ -72,25 +62,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.rollout_ngpus_per_node_per_instance=${ROLL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS} \
-    \
-    reward_model.enable=True \
-    reward_model.use_reward_loop=True \
-    reward_model.reward_manager=gen \
-    reward_model.model.path="${RM_MODEL_PATH}" \
-    reward_model.num_replicas=${RM_INSTANCES} \
-    reward_model.enable_resource_pool=True \
-    reward_model.n_gpus_per_node=${RM_NGPUS_PER_NODE_PER_INSTANCE} \
-    reward_model.nnodes=${NNODES} \
-    reward_model.rollout_ngpus_per_instance_per_node=${RM_NGPUS_PER_NODE_PER_INSTANCE} \
-    reward_model.rollout_nnodes_per_instance=1 \
-    reward_model.rollout.tensor_model_parallel_size=${RM_TP} \
-    reward_model.rollout.pipeline_model_parallel_size=${RM_PP} \
-    reward_model.rollout.name=vllm \
-    reward_model.rollout.dtype=bfloat16 \
-    reward_model.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length + max_response_length)) \
-    reward_model.rollout.max_model_len=10240 \
-    reward_model.gen_reward_function=${RM_GEN_REWARD_FUNCTION} \
-    reward_model.rollout.task=${RM_VLLM_TASK} \
     \
     gen_actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \

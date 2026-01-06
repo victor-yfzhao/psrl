@@ -287,12 +287,12 @@ class PSRL_vLLMRollout:
             pooling_config = config.pooling_config
             # Use getattr for objects/DictConfig, dict.get() for regular dicts
             if isinstance(pooling_config, dict) and not isinstance(pooling_config, DictConfig):
-                normalize = pooling_config.get("normalize", True)
+                normalize = pooling_config.get("normalize", False)
                 use_activation = pooling_config.get("use_activation", False)
                 task = pooling_config.get("task", "classify")
             else:
                 # DictConfig and objects support attribute access
-                normalize = getattr(pooling_config, "normalize", True)
+                normalize = getattr(pooling_config, "normalize", False)
                 use_activation = getattr(pooling_config, "use_activation", False)
                 task = getattr(pooling_config, "task", "classify")
             self.pooling_params = PoolingParams(
@@ -301,6 +301,8 @@ class PSRL_vLLMRollout:
                 task=task,
             )
             self.sampling_params = None
+            psrl_logger.info(f"pooling_params: {self.pooling_params}")
+            print(f"pooling_params: {normalize=}, {use_activation=}, {task=}")
             psrl_logger.info(f"Initialized PoolingParams for pooling model")
         else:
             # For generative models, use SamplingParams
@@ -728,6 +730,7 @@ class PSRL_vLLMRollout:
             outputs = self.inference_engine.encode(
                 prompts=prompts_list,
                 pooling_params=self.pooling_params,
+                pooling_task=self.pooling_params.task,
             )
             
             return self.post_process_outputs(prompts, outputs)

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from typing import Any
 
 import numpy as np
 import ray
@@ -20,9 +21,10 @@ from psrl.utils.logger import (
 from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.reward.reward_loop import load_reward_loop_manager
+from psrl.workers.reward.reward_model import PSRL_RewardModelManager
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 class RewardManager(CommandExtension):
@@ -32,9 +34,8 @@ class RewardManager(CommandExtension):
         tokenizer,
         processor,
         ps_manager_handle,
-        reward_model_router=None,
-        reward_model_replica_handles: list | None = None,
-        reward_model_tokenizer=None,
+        reward_loop_fn_dict: dict[str, list[str | tuple[str, str]]] = {"naive": ["default"]},
+        reward_model_manager_mapping: dict[str, PSRL_RewardModelManager] = {},
     ):
         """Initialize the reward manager for processing rollout data and computing rewards.
 
@@ -47,18 +48,15 @@ class RewardManager(CommandExtension):
             tokenizer: Tokenizer for processing text data and converting tokens
             processor: Processor for processing multi-modal data
             ps_manager_handle: Handle to the parameter server for status updates and communication
-            reward_model_router: Optional router handle for distributed reward computation
-            reward_model_replica_handles: Optional list of direct reward model replica handles
-            reward_model_tokenizer: Optional tokenizer object for the reward model
+            reward_loop_fn_dict: Dictionary of reward loop types and their corresponding reward functions
+            reward_model_manager_mapping: Mapping of reward model names to reward model managers
         """
         super().__init__()
 
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
-        self.reward_model_router = reward_model_router
-        self.reward_model_replica_handles = reward_model_replica_handles or []
-        self._external_reward_model_tokenizer = reward_model_tokenizer
+        self.reward_model_manager_mapping = reward_model_manager_mapping
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
@@ -85,6 +83,14 @@ class RewardManager(CommandExtension):
         # Data
         self.request_buffer = {}  # Maps sample IDs to request DataProto (for merging with rollout data)
 
+        self.reward_loop_fn_dict = reward_loop_fn_dict
+
+        # different reward loops for different reward functions
+        # key should be: reward_loop_manager_type + reward_fn
+        # like: {"naive": {"default": ..., "customized": ...}, "gen": {"default": ..., "customized": ...}}
+        # the value should be the reward loop manager instance
+        self.reward_loop_managers = {}
+
         self._init_reward_fn()
 
         # Build logger
@@ -100,23 +106,46 @@ class RewardManager(CommandExtension):
         """
         input_tokenizer_local_path = copy_to_local(self.config.train_actor_rollout_ref.model.path)
         self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
-        self.reward_model_tokenizer = None
-        if self.config.reward_model.enable:
-            if self._external_reward_model_tokenizer is not None:
-                self.reward_model_tokenizer = self._external_reward_model_tokenizer
+        # self.reward_loop = load_reward_loop_manager(
+        #     self.config,
+        #     self.input_tokenizer,
+        #     reward_model_manager=self.reward_model_managers[0] if self.reward_model_managers else None,
+        # )
+        # self.reward_loop_managers["legacy_type"] = {
+        #     "default": self.reward_loop,
+        # }
+        # return
+
+        for reward_loop_manager_type, reward_fns in self.reward_loop_fn_dict.items():
+            reward_loop_sub_dict = {}
+            # non-generative reward loop, usually only contain reward_fn
+            # like: {"naive": ["default", "customized", ...]}
+            if reward_loop_manager_type != "gen":
+                for reward_fn in reward_fns:
+                    reward_loop_manager = load_reward_loop_manager(
+                        self.config,
+                        self.input_tokenizer,
+                        reward_loop_type = reward_loop_manager_type,
+                        reward_fn = reward_fn,
+                    )
+                    reward_loop_sub_dict[reward_fn] = reward_loop_manager
+
+            # generative reward loop, contain reward_fn and model_name
+            # like: {"gen": [("default", "Qwen3-30B-A3B"), ("skywork", "skywork-reward-v2"), ...]}
+            # allow different reward_fn uses same reward model manager if the model they use is the same
             else:
-                reward_model_tokenizer_local_path = copy_to_local(self.config.reward_model.model.path)
-                self.reward_model_tokenizer = hf_tokenizer(
-                    reward_model_tokenizer_local_path, trust_remote_code=True
-                )
-        self.reward_loop = load_reward_loop_manager(
-            self.config,
-            self.input_tokenizer,
-            reward_model_manager=None,
-            reward_model_router=self.reward_model_router,
-            reward_model_tokenizer=self.reward_model_tokenizer,
-            reward_model_replica_handles=self.reward_model_replica_handles,
-        )
+                for reward_fn, model_name in reward_fns:
+                    if model_name not in self.reward_model_manager_mapping:
+                        raise ValueError(f"Reward model manager for {model_name} not found")
+                    reward_loop_manager = load_reward_loop_manager(
+                        self.config,
+                        self.input_tokenizer,
+                        reward_model_manager=self.reward_model_manager_mapping[model_name],
+                        reward_loop_type = reward_loop_manager_type,
+                        reward_fn = reward_fn,
+                    )
+                    reward_loop_sub_dict[(reward_fn, model_name)] = reward_loop_manager
+            self.reward_loop_managers[reward_loop_manager_type] = reward_loop_sub_dict
 
     def add_requests(self, sample_id_to_request_data: dict[int, DataProto]):
         self.request_buffer.update(sample_id_to_request_data)
@@ -404,6 +433,16 @@ class RewardManager(CommandExtension):
                 reward_input = reward_inputs[i : i + 1]
                 reward_input = reward_input.union(request_data)
 
+                reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
+                reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
+                reward_fn = reward_model_dict.get("reward_fn", "default")
+                reward_model_name = reward_model_dict.get("reward_model_name", None)
+
+                if reward_loop_type == "gen":
+                    reward_loop = self.reward_loop_managers[reward_loop_type][(reward_fn, reward_model_name)]
+                else:
+                    reward_loop = self.reward_loop_managers[reward_loop_type][reward_fn]
+
                 if self.config.reward_model.launch_reward_fn_async:
                     # Launch async reward computation
                     with log_dual_events(
@@ -420,7 +459,8 @@ class RewardManager(CommandExtension):
                         level=logging.DEBUG,
                         event_type=EventType.OTHER,
                     ):
-                        result = await self.reward_loop.run_single(reward_input)
+                        psrl_logger.info(f"{request_id=} sync reward task, reward loop type: {reward_loop_type}, reward fn: {reward_fn}, reward model name: {reward_model_name}")
+                        result = await reward_loop.run_single(reward_input)
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(
                             int(request_id), PSRL_RequestStatus.REWARD_COMPLETED
@@ -433,7 +473,20 @@ class RewardManager(CommandExtension):
     async def _async_reward_task(self, reward_input: DataProto):
         """Async task to compute reward and store the result for later retrieval."""
         request_id = reward_input.non_tensor_batch["uid"][0]
-        result = await self.reward_loop.run_single(reward_input)
+
+        reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
+        reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
+        reward_fn = reward_model_dict.get("reward_fn", "default")
+        reward_model_name = reward_model_dict.get("reward_model_name", None)
+
+        if reward_loop_type == "gen":
+            reward_loop = self.reward_loop_managers[reward_loop_type][(reward_fn, reward_model_name)]
+        else:
+            reward_loop = self.reward_loop_managers[reward_loop_type][reward_fn]
+
+        psrl_logger.info(f"{request_id=} async reward task, reward loop type: {reward_loop_type}, reward fn: {reward_fn}, reward model name: {reward_model_name}")
+
+        result = await reward_loop.run_single(reward_input)
         # Store results which will be fetched by the main trainer later
         # for overlapping with logprobs' recomputation
         await self.set_reward_for_requests({request_id: result})

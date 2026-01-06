@@ -12,6 +12,7 @@ from verl.trainer.ppo.reward import get_custom_reward_fn
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
 from psrl.workers.reward.gen_reward_function import get_gen_reward_function_cls
+from psrl.workers.reward.reward_model import PSRL_RewardModelManager
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -59,83 +60,74 @@ def get_reward_loop_manager_cls(name: str) -> type[RewardLoopManagerBase]:
 
 
 def load_reward_loop_manager(
-    config: DictConfig,
+    reward_model_config: DictConfig,
     input_tokenizer: Any,
-    reward_model_manager: Any = None,
-    reward_model_router: Any = None,
-    reward_model_tokenizer: Any = None,
-    reward_model_replica_handles: list | None = None,
+    reward_loop_type: str,
+    reward_fn: str,
+    reward_model_manager: PSRL_RewardModelManager = None,
     **reward_kwargs: Any,
 ) -> RewardLoopManagerBase:
     """Load the reward loop manager based on the configuration.
 
     Args:
-        config: `(DictConfig)`
-            The configuration for the reward loop manager.
+        reward_model_config: `(DictConfig)`
+            The configuration for the reward model.
+        reward_loop_type: `(str)`
+            The type of the reward loop manager.
+        reward_fn: `(str)`
+            The name of the reward function.
         input_tokenizer: `(Any)`
             The tokenizer for the input.
-        reward_model_router: `(Any)`
-            The reward model router.
-        reward_model_tokenizer: `(Any)`
-            The tokenizer for the reward model.
+        reward_model_manager: `(PSRL_RewardModelManager)`
+            The reward model manager.
         **reward_kwargs: `(Any)`
             Additional keyword arguments for the reward loop manager.
     Returns:
         `(RewardLoopManagerBase)`: The reward loop manager instance.
     """
-    # Try to get a custom reward function based on the configuration
-    # user defined reward manager can be registered in custom_reward_fn
-    compute_score = get_custom_reward_fn(config)
-
-    reward_loop_manager_name = config.reward_model.get("reward_manager", "naive")
+    reward_loop_manager_name = reward_loop_type
     reward_loop_manager_cls = get_reward_loop_manager_cls(reward_loop_manager_name)
 
-    final_compute_score = compute_score
-    if final_compute_score is None:
-        sandbox_config = config.reward_model.get("sandbox_fusion")
-        sandbox_url = sandbox_config.get("url") if sandbox_config else None
-        memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
-        if sandbox_url:
-            # Create an asyncio.Semaphore to control concurrent access to the sandbox
-            # Note: asyncio.Semaphore must be created in the same event loop where it will be used
-            # Therefore, we pass max_concurrent as a parameter and create the semaphore later
-            max_concurrent = sandbox_config.get("max_concurrent", 64)
-            _concurrent_semaphore = asyncio.Semaphore(max_concurrent)
-            final_compute_score = partial(
-                default_compute_score_async,
-                sandbox_fusion_url=sandbox_url,
-                concurrent_semaphore=_concurrent_semaphore,
-                memory_limit_mb=memory_limit_mb,
-            )
-        else:
-            final_compute_score = default_compute_score_async
+    # Try to get a custom reward function based on the configuration
+    # user defined reward manager can be registered in custom_reward_fn
+    # TODO(zyf): need a new way to get the custom reward function
+    # compute_score = get_custom_reward_fn(reward_model_config)
+    # final_compute_score = compute_score
+    # if final_compute_score is None:
+    #     sandbox_config = reward_model_config.get("sandbox_fusion")
+    #     sandbox_url = sandbox_config.get("url") if sandbox_config else None
+    #     memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
+    #     if sandbox_url:
+    #         # Create an asyncio.Semaphore to control concurrent access to the sandbox
+    #         # Note: asyncio.Semaphore must be created in the same event loop where it will be used
+    #         # Therefore, we pass max_concurrent as a parameter and create the semaphore later
+    #         max_concurrent = sandbox_config.get("max_concurrent", 64)
+    #         _concurrent_semaphore = asyncio.Semaphore(max_concurrent)
+    #         final_compute_score = partial(
+    #             default_compute_score_async,
+    #             sandbox_fusion_url=sandbox_url,
+    #             concurrent_semaphore=_concurrent_semaphore,
+    #             memory_limit_mb=memory_limit_mb,
+    #         )
+    #     else:
+    #         final_compute_score = default_compute_score_async
+    final_compute_score = default_compute_score_async
 
     if reward_loop_manager_name == "gen":
         # Get gen_reward_function from config or reward_kwargs
-        gen_reward_function_name = reward_kwargs.pop(
-            "gen_reward_function", 
-            config.reward_model.get("gen_reward_function", "default")
-        )
-        psrl_logger.info(f"Loading gen reward function: {gen_reward_function_name}")
+        gen_reward_function_name = reward_fn
         gen_reward_function_cls = get_gen_reward_function_cls(gen_reward_function_name)
-        psrl_logger.info(f"Loaded gen reward function class: {gen_reward_function_cls.__name__}")
-        
         return reward_loop_manager_cls(
-            config,
+            reward_model_config,
             input_tokenizer,
             reward_model_manager=reward_model_manager,
             reward_function=gen_reward_function_cls(),
-            router_process=reward_model_router,
-            replica_handles=reward_model_replica_handles or [],
-            reward_model_tokenizer=reward_model_tokenizer,
             **reward_kwargs,
         )
 
     return reward_loop_manager_cls(
-        config,
+        reward_model_config,
         input_tokenizer,
         final_compute_score,
-        reward_model_router,
-        reward_model_tokenizer,
         **reward_kwargs,
     )

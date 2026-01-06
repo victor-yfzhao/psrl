@@ -148,28 +148,28 @@ class TaskRunner:
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
         }
 
-        # Reward model resource pool
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward_model.nnodes <= 0:
-                raise ValueError("config.reward_model.nnodes must be greater than 0")
+        # # Reward model resource pool
+        # if config.reward_model.enable_resource_pool:
+        #     if config.reward_model.n_gpus_per_node <= 0:
+        #         raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
+        #     if config.reward_model.nnodes <= 0:
+        #         raise ValueError("config.reward_model.nnodes must be greater than 0")
 
-            if config.reward_model.use_reward_loop:
-                reward_loop_instances = getattr(
-                    config.reward_model,
-                    "n_rollout_instances",
-                    config.reward_model.get("num_replicas", 1),
-                )
-                reward_pool_id_list = [f"reward_pool_{i}" for i in range(reward_loop_instances)]
-                for i in range(reward_loop_instances):
-                    resource_pool_spec[f"reward_pool_{i}"] = [
-                        config.reward_model.rollout_ngpus_per_instance_per_node
-                    ] * config.reward_model.rollout_nnodes_per_instance
-            else:
-                resource_pool_spec["reward_pool"] = [
-                    config.reward_model.n_gpus_per_node
-                ] * config.reward_model.nnodes
+        #     if config.reward_model.use_reward_loop:
+        #         reward_loop_instances = getattr(
+        #             config.reward_model,
+        #             "n_rollout_instances",
+        #             config.reward_model.get("num_replicas", 1),
+        #         )
+        #         reward_pool_id_list = [f"reward_pool_{i}" for i in range(reward_loop_instances)]
+        #         for i in range(reward_loop_instances):
+        #             resource_pool_spec[f"reward_pool_{i}"] = [
+        #                 config.reward_model.rollout_ngpus_per_instance_per_node
+        #             ] * config.reward_model.rollout_nnodes_per_instance
+        #     else:
+        #         resource_pool_spec["reward_pool"] = [
+        #             config.reward_model.n_gpus_per_node
+        #         ] * config.reward_model.nnodes
 
         # Set the resource pool spec for each rollout instance.
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
@@ -207,14 +207,42 @@ class TaskRunner:
         self.mapping[PSRL_Role.Actor] = [train_pool_id]
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
         self.mapping[PSRL_Role.Critic] = [train_pool_id]
-        
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.use_reward_loop:
-                self.mapping[PSRL_Role.RewardModel] = reward_pool_id_list
-            else:
-                self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
-        else:
-            self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
+
+        # Reward model resource pool
+        total_reward_pool_id_list = []
+        reward_models_config = config.reward_models_config
+        for reward_model in reward_models_config.reward_models:
+            if reward_model.reward_loop_type != "gen":
+                continue
+            if reward_model.enable_resource_pool:
+                if reward_model.n_gpus_per_node <= 0:
+                    raise ValueError("reward_model.n_gpus_per_node must be greater than 0")
+                if reward_model.nnodes <= 0:
+                    raise ValueError("reward_model.nnodes must be greater than 0")
+
+                reward_loop_instances = getattr(
+                    reward_model,
+                    "n_rollout_instances",
+                    reward_model.get("num_replicas", 1),
+                )
+                reward_model_name = reward_model.get("model_name", reward_model.model.path.split("/")[-1])
+                reward_pool_id_list = [
+                    f"reward_pool_{reward_model_name}_{i}" 
+                    for i in range(reward_loop_instances)
+                ]
+                for i in range(reward_loop_instances):
+                    resource_pool_spec[reward_pool_id_list[i]] = [
+                        reward_model.rollout_ngpus_per_instance_per_node
+                    ] * reward_model.rollout_nnodes_per_instance
+                total_reward_pool_id_list.extend(reward_pool_id_list)
+        # if config.reward_model.enable_resource_pool:
+        #     if config.reward_model.use_reward_loop:
+        #         self.mapping[PSRL_Role.RewardModel] = reward_pool_id_list
+        #     else:
+        #         self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
+        # else:
+        #     self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
+        self.mapping[PSRL_Role.RewardModel] = total_reward_pool_id_list
             
         from psrl.trainer.ppo.utils import ResourcePoolManager
 
@@ -237,26 +265,28 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
-        if config.reward_model.enable:
-            # Legacy Version
-            if not config.reward_model.use_reward_loop:
-                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                    from verl.workers.fsdp_workers import RewardModelWorker
-                elif config.reward_model.strategy == "megatron":
-                    from verl.workers.megatron_workers import RewardModelWorker
-                else:
-                    raise NotImplementedError
+        # if config.reward_model.enable:
+        #     # Legacy Version
+        #     if not config.reward_model.use_reward_loop:
+        #         if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+        #             from verl.workers.fsdp_workers import RewardModelWorker
+        #         elif config.reward_model.strategy == "megatron":
+        #             from verl.workers.megatron_workers import RewardModelWorker
+        #         else:
+        #             raise NotImplementedError
 
-                self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
-            # Reward Loop Version
-            # Which means we need to create a independent rollout woker group for the reward loop
-            else:
-                # NOTE(zyf): Considering Reward Model is disaggregated from actor/critic/ref/trainer, 
-                # Reward Model MUST have independent resource pool to launch.
-                assert config.reward_model.enable_resource_pool, "Reward loop must be enabled with resource pool"
+        #         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
+        #     # Reward Loop Version
+        #     # Which means we need to create a independent rollout woker group for the reward loop
+        #     else:
+        #         # NOTE(zyf): Considering Reward Model is disaggregated from actor/critic/ref/trainer, 
+        #         # Reward Model MUST have independent resource pool to launch.
+        #         assert config.reward_model.enable_resource_pool, "Reward loop must be enabled with resource pool"
                 
-                from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
-                self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
+        #         from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
+        #         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
+        from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
+        self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
@@ -293,12 +323,7 @@ class TaskRunner:
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
-        # We should adopt a multi-source reward function here:
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # finally, we combine all the rewards together
-        # The reward type depends on the tag of the data
+        # Only initialize generative reward model workers
         self.add_reward_model_worker(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.

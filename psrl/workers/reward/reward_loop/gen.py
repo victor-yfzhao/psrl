@@ -8,13 +8,14 @@ from tensordict import TensorDict
 from verl import DataProto
 
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.logger import DualOutputHandler
 from psrl.workers.reward.reward_model.manager import PSRL_RewardModelManager
 from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
 from psrl.workers.reward.gen_reward_function import DefaultGenRewardFunction, GenRewardFunctionBase
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 @register("gen")
@@ -32,11 +33,8 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         self,
         config,
         tokenizer,
-        reward_model_manager: PSRL_RewardModelManager | None = None,
+        reward_model_manager: PSRL_RewardModelManager = None,
         reward_function: GenRewardFunctionBase = DefaultGenRewardFunction(),
-        router_process=None,
-        replica_handles: list | None = None,
-        reward_model_tokenizer=None,
         **reward_kwargs,
     ):
         """
@@ -58,21 +56,13 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.reward_function.compute_score)
 
         self.reward_model_manager = reward_model_manager
-        self.reward_model_tokenizer = reward_model_tokenizer
-        if self.reward_model_manager is not None:
-            if self.reward_model_tokenizer is None:
-                self.reward_model_tokenizer = self.reward_model_manager.get_reward_model_tokenizer()
-            router_process = router_process or self.reward_model_manager.get_router_process()
-            replica_handles = replica_handles or self.reward_model_manager.get_replica_handles()
-        self.router_process = router_process
-        self.replica_handles = [handle for handle in (replica_handles or []) if handle is not None]
-        if self.reward_model_tokenizer is None:
-            raise ValueError("Reward model tokenizer must be provided for GenRewardLoopManager.")
-        if self.router_process is None and not self.replica_handles:
-            raise ValueError("No router process or replica handles provided for reward model inference.")
+        self.reward_model_tokenizer = self.reward_model_manager.get_reward_model_tokenizer()
+        self.router_process = self.reward_model_manager.get_router_process()
+        self.replica_handles = self.reward_model_manager.get_replica_handles()
         self._replica_rr_index = 0
         self.reward_kwargs = reward_kwargs
-        psrl_logger.info(f"RewardModelManager's Initialization Complete")
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, "gen_reward_loop"))
+        psrl_logger.info("Initialized GenRewardLoopManager.")
 
     async def run_single(self, data: DataProto) -> dict:
         """
@@ -184,12 +174,6 @@ class GenRewardLoopManager(RewardLoopManagerBase):
             reward_extra_info["rm_output_value"] = rm_output_value
         reward_extra_info["agent_response"] = response_str
         psrl_logger.info(
-            "Reward computed uid=%s score=%.4f extra=%s",
-            request_uid,
-            score,
-            {k: v for k, v in reward_extra_info.items() if k not in {"rm_output", "agent_response"}},
-        )
-        print(
             "Reward computed uid=%s score=%.4f extra=%s",
             request_uid,
             score,
@@ -332,7 +316,6 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         else:
             psrl_logger.warning("No raw_response_ids in RM output non_tensor_batch")
 
-        print(result)
         return result
 
     def _get_next_replica_handle(self):

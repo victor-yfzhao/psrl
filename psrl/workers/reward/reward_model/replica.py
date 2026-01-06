@@ -78,8 +78,10 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
         model_config: HFModelConfig,
         psrl_config: DictConfig,
         resource_pool: RayResourcePool,
+        reward_model_name: str,
     ):
         super().__init__(replica_rank, reward_model_config, rollout_config, model_config, psrl_config, resource_pool)
+        self.reward_model_name = reward_model_name
 
         self.worker_group: RayWorkerGroup | None = None
         self._worker_handle = None
@@ -93,10 +95,15 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
             psrl_config=self.psrl_config,
             instance_id=self.replica_rank,
         )
+        # Include reward_model_name in name_prefix to ensure uniqueness across multiple reward models
+        if self.reward_model_name:
+            name_prefix = f"{self.reward_model_name}_reward_model_{self.replica_rank}"
+        else:
+            name_prefix = f"reward_model_{self.replica_rank}"
         self.worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=ray_cls_with_init,
-            name_prefix=f"reward_model_{self.replica_rank}",
+            name_prefix=name_prefix,
         )
         # Use the first worker as the main handle for this replica
         self._worker_handle = self.worker_group.workers[0] if self.worker_group.workers else None

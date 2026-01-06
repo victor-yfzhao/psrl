@@ -17,8 +17,6 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         config,
         tokenizer,
         compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
     ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async
@@ -28,8 +26,6 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         overlong_buffer_cfg = config.reward_model.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = config.reward_model.get("reward_kwargs", {}).get("max_resp_len", None)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (

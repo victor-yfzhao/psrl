@@ -17,14 +17,10 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
         config,
         tokenizer,
         compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
     ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
 
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"

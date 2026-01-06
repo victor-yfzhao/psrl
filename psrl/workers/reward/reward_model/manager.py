@@ -26,6 +26,7 @@ class PSRL_RewardModelManager:
 
     def __init__(
         self,
+        reward_model_name: str,
         config: DictConfig,
         reward_model_config: DictConfig,
         resource_pools: RayResourcePool | list[RayResourcePool],
@@ -33,10 +34,9 @@ class PSRL_RewardModelManager:
         """
         Initialize the reward model manager.
 
-        Args:
-            config: RewardModelConfig from PSRL configuration.
         """
         self.config = config
+        self.reward_model_name = reward_model_name
         self.reward_model_config = reward_model_config
         if isinstance(resource_pools, RayResourcePool):
             resource_pools = [resource_pools]
@@ -78,8 +78,9 @@ class PSRL_RewardModelManager:
                     reward_model_config=self.reward_model_config,
                     rollout_config=rollout_config,
                     model_config=model_config,
-                    psrl_config=self.config,
+                    psrl_config=self.config.psrl,
                     resource_pool=resource_pool,
+                    reward_model_name=self.reward_model_name,
                 )
             )
 
