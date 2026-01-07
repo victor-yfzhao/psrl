@@ -53,7 +53,7 @@ class BatchGenerateAgentLoop(AgentLoopBase):
 
         reward_input = output
         reward_result = await self.reward_manager.compute_score.remote(reward_input)
-        if not self.config.reward_model.launch_reward_fn_async:
+        if not self.config.reward_models_config.launch_reward_fn_async:
             output = self._post_process_and_merge_reward(reward_result, output)
 
         return output

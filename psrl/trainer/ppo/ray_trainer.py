@@ -309,12 +309,12 @@ class PSRL_RayPPOTrainer:
             )
 
         # Check for reward model micro-batch size conflicts
-        if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
-            check_mutually_exclusive(
-                config.reward_model.micro_batch_size,
-                config.reward_model.micro_batch_size_per_gpu,
-                "reward_model",
-            )
+        # if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
+        #     check_mutually_exclusive(
+        #         config.reward_model.micro_batch_size,
+        #         config.reward_model.micro_batch_size_per_gpu,
+        #         "reward_model",
+        #     )
 
         # Actor training
         # check if train_batch_size is larger than ppo_mini_batch_size
@@ -772,8 +772,8 @@ class PSRL_RayPPOTrainer:
             )
 
             # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+            # if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            #     return {}
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
@@ -1866,13 +1866,15 @@ class PSRL_RayPPOTrainer:
                             reward_tensor = rm_scores  # [bsz, response_length]
 
                             # add reward_extra_info to non_tensor_batch
-                            reward_extra_infos_dict = defaultdict(list)
-                            for reward_extra_infos in reward_extra_infos_dict_list:
-                                for key, value in reward_extra_infos.items():
-                                    if not isinstance(value, list):
-                                        value = [value]
-                                    reward_extra_infos_dict[key].extend(value)
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            # reward_extra_infos_dict = defaultdict(list)
+                            # for reward_extra_infos in reward_extra_infos_dict_list:
+                            #     for key, value in reward_extra_infos.items():
+                            #         if not isinstance(value, list):
+                            #             value = [value]
+                            #         reward_extra_infos_dict[key].extend(value)
+                            # batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            if reward_extra_infos_dict_list:
+                                batch.non_tensor_batch["reward_extra_info"] = np.array(reward_extra_infos_dict_list, dtype=object)
                 else:
                     reward_tensor = batch.batch.pop("rm_scores", None)
 

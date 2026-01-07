@@ -23,9 +23,10 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
         # DAPO Reward Config
-        overlong_buffer_cfg = config.reward_model.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
+        # TODO(zyf): use specific reward model's config to load reward loop manager
+        overlong_buffer_cfg = config.reward_models_config.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
         self.overlong_buffer_cfg = overlong_buffer_cfg
-        self.max_resp_len = config.reward_model.get("reward_kwargs", {}).get("max_resp_len", None)
+        self.max_resp_len = config.reward_models_config.get("reward_kwargs", {}).get("max_resp_len", None)
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (

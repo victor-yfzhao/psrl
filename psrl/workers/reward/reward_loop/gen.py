@@ -162,17 +162,20 @@ class GenRewardLoopManager(RewardLoopManagerBase):
 
         # Parse result
         reward_extra_info = {}
+        score: float
         if isinstance(result, dict):
             score = result["score"]
-            reward_extra_info.update(result)
+            for key, value in result.items():
+                reward_extra_info[key] = value
         else:
-            score = float(result)
+            score = result
+            reward_extra_info["score"] = score
             reward_extra_info["acc"] = score
-
         reward_extra_info["rm_output"] = rm_output_str
         if rm_output_value is not None:
             reward_extra_info["rm_output_value"] = rm_output_value
         reward_extra_info["agent_response"] = response_str
+
         psrl_logger.info(
             "Reward computed uid=%s score=%.4f extra=%s",
             request_uid,

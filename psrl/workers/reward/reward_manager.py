@@ -120,6 +120,7 @@ class RewardManager(CommandExtension):
             reward_loop_sub_dict = {}
             # non-generative reward loop, usually only contain reward_fn
             # like: {"naive": ["default", "customized", ...]}
+            # TODO(zyf): use specific reward model's config to load reward loop manager
             if reward_loop_manager_type != "gen":
                 for reward_fn in reward_fns:
                     reward_loop_manager = load_reward_loop_manager(
@@ -443,7 +444,7 @@ class RewardManager(CommandExtension):
                 else:
                     reward_loop = self.reward_loop_managers[reward_loop_type][reward_fn]
 
-                if self.config.reward_model.launch_reward_fn_async:
+                if self.config.reward_models_config.launch_reward_fn_async:
                     # Launch async reward computation
                     with log_dual_events(
                         "Launch async reward model score",

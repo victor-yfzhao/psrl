@@ -366,7 +366,7 @@ class PSRL_AgentLoopManager:
 
         meta_info = {}
         # Reward processing
-        if not self.config.reward_model.launch_reward_fn_async:
+        if not self.config.reward_models_config.launch_reward_fn_async:
             ## psrl_logger.info("Reward processing begin")
             scores = inputs.non_tensor_batch.pop("reward_scores", None).tolist()
             prompt_length = prompt_ids.size(1)
@@ -377,10 +377,11 @@ class PSRL_AgentLoopManager:
 
             # add reward_extra_info to non_tensor_batch
             reward_extra_infos = inputs.non_tensor_batch.pop("reward_extra_infos", None)
-            reward_extra_keys = list(reward_extra_infos[0].keys())
-            for key in reward_extra_keys:
-                non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-            meta_info = {"reward_extra_keys": reward_extra_keys}
+            non_tensor_batch["reward_extra_infos"] = reward_extra_infos
+            # reward_extra_keys = list(reward_extra_infos[0].keys())
+            # for key in reward_extra_keys:
+            #     non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            # meta_info = {"reward_extra_keys": reward_extra_keys}
 
         ## psrl_logger.info("Return data proto")
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
