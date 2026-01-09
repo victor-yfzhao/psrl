@@ -72,6 +72,10 @@ class RewardManager(CommandExtension):
         self.request_id_to_future = {}
         self.request_id_to_reward = {}
 
+        # Reward normalization
+        self.reward_normalization = self.config.reward_models_config.reward_normalization
+        self.request_id_to_group = {}
+
         # Background event handler
         self.running_loop = None
         self.command_loop_task = None
@@ -343,6 +347,11 @@ class RewardManager(CommandExtension):
                         abort_request_uids.update(uids)
 
                     psrl_logger.debug(f"Total of {len(abort_request_uids)} requests to abort")
+
+                    # remove requests from request_id_to_group
+                    for abort_request_id in abort_request_uids:
+                        self.request_id_to_group.pop(abort_request_id, None)
+
                     # Abort requests in the reward manager
                     # request_id -> reward_future
                     # 1. Kill running reward computation futures
@@ -434,6 +443,16 @@ class RewardManager(CommandExtension):
                 reward_input = reward_inputs[i : i + 1]
                 reward_input = reward_input.union(request_data)
 
+                if self.reward_normalization == "batch":
+                    group_id = (
+                        reward_input[0].non_tensor_batch["data_source"], 
+                        reward_input[0].non_tensor_batch["reward_model_dict"].get("reward_model_name", None)
+                    )
+                    self.request_id_to_group[request_id] = group_id
+                elif self.reward_normalization == "group":
+                    group_id = reward_input[0].non_tensor_batch["parent_id"]
+                    self.request_id_to_group[request_id] = group_id
+
                 reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
                 reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
                 reward_fn = reward_model_dict.get("reward_fn", "default")
@@ -469,6 +488,10 @@ class RewardManager(CommandExtension):
                         complete_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                         if complete_request_idxs:
                             results[request_id] = result
+            
+                if not self.config.reward_models_config.launch_reward_fn_async:
+                    results = self.normalize_reward(results)
+        
         return results
 
     async def _async_reward_task(self, reward_input: DataProto):
@@ -520,7 +543,9 @@ class RewardManager(CommandExtension):
         for request_id in request_ids:
             self.request_id_to_future.pop(request_id, None)
 
-        return request_id_to_reward
+        request_id_to_norm_reward = self.normalize_reward(request_id_to_reward)
+        
+        return request_id_to_norm_reward
 
     async def set_reward_for_requests(self, request_id_to_reward: dict[int, float]):
         """Set the reward for the specified request IDs."""
@@ -531,3 +556,43 @@ class RewardManager(CommandExtension):
                     fut.set_result(reward)
             else:
                 self.request_id_to_reward[request_id] = reward
+
+    def normalize_reward(self, request_id_to_reward: dict[int, float | dict]) -> dict[int, float | dict]:
+        if self.reward_normalization != "batch" and self.reward_normalization != "group":
+            return request_id_to_reward
+        group_rewards_dicts = {}
+        # Store original reward structure (dict or float) for each request_id
+        original_rewards = {}
+        for request_id, reward in request_id_to_reward.items():
+            # Extract reward_score if reward is a dict (from reward_loop.run_single())
+            if isinstance(reward, dict):
+                reward_value = reward.get("reward_score", reward)
+                original_rewards[request_id] = reward
+            else:
+                reward_value = reward
+                original_rewards[request_id] = None  # Mark as float, will be replaced directly
+            
+            group_id = self.request_id_to_group[request_id]
+            if group_id not in group_rewards_dicts:
+                group_rewards_dicts[group_id] = {
+                    "request_ids": [], 
+                    "rewards": []
+                }
+            group_rewards_dicts[group_id]["request_ids"].append(request_id)
+            group_rewards_dicts[group_id]["rewards"].append(reward_value)
+            self.request_id_to_group.pop(request_id, None)
+        for group_id, group_rewards_dict in group_rewards_dicts.items():
+            request_ids = group_rewards_dict["request_ids"]
+            rewards = np.array(group_rewards_dict["rewards"])
+            psrl_logger.info(f"Rewards for group {group_id}: {len(rewards)}")
+            norm_rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            for request_id, norm_reward in zip(request_ids, norm_rewards):
+                # If original reward was a dict, update reward_score and keep the structure
+                if original_rewards[request_id] is not None:
+                    original_rewards[request_id]["reward_score"] = float(norm_reward)
+                    request_id_to_reward[request_id] = original_rewards[request_id]
+                else:
+                    # If original reward was a float, replace directly
+                    request_id_to_reward[request_id] = float(norm_reward)
+        return request_id_to_reward
+

@@ -1,6 +1,8 @@
 # configs for the reward model
 launch_reward_fn_async: True
 
+reward_normalization: group
+
 reward_models:
   - reward_loop_type: naive
     reward_fn: 
@@ -10,58 +12,58 @@ reward_models:
     reward_fn: 
       - default
 
-  - reward_loop_type: gen
-    reward_fn: 
-      - default
-    model_name: Qwen3-8B
+  # - reward_loop_type: gen
+  #   reward_fn: 
+  #     - default
+  #   model_name: Qwen3-8B
 
-    enable_resource_pool: True
-    n_gpus_per_node: 1
-    num_replicas: 1
-    nnodes: 1
-    rollout_ngpus_per_instance_per_node: 1
-    rollout_nnodes_per_instance: 1
+  #   enable_resource_pool: True
+  #   n_gpus_per_node: 1
+  #   num_replicas: 1
+  #   nnodes: 1
+  #   rollout_ngpus_per_instance_per_node: 1
+  #   rollout_nnodes_per_instance: 1
 
-    model:
-      path: /jizhicfs/pkuhetu/models/Qwen3-8B
-      external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
-      trust_remote_code: False
+  #   model:
+  #     path: /jizhicfs/pkuhetu/models/Qwen3-8B
+  #     external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
+  #     trust_remote_code: False
 
-    rollout:
-      _target_: psrl.workers.config.RolloutConfig
-      name: vllm
-      mode: psrl_async
-      disable_attn: False
-      dtype: bfloat16
-      gpu_memory_utilization: 0.5
-      enforce_eager: true
-      cudagraph_capture_sizes: null
-      free_cache_engine: true
-      data_parallel_size: 1
-      expert_parallel_size: 1
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      max_num_batched_tokens: 8192
-      max_num_seqs: 1024
-      load_format: auto
-      engine_kwargs: {}
-      limit_images: null
-      enable_chunked_prefill: false
-      enable_prefix_caching: false
-      disable_log_stats: true
-      skip_tokenizer_init: false
+  #   rollout:
+  #     _target_: psrl.workers.config.RolloutConfig
+  #     name: vllm
+  #     mode: psrl_async
+  #     disable_attn: False
+  #     dtype: bfloat16
+  #     gpu_memory_utilization: 0.5
+  #     enforce_eager: true
+  #     cudagraph_capture_sizes: null
+  #     free_cache_engine: true
+  #     data_parallel_size: 1
+  #     expert_parallel_size: 1
+  #     tensor_model_parallel_size: 1
+  #     pipeline_model_parallel_size: 1
+  #     max_num_batched_tokens: 8192
+  #     max_num_seqs: 1024
+  #     load_format: auto
+  #     engine_kwargs: {}
+  #     limit_images: null
+  #     enable_chunked_prefill: false
+  #     enable_prefix_caching: false
+  #     disable_log_stats: true
+  #     skip_tokenizer_init: false
 
-      prompt_length: 4096
-      response_length: 4096
-      max_model_len: 8192
+  #     prompt_length: 4096
+  #     response_length: 4096
+  #     max_model_len: 8192
 
-      runner: generate
-      task: generate
+  #     runner: generate
+  #     task: generate
 
-    sampling_config:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: 0
+  #   sampling_config:
+  #     temperature: 0.0
+  #     top_p: 1.0
+  #     top_k: 0
   
   - reward_loop_type: gen
     reward_fn: 
@@ -94,7 +96,7 @@ reward_models:
       expert_parallel_size: 1
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 20480
       max_num_seqs: 1024
       load_format: auto
       engine_kwargs: {}
@@ -104,9 +106,9 @@ reward_models:
       disable_log_stats: true
       skip_tokenizer_init: false
 
-      prompt_length: 4096
-      response_length: 4096
-      max_model_len: 8192
+      prompt_length: 8192
+      response_length: 8192
+      max_model_len: 16384
 
       runner: pooling
       task: classify

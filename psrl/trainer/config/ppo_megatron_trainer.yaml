@@ -15,7 +15,8 @@ defaults:
   - rollout@gen_actor_rollout_ref.rollout: rollout
 
   # data: trainer/config/data/data.yaml
-  - data@data: data
+  # - data@data: data
+  - data@data: multi_datasets
 
   # load the reference default config, then apply the fields in the current yaml
   # Reference model config.

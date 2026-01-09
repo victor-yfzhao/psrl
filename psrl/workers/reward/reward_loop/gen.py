@@ -100,7 +100,11 @@ class GenRewardLoopManager(RewardLoopManagerBase):
 
         # Extract metadata for reward computation
         data_source = data_item.non_tensor_batch.get("data_source", "unknown")
-        ground_truth = data_item.non_tensor_batch["reward_model"].get("ground_truth", "")
+        reward_model_info = data_item.non_tensor_batch.get("reward_model")
+        if isinstance(reward_model_info, dict):
+            ground_truth = reward_model_info.get("ground_truth", "")
+        else:
+            ground_truth = ""
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
         psrl_logger.info("Reward loop received uid=%s source=%s", request_uid, data_source)
 

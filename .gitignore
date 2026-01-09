@@ -138,5 +138,5 @@ log
 outputs
 
 
-models/
-data/
+/models/
+/data/
