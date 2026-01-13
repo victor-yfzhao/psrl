@@ -3,13 +3,15 @@ set -xeuo pipefail
 
 PSRL_WORKSPACE=/jizhicfs/pkuhetu/yfzhao/psrl
 
-project_name='psrl_multi_reward_model'
-experiment_name='Qwen2.5-Math-7B-GenLoop-naive-dapo-gen-dis'
+project_name='psrl_multi_datasets'
+experiment_name='Qwen2.5-Math-7B-MultiDatasets-stream-dis'
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source ${PSRL_WORKSPACE}/env/env_311.sh
 
 PSRL_WORKSPACE=/jizhicfs/pkuhetu/yfzhao/psrl
-
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl, os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -17,13 +19,10 @@ HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
-TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
-
 # rollout / reward settings
 ROLL_TP=1
 ROLL_PP=1
-ROLL_INSTANCES=2
+ROLL_INSTANCES=3
 ROLL_NGPUS_PER_NODE_PER_INSTANCE=$((ROLL_TP * ROLL_PP))
 
 # training settings
@@ -41,10 +40,10 @@ val_top_p=0.7
 train_prompt_bsz=128
 train_prompt_mini_bsz=64
 n_resp_per_prompt=8
-max_prompt_length=2048
-max_response_length=4096
+max_prompt_length=4096
+max_response_length=8192
 
-export PSRL_LOGGING_LEVEL=INFO
+export PSRL_LOGGING_LEVEL=DEBUG
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -55,8 +54,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/logs/reward_rm_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=rollout \
     psrl.deployment.n_rollout_instances=${ROLL_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${ROLL_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -70,9 +67,14 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.temperature=${temperature} \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
     gen_actor_rollout_ref.rollout.top_k=-1 \
-    gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length + 4096)) \
+    gen_actor_rollout_ref.rollout.max_model_len=$((max_prompt_length + max_response_length)) \
+    gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     \
     train_actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
+    train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length + 4096)) \
+    train_actor_rollout_ref.rollout.max_model_len=$((max_prompt_length + max_response_length)) \
+    train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${TRAIN_PP} \
@@ -88,16 +90,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
-    data.train_files="${TRAIN_FILE}" \
-    data.val_files="${TEST_FILE}" \
-    data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.val_before_train=False \

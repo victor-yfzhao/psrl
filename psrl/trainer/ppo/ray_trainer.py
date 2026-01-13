@@ -548,8 +548,29 @@ class PSRL_RayPPOTrainer:
         else:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
 
-    def init_reward_manager(self):
-        """Initialize the reward manager for computing rewards during training."""
+    def init_reward_manager(self, validation: bool = False):
+        """Initialize the reward manager for computing rewards during training or validation."""
+        if validation:
+            ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+            self.val_reward_manager = (
+                ray.remote(RewardManager)
+                .options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=ip_to_node_id[self.config.psrl.reward_service_ip],
+                        soft=False,
+                    )
+                )
+                .remote(
+                    config=self.config,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    reward_model_configs=self.config.reward_models_config.reward_models,
+                    reward_model_manager_mapping=self.reward_model_manager_mapping,
+                    ps_manager_handle=self.ps_manager_handle,
+                    validation=validation,
+                )
+            )
+            return
         assert self.data_processor is not None, (
             "Data processor must be initialized before starting reward computation."
         )
@@ -567,12 +588,13 @@ class PSRL_RayPPOTrainer:
                 )
             )
             .remote(
-                self.config,
-                self.tokenizer,
-                self.processor,
-                self.ps_manager_handle,
-                reward_loop_fn_dict=self.reward_loop_fn_dict,
+                config=self.config,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                ps_manager_handle=self.ps_manager_handle,
+                reward_model_configs=self.config.reward_models_config.reward_models,
                 reward_model_manager_mapping=self.reward_model_manager_mapping,
+                validation=False,
             )
         )
 
@@ -680,10 +702,6 @@ class PSRL_RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-
-
-
-    # TODO
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
@@ -718,6 +736,7 @@ class PSRL_RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_parent_ids = []
+        request_ids = []
 
         batch_count = 0
         while True:
@@ -748,9 +767,14 @@ class PSRL_RayPPOTrainer:
                 interleave=True,
             )
 
-            # we only do validation on rule-based rm
-            # if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-            #     return {}
+            # Ensure each sample has a stable id for reward mapping.
+            # Some validation datasets/controllers do not provide `uid`.
+            test_batch.non_tensor_batch["uid"] = np.arange(
+                len(request_ids), len(request_ids) + len(test_batch), 
+                dtype=np.int64
+            )
+            
+            request_ids.extend(test_batch.non_tensor_batch["uid"].tolist())
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
@@ -818,27 +842,29 @@ class PSRL_RayPPOTrainer:
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            # TODO(zyf): If use gen_rm, a cutomized reward function is required, which usually is a prompt template.
-            # Therefore, we need to launch Reward Model Rollout to compute the reward.
-            # Currently, only support functional reward function.
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+            if self.val_reward_manager is None:
+                raise ValueError("Reward manager must be provided for validation.")
 
+            request_id_to_reward = ray.get(self.val_reward_manager.compute_score_for_validation.remote(test_batch))
+
+            _request_ids = test_batch.non_tensor_batch["uid"].tolist()
+            scores = []
+            reward_extra_infos_dict_list = []
+            for request_id in _request_ids:
+                reward_score = request_id_to_reward[request_id]["reward_score"]
+                extra_info = request_id_to_reward[request_id].get("reward_extra_info", {})
+                scores.append(reward_score)
+                reward_extra_infos_dict_list.append(extra_info)
+            sample_scores.extend(scores)
             reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+            reward_extra_infos_dict["reward_extra_info"].extend(reward_extra_infos_dict_list)
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(
-                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(request_ids))
             )
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -904,16 +930,19 @@ class PSRL_RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         reward_models_config = self.config.reward_models_config
-        self.reward_loop_fn_dict = {}
+        # self.reward_loop_fn_dict = {}
         for reward_model in reward_models_config.reward_models:
+            # reward_model_kwargs = reward_model.get("reward_model_kwargs", {})
             if reward_model.reward_loop_type != "gen":
-                self.reward_loop_fn_dict[reward_model.reward_loop_type] = reward_model.reward_fn
+                # if reward_model.reward_loop_type not in self.reward_loop_fn_dict:
+                #     self.reward_loop_fn_dict[reward_model.reward_loop_type] = []
+                # self.reward_loop_fn_dict[reward_model.reward_loop_type].append((reward_model.reward_fn, reward_model_kwargs))
                 continue
             reward_model_name = reward_model.get("model_name", reward_model.model.path.split("/")[-1])
-            if reward_model.reward_loop_type not in self.reward_loop_fn_dict:
-                self.reward_loop_fn_dict[reward_model.reward_loop_type] = []
-            for _reward_fn in reward_model.reward_fn:
-                self.reward_loop_fn_dict[reward_model.reward_loop_type].append((_reward_fn, reward_model_name))
+            # if reward_model.reward_loop_type not in self.reward_loop_fn_dict:
+            #     self.reward_loop_fn_dict[reward_model.reward_loop_type] = []
+            # for _reward_fn in reward_model.reward_fn:
+            #     self.reward_loop_fn_dict[reward_model.reward_loop_type].append((_reward_fn, reward_model_name))
             reward_model_resource_pools = []
             for i in range(reward_model.num_replicas):
                 reward_model_resource_pools.append(
@@ -1537,10 +1566,10 @@ class PSRL_RayPPOTrainer:
             )
             return
 
+        # initialize reward manager for validation
+        self.init_reward_manager(validation=True)
         # perform validation before training
-        # currently, we only support validation using the reward_function.
-        # TODO(zyf): Add validation for reward model version.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.val_reward_manager is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
@@ -1561,7 +1590,7 @@ class PSRL_RayPPOTrainer:
             futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(futures)
 
-        self.init_reward_manager()
+        self.init_reward_manager(validation=False)
         futures = []
         futures.append(self.data_processor.set_reward_manager.remote(self.reward_manager))
         futures.append(self.ps_manager_handle.set_reward_manager.remote(self.reward_manager))
@@ -1976,8 +2005,7 @@ class PSRL_RayPPOTrainer:
 
                 # validate
                 if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
+                    self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):

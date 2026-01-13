@@ -33,7 +33,7 @@ defaults:
   # - reward_manager@reward_manager
 
   # Multi-reward model config.
-  - reward_model@reward_models_config: multi_reward_model
+  - reward_model@reward_models_config: multi_rewards
 
   # Rollout correction config.
   - algorithm@algorithm.rollout_correction: rollout_correction

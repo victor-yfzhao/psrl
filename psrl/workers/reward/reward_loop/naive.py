@@ -17,6 +17,7 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
         config,
         tokenizer,
         compute_score=None,
+        **reward_kwargs,
     ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async

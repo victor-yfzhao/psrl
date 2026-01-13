@@ -18,7 +18,7 @@ class PSRL_RewardModelRouter:
     This router accepts Ray ActorHandles and forwards generation requests
     to the least-loaded replica.
     
-    TODO(zyf): will enable to use http-server instead of ray actor in the future.
+    NOTE(zyf): will enable to use http-server instead of ray actor in the future.
     """
 
     def __init__(

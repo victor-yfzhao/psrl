@@ -67,6 +67,7 @@ class DataProcessor:
             self.train_dataloader_iters = None
             self.val_dataloader_iters = None
             self.train_datasets_ratios = self.config.data.train_datasets_ratios
+            self._val_dataloader_idx = 0  # Index for round-robin selection of validation dataloaders
 
         self.global_steps = 0
         self._train_sample_idx = 0
@@ -322,25 +323,46 @@ class DataProcessor:
         return self.total_training_steps
 
     # ------- Dataloader Management Methods -------
-    # TODO(zyf): Add save and load for train dataloaders
-    def save_train_dataloader(self, dataloader_local_path: str) -> None:
+    def save_train_dataloader(self, dataloader_local_paths: str | list[str]) -> None:
         """Save the dataloader to a local path for future resume."""
-        assert self.train_dataloader is not None, (
-            "Train dataloader is not built yet. Call build_train_dataloader() first."
-        )
+        if self.config.data.legacy:
+            assert self.train_dataloader is not None, (
+                "Train dataloader is not built yet. Call build_train_dataloader() first."
+            )
 
-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-        psrl_logger.info(f"Train dataloader saved to {dataloader_local_path}")
+            torch.save(self.train_dataloader.state_dict(), dataloader_local_paths)
+            psrl_logger.info(f"Train dataloader saved to {dataloader_local_paths}")
+        else:
+            assert self.train_dataloaders is not None, (
+                "Train dataloaders are not built yet. Call build_train_dataloader() first."
+            )
+            assert len(self.train_dataloaders) == len(dataloader_local_paths), (
+                "The number of train dataloaders and dataloader local paths must be the same."
+            )
+            for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
+                torch.save(dataloader.state_dict(), dataloader_local_path)
+            psrl_logger.info(f"Train dataloaders saved to {dataloader_local_paths}")
 
-    def load_train_dataloader(self, dataloader_local_path: str) -> None:
+    def load_train_dataloader(self, dataloader_local_paths: str | list[str]) -> None:
         """Load the dataloader from a local path."""
-        assert self.train_dataloader is not None, (
-            "Train dataloader is not built yet. Call build_train_dataloader() first."
-        )
-
-        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-        self.train_dataloader.load_state_dict(dataloader_state_dict)
-        psrl_logger.info(f"Train dataloader loaded from {dataloader_local_path}")
+        if self.config.data.legacy:
+            assert self.train_dataloader is not None, (
+                "Train dataloader is not built yet. Call build_train_dataloader() first."
+            )
+            dataloader_state_dict = torch.load(dataloader_local_paths, weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            psrl_logger.info(f"Train dataloader loaded from {dataloader_local_paths}")
+        else:
+            assert self.train_dataloaders is not None, (
+                "Train dataloaders are not built yet. Call build_train_dataloader() first."
+            )
+            assert len(self.train_dataloaders) == len(dataloader_local_paths), (
+                "The number of train dataloaders and dataloader local paths must be the same."
+            )
+            for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                dataloader.load_state_dict(dataloader_state_dict)
+            psrl_logger.info(f"Train dataloaders loaded from {dataloader_local_paths}")
 
     # ------- Data Retrieval Methods -------
     def get_train_next(self):
@@ -400,17 +422,44 @@ class DataProcessor:
             StopIteration: If the validation dataloader iterator is exhausted.
         """
         # Initialize the validation dataloader iterator if it is None
-        if self.val_dataloader_iter is None:
-            self.val_dataloader_iter = iter(self.val_dataloader)
+        if self.config.data.legacy:
+            if self.val_dataloader_iter is None:
+                self.val_dataloader_iter = iter(self.val_dataloader)
 
-        try:
-            data = next(self.val_dataloader_iter)
-        except StopIteration:
-            psrl_logger.info("Validation dataloader iterator exhausted.")
-            self.val_dataloader_iter = iter(self.val_dataloader)
-            raise
-        return data
+            try:
+                data = next(self.val_dataloader_iter)
+            except StopIteration:
+                psrl_logger.info("Validation dataloader iterator exhausted.")
+                self.val_dataloader_iter = iter(self.val_dataloader)
+                raise
+            return data
+        
+        if self.val_dataloader_iters is None:
+            self.val_dataloader_iters = [iter(dataloader) for dataloader in self.val_dataloaders]
+            self._val_dataloader_idx = 0
+        
+        # Sequentially get data from each dataloader, starting from the first one
+        # Continue with the current dataloader until it's exhausted, then move to the next
+        num_dataloaders = len(self.val_dataloader_iters)
+        
+        while self._val_dataloader_idx < num_dataloaders:
+            i = self._val_dataloader_idx
+            dataloader_iter = self.val_dataloader_iters[i]
+            try:
+                data = next(dataloader_iter)
+                return data
+            except StopIteration:
+                psrl_logger.info(f"Validation dataloader {i} iterator exhausted.")
+                # Reset the exhausted iterator and move to next dataloader
+                self.val_dataloader_iters[i] = iter(self.val_dataloaders[i])
+                self._val_dataloader_idx += 1
+                continue
 
+        # If we reach here, all dataloaders have been exhausted
+        # Reset index for next epoch
+        self._val_dataloader_idx = 0
+        raise StopIteration("All validation dataloader iterators exhausted.")
+        
     def get_train_len(self):
         return len(self.train_dataloader)
 

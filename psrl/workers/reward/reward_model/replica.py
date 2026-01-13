@@ -19,7 +19,7 @@ class PSRL_RewardModelReplicaBase(ABC):
     """
     Manages a single replica of the reward model.
     
-    TODO(zyf): will enable to use http-server instead of ray actor in the future.
+    NOTE(zyf): will enable to use http-server instead of ray actor in the future.
     """
     def __init__(
         self,

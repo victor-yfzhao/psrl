@@ -15,7 +15,7 @@ from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
 from psrl.workers.reward.gen_reward_function import DefaultGenRewardFunction, GenRewardFunctionBase
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 @register("gen")

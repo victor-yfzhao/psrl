@@ -45,12 +45,12 @@ val_datas:
     reward_loop_type: dapo
     reward_fn: default
     reward_model_name: null
-  - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/test.parquet
-    prompt_key: prompt
-    reward_fn_key: data_source
-    reward_loop_type: gen
-    reward_fn: skywork
-    reward_model_name: Skywork-Reward-V2-Qwen3-8B
+  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/test.parquet
+  #   prompt_key: prompt
+  #   reward_fn_key: data_source
+  #   reward_loop_type: gen
+  #   reward_fn: skywork
+  #   reward_model_name: Skywork-Reward-V2-Qwen3-8B
 
 
 # Maximum prompt length. All prompts will be left-padded to this length.
