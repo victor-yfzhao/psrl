@@ -2,7 +2,6 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-import time
 
 import numpy as np
 import ray
@@ -59,15 +58,13 @@ class DataProcessor:
         self.tokenizer = tokenizer
         self.processor = processor
 
-        # Legacy
-        if self.config.data.legacy:
-            self.train_dataloader_iter = None
-            self.val_dataloader_iter = None
-        else:
-            self.train_dataloader_iters = None
-            self.val_dataloader_iters = None
-            self.train_datasets_ratios = self.config.data.train_datasets_ratios
-            self._val_dataloader_idx = 0  # Index for round-robin selection of validation dataloaders
+        # self.train_dataloader_iter = None
+        # self.val_dataloader_iter = None
+
+        self.train_dataloader_iters = None
+        self.val_dataloader_iters = None
+        self.train_datasets_ratios = self.config.data.train_datasets_ratios
+        self._val_dataloader_idx = 0  # Index for round-robin selection of validation dataloaders
 
         self.global_steps = 0
         self._train_sample_idx = 0
@@ -114,22 +111,15 @@ class DataProcessor:
     # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
         """Build the training and validation datasets."""
-        # Legacy
-        if self.config.data.legacy:
-            self.train_dataset = create_rl_dataset(
-                self.config.data.train_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-            )
-            self.val_dataset = create_rl_dataset(
-                self.config.data.val_files, 
-                self.config.data, 
-                self.tokenizer, 
-                self.processor
-            )
-            return
-
+        # self.train_dataset = create_rl_dataset(
+        #     self.config.data.train_files,
+        #     self.config.data,
+        #     self.tokenizer,
+        #     self.processor,
+        # )
+        # self.val_dataset = create_rl_dataset(
+        #     self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+        # )
         self.train_datasets = [
             create_rl_dataset(
                 idx=idx,
@@ -160,13 +150,12 @@ class DataProcessor:
 
     def build_train_sampler(self) -> None:
         """Build the training sampler."""
-        if self.config.data.legacy:
-            assert self.train_dataset is not None, (
-                "Train dataset is not built yet. Call build_train_and_val_dataset() first."
-            )
+        # assert self.train_dataset is not None, (
+        #     "Train dataset is not built yet. Call build_train_and_val_dataset() first."
+        # )
 
-            self.train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-            return
+        # self.train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+
         assert self.train_datasets is not None, (
             "Train datasets are not built yet. Call build_train_and_val_dataset() first."
         )
@@ -180,35 +169,33 @@ class DataProcessor:
         use `train_batch_size` as fallback.
         It also checks that the batch size is divisible by the number of rollout instances if process_mode is "batch".
         """
-        if self.config.data.legacy:
-            assert self.train_dataset is not None, (
-                "Train dataset is not built yet. Call build_train_and_val_dataset() first."
-            )
-            assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
+        # assert self.train_dataset is not None, (
+        #     "Train dataset is not built yet. Call build_train_and_val_dataset() first."
+        # )
+        # assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
 
-            if self.config.psrl.redundant_rollout.enable:
-                batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
-            else:
-                batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        # if self.config.psrl.redundant_rollout.enable:
+        #     batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
+        # else:
+        #     batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
 
-            assert (
-                self.config.psrl.gen_mode != "batch" or batch_size % self.config.psrl.deployment.n_rollout_instances == 0
-            ), (
-                f"In batch mode, batch size {batch_size} is not divisible by"
-                f" the number of rollout instances {self.config.psrl.deployment.n_rollout_instances}"
-            )
+        # assert (
+        #     self.config.psrl.gen_mode != "batch" or batch_size % self.config.psrl.deployment.n_rollout_instances == 0
+        # ), (
+        #     f"In batch mode, batch size {batch_size} is not divisible by"
+        #     f" the number of rollout instances {self.config.psrl.deployment.n_rollout_instances}"
+        # )
 
-            self.train_dataloader = StatefulDataLoader(
-                dataset=self.train_dataset,
-                batch_size=batch_size,
-                num_workers=self.config.data.get("dataloader_num_workers", 8),
-                drop_last=True,
-                collate_fn=self.collate_fn,
-                sampler=self.train_sampler,
-            )
-            assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-            print(f"Size of train dataloader: {len(self.train_dataloader)}")
-            return
+        # self.train_dataloader = StatefulDataLoader(
+        #     dataset=self.train_dataset,
+        #     batch_size=batch_size,
+        #     num_workers=self.config.data.get("dataloader_num_workers", 8),
+        #     drop_last=True,
+        #     collate_fn=self.collate_fn,
+        #     sampler=self.train_sampler,
+        # )
+        # assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        # print(f"Size of train dataloader: {len(self.train_dataloader)}")
 
         assert self.train_datasets is not None, (
             "Train datasets are not built yet. Call build_train_and_val_dataset() first."
@@ -245,7 +232,6 @@ class DataProcessor:
         self.train_dataloader_lens = [len(dataloader) for dataloader in self.train_dataloaders]
         print(f"Size of train dataloaders: {self.train_dataloader_lens}")
 
-
     def build_val_dataloader(self) -> None:
         """Build the validation dataloader.
 
@@ -253,22 +239,20 @@ class DataProcessor:
         The batch size is determined by `val_batch_size` in the configuration,
         use the length of the validation dataset as fallback.
         """
-        if self.config.data.legacy:
-            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-            if val_batch_size is None:
-                val_batch_size = len(self.val_dataset)
-            self.val_dataloader = StatefulDataLoader(
-                dataset=self.val_dataset,
-                batch_size=val_batch_size,
-                num_workers=self.config.data.get("dataloader_num_workers", 8),
-                shuffle=False,
-                drop_last=False,
-                collate_fn=self.collate_fn,
-            )
-            assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
-            print(f"Size of validation dataloader: {len(self.val_dataloader)}")
-            return
-        
+        # val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        # if val_batch_size is None:
+        #     val_batch_size = len(self.val_dataset)
+        # self.val_dataloader = StatefulDataLoader(
+        #     dataset=self.val_dataset,
+        #     batch_size=val_batch_size,
+        #     num_workers=self.config.data.get("dataloader_num_workers", 8),
+        #     shuffle=False,
+        #     drop_last=False,
+        #     collate_fn=self.collate_fn,
+        # )
+        # assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        # print(f"Size of validation dataloader: {len(self.val_dataloader)}")
+
         assert self.val_datasets is not None, (
             "Validation datasets are not built yet. Call build_train_and_val_dataset() first."
         )
@@ -306,10 +290,8 @@ class DataProcessor:
         self.build_train_dataloader()
         self.build_val_dataloader()
 
-        if self.config.data.legacy:
-            total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-        else:
-            total_training_steps = min(self.train_dataloader_lens) * self.config.trainer.total_epochs
+        # total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = min(self.train_dataloader_lens) * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = min(total_training_steps, self.config.trainer.total_training_steps)
         self.total_training_steps = total_training_steps
@@ -323,46 +305,49 @@ class DataProcessor:
         return self.total_training_steps
 
     # ------- Dataloader Management Methods -------
-    def save_train_dataloader(self, dataloader_local_paths: str | list[str]) -> None:
+    # def save_train_dataloader(self, dataloader_local_path: str) -> None:
+    #     """Save the dataloader to a local path for future resume."""
+    #     assert self.train_dataloader is not None, (
+    #         "Train dataloader is not built yet. Call build_train_dataloader() first."
+    #     )
+
+    #     torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+    #     psrl_logger.info(f"Train dataloader saved to {dataloader_local_path}")
+
+    # def load_train_dataloader(self, dataloader_local_path: str) -> None:
+    #     """Load the dataloader from a local path."""
+    #     assert self.train_dataloader is not None, (
+    #         "Train dataloader is not built yet. Call build_train_dataloader() first."
+    #     )
+
+    #     dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+    #     self.train_dataloader.load_state_dict(dataloader_state_dict)
+    #     psrl_logger.info(f"Train dataloader loaded from {dataloader_local_path}")
+
+    def save_train_dataloader(self, dataloader_local_paths: list[str]) -> None:
         """Save the dataloader to a local path for future resume."""
-        if self.config.data.legacy:
-            assert self.train_dataloader is not None, (
-                "Train dataloader is not built yet. Call build_train_dataloader() first."
-            )
+        assert self.train_dataloaders is not None, (
+            "Train dataloaders are not built yet. Call build_train_dataloader() first."
+        )
+        assert len(self.train_dataloaders) == len(dataloader_local_paths), (
+            "The number of train dataloaders and dataloader local paths must be the same."
+        )
+        for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
+            torch.save(dataloader.state_dict(), dataloader_local_path)
+        psrl_logger.info(f"Train dataloaders saved to {dataloader_local_paths}")
 
-            torch.save(self.train_dataloader.state_dict(), dataloader_local_paths)
-            psrl_logger.info(f"Train dataloader saved to {dataloader_local_paths}")
-        else:
-            assert self.train_dataloaders is not None, (
-                "Train dataloaders are not built yet. Call build_train_dataloader() first."
-            )
-            assert len(self.train_dataloaders) == len(dataloader_local_paths), (
-                "The number of train dataloaders and dataloader local paths must be the same."
-            )
-            for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
-                torch.save(dataloader.state_dict(), dataloader_local_path)
-            psrl_logger.info(f"Train dataloaders saved to {dataloader_local_paths}")
-
-    def load_train_dataloader(self, dataloader_local_paths: str | list[str]) -> None:
+    def load_train_dataloader(self, dataloader_local_paths: list[str]) -> None:
         """Load the dataloader from a local path."""
-        if self.config.data.legacy:
-            assert self.train_dataloader is not None, (
-                "Train dataloader is not built yet. Call build_train_dataloader() first."
-            )
-            dataloader_state_dict = torch.load(dataloader_local_paths, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-            psrl_logger.info(f"Train dataloader loaded from {dataloader_local_paths}")
-        else:
-            assert self.train_dataloaders is not None, (
-                "Train dataloaders are not built yet. Call build_train_dataloader() first."
-            )
-            assert len(self.train_dataloaders) == len(dataloader_local_paths), (
-                "The number of train dataloaders and dataloader local paths must be the same."
-            )
-            for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
-                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-                dataloader.load_state_dict(dataloader_state_dict)
-            psrl_logger.info(f"Train dataloaders loaded from {dataloader_local_paths}")
+        assert self.train_dataloaders is not None, (
+            "Train dataloaders are not built yet. Call build_train_dataloader() first."
+        )
+        assert len(self.train_dataloaders) == len(dataloader_local_paths), (
+            "The number of train dataloaders and dataloader local paths must be the same."
+        )
+        for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
+            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            dataloader.load_state_dict(dataloader_state_dict)
+        psrl_logger.info(f"Train dataloaders loaded from {dataloader_local_paths}")
 
     # ------- Data Retrieval Methods -------
     def get_train_next(self):
@@ -377,35 +362,23 @@ class DataProcessor:
         Raises:
             StopIteration: If all epochs are finished.
         """
-        # Initialize the train dataloader iterator if it is None
-        if self.config.data.legacy:
-            if self.train_dataloader_iter is None:
-                self.train_dataloader_iter = iter(self.train_dataloader)
+        # # Initialize the train dataloader iterator if it is None
+        # if self.train_dataloader_iter is None:
+        #     self.train_dataloader_iter = iter(self.train_dataloader)
 
-            epoch = 0
-            try:
-                data = next(self.train_dataloader_iter)
-            except StopIteration:
-                psrl_logger.debug("Train dataloader iterator exhausted.")
-                epoch += 1
-                if epoch == self.config.trainer.total_epochs:
-                    psrl_logger.info("All training epochs completed, stopping data processing.")
-                    raise
-                self.train_dataloader_iter = iter(self.train_dataloader)
-                data = next(self.train_dataloader_iter)
-            return data
-        
-        if self.train_dataloader_iters is None:
-            self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
-        
-        epoch = 0
-        try:
-            datas = [next(dataloader_iter) for dataloader_iter in self.train_dataloader_iters]
-            print(datas)
-            time.sleep(100000)
-        except StopIteration:
-            psrl_logger.debug("Train dataloader iterator exhausted.")
-            epoch += 1
+        # epoch = 0
+        # try:
+        #     data = next(self.train_dataloader_iter)
+        # except StopIteration:
+        #     psrl_logger.debug("Train dataloader iterator exhausted.")
+        #     epoch += 1
+        #     if epoch == self.config.trainer.total_epochs:
+        #         psrl_logger.info("All training epochs completed, stopping data processing.")
+        #         raise
+        #     self.train_dataloader_iter = iter(self.train_dataloader)
+        #     data = next(self.train_dataloader_iter)
+        # return data
+        raise NotImplementedError("get_train_next() is not implemented for multi-dataset training.")
 
     def get_val_next(self):
         """Get the next batch of validation data.
@@ -421,19 +394,18 @@ class DataProcessor:
         Raises:
             StopIteration: If the validation dataloader iterator is exhausted.
         """
-        # Initialize the validation dataloader iterator if it is None
-        if self.config.data.legacy:
-            if self.val_dataloader_iter is None:
-                self.val_dataloader_iter = iter(self.val_dataloader)
+        # # Initialize the validation dataloader iterator if it is None
+        # if self.val_dataloader_iter is None:
+        #     self.val_dataloader_iter = iter(self.val_dataloader)
 
-            try:
-                data = next(self.val_dataloader_iter)
-            except StopIteration:
-                psrl_logger.info("Validation dataloader iterator exhausted.")
-                self.val_dataloader_iter = iter(self.val_dataloader)
-                raise
-            return data
-        
+        # try:
+        #     data = next(self.val_dataloader_iter)
+        # except StopIteration:
+        #     psrl_logger.info("Validation dataloader iterator exhausted.")
+        #     self.val_dataloader_iter = iter(self.val_dataloader)
+        #     raise
+        # return data
+
         if self.val_dataloader_iters is None:
             self.val_dataloader_iters = [iter(dataloader) for dataloader in self.val_dataloaders]
             self._val_dataloader_idx = 0
@@ -459,7 +431,7 @@ class DataProcessor:
         # Reset index for next epoch
         self._val_dataloader_idx = 0
         raise StopIteration("All validation dataloader iterators exhausted.")
-        
+
     def get_train_len(self):
         return len(self.train_dataloader)
 
@@ -611,21 +583,17 @@ class DataProcessor:
         assert self.reward_manager_handle is not None, (
             "Reward manager handle is not set. Call `reward_manager_handle()` first."
         )
-        if self.config.data.legacy:
-            self.train_dataloader_iter = iter(self.train_dataloader)
-        else:
-            self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
+        # self.train_dataloader_iter = iter(self.train_dataloader)
+        self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
 
         total_epochs = self.config.trainer.total_epochs
 
         # loop until all epochs are processed
         while not self.stop_data_process:
             try:
-                if self.config.data.legacy:
-                    batch_dict = next(self.train_dataloader_iter)
-                else:
-                    batch_dicts = [next(dataloader_iter) for dataloader_iter in self.train_dataloader_iters]
-                    batch_dict = self._shuffle_batch_dict(self._concat_batch_dicts(batch_dicts))
+                # batch_dict = next(self.train_dataloader_iter)
+                batch_dicts = [next(dataloader_iter) for dataloader_iter in self.train_dataloader_iters]
+                batch_dict = self._shuffle_batch_dict(self._concat_batch_dicts(batch_dicts))
                 batch_size = len(batch_dict[list(batch_dict.keys())[0]])
                 sample_ids = [self._train_sample_idx + i for i in range(batch_size)]
                 self._train_sample_idx += batch_size

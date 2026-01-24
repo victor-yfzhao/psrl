@@ -11,6 +11,13 @@ reward_models:
   - reward_loop_type: dapo
     reward_fn: 
       - default
+    reward_loop_kwargs:
+      max_resp_len: 5120
+      overlong_buffer_cfg:
+        enable: True
+        len: 3072
+        penalty_factor: 1.0
+        log: False
 
   # - reward_loop_type: gen
   #   reward_fn: 
@@ -68,7 +75,7 @@ reward_models:
   - reward_loop_type: gen
     reward_fn: 
       - skywork
-    model_name: Skywork-Reward-V2-Qwen3-8B
+    reward_model_name: Skywork-Reward-V2-Qwen3-8B
 
     enable_resource_pool: True
     n_gpus_per_node: 1

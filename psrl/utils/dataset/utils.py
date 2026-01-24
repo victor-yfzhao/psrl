@@ -7,9 +7,9 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+# def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
 def create_rl_dataset(
     idx = None, 
-    data_paths = None, # Legacy, will be removed in the future
     data_config = None, 
     tokenizer = None, 
     processor = None, 
@@ -17,8 +17,7 @@ def create_rl_dataset(
     """Create a dataset.
 
     Arguments:
-        idx: The index of the dataset.
-        data_paths: List of paths to data files. (Legacy, will be removed in the future)
+        data_paths: List of paths to data files.
         data_config: The data config.
         tokenizer (Tokenizer): The tokenizer.
         processor (Processor): The processor.
@@ -26,38 +25,37 @@ def create_rl_dataset(
     Returns:
         dataset (Dataset): The dataset.
     """
-    # Check if a custom dataset class is specified in the data configuration
-    # and if the path to the custom class is provided
-    if data_config.legacy:
-        if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
-            from torch.utils.data import Dataset
-            from verl.utils.import_utils import load_extern_type
+    # # Check if a custom dataset class is specified in the data configuration
+    # # and if the path to the custom class is provided
+    # if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
+    #     from torch.utils.data import Dataset
+    #     from verl.utils.import_utils import load_extern_type
 
-            # Dynamically load the custom dataset class
-            dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-            # Verify that the custom dataset class inherits from torch.utils.data.Dataset
-            if not issubclass(dataset_cls, Dataset):
-                raise TypeError(
-                    f"The custom dataset class '{data_config.custom_cls.name}' from "
-                    f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
-                )
-        else:
-            from verl.utils.dataset.rl_dataset import RLHFDataset
+    #     # Dynamically load the custom dataset class
+    #     dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
+    #     # Verify that the custom dataset class inherits from torch.utils.data.Dataset
+    #     if not issubclass(dataset_cls, Dataset):
+    #         raise TypeError(
+    #             f"The custom dataset class '{data_config.custom_cls.name}' from "
+    #             f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
+    #         )
+    # else:
+    #     from verl.utils.dataset.rl_dataset import RLHFDataset
 
-            # Use the default RLHFDataset class if no custom class is specified
-            dataset_cls = RLHFDataset
-        psrl_logger.info(f"Using dataset class: {dataset_cls.__name__}")
+    #     # Use the default RLHFDataset class if no custom class is specified
+    #     dataset_cls = RLHFDataset
+    # psrl_logger.info(f"Using dataset class: {dataset_cls.__name__}")
 
-        # Instantiate the dataset using the determined dataset class
-        dataset = dataset_cls(
-            data_files=data_paths,
-            tokenizer=tokenizer,
-            processor=processor,
-            config=data_config,
-        )
+    # # Instantiate the dataset using the determined dataset class
+    # dataset = dataset_cls(
+    #     data_files=data_paths,
+    #     tokenizer=tokenizer,
+    #     processor=processor,
+    #     config=data_config,
+    # )
 
-        return dataset
-    
+    # return dataset
+
     dataset_config = data_config.train_datas[idx] if is_train else data_config.val_datas[idx]
     
     if "custom_cls" in dataset_config and dataset_config.custom_cls.get("path", None) is not None:

@@ -66,6 +66,7 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
                 reward_extra_info[key] = value
         else:
             score = result
+            reward_extra_info["score"] = score
             reward_extra_info["acc"] = score
 
         reward = score

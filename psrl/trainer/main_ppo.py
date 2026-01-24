@@ -8,8 +8,8 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
+from verl.trainer.ppo.reward import load_reward_manager
 
-from psrl.workers.reward.reward_loop import load_reward_loop_manager
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.post_processor import (
@@ -155,21 +155,8 @@ class TaskRunner:
         #     if config.reward_model.nnodes <= 0:
         #         raise ValueError("config.reward_model.nnodes must be greater than 0")
 
-        #     if config.reward_model.use_reward_loop:
-        #         reward_loop_instances = getattr(
-        #             config.reward_model,
-        #             "n_rollout_instances",
-        #             config.reward_model.get("num_replicas", 1),
-        #         )
-        #         reward_pool_id_list = [f"reward_pool_{i}" for i in range(reward_loop_instances)]
-        #         for i in range(reward_loop_instances):
-        #             resource_pool_spec[f"reward_pool_{i}"] = [
-        #                 config.reward_model.rollout_ngpus_per_instance_per_node
-        #             ] * config.reward_model.rollout_nnodes_per_instance
-        #     else:
-        #         resource_pool_spec["reward_pool"] = [
-        #             config.reward_model.n_gpus_per_node
-        #         ] * config.reward_model.nnodes
+        #     reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
+        #     resource_pool_spec["reward_pool"] = reward_pool
 
         # Set the resource pool spec for each rollout instance.
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
@@ -225,7 +212,7 @@ class TaskRunner:
                     "n_rollout_instances",
                     reward_model.get("num_replicas", 1),
                 )
-                reward_model_name = reward_model.get("model_name", reward_model.model.path.split("/")[-1])
+                reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
                 reward_pool_id_list = [
                     f"reward_pool_{reward_model_name}_{i}" 
                     for i in range(reward_loop_instances)
@@ -235,15 +222,9 @@ class TaskRunner:
                         reward_model.rollout_ngpus_per_instance_per_node
                     ] * reward_model.rollout_nnodes_per_instance
                 total_reward_pool_id_list.extend(reward_pool_id_list)
-        # if config.reward_model.enable_resource_pool:
-        #     if config.reward_model.use_reward_loop:
-        #         self.mapping[PSRL_Role.RewardModel] = reward_pool_id_list
-        #     else:
-        #         self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
-        # else:
-        #     self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
+
         self.mapping[PSRL_Role.RewardModel] = total_reward_pool_id_list
-            
+
         from psrl.trainer.ppo.utils import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -266,27 +247,21 @@ class TaskRunner:
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
         # if config.reward_model.enable:
-        #     # Legacy Version
-        #     if not config.reward_model.use_reward_loop:
-        #         if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-        #             from verl.workers.fsdp_workers import RewardModelWorker
-        #         elif config.reward_model.strategy == "megatron":
-        #             from verl.workers.megatron_workers import RewardModelWorker
-        #         else:
-        #             raise NotImplementedError
-
-        #         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
-        #     # Reward Loop Version
-        #     # Which means we need to create a independent rollout woker group for the reward loop
+        #     if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+        #         from verl.workers.fsdp_workers import RewardModelWorker
+        #     elif config.reward_model.strategy == "megatron":
+        #         from verl.workers.megatron_workers import RewardModelWorker
         #     else:
-        #         # NOTE(zyf): Considering Reward Model is disaggregated from actor/critic/ref/trainer, 
-        #         # Reward Model MUST have independent resource pool to launch.
-        #         assert config.reward_model.enable_resource_pool, "Reward loop must be enabled with resource pool"
-                
-        #         from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
-        #         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
+        #         raise NotImplementedError
+
+        #     self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
+        #     if config.reward_model.enable_resource_pool:
+        #         self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
+        #     else:
+        #         self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
+
         from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
-        self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
+        self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)  
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
@@ -323,7 +298,12 @@ class TaskRunner:
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
-        # Only initialize generative reward model workers
+        # We should adopt a multi-source reward function here:
+        # - for rule-based rm, we directly call a reward score
+        # - for model-based rm, we call a model
+        # - for code related prompt, we send to a sandbox if there are test cases
+        # finally, we combine all the rewards together
+        # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.
@@ -347,21 +327,23 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        # Load the reward manager for training and validation.
+        # reward_fn = load_reward_manager(
+        #     config,
+        #     tokenizer,
+        #     num_examine=0,
+        #     **config.reward_model.get("reward_kwargs", {}),
+        # )
         reward_fn = None
+        
+        # val_reward_fn = load_reward_manager(
+        #     config,
+        #     tokenizer,
+        #     num_examine=1,
+        #     **config.reward_model.get("reward_kwargs", {}),
+        # )
+
         val_reward_fn = None
-        # TODO(zyf): add reward loop manager support
-        # if config.reward_model.enable and not config.reward_model.use_reward_loop:
-        #     reward_kwargs = config.reward_model.get("reward_kwargs", {})
-        #     reward_fn = load_reward_loop_manager(
-        #         config,
-        #         tokenizer,
-        #         **reward_kwargs,
-        #     )
-        #     val_reward_fn = load_reward_loop_manager(
-        #         config,
-        #         tokenizer,
-        #         **reward_kwargs,
-        #     )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

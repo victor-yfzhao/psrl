@@ -17,8 +17,8 @@ from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
-from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -188,10 +188,10 @@ class PSRL_vLLMRollout:
             distributed_executor_backend = "external_launcher"
         else:
             distributed_executor_backend = None  # auto detect
-            
+
         runner = config.get("runner", "generate")
         task = config.get("task", "generate")
-
+        
         llm_kwargs = dict(
             model=model_path,
             enable_sleep_mode=False,
@@ -222,9 +222,9 @@ class PSRL_vLLMRollout:
             **lora_kwargs,
             **engine_kwargs,
         )
-        
-        # Support for pooling models (e.g., reward models)
-        self.is_pooling_model = runner == "pooling"
+
+                # Support for pooling models (e.g., reward models)
+        self.is_pooling_model = (runner == "pooling")
 
         """
         if psrl_config.ps_mode == "nixl_cpu" or psrl_config.ps_mode == "nixl_gpu":
@@ -279,6 +279,25 @@ class PSRL_vLLMRollout:
         if load_format == "dummy" and config.free_cache_engine:
             self.inference_engine.sleep(level=1)
         """
+
+        # kwargs = dict(
+        #     n=1,
+        #     logprobs=0,  # can be set to 0 and let actor to recompute
+        #     max_tokens=config.response_length,
+        #     repetition_penalty=config.get("repetition_penalty", 1.0),
+        #     output_kind=RequestOutputKind.CUMULATIVE,
+        # )
+
+        # # we may detokenize the result all together later
+        # kwargs["detokenize"] = False
+
+        # # supporting adding any sampling params from the config file
+        # for k in config.keys():
+        #     if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
+        #         kwargs[k] = config.get(k)
+        # kwargs["n"] = 1  # already repeat in ray_trainer
+        # psrl_logger.info(f"kwargs: {kwargs}")
+        # self.sampling_params = SamplingParams(**kwargs)
 
         # Initialize parameters based on model type
         if self.is_pooling_model:
@@ -530,25 +549,16 @@ class PSRL_vLLMRollout:
         response_len_list = []
         interrupted_list = []
         interrupted_by_scheduler_list = []
-        all_log_prob_list = []
         pooling_output_list = []
+        all_log_prob_list = []
         routed_experts_list = []
 
         for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
-            
-            # Handle PoolingRequestOutput differently from RequestOutput
-            if isinstance(vllm_output, PoolingRequestOutput):
+            if self.is_pooling_model:
                 # For pooling models, outputs is a PoolingOutput object, not a list
-                # Extract pooling output data
-                pooling_output_value = None
-                if hasattr(vllm_output, "outputs") and vllm_output.outputs is not None:
-                    if hasattr(vllm_output.outputs, "data"):
-                        # PoolingOutput has a data attribute (torch.Tensor)
-                        pooling_output_value = vllm_output.outputs.data
-                    else:
-                        # Some pooling models may have outputs as the data directly
-                        pooling_output_value = vllm_output.outputs
+                # Extract pooling output data, PoolingOutput has a data attribute (torch.Tensor)
+                pooling_output_value = vllm_output.outputs.data
                 pooling_output_list.append(pooling_output_value)
                 
                 # Pooling models don't generate tokens, so use empty response
@@ -556,10 +566,7 @@ class PSRL_vLLMRollout:
                 response_len = 0
                 interrupted = False
             else:
-                # For generative models, outputs is a list of CompletionOutput
                 assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."
-                pooling_output_list.append(None)
-                
                 response_ids = vllm_output.outputs[0].token_ids
                 response_len = len(response_ids)
                 interrupted = vllm_output.outputs[0].finish_reason == "abort"
@@ -581,7 +588,7 @@ class PSRL_vLLMRollout:
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
             if (
-                not isinstance(vllm_output, PoolingRequestOutput)
+                not self.is_pooling_model
                 and self.psrl_config.log_prob.enable_rollout_engine_log_prob
                 and hasattr(vllm_output.outputs[0], "logprobs")
                 and vllm_output.outputs[0].logprobs is not None
@@ -630,7 +637,7 @@ class PSRL_vLLMRollout:
         non_tensor_batch["interrupted_by_scheduler"] = np.array(interrupted_by_scheduler_list, dtype=bool)
 
         # Update rollout_log_probs
-        if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
+        if not self.is_pooling_model and self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:
@@ -641,13 +648,9 @@ class PSRL_vLLMRollout:
         # process routed experts
         if self.config.enable_rollout_routing_replay:
             non_tensor_batch["routed_experts"] = np.fromiter(routed_experts_list, dtype=object)
-
-        # Store pooling outputs if available (for reward models)
-        if any(x is not None for x in pooling_output_list):
-            pooling_output_array = np.empty(len(pooling_output_list), dtype=object)
-            for i, pooling_output_value in enumerate(pooling_output_list):
-                pooling_output_array[i] = pooling_output_value
-            non_tensor_batch["pooling_output"] = pooling_output_array
+        
+        if len(pooling_output_list) > 0:
+            non_tensor_batch["pooling_output"] = np.fromiter(pooling_output_list, dtype=object)
 
         batch = TensorDict(
             {
@@ -719,7 +722,7 @@ class PSRL_vLLMRollout:
             DataProto with generated sequences and updated metadata
         """
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # For pooling models, use encode method with PoolingParams
+        # users can customize different sampling_params at different run
         if self.is_pooling_model:
             # Convert vllm_inputs to prompt format for encode
             if isinstance(vllm_inputs[0], dict):
@@ -735,8 +738,6 @@ class PSRL_vLLMRollout:
             
             return self.post_process_outputs(prompts, outputs)
         else:
-            # For generative models, use generate method with SamplingParams
-            # users can customize different sampling_params at different run
             with self.update_sampling_params(**kwargs):
                 # the inference_engine will handle the request_id internally
                 outputs = self.inference_engine.generate(
@@ -794,8 +795,7 @@ class PSRL_vLLMRollout:
 
             return DataProto.concat(completed_rollout)
         else:
-            # For generative models, use generate method with SamplingParams
-            # users can customize different sampling_params at different run
+        # users can customize different sampling_params at different run
             with self.update_sampling_params(**kwargs):
                 tasks = []
                 for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(
@@ -827,36 +827,15 @@ class PSRL_vLLMRollout:
         )
 
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # For pooling models, use encode method with PoolingParams
-        if self.is_pooling_model:
-            # Convert vllm_inputs to prompt format for encode
-            if isinstance(vllm_inputs[0], dict):
-                prompts_list = [TokensPrompt(**inp) for inp in vllm_inputs]
-            else:
-                prompts_list = vllm_inputs
-            
-            # Use encode for pooling models
-            outputs = []
-            for prompt in prompts_list:
-                request_id = str(uuid.uuid4())
-                # encode returns an async generator, but we need sync execution
-                # For sync mode, we'll need to handle this differently
-                # For now, raise an error as pooling models should use async mode
-                raise NotImplementedError(
-                    "raw_generate_sequences for pooling models is not supported in sync mode. "
-                    "Please use async mode (generate_sequences_async)."
-                )
-        else:
-            # For generative models, use generate method with SamplingParams
-            # users can customize different sampling_params at different run
-            with self.update_sampling_params(**kwargs):
-                # the inference_engine will handle the request_id internally
-                outputs = self.inference_engine.generate(
-                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                    sampling_params=self.sampling_params,
-                    use_tqdm=False,
-                )
-                return outputs
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            # the inference_engine will handle the request_id internally
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                use_tqdm=False,
+            )
+            return outputs
 
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()

@@ -10,26 +10,48 @@ use_shm: False
 # The program will read all files into memory, so it can't be too large (< 100GB).
 # The path can be either a local path or an HDFS path.
 # For HDFS path, we provide utils to download it to DRAM and convert it to a local path.
+
+
+# train_datas:
+#   - file: xxxxx
+#     prompt_key: prompt
+#     reward_model_dicts:
+#       - reward_fn_key: data_source
+#         reward_loop_type: naive
+#         reward_fn: default
+#         reward_model_name: null
+#       - reward_fn_key: data_source
+#         reward_loop_type: gen
+#         reward_fn: default
+#         reward_model_name: xxxxx
+#    reward_model_coefs: [0.5, 0.5]
+
+
+
 train_datas: 
   - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/gsm8k_verl/train.parquet
+    data_source_name: openai/gsm8k
     prompt_key: prompt
     reward_fn_key: data_source
     reward_loop_type: naive
     reward_fn: default
     reward_model_name: null
   - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/dapo-math-17k.parquet
+    data_source_name: dapo/dapo-math-17k
     prompt_key: prompt
     reward_fn_key: data_source
     reward_loop_type: dapo
     reward_fn: default
     reward_model_name: null
-  - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/train.parquet
-    prompt_key: prompt
-    reward_fn_key: data_source
-    reward_loop_type: gen
-    reward_fn: skywork
-    reward_model_name: Skywork-Reward-V2-Qwen3-8B
-train_datasets_ratios: [0.3, 0.3, 0.4]
+  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/train.parquet
+  #   data_source_name: full-hh-rlhf
+  #   prompt_key: prompt
+  #   reward_fn_key: data_source
+  #   reward_loop_type: gen
+  #   reward_fn: skywork
+  #   reward_model_name: Skywork-Reward-V2-Qwen3-8B
+# train_datasets_ratios: [0.3, 0.5, 0.2]
+train_datasets_ratios: [0.5,0.5]
 
 # Validation parquet. Can be a list or a single file.
 val_datas: 

@@ -7,7 +7,9 @@ from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
 from .model import HFModelConfig
-from .rollout import PoolingConfig, RolloutConfig, SamplingConfig, ServerConfig
+from .rollout import RolloutConfig, SamplingConfig, ServerConfig, PoolingConfig
+
+# __all__ = ["SandboxFusionConfig", "RewardModelDataProcessorConfig", "RewardModelConfig"]
 
 __all__ = [
     "SandboxFusionConfig",
@@ -16,7 +18,6 @@ __all__ = [
     "SingleRewardModelConfig",
     "MultiRewardModelConfig",
 ]
-
 
 def get_custome_process_fn(file_path, function_name):
     if not file_path:
@@ -86,7 +87,6 @@ class RewardModelConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields
 
     enable: bool = False
-    use_reward_loop: bool = False
     model_type: str = "discriminative"
     name: str = "sglang"
     enable_resource_pool: bool = False
@@ -102,7 +102,6 @@ class RewardModelConfig(BaseConfig):
 
     # for generative reward model
     sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
-    pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
     data_processor_config: RewardModelDataProcessorConfig = field(default_factory=RewardModelDataProcessorConfig)
     max_new_tokens: int = 4096
 
@@ -116,7 +115,6 @@ class RewardModelConfig(BaseConfig):
     # Server configuration for sglang server mode
     server_config: ServerConfig = field(default_factory=ServerConfig)
 
-
 @dataclass
 class SingleRewardModelConfig(BaseConfig):
     """Configuration for a single reward model in the multi-reward model setup.
@@ -124,7 +122,7 @@ class SingleRewardModelConfig(BaseConfig):
     Args:
         reward_loop_type (Optional[str]): Type of reward loop (naive, dapo, gen, None).
         reward_fn (Optional[str]): Reward function name (default, None).
-        model_name (Optional[str]): Name of the model.
+        reward_model_name (Optional[str]): Name of the model.
         enable_resource_pool (bool): Whether to enable resource pool.
         n_gpus_per_node (int): Number of GPUs per node.
         num_replicas (int): Number of replicas.
@@ -140,7 +138,7 @@ class SingleRewardModelConfig(BaseConfig):
 
     reward_loop_type: str | None = None
     reward_fn: list[str] | None = None
-    model_name: str | None = None
+    reward_model_name: str | None = None
     enable_resource_pool: bool = False
     n_gpus_per_node: int = 0
     num_replicas: int = 1

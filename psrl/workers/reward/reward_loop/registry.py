@@ -1,10 +1,10 @@
 # Modified from verl/experimental/reward/reward_loop/registry.py
 import asyncio
-import importlib
-import logging
-import os
 from collections.abc import Callable
 from functools import partial
+import importlib
+import inspect
+import os
 import sys
 from typing import Any
 
@@ -13,11 +13,9 @@ from verl.trainer.ppo.reward import get_custom_reward_fn
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
+
 from psrl.workers.reward.gen_reward_function import get_gen_reward_function_cls
 from psrl.workers.reward.reward_model import PSRL_RewardModelManager
-
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 __all__ = ["register", "get_reward_loop_manager_cls", "load_reward_loop_manager"]
 
@@ -62,32 +60,73 @@ def get_reward_loop_manager_cls(name: str) -> type[RewardLoopManagerBase]:
 
 
 def load_reward_loop_manager(
+    # config: DictConfig,
+    # input_tokenizer: Any,
+    # reward_model_router: Any,
+    # reward_model_tokenizer: Any,
+    # **reward_kwargs: Any,
+    # config: DictConfig,
     reward_model_config: DictConfig,
     input_tokenizer: Any,
+    # reward_model_router: Any,
+    # reward_model_tokenizer: Any,
     reward_loop_type: str,
-    reward_fn: str | dict[str, str],
+    reward_fn: str | dict,
     reward_model_manager: PSRL_RewardModelManager = None,
     **reward_kwargs: Any,
 ) -> RewardLoopManagerBase:
     """Load the reward loop manager based on the configuration.
 
     Args:
-        reward_model_config: `(DictConfig)`
-            The configuration for the reward model.
-        reward_loop_type: `(str)`
-            The type of the reward loop manager.
-        reward_fn: `(str | dict[str, str])`
-            The name of the reward function.
-            Or, a customized reward function, like `{name: ..., path: ...}`
+        config: `(DictConfig)`
+            The configuration for the reward loop manager.
         input_tokenizer: `(Any)`
             The tokenizer for the input.
-        reward_model_manager: `(PSRL_RewardModelManager)`
-            The reward model manager.
+        reward_model_router: `(Any)`
+            The reward model router.
+        reward_model_tokenizer: `(Any)`
+            The tokenizer for the reward model.
         **reward_kwargs: `(Any)`
             Additional keyword arguments for the reward loop manager.
     Returns:
         `(RewardLoopManagerBase)`: The reward loop manager instance.
     """
+    # Try to get a custom reward function based on the configuration
+    # user defined reward manager can be registered in custom_reward_fn
+    # compute_score = get_custom_reward_fn(config)
+
+    # reward_loop_manager_name = config.reward_model.get("reward_manager", "naive")
+    # reward_loop_manager_cls = get_reward_loop_manager_cls(reward_loop_manager_name)
+
+    # if compute_score is None:
+    #     sandbox_config = config.reward_model.get("sandbox_fusion")
+    #     sandbox_url = sandbox_config.get("url") if sandbox_config else None
+    #     memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
+    #     if sandbox_url:
+    #         # Create an asyncio.Semaphore to control concurrent access to the sandbox
+    #         # Note: asyncio.Semaphore must be created in the same event loop where it will be used
+    #         # Therefore, we pass max_concurrent as a parameter and create the semaphore later
+    #         max_concurrent = sandbox_config.get("max_concurrent", 64)
+    #         _concurrent_semaphore = asyncio.Semaphore(max_concurrent)
+    #         final_compute_score = partial(
+    #             default_compute_score_async,
+    #             sandbox_fusion_url=sandbox_url,
+    #             concurrent_semaphore=_concurrent_semaphore,
+    #             memory_limit_mb=memory_limit_mb,
+    #         )
+    #     else:
+    #         final_compute_score = default_compute_score_async
+
+    # return reward_loop_manager_cls(
+    #     config,
+    #     input_tokenizer,
+    #     final_compute_score,
+    #     reward_model_router,
+    #     reward_model_tokenizer,
+    #     **reward_kwargs,
+    # )
+
+    # compute_score = get_custom_reward_fn(config)
     reward_loop_manager_name = reward_loop_type
     reward_loop_manager_cls = get_reward_loop_manager_cls(reward_loop_manager_name)
 
@@ -126,13 +165,15 @@ def load_reward_loop_manager(
             reward_function=gen_reward_function_cls(),
             **reward_kwargs,
         )
-
+        
     return reward_loop_manager_cls(
         reward_model_config,
         input_tokenizer,
         final_compute_score,
         **reward_kwargs,
     )
+
+
 
 # Modified from verl/trainer/ppo/reward.py
 def get_custom_reward_fn(reward_fn: dict[str, Any]) -> Callable[[], Any]:
@@ -179,9 +220,26 @@ def get_custom_reward_fn(reward_fn: dict[str, Any]) -> Callable[[], Any]:
     print(f"using customized reward function '{function_name}' from '{module.__file__}'")
     raw_fn = getattr(module, function_name)
 
-    reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
+    reward_kwargs = dict(reward_fn.get("reward_kwargs", {}))
 
     if not inspect.iscoroutinefunction(raw_fn):
         return partial(_call_with_kwargs, raw_fn, reward_kwargs)
     else:
         return partial(_call_with_kwargs_async, raw_fn, reward_kwargs)
+
+def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
+    """Calls `raw_fn` by merging `extra_kwargs` into call-time `kwargs`, with `extra_kwargs` taking precedence.
+
+    This function is used to merge additional keyword arguments with the original function's arguments.
+    """
+    merged_kwargs = {**kwargs, **extra_kwargs}
+    return raw_fn(*args, **merged_kwargs)
+
+
+async def _call_with_kwargs_async(raw_fn, extra_kwargs, *args, **kwargs):
+    """Calls `raw_fn` by merging `extra_kwargs` into call-time `kwargs`, with `extra_kwargs` taking precedence.
+
+    This function is used to merge additional keyword arguments with the original function's arguments.
+    """
+    merged_kwargs = {**kwargs, **extra_kwargs}
+    return await raw_fn(*args, **merged_kwargs)

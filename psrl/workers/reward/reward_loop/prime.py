@@ -147,6 +147,7 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
             score = float(result[0]) if result else 0.0
 
         reward_extra_info["acc"] = score
+        reward_extra_info["score"] = score
         reward = score
 
         # Logging for examination

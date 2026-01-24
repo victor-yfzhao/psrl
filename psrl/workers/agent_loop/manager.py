@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -377,11 +377,22 @@ class PSRL_AgentLoopManager:
 
             # add reward_extra_info to non_tensor_batch
             reward_extra_infos = inputs.non_tensor_batch.pop("reward_extra_infos", None)
-            non_tensor_batch["reward_extra_infos"] = reward_extra_infos
             # reward_extra_keys = list(reward_extra_infos[0].keys())
             # for key in reward_extra_keys:
             #     non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-            # meta_info = {"reward_extra_keys": reward_extra_keys}
+            # Align with ray_trainer.py logic: collect list fields, keep full dict list
+            reward_extra_infos_dict = defaultdict(list)
+            for reward_extra_info in reward_extra_infos:
+                for key, value in reward_extra_info.items():
+                    if key == "score" or key == "acc" or key == "data_source":
+                        if not isinstance(value, list):
+                            value = [value]
+                        reward_extra_infos_dict[key].extend(value)
+                reward_extra_infos_dict["reward_extra_info"].append(reward_extra_info)
+
+            reward_extra_keys = list(reward_extra_infos_dict.keys())
+            non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+            meta_info = {"reward_extra_keys": reward_extra_keys}
 
         ## psrl_logger.info("Return data proto")
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
