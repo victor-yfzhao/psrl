@@ -152,7 +152,7 @@ launch_reward_fn_async: True
 # How to normalize rewards after calling reward models
 # none: Doing Nothing.
 # group: normalize rewards within a sampling group (like in grpo).
-# batch: normalize rewards within a group of data which is from the same dataset and handled with the same reward model.
+# batch: normalize rewards within a group of data which is from the same dataset.
 reward_normalization: group
 
 # Reward Models Definitions & Configs
@@ -177,10 +177,25 @@ file: path/to/dataset/parquet  # The parquet file that stores training/validatio
 prompt_key: prompt             # In which field that contains prompt. Currently, we don't support multimodal datasets.
 
 # Reward Model Definition
-reward_fn_key: data_source    # The field used to select the reward function (if using different ones per example).
-reward_loop_type: naive       # The reward loop type going to use. (e.g. naive/dapo/gen)
-reward_fn: default            # The reward function used in reward loop. (e.g. default/customized)
-reward_model_name: Qwen3-8B   # If using a generative reward model, LLM's name must be provided.
+reward_model_dicts:
+  ...
+```
+
+We support you to use multiple reward models to evaluate trajectories.
+You can configure reward models for each dataset in key `reward_model_dicts`, like this:
+
+**IMPORTANCE** Currently, we only support one kind of reward model in Validation Dataset.
+
+```yaml
+# Reward Model Definition
+reward_model_dicts:
+  - reward_fn_key: data_source    # The field used to select the reward function (if using different ones per example).
+    reward_loop_type: naive       # The reward loop type going to use. (e.g. naive/dapo/gen)
+    reward_fn: default            # The reward function used in reward loop. (e.g. default/customized)
+    reward_model_name: Qwen3-8B   # If using a generative reward model, LLM's name must be provided.
+    reward_coef: 1.0              # The coefficient of current reward model, 
+                                  # the return score will be `reward_coef * reward_score` as a part of total reward score.
+  - ...
 ```
 
 Training/Validation datasets should be construct as follows:
@@ -188,10 +203,18 @@ Training/Validation datasets should be construct as follows:
 train_datas: 
   - file: data/gsm8k_verl/train.parquet
     prompt_key: prompt
-    reward_fn_key: data_source
-    reward_loop_type: naive
-    reward_fn: default
-    reward_model_name: null
+    reward_model_dicts:
+      - reward_fn_key: data_source
+        reward_loop_type: naive
+        reward_fn: default
+        reward_model_name: null
+        reward_coef: 1.0
+      - reward_fn_key: data_source
+        reward_loop_type: gen
+        reward_fn: default
+        reward_model_name: Qwen3-8B
+        reward_coef: 1.0
+      - ...
   # ...
 
 # split ratio, which instruct how to form a batch with datasets above.
@@ -201,13 +224,16 @@ train_datasets_ratios: [0.3, 0.3, 0.4]
 val_datas: 
   - file: data/gsm8k_verl/test.parquet
     prompt_key: prompt
-    reward_fn_key: data_source
-    reward_loop_type: naive
-    reward_fn: default
-    reward_model_name: null
+    - reward_model_dicts:
+      reward_fn_key: data_source
+      reward_loop_type: naive
+      reward_fn: default
+      reward_model_name: null
+      reward_coef: 1.0
   # ...
 ```
 
 ## 3. Example
 
-See `examples/precision_test/multi_dataset/multi_datasets_stream_megatron_qwen_7b.sh`
+See `examples/precision_test/multi_dataset/multi_datasets_stream_megatron_qwen_7b.sh`.
+See default configs in `psrl/trainer/config/data/multi_datasets.yaml` and `psrl/trainer/config/reward_model/multi_rewards.yaml`.

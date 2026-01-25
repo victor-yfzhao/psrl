@@ -407,15 +407,24 @@ class RewardManager(CommandExtension):
         psrl_logger.info("Command event handler of reward manager has finished.")
 
     def normalize_reward(self, request_id_to_reward: dict[int, dict]) -> dict[int, dict]:
+        """Normalize the reward for the given request_id_to_reward.
+        
+        Args:
+            request_id_to_reward (dict[int, dict]): Mapping from request IDs to reward scores and extra info.
+        Returns:
+            Dict[int, dict]: Mapping from request IDs to normalized reward scores and extra info.
+        """
         for request_id, reward in request_id_to_reward.items():
             reward["reward_extra_info"]["data_source"] = self.request_id_to_data_source.pop(request_id)
         if self.reward_normalization != "batch" and self.reward_normalization != "group":
             return request_id_to_reward
+        
         group_rewards_dicts = {}
         # Store original reward structure (dict or float) for each request_id
         original_rewards = {}
         for request_id, reward in request_id_to_reward.items():
             reward_value = reward["reward_score"]
+            reward["reward_extra_info"]["original_reward_score"] = reward_value
             original_rewards[request_id] = reward
             
             group_id = self.request_id_to_group[request_id]
@@ -507,12 +516,26 @@ class RewardManager(CommandExtension):
 
                 self.request_id_to_data_source[request_id] = reward_input[0].non_tensor_batch["data_source"]
 
-                reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
-                reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
-                reward_fn = reward_model_dict.get("reward_fn", "default")
-                reward_model_name = reward_model_dict.get("reward_model_name", None)
+                # reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
+                # reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
+                # reward_fn = reward_model_dict.get("reward_fn", "default")
+                # reward_model_name = reward_model_dict.get("reward_model_name", None)
 
-                reward_loop = self.reward_loop_managers[reward_loop_type][(reward_fn, reward_model_name)]
+                # reward_loop = self.reward_loop_managers[reward_loop_type][(reward_fn, reward_model_name)]
+
+                reward_model_dicts = reward_input[0].non_tensor_batch["reward_model_dicts"]
+                reward_loops_keys = []
+                reward_loops = []
+                reward_coefs = []
+
+                for reward_model_dict in reward_model_dicts:
+                    reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
+                    reward_fn = reward_model_dict.get("reward_fn", "default")
+                    reward_model_name = reward_model_dict.get("reward_model_name", None)
+                    reward_loop = self.reward_loop_managers[reward_loop_type][(reward_fn, reward_model_name)]
+                    reward_loops_keys.append(f"{reward_loop_type}/{reward_fn}/{reward_model_name}")
+                    reward_loops.append(reward_loop)
+                    reward_coefs.append(reward_model_dict.get("reward_coef", 1.0))
 
                 if self.config.reward_models_config.launch_reward_fn_async:
                     # Launch async reward computation
@@ -523,7 +546,8 @@ class RewardManager(CommandExtension):
                         event_type=EventType.OTHER,
                     ):
                         # asyncio.create_task(self._async_reward_task(reward_input))
-                        asyncio.create_task(self._async_reward_task(reward_input, reward_loop))
+                        # asyncio.create_task(self._async_reward_task(reward_input, reward_loop))
+                        asyncio.create_task(self._async_reward_task(reward_input, reward_loops_keys, reward_loops, reward_coefs))
                 else:
                     with log_dual_events(
                         "Compute reward model score",
@@ -532,7 +556,19 @@ class RewardManager(CommandExtension):
                         event_type=EventType.OTHER,
                     ):
                         # result = await self.reward_loop.run_single(reward_input)
-                        result = await reward_loop.run_single(reward_input)
+                        # result = await reward_loop.run_single(reward_input)
+
+                        # TODO(zyf): need to support batchify reward computation for sync mode
+                        reward_score = 0.0
+                        reward_extra_info_dict = {}
+                        for reward_loop, reward_coef, reward_loop_key in zip(reward_loops, reward_coefs, reward_loops_keys):
+                            result = await reward_loop.run_single(reward_input)
+                            reward_score += result * reward_coef
+                            reward_extra_info_dict[reward_loop_key] = result["reward_extra_info"]
+                        result = {
+                            "reward_score": reward_score,
+                            "reward_extra_info": reward_extra_info_dict
+                        }
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(
                             int(request_id), PSRL_RequestStatus.REWARD_COMPLETED
@@ -542,7 +578,7 @@ class RewardManager(CommandExtension):
                             results[request_id] = result
 
             if not self.config.reward_models_config.launch_reward_fn_async:
-                results = self.normalize_reward(results)    
+                results = self.normalize_reward(results)
 
         return results
 
@@ -554,12 +590,45 @@ class RewardManager(CommandExtension):
     #     # for overlapping with logprobs' recomputation
     #     await self.set_reward_for_requests({request_id: result})
 
-    async def _async_reward_task(self, reward_input: DataProto, reward_loop: RewardLoopManagerBase):
+    async def _async_reward_task_for_validation(self, reward_input: DataProto, reward_loop: RewardLoopManagerBase):
         """Async task to compute reward and store the result for later retrieval."""
         request_id = reward_input.non_tensor_batch["uid"][0]
         result = await reward_loop.run_single(reward_input)
         # Store results which will be fetched by the main trainer later
         # for overlapping with logprobs' recomputation
+        await self.set_reward_for_requests({request_id: result})
+
+    async def _async_reward_task(
+        self, 
+        reward_input: DataProto, 
+        reward_loops_keys: list[str], 
+        reward_loops: list[RewardLoopManagerBase], 
+        reward_coefs: list[float]
+    ):
+        """Async task to compute reward and store the result for later retrieval."""
+        request_id = reward_input.non_tensor_batch["uid"][0]
+        
+        futures = [
+            asyncio.create_task(reward_loop.run_single(reward_input)) 
+            for reward_loop in reward_loops
+        ]
+
+        results = await asyncio.gather(*futures)
+
+        reward_score = sum(
+            result["reward_score"] * reward_coef 
+            for result, reward_coef in zip(results, reward_coefs)
+        )
+
+        reward_extra_info_dict = {
+            reward_loop_key: result["reward_extra_info"] 
+            for reward_loop_key, result in zip(reward_loops_keys, results)
+        }
+        
+        result = {
+            "reward_score": reward_score,
+            "reward_extra_info": reward_extra_info_dict
+        }
         await self.set_reward_for_requests({request_id: result})
 
     async def wait_for_reward_of_requests(self, request_ids: list[int],  validation: bool = False):
@@ -634,7 +703,13 @@ class RewardManager(CommandExtension):
             for i, request_id in enumerate(_request_ids):
                 reward_input = reward_inputs[i : i + 1]
 
-                reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
+                # reward_model_dict = reward_input[0].non_tensor_batch["reward_model_dict"]
+                # reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
+                # reward_fn = reward_model_dict.get("reward_fn", "default")
+                # reward_model_name = reward_model_dict.get("reward_model_name", None)
+                reward_model_dicts = reward_input[0].non_tensor_batch["reward_model_dicts"]
+                assert len(reward_model_dicts) == 1, "Only one reward model is supported for validation."
+                reward_model_dict = reward_model_dicts[0]
                 reward_loop_type = reward_model_dict.get("reward_loop_type", "naive")
                 reward_fn = reward_model_dict.get("reward_fn", "default")
                 reward_model_name = reward_model_dict.get("reward_model_name", None)
@@ -658,7 +733,7 @@ class RewardManager(CommandExtension):
                         level=logging.DEBUG,
                         event_type=EventType.OTHER,
                     ):
-                        asyncio.create_task(self._async_reward_task(reward_input, reward_loop))
+                        asyncio.create_task(self._async_reward_task_for_validation(reward_input, reward_loop))
                 else:
                     with log_dual_events(
                         "Compute reward model score",

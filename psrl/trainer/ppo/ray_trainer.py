@@ -1861,6 +1861,21 @@ class PSRL_RayPPOTrainer:
                             psrl_logger,
                             event_type=EventType.OTHER,
                         ):
+                            # result structure:
+                            # {
+                            #     "reward_score": float,
+                            #     "reward_extra_info": {
+                            #         "original_reward_score": float,
+                            #         "data_source": string
+                            #         $reward_model_key_0: {
+                            #             score: float,
+                            #             acc: float,
+                            #             ...
+                            #         },
+                            #         $reward_model_key_1: {...},
+                            #         ...
+                            #     },
+                            # }
                             scores = []
                             reward_extra_infos_dict_list = []
                             for request_id in request_ids:
@@ -1885,7 +1900,11 @@ class PSRL_RayPPOTrainer:
                                     # if not isinstance(value, list):
                                     #     value = [value]
                                     # reward_extra_infos_dict[key].extend(value)
-                                    if key == "score" or key == "acc" or key == "data_source":
+                                    # if key == "score" or key == "acc" or key == "data_source":
+                                    #     if not isinstance(value, list):
+                                    #         value = [value]
+                                    #         reward_extra_infos_dict[key].extend(value)
+                                    if key == "data_source" or key == "original_reward_score":
                                         if not isinstance(value, list):
                                             value = [value]
                                         reward_extra_infos_dict[key].extend(value)
