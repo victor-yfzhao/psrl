@@ -44,6 +44,7 @@ from psrl.trainer.ppo.utils import (
     need_critic,
     need_reference_policy,
     need_reward_model,
+    record_rollout_rm_metrics,
 )
 from psrl.utils.dataset import DataProcessor, DatasetType
 from psrl.utils.logger import (
@@ -1045,27 +1046,6 @@ class PSRL_RayPPOTrainer:
         #     )
         #     self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
-        # create reward model managers
-        reward_models_config = self.config.reward_models_config
-        for reward_model in reward_models_config.reward_models:
-            if reward_model.reward_loop_type != "gen":
-                continue
-            reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
-            reward_model_resource_pools = []
-            for i in range(reward_model.num_replicas):
-                reward_model_resource_pools.append(
-                    self.resource_pool_manager.resource_pool_dict[f"reward_pool_{reward_model_name}_{i}"]
-                )
-            for pool in reward_model_resource_pools:
-                self.resource_pool_to_cls.pop(pool, None)
-            self.reward_model_manager_mapping[reward_model_name] = PSRL_RewardModelManager(
-                reward_model_name=reward_model_name,
-                config=self.config,
-                reward_model_config=reward_model,
-                resource_pools=reward_model_resource_pools,
-            )
-        psrl_logger.info(f"reward_model_manager_mapping: {self.reward_model_manager_mapping}")
-
         if not self.use_critic and not self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.DummyPolicy)
             dummy_policy_cls = RayClassWithInitArgs(
@@ -1211,6 +1191,28 @@ class PSRL_RayPPOTrainer:
             all_wg.update(create_worker_group(resource_pool, class_dict))
         """
 
+        # create reward model managers
+        psrl_logger.info("Creating reward model managers")
+        reward_models_config = self.config.reward_models_config
+        for reward_model in reward_models_config.reward_models:
+            if reward_model.reward_loop_type != "gen":
+                continue
+            reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
+            reward_model_resource_pools = []
+            for i in range(reward_model.num_replicas):
+                reward_model_resource_pools.append(
+                    self.resource_pool_manager.resource_pool_dict[f"reward_pool_{reward_model_name}_{i}"]
+                )
+            for pool in reward_model_resource_pools:
+                self.resource_pool_to_cls.pop(pool, None)
+            self.reward_model_manager_mapping[reward_model_name] = PSRL_RewardModelManager(
+                reward_model_name=reward_model_name,
+                config=self.config,
+                reward_model_config=reward_model,
+                resource_pools=reward_model_resource_pools,
+            )
+        psrl_logger.info(f"reward_model_manager_mapping: {self.reward_model_manager_mapping}")
+        
         # create agent loop workers
         self.agent_loop_workers = []
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.config.psrl.deployment.n_rollout_instances)]
@@ -1878,12 +1880,14 @@ class PSRL_RayPPOTrainer:
                             # }
                             scores = []
                             reward_extra_infos_dict_list = []
+                            reward_metrics_dict_list = []
                             for request_id in request_ids:
                                 reward_score = request_id_to_reward[request_id]["reward_score"]
                                 extra_info = request_id_to_reward[request_id].get("reward_extra_info", {})
+                                reward_metrics = request_id_to_reward[request_id].get("reward_metrics", {})
                                 scores.append(reward_score)
                                 reward_extra_infos_dict_list.append(extra_info)
-
+                                reward_metrics_dict_list.append(reward_metrics)
                             prompt_length = batch.batch["prompts"].size(1)
                             response_length = batch.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
                             rm_scores = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
@@ -1910,11 +1914,15 @@ class PSRL_RayPPOTrainer:
                                         reward_extra_infos_dict[key].extend(value)
                                 reward_extra_infos_dict["reward_extra_info"].append(reward_extra_infos)
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.meta_info["reward_metrics"] = np.array(reward_metrics_dict_list, dtype=object)
                 else:
                     reward_tensor = batch.batch.pop("rm_scores", None)
 
                 batch.batch["token_level_scores"] = reward_tensor
 
+                # print(f"batch_metrics: {batch[0].meta_info['rollout_metrics']=}, {batch[0].meta_info['reward_metrics']=}")
+                print(f"dump meta_info: {batch.meta_info=}")
+                record_rollout_rm_metrics(batch, output_path="/jizhicfs/pkuhetu/yfzhao/psrl/logs/test_metrics.jsonl")
                 with marked_timer("adv", timing_raw, color="brown"):
                     with log_dual_events("Compute advantage", psrl_logger, event_type=EventType.OTHER):
                         # compute rewards. apply_kl_penalty if available

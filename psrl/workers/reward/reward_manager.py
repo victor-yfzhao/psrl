@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from typing import Any
 
 import numpy as np
 from omegaconf import DictConfig
@@ -624,10 +625,16 @@ class RewardManager(CommandExtension):
             reward_loop_key: result["reward_extra_info"] 
             for reward_loop_key, result in zip(reward_loops_keys, results)
         }
+
+        reward_metrics_dict = {
+            reward_loop_key: result.get("reward_metrics", {}) 
+            for reward_loop_key, result in zip(reward_loops_keys, results)
+        }
         
         result = {
             "reward_score": reward_score,
-            "reward_extra_info": reward_extra_info_dict
+            "reward_extra_info": reward_extra_info_dict,
+            "reward_metrics": reward_metrics_dict
         }
         await self.set_reward_for_requests({request_id: result})
 
@@ -665,7 +672,7 @@ class RewardManager(CommandExtension):
         else:
             return request_id_to_reward
 
-    async def set_reward_for_requests(self, request_id_to_reward: dict[int, float]):
+    async def set_reward_for_requests(self, request_id_to_reward: dict[int, Any]):
         """Set the reward for the specified request IDs."""
         for request_id, reward in request_id_to_reward.items():
             if request_id in self.request_id_to_future:

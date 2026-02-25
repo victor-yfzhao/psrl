@@ -148,7 +148,7 @@ index a866e968..63188ff6 100644
 -    trainer.log_val_generations=10
 +    trainer.log_val_generations=10 2>&1 | tee ${exp_name}.log
 diff --git a/verl/protocol.py b/verl/protocol.py
-index 43eb26da..0784603d 100644
+index 43eb26da..838ae0b5 100644
 --- a/verl/protocol.py
 +++ b/verl/protocol.py
 @@ -749,7 +749,7 @@ class DataProto:
@@ -160,6 +160,48 @@ index 43eb26da..0784603d 100644
              tensors[key] = self.batch.pop(key)
          non_tensors = {}
          # non tensor batch
+@@ -947,22 +947,31 @@ class DataProto:
+         # Merge meta_info with special handling for metrics
+         merged_meta_info = {}
+         if data:
+-            # Merge non-metric meta_info and aggregate metrics from all workers.
+-            all_metrics = []
++            # Collect all keys from all workers
++            all_keys = set()
+             for d in data:
+-                for k, v in d.meta_info.items():
+-                    if k == "metrics":
++                all_keys.update(d.meta_info.keys())
++
++            all_metrics = []  # for key "metrics" only
++            for k in all_keys:
++                if k == "metrics":
++                    for d in data:
++                        v = d.meta_info.get(k)
+                         if v is not None:
+                             if isinstance(v, list):
+                                 all_metrics.extend(v)
+                             else:
+                                 all_metrics.append(v)
+-                    else:
+-                        if k in merged_meta_info:
+-                            # Ensure consistency for overlapping non-metric keys
+-                            assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+-                        else:
+-                            merged_meta_info[k] = v
++                elif k.endswith("_metrics"):
++                    # For xxx_metrics: merge as np.array([dict1, dict2, ...]) from each worker
++                    values = [d.meta_info.get(k) for d in data]
++                    merged_meta_info[k] = np.array(values)
++                else:
++                    # Ensure consistency for overlapping non-metric keys
++                    vals = [d.meta_info[k] for d in data if k in d.meta_info]
++                    if vals:
++                        assert all(vals[0] == v for v in vals), f"Conflicting values for meta_info key '{k}'"
++                        merged_meta_info[k] = vals[0]
+ 
+             # Flatten list of dicts to dict of lists for consistent metrics structure
+             if all_metrics:
 diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
 index 4b82f4e1..3f3a1b86 100644
 --- a/verl/single_controller/base/worker.py
@@ -309,6 +351,61 @@ index 7c3a0bf0..78dcc4e5 100644
          "CUDA_DEVICE_MAX_CONNECTIONS": "1",
          # To prevent hanging or crash during synchronization of weights between actor and rollout
          # in disaggregated mode. See:
+diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
+index 876d6907..771e3918 100644
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -124,6 +124,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     non_aborted_sequence_score = sequence_score[non_aborted_mask]
+     non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+ 
++    np_non_aborted_mask = non_aborted_mask.numpy()
++    non_aborted_original_scores = batch.non_tensor_batch["original_reward_score"][np_non_aborted_mask]
++    non_aborted_data_sources = batch.non_tensor_batch["data_source"][np_non_aborted_mask]
++    # print(non_aborted_data_sources)
++    # import time; time.sleep(10000000)
++    data_sources, data_source_counts = np.unique(non_aborted_data_sources, return_counts=True)
++    print("In this batch, the data sources are:")
++    for data_source, data_source_count in zip(data_sources, data_source_counts):
++        print(f"{data_source}: {data_source_count}")
++    print("--------------------------------")
++    data_src2original_score_metrics = defaultdict(dict)
++    for data_source in data_sources:
++        ds_mask = non_aborted_data_sources == data_source
++        ds_original_scores = non_aborted_original_scores[ds_mask]
++        data_src2original_score_metrics[data_source]["mean"] = np.mean(ds_original_scores)
++        data_src2original_score_metrics[data_source]["max"] = np.max(ds_original_scores)
++        data_src2original_score_metrics[data_source]["min"] = np.min(ds_original_scores)
++
+     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
+     score_max = torch.max(non_aborted_sequence_score).detach().item()
+     score_min = torch.min(non_aborted_sequence_score).detach().item()
+@@ -157,6 +175,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+         raise ValueError("All samples are aborted, this should not happen.")
+ 
+     metrics = {
++        **{
++            key: value
++            for data_source in data_sources
++            for key, value in {
++                f"critic/original_score/{data_source}/mean": data_src2original_score_metrics[data_source]["mean"],
++                f"critic/original_score/{data_source}/max": data_src2original_score_metrics[data_source]["max"],
++                f"critic/original_score/{data_source}/min": data_src2original_score_metrics[data_source]["min"],
++            }.items()
++        },
++
+         # score
+         "critic/score/mean": score_mean,
+         "critic/score/max": score_max,
+@@ -436,7 +464,7 @@ def process_validation_metrics(
+     for data_source, uid2var2vals in data_src2uid2var2vals.items():
+         for uid, var2vals in uid2var2vals.items():
+             for var_name, var_vals in var2vals.items():
+-                if isinstance(var_vals[0], str):
++                if isinstance(var_vals[0], str) or isinstance(var_vals[0], dict):
+                     continue
+ 
+                 metric = {}
 diff --git a/verl/trainer/sft_trainer.py b/verl/trainer/sft_trainer.py
 index d498e915..07f45443 100644
 --- a/verl/trainer/sft_trainer.py
@@ -335,18 +432,10 @@ index df927583..1ce90c5e 100644
 -
 -__all__ = ["CheckpointHandler", "OrchestrationMode"]
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
-index 870c4751..7d85b24b 100644
+index 870c4751..15299589 100644
 --- a/verl/utils/dataset/rl_dataset.py
 +++ b/verl/utils/dataset/rl_dataset.py
-@@ -17,6 +17,7 @@
- import copy
- import logging
- import os
-+import random
- import re
- import traceback
- from collections import defaultdict
-@@ -85,6 +86,7 @@ class RLHFDataset(Dataset):
+@@ -85,6 +85,7 @@ class RLHFDataset(Dataset):
  
      def __init__(
          self,
@@ -354,84 +443,86 @@ index 870c4751..7d85b24b 100644
          data_files: str | list[str],
          tokenizer: PreTrainedTokenizer,
          config: DictConfig,
-@@ -94,6 +96,20 @@ class RLHFDataset(Dataset):
+@@ -94,6 +95,22 @@ class RLHFDataset(Dataset):
          if not isinstance(data_files, list | ListConfig):
              data_files = [data_files]
  
-+        if not config.legacy:
-+            self.dataset_config = dataset_config
-+            self.reward_fn_key = dataset_config.get("reward_fn_key", "data_source")
-+            self.reward_loop_type = dataset_config.get("reward_loop_type", "naive")
-+            self.reward_fn = dataset_config.get("reward_fn", "default")
-+            self.reward_model_name = dataset_config.get("reward_model_name", "null")
-+            self.prompt_key = dataset_config.get("prompt_key", "prompt")
-+        else:
-+            self.reward_fn_key = config.get("reward_fn_key", "data_source")
-+            self.reward_loop_type = config.get("reward_loop_type", "naive")
-+            self.reward_fn = config.get("reward_fn", "default")
-+            self.reward_model_name = config.get("reward_model_name", "null")
-+            self.prompt_key = config.get("prompt_key", "prompt")
++        self.dataset_config = dataset_config
++        self.prompt_key = dataset_config.get("prompt_key", "prompt")
++        self.data_source_name = dataset_config.get("data_source_name", data_files[0])
++
++        # self.reward_fn_key = dataset_config.get("reward_fn_key", "data_source")
++        # self.reward_loop_type = dataset_config.get("reward_loop_type", "naive")
++        # self.reward_fn = dataset_config.get("reward_fn", "default")
++        # self.reward_model_name = dataset_config.get("reward_model_name", "null")
++        default_reward_model_dict = {
++            "reward_loop_type": "naive",
++            "reward_fn": "default",
++            "reward_model_name": "null",
++            "reward_coef": 1.0,
++        }
++        self.reward_model_dicts = dataset_config.get("reward_model_dicts", [default_reward_model_dict])
 +        
          self.data_files = copy.deepcopy(data_files)
          self.original_data_files = copy.deepcopy(data_files)  # use for resume
          self.tokenizer = tokenizer
-@@ -102,7 +118,6 @@ class RLHFDataset(Dataset):
+@@ -102,7 +119,7 @@ class RLHFDataset(Dataset):
          self.config = config
  
          self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
 -        self.prompt_key = config.get("prompt_key", "prompt")
++        # self.prompt_key = config.get("prompt_key", "prompt")
          self.image_key = config.get("image_key", "images")
          self.video_key = config.get("video_key", "videos")
          self.image_patch_size = config.get("image_patch_size", 14)
-@@ -263,6 +278,18 @@ class RLHFDataset(Dataset):
+@@ -263,6 +280,25 @@ class RLHFDataset(Dataset):
          else:
              print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
  
 +    def over_sample_dataset(self, over_sample_ratio: float = 1.0):
-+        assert over_sample_ratio >= 1.0, "over_sample_ratio must be greater than or equal to 1.0"
++        assert over_sample_ratio >= 1.0, "over_sample_ratio must be >= 1.0"
++
 +        total = len(self.dataframe)
-+        if self.shuffle:
-+            rngs_args = (self.seed,) if self.seed is not None else ()
-+            rng = np.random.default_rng(*rngs_args)
-+            indices = rng.choice(total, size=int(total * over_sample_ratio), replace=True)
-+        else:
-+            indices = np.arange(int(total * over_sample_ratio))
++        target_size = int(np.ceil(total * over_sample_ratio))
++
++        # if self.shuffle:
++        #     rng = np.random.default_rng(self.seed)
++        #     indices = rng.choice(total, size=target_size, replace=True)
++        # else:
++        #     repeat_times = int(np.ceil(over_sample_ratio))
++        #     indices = np.tile(np.arange(total), repeat_times)[:target_size]
++
++        repeat_times = int(np.ceil(over_sample_ratio))
++        indices = np.tile(np.arange(total), repeat_times)[:target_size]
++
 +        self.dataframe = self.dataframe.select(indices.tolist())
 +        print(f"over sampled dataset len: {len(self.dataframe)}")
 +    
      def __len__(self):
          return len(self.dataframe)
  
-@@ -450,6 +477,32 @@ class RLHFDataset(Dataset):
+@@ -450,6 +486,24 @@ class RLHFDataset(Dataset):
          row_dict["index"] = index
          row_dict["tools_kwargs"] = tools_kwargs
          row_dict["interaction_kwargs"] = interaction_kwargs
 +
 +        # add reward loop type and reward fn
-+        reward_loop_type = self.reward_loop_type
-+        reward_fn = self.reward_fn
-+        reward_model_name = self.reward_model_name
++        # reward_loop_type = self.reward_loop_type
++        # reward_fn = self.reward_fn
++        # reward_model_name = self.reward_model_name
 +
-+        # ---------------DEBUG---------------
-+        # EXAMPLE_REWARD_LOOP_LIST = [
-+        #     ("naive", "default", None),
-+        #     ("dapo", "default", None),
-+        #     ("gen", "default", "Qwen3-8B"),
-+        #     ("gen", "skywork", "Skywork-Reward-V2-Qwen3-8B"),
-+        # ]
++        # reward_model_dict = {
++        #     "reward_loop_type": reward_loop_type,
++        #     "reward_fn": reward_fn,
++        #     "reward_model_name": reward_model_name,
++        # }
++        # row_dict["reward_model_dict"] = reward_model_dict
++        row_dict["reward_model_dicts"] = self.reward_model_dicts
 +
-+        # _random_reward_loop_type, _random_reward_fn, _random_reward_model_name = random.choice(EXAMPLE_REWARD_LOOP_LIST)
-+        # reward_loop_type = _random_reward_loop_type
-+        # reward_fn = _random_reward_fn
-+        # reward_model_name = _random_reward_model_name
-+        # ---------------DEBUG---------------
-+
-+        reward_model_dict = {
-+            "reward_loop_type": reward_loop_type,
-+            "reward_fn": reward_fn,
-+            "reward_model_name": reward_model_name,
-+        }
-+        row_dict["reward_model_dict"] = reward_model_dict
++        data_source = row_dict.get("data_source", None)
++        if data_source is None:
++            data_source = self.data_source_name
++        row_dict["data_source"] = data_source
          return row_dict
  
      def __getstate__(self):
@@ -535,6 +626,27 @@ index c319910d..8d2832ab 100644
  
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
+diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+index 251a5be6..f108aafa 100644
+--- a/verl/utils/tracking.py
++++ b/verl/utils/tracking.py
+@@ -65,9 +65,14 @@ class Tracking:
+ 
+             import wandb
+ 
+-            settings = None
++            # Set init_timeout to avoid timeout errors (default 180 seconds)
++            init_timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "180"))
++            settings_kwargs = {"init_timeout": init_timeout}
++            
+             if config and config["trainer"].get("wandb_proxy", None):
+-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
++                settings_kwargs["https_proxy"] = config["trainer"]["wandb_proxy"]
++            
++            settings = wandb.Settings(**settings_kwargs)
+             entity = os.environ.get("WANDB_ENTITY", None)
+             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+             self.logger["wandb"] = wandb
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
 index 466402ca..5ed8a5bc 100644
 --- a/verl/workers/actor/megatron_actor.py

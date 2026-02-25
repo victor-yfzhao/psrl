@@ -255,7 +255,13 @@ class PSRL_vLLMRollout:
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
             stat_loggers = None
-            if not config.disable_log_stats and psrl_config.status_collection.enable:
+            # Status collection requires status_queue (provided by policy rollout's GenInterface).
+            # Reward model and other non-policy rollouts do not pass status_queue; skip StatCollector.
+            if (
+                not config.disable_log_stats
+                and psrl_config.status_collection.enable
+                and "status_queue" in kwargs
+            ):
                 psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
                 # Use custom stat loggers to collect engine stats
                 vllm_config = engine_args.create_engine_config()
@@ -545,6 +551,8 @@ class PSRL_vLLMRollout:
         non_tensor_batch = prompts.non_tensor_batch
         uid_list = non_tensor_batch["uid"].tolist()
 
+        meta_info = prompts.meta_info
+
         response_ids_list = []
         response_len_list = []
         interrupted_list = []
@@ -553,8 +561,15 @@ class PSRL_vLLMRollout:
         all_log_prob_list = []
         routed_experts_list = []
 
+        metrics_list = []
+
         for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
+            try:
+                metrics_list.append(vllm_output.metrics)
+            except Exception as e:
+                psrl_logger.warning(f"Failed to get metrics for request {uid}: {e}")
+                metrics_list.append({})
             if self.is_pooling_model:
                 # For pooling models, outputs is a PoolingOutput object, not a list
                 # Extract pooling output data, PoolingOutput has a data attribute (torch.Tensor)
@@ -636,6 +651,9 @@ class PSRL_vLLMRollout:
         non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
         non_tensor_batch["interrupted_by_scheduler"] = np.array(interrupted_by_scheduler_list, dtype=bool)
 
+        meta_info["vllm_metrics"] = np.array(metrics_list, dtype=object)
+        # meta_info["metrics"] = metrics_list
+
         # Update rollout_log_probs
         if not self.is_pooling_model and self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
@@ -658,7 +676,7 @@ class PSRL_vLLMRollout:
             },
             batch_size=batch_size,
         )
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
     def add_requests(self, prompts: DataProto, **kwargs):
         """

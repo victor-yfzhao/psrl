@@ -1,7 +1,9 @@
+import json
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 
+import numpy as np
 import ray
 import torch
 from omegaconf import DictConfig
@@ -266,3 +268,99 @@ def PSRL_compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+def _stats_to_timestamps(stats) -> dict | None:
+    if stats is None:
+        return None
+
+    if hasattr(stats, "__len__") and len(stats) > 0 and not hasattr(stats, "arrival_time"):
+        stats = stats[0]
+
+    arrival = getattr(stats, "arrival_time", None)
+    ft_latency = getattr(stats, "first_token_latency", None)
+    ft_ts_mono = getattr(stats, "first_token_ts", None)
+    last_ts_mono = getattr(stats, "last_token_ts", None)
+
+    if arrival is None:
+        return None
+
+    arrival_ts = float(arrival)
+    ttft_ts = None
+    finish_ts = None
+
+    if ft_latency is not None:
+        ttft_ts = arrival_ts + float(ft_latency)
+
+    if ft_latency is not None and ft_ts_mono is not None and last_ts_mono is not None:
+        decode_dur = float(last_ts_mono) - float(ft_ts_mono)
+        finish_ts = arrival_ts + float(ft_latency) + decode_dur
+
+    if ttft_ts is None and finish_ts is None:
+        return None
+
+    return {
+        "arrival_ts": arrival_ts,
+        "ttft_ts": ttft_ts,
+        "finish_ts": finish_ts,
+    }
+
+
+def record_rollout_rm_metrics(data: DataProto, output_path: str | None = None) -> list[dict]:
+    """Extract rollout/reward timestamps from DataProto and optionally write to jsonl.
+
+    Output format (one line per .jsonl):
+        {
+            "uid": 123,
+            "rollout_metrics": {"arrival_ts": xxx, "ttft_ts": xxx, "finish_ts": xxx},
+            "reward_metrics": {"gen/default/Qwen3-8B": {"arrival_ts": xxx, "ttft_ts": xxx, "finish_ts": xxx}}
+        }
+
+    Args:
+        data: DataProto containing meta_info['rollout_metrics'], meta_info['reward_metrics'] and non_tensor_batch['uid'].
+        output_path: If provided, append each record of this batch to the jsonl file.
+
+    Returns:
+        List of records (dict) for each sample in this batch.
+    """
+    meta = getattr(data, "meta_info", None) or {}
+    rollout_metrics_arr = meta.get("rollout_metrics")
+    reward_metrics_arr = meta.get("reward_metrics")
+    uids = data.non_tensor_batch.get("uid", None)
+    if uids is not None and hasattr(uids, "tolist"):
+        uids = uids.tolist()
+    batch_size = data.batch.batch_size[0]
+    if uids is None or len(uids) != batch_size:
+        uids = list(range(batch_size))
+
+    records = []
+    for i in range(batch_size):
+        rec = {"uid": int(uids[i]) if np.issubdtype(type(uids[i]), np.integer) else uids[i]}
+
+        if rollout_metrics_arr is not None and i < len(rollout_metrics_arr):
+            rec["rollout_metrics"] = _stats_to_timestamps(rollout_metrics_arr[i])
+        else:
+            rec["rollout_metrics"] = None
+
+        if reward_metrics_arr is not None and i < len(reward_metrics_arr):
+            rm_dict = reward_metrics_arr[i]
+            if isinstance(rm_dict, dict):
+                rec["reward_metrics"] = {}
+                for key, val in rm_dict.items():
+                    if val is None or (hasattr(val, "__len__") and len(val) == 0):
+                        continue
+                    ts = _stats_to_timestamps(val)
+                    if ts is not None:
+                        rec["reward_metrics"][key] = ts
+            else:
+                rec["reward_metrics"] = None
+        else:
+            rec["reward_metrics"] = None
+ 
+        records.append(rec)
+
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return records

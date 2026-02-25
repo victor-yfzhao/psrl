@@ -42,6 +42,12 @@ class GenerateAgentLoop(AgentLoopBase):
                 rollout_log_probs = output.non_tensor_batch["rollout_log_probs"][0]
                 rollout_log_probs = rollout_log_probs[: self.response_length]
                 output.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs])
+
+            metrics = output.meta_info.pop("vllm_metrics", None)
+            if metrics is not None:
+                output.meta_info["rollout_metrics"] = metrics
+            else:
+                output.meta_info["rollout_metrics"] = {}
         else:
             # Indicate that the request is aborted
             return None

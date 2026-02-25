@@ -138,6 +138,8 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         rm_output_str = rm_output_dict.get("rm_output_str", "")
         rm_output_value = rm_output_dict.get("rm_output_value")
 
+        reward_metrics = rm_output_dict.get("reward_metrics", {})
+
         # Compute final reward score using custom scoring function
         # Pass both rm_output_str and rm_output_logits, let compute_score choose which one to use
         if self.is_async_reward_score:
@@ -187,7 +189,7 @@ class GenRewardLoopManager(RewardLoopManagerBase):
             {k: v for k, v in reward_extra_info.items() if k not in {"rm_output", "agent_response"}},
         )
 
-        return {"reward_score": score, "reward_extra_info": reward_extra_info}
+        return {"reward_score": score, "reward_extra_info": reward_extra_info, "reward_metrics": reward_metrics}
 
     def _build_rm_data_proto(self, rm_inputs: dict, request_uid: str | None) -> DataProto:
         """
@@ -284,11 +286,19 @@ class GenRewardLoopManager(RewardLoopManagerBase):
             psrl_logger.info("Sending reward uid=%s to replica_%d", request_uid, replica_idx)
             rm_outputs = await replica_handle.generate_async.remote(rm_data_proto)
 
-        result = {"rm_output_str": "", "rm_output_value": None}
+        result = {"rm_output_str": "", "rm_output_value": None, "reward_metrics": {}}
 
         if rm_outputs is None or len(rm_outputs) == 0:
             psrl_logger.warning("Reward model returned empty output")
             return result
+
+        reward_metrics = rm_outputs.meta_info.pop("vllm_metrics", None)
+
+        # print(f"dump reward_metrics: {reward_metrics=}")
+        if reward_metrics is not None:
+            result["reward_metrics"] = reward_metrics[0]
+        else:
+            result["reward_metrics"] = {}
 
         # Try to extract pooling output (for Skywork-like reward models)
         if "pooling_output" in rm_outputs.non_tensor_batch:

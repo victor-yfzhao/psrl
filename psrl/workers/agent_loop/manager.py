@@ -364,7 +364,7 @@ class PSRL_AgentLoopManager:
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
-        meta_info = {}
+        meta_info = inputs.meta_info
         # Reward processing
         if not self.config.reward_models_config.launch_reward_fn_async:
             ## psrl_logger.info("Reward processing begin")

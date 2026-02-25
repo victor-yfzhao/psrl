@@ -45,7 +45,7 @@ class PSRL_RewardModelManager:
         self.resource_pools: list[RayResourcePool] = list(resource_pools)
         self.replicas: list[PSRL_RewardModelReplica] = []
         self.router_process: ray.actor.ActorHandle | None = None
-        self.router_address: str | None = None
+        # self.router_address: str | None = None
 
         # Initialize replicas and router
         self._initialize_replicas()
@@ -129,10 +129,10 @@ class PSRL_RewardModelManager:
 
         # Launch the router as a separate Ray actor or process
         self.router_process = launch_router_process(worker_handles=worker_handles)
-        psrl_logger.info(f"RewardModelRouter launched at {self.router_address}")
+        psrl_logger.info(f"RewardModelRouter launched!")
 
-    def get_router_address(self) -> str | None:
-        pass
+    # def get_router_address(self) -> str | None:
+    #     pass
 
     def get_replica_handles(self) -> list:
         """
