@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+from ray.util.queue import Queue as RayQueue
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoConfig
 from verl import DataProto
@@ -115,6 +116,8 @@ class PSRL_RewardModelWorker(Worker):
         config: DictConfig,
         role: str,
         psrl_config: DictConfig,
+        status_queue: RayQueue,
+        reward_model_name: str | None = None,
         **kwargs,
     ) -> None:
         """
@@ -129,6 +132,8 @@ class PSRL_RewardModelWorker(Worker):
         super().__init__()
         self.config = config
         self.psrl_config = psrl_config
+        self.status_queue = status_queue
+        self.reward_model_name = reward_model_name
         self.seed = kwargs.get("seed", 0)
         self.instance_id = kwargs.get("instance_id", 0)
         self.rollout: PSRL_vLLMRollout | None = None
@@ -248,6 +253,9 @@ class PSRL_RewardModelWorker(Worker):
             model_config=model_config,
             seed=self.seed,
             instance_id=self.get_instance_id(),
+            status_queue=self.status_queue,
+            reward_model_name=self.reward_model_name,
+            is_reward_model=True,
         )
         return rollout
 

@@ -138,6 +138,7 @@ class PSRL_RayPPOTrainer:
         self.rollout_coordinator = None
         self.reward_manager = None
 
+        self.reward_model_status_queues_mapping = {}
         self.reward_model_manager_mapping = {}
 
         # Parameter server handle for other workers to access
@@ -1205,11 +1206,15 @@ class PSRL_RayPPOTrainer:
                 )
             for pool in reward_model_resource_pools:
                 self.resource_pool_to_cls.pop(pool, None)
+            self.reward_model_status_queues_mapping[reward_model_name] = [
+                RayQueue() for _ in range(reward_model.num_replicas)
+            ]
             self.reward_model_manager_mapping[reward_model_name] = PSRL_RewardModelManager(
                 reward_model_name=reward_model_name,
                 config=self.config,
                 reward_model_config=reward_model,
                 resource_pools=reward_model_resource_pools,
+                status_queues=self.reward_model_status_queues_mapping[reward_model_name],
             )
         psrl_logger.info(f"reward_model_manager_mapping: {self.reward_model_manager_mapping}")
         

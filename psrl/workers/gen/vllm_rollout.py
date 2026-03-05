@@ -47,6 +47,7 @@ class PSRL_vLLMRollout:
         psrl_config: DictConfig,
         config: RolloutConfig,
         model_config: HFModelConfig,
+        is_reward_model: bool = False,
         **kwargs,
     ):
         """
@@ -63,6 +64,11 @@ class PSRL_vLLMRollout:
         self.psrl_config = psrl_config
         self.config = config
         self.stat_collector = None
+        self.is_reward_model = is_reward_model
+        if self.is_reward_model:
+            self.reward_model_name = kwargs.get("reward_model_name")
+        else:
+            self.reward_model_name = None
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
@@ -255,8 +261,7 @@ class PSRL_vLLMRollout:
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
             stat_loggers = None
-            # Status collection requires status_queue (provided by policy rollout's GenInterface).
-            # Reward model and other non-policy rollouts do not pass status_queue; skip StatCollector.
+            # Status collection requires status_queue.
             if (
                 not config.disable_log_stats
                 and psrl_config.status_collection.enable
@@ -266,7 +271,13 @@ class PSRL_vLLMRollout:
                 # Use custom stat loggers to collect engine stats
                 vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
-                self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
+                self.stat_collector = StatCollector(
+                    vllm_config, 
+                    psrl_config, 
+                    instance_id=kwargs.get("instance_id", 0),
+                    is_reward_model=self.is_reward_model,
+                    reward_model_name=self.reward_model_name,
+                )
                 self.stat_collector.begin_record()
                 self.stat_collector.init_output_queue(status_queue)
                 self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)

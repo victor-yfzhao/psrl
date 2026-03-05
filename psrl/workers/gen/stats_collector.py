@@ -78,7 +78,14 @@ class StatCollector(StatLoggerBase):
     - Send status updates to output queue for coordinator consumption
     """
 
-    def __init__(self, vllm_config: VllmConfig, psrl_config: DictConfig, instance_id: int = 0):
+    def __init__(
+        self, 
+        vllm_config: VllmConfig, 
+        psrl_config: DictConfig, 
+        instance_id: int = 0,
+        is_reward_model: bool = False,
+        reward_model_name: str | None = None,
+    ):
         """
         Initialize the StatCollector.
 
@@ -89,7 +96,9 @@ class StatCollector(StatLoggerBase):
         self.vllm_config = vllm_config
         self.psrl_config = psrl_config
         self.instance_id = instance_id
-
+        self.is_reward_model = is_reward_model
+        self.reward_model_name = reward_model_name
+        
         self.model_version = 0
         self._begin_record = False
         self.start_time = None
@@ -99,7 +108,10 @@ class StatCollector(StatLoggerBase):
 
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
-            self.log_prefix = f"StatCollector_I{self.instance_id}"
+            if self.is_reward_model:
+                self.log_prefix = f"StatCollector_RM_{self.reward_model_name}_I{self.instance_id}"
+            else:
+                self.log_prefix = f"StatCollector_I{self.instance_id}"
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized StatCollector for instance {self.instance_id}.")
 

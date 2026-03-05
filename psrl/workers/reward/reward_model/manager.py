@@ -5,9 +5,11 @@ import os
 
 from omegaconf import DictConfig
 import ray
+from ray.util.queue import Queue as RayQueue
 from verl.single_controller.ray.base import RayResourcePool
 
 from psrl.workers.config import HFModelConfig
+from psrl.workers.reward.reward_model.coordinator import RewardModelCoordinator
 from psrl.workers.reward.reward_model.replica import PSRL_RewardModelReplica
 
 psrl_logger = logging.getLogger(__file__)
@@ -30,6 +32,7 @@ class PSRL_RewardModelManager:
         config: DictConfig,
         reward_model_config: DictConfig,
         resource_pools: RayResourcePool | list[RayResourcePool],
+        status_queues: list[RayQueue],
     ):
         """
         Initialize the reward model manager.
@@ -45,7 +48,16 @@ class PSRL_RewardModelManager:
         self.resource_pools: list[RayResourcePool] = list(resource_pools)
         self.replicas: list[PSRL_RewardModelReplica] = []
         self.router_process: ray.actor.ActorHandle | None = None
+        self.status_queues: list[RayQueue] = status_queues
+
+        self.reward_model_wg_list = []
         # self.router_address: str | None = None
+
+        self.reward_model_coordinator = RewardModelCoordinator.remote(
+            config=self.config,
+            rm_config=self.reward_model_config,
+            status_queues=self.status_queues,
+        )
 
         # Initialize replicas and router
         self._initialize_replicas()
@@ -72,6 +84,7 @@ class PSRL_RewardModelManager:
         self.replicas = []
         for i in range(requested_replicas):
             resource_pool = self.resource_pools[i]
+            status_queue = self.status_queues[i]
             self.replicas.append(
                 PSRL_RewardModelReplica(
                     replica_rank=i,
@@ -81,6 +94,7 @@ class PSRL_RewardModelManager:
                     psrl_config=self.config.psrl,
                     resource_pool=resource_pool,
                     reward_model_name=self.reward_model_name,
+                    status_queue=status_queue,
                 )
             )
 
@@ -91,7 +105,15 @@ class PSRL_RewardModelManager:
         Initialize all replicas and their models in parallel.
         """
         await asyncio.gather(*[replica.init_replica() for replica in self.replicas])
-        await asyncio.gather(*[replica.init_model() for replica in self.replicas])
+        # await asyncio.gather(*[replica.init_model() for replica in self.replicas])
+        for i in range(len(self.replicas)):
+            self.reward_model_wg_list.append(self.replicas[i].worker_group)
+
+        ray.get(self.reward_model_coordinator.set_reward_model_wg_list.remote(self.reward_model_wg_list))
+        ray.get(self.reward_model_coordinator.init_model.remote())
+        ray.get(self.reward_model_coordinator.start_busy_loop.remote())
+        psrl_logger.info(f"Reward model coordinator started!")
+
         psrl_logger.info(f"All {len(self.replicas)} reward model replicas initialized.")
 
     def _run_coroutines_blocking(self, coroutines: list[asyncio.Future]):

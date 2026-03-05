@@ -4,6 +4,7 @@ import os
 import ray
 from abc import ABC, abstractmethod
 from omegaconf import DictConfig
+from ray.util.queue import Queue as RayQueue
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import RayResourcePool
@@ -79,10 +80,11 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
         psrl_config: DictConfig,
         resource_pool: RayResourcePool,
         reward_model_name: str,
+        status_queue: RayQueue,
     ):
         super().__init__(replica_rank, reward_model_config, rollout_config, model_config, psrl_config, resource_pool)
         self.reward_model_name = reward_model_name
-
+        self.status_queue = status_queue
         self.worker_group: RayWorkerGroup | None = None
         self._worker_handle = None
 
@@ -94,6 +96,8 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
             role="reward_model",
             psrl_config=self.psrl_config,
             instance_id=self.replica_rank,
+            status_queue=self.status_queue,
+            reward_model_name=self.reward_model_name,
         )
         # Include reward_model_name in name_prefix to ensure uniqueness across multiple reward models
         if self.reward_model_name:
@@ -116,11 +120,11 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
     def worker_handle(self):
         return self._worker_handle
 
-    async def init_model(self):
-        if self.worker_group:
-            remote_refs = self.worker_group.execute_all_async("init_model")
-            # execute_all_async returns a list of Ray ObjectRefs, use ray.get() to wait
-            ray.get(remote_refs)
+    # async def init_model(self):
+    #     if self.worker_group:
+    #         remote_refs = self.worker_group.execute_all_async("init_model")
+    #         # execute_all_async returns a list of Ray ObjectRefs, use ray.get() to wait
+    #         ray.get(remote_refs)
 
     async def generate(self, request):
         if self._worker_handle is None:
