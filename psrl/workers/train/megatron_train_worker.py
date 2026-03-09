@@ -18,6 +18,10 @@ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAc
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import GPUMemoryLogger
 from verl.workers.megatron_workers import ActorRolloutRefWorker
+from verl.utils.megatron_utils import(
+    load_megatron_optimizer,
+    offload_megatron_optimizer,
+)
 
 from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.converter import create_parameter_mapping
@@ -154,6 +158,116 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         self.unified_state_dict = unified_state_dict
         self.unified_sharding_dict = unified_sharding_dict
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def change_expert_mapping(self, new_logical_to_physical_expert_mapping):
+        num_layers, num_experts = new_logical_to_physical_expert_mapping.shape
+        physical_to_logical_expert_mapping = torch.empty_like(new_logical_to_physical_expert_mapping)
+        for layer_number in range(num_layers):
+            physical_to_logical_expert_mapping[layer_number, new_logical_to_physical_expert_mapping[layer_number]] = torch.arange(
+                num_experts, dtype=torch.long, device=new_logical_to_physical_expert_mapping.device
+            )
+
+        def convert_key(original_key, add_prefix="tmp_"):
+            parts = original_key.split('.')
+            nums = [(index, int(p)) for index, p in enumerate(parts) if p.isdigit()]
+            assert len(nums) == 2
+            layer_number, old_logical_expert_id = nums[0][1], nums[1][1]
+            if self.old_logical_to_physical_expert_mapping is None:
+                physical_expert_id = old_logical_expert_id
+            else:
+                physical_expert_id = int(self.old_logical_to_physical_expert_mapping[layer_number][old_logical_expert_id].item())
+            logical_expert_id = int(physical_to_logical_expert_mapping[layer_number][physical_expert_id].item())
+            parts[nums[1][0]] = f"{logical_expert_id}"
+            new_key = add_prefix + ".".join(parts)
+            return new_key
+
+        # change self.unified_state_dict
+        key_values_to_add = []
+        keys_to_delete = []
+        for key, value in self.unified_state_dict.items():
+            if "mlp.experts" in key:
+                new_tmp_key = convert_key(key)
+                key_values_to_add.append((new_tmp_key, value))
+                keys_to_delete.append(key)
+        for key, value in key_values_to_add:
+            self.unified_state_dict[key] = value
+        for key in keys_to_delete:
+            del self.unified_state_dict[key]
+        key_values_to_add = []
+        keys_to_delete = []
+        for key, value in self.unified_state_dict.items():
+            if "mlp.experts" in key:
+                new_key = key[4:]
+                key_values_to_add.append((new_key, value))
+                keys_to_delete.append(key)
+        for key, value in key_values_to_add:
+            self.unified_state_dict[key] = value
+        for key in keys_to_delete:
+            del self.unified_state_dict[key]
+
+        # change _comm_info.push_to_ps_plan
+        comm_plan = self.nixl_storage_client._comm_plan
+        key_values_to_add = []
+        keys_to_delete = []
+        for client_name, cur_plan in comm_plan.push_to_ps_plan.items():
+            for key, target_plan in cur_plan.items():
+                if "mlp.experts" in key:
+                    new_tmp_key = convert_key(key)
+                    key_values_to_add.append((client_name, new_tmp_key, target_plan))
+                    keys_to_delete.append((client_name, key))
+        for client_name, new_tmp_key, target_plan in key_values_to_add:
+            comm_plan.push_to_ps_plan[client_name][new_tmp_key] = target_plan
+        for client_name, key in keys_to_delete:
+            del comm_plan.push_to_ps_plan[client_name][key]
+        key_values_to_add = []
+        keys_to_delete = []
+        for client_name, cur_plan in comm_plan.push_to_ps_plan.items():
+            for key, target_plan in cur_plan.items():
+                if "mlp.experts" in key:
+                    new_key = key[4:]
+                    key_values_to_add.append((client_name, new_key, target_plan))
+                    keys_to_delete.append((client_name, key))
+        for client_name, new_key, target_plan in key_values_to_add:
+            comm_plan.push_to_ps_plan[client_name][new_key] = target_plan
+        for client_name, key in keys_to_delete:
+            del comm_plan.push_to_ps_plan[client_name][key]
+
+        # change local_client_info.tensor_infos
+        local_client_info = self.nixl_storage_client.local_client_info
+        key_values_to_add = []
+        keys_to_delete = []
+        for key, value in local_client_info.tensor_infos.items():
+            if "mlp.experts" in key:
+                new_tmp_key = convert_key(key)
+                key_values_to_add.append((new_tmp_key, value))
+                keys_to_delete.append(key)
+        for key, value in key_values_to_add:
+            local_client_info.tensor_infos[key] = value
+        for key in keys_to_delete:
+            del local_client_info.tensor_infos[key]
+        key_values_to_add = []
+        keys_to_delete = []
+        for key, value in local_client_info.tensor_infos.items():
+            if "mlp.experts" in key:
+                new_key = key[4:]
+                key_values_to_add.append((new_key, value))
+                keys_to_delete.append(key)
+        for key, value in key_values_to_add:
+            local_client_info.tensor_infos[key] = value
+        for key in keys_to_delete:
+            del local_client_info.tensor_infos[key]
+
+        self.old_logical_to_physical_expert_mapping = new_logical_to_physical_expert_mapping
+
+        # megatron param change
+        self.actor_module[0].module._modules['module'].decoder.change_expert_mapping(new_logical_to_physical_expert_mapping)
+        # megatron optimizer change
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
+        self.actor_optimizer.chained_optimizers[1].change_expert_mapping(new_logical_to_physical_expert_mapping)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
+
     def ray_push_model(self) -> None:
         """
         Push the model weights to the PS.
@@ -229,7 +343,12 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         level=logging.INFO,
         log_only_rank_0=False,
     )
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(
+        self, 
+        data: DataProto, 
+        micro_batch_indices: list[list[int]] | None = None,
+        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
+    ):
         with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
             assert self._is_actor
             if self._is_offload_param:
@@ -251,7 +370,12 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            output, entropys, layers_topk_idx = self.actor.compute_log_prob(
+                data=data, 
+                calculate_entropy=True,
+                micro_batch_indices=micro_batch_indices,
+                logical_to_physical_mapping_list=logical_to_physical_mapping_list
+            )
             output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
 
             if self.config.actor.router_replay.mode == "R2":
@@ -283,3 +407,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_moe_cpu_weights(self):
+        self.actor_module[0].module._modules['module'].decoder.update_moe_cpu_weights()

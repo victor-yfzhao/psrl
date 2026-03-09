@@ -1,0 +1,8 @@
+# whether to enable batch-level EPLB
+enable_batch_level_eplb: False
+
+# batch-level EPLB imbalance ratio threshold (typical: 0.3-0.5)
+batch_level_eplb_threshold: 0.4
+
+# whether to enable micro-batch-level EPLB
+enable_micro_batch_level_eplb: False

@@ -32,6 +32,8 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.seqlen_balancing import (
     get_seqlen_balanced_partitions,
     log_seqlen_unbalance,
+    calculate_workload,
+    ceildiv
 )
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.torch_dtypes import PrecisionType
@@ -54,6 +56,10 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+from psrl.utils.eplb import (
+    ExpertLoadMonitor,
+    compute_micro_batch_logical_to_physical_mapping_list
+)
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.ps import (
@@ -140,6 +146,13 @@ class PSRL_RayPPOTrainer:
 
         # Async rollout mode for training worker
         self.async_rollout_mode = False
+
+        # EPLB monitor states
+        self.expert_load_monitor = None
+        self.latest_logical_to_physical_mapping = None
+
+        self.last_routed_experts = None
+        self.last_attention_mask = None
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -1418,6 +1431,200 @@ class PSRL_RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _pack_and_compute_expert_mapping(
+        self,
+        batch: DataProto,
+        *,
+        dp_size: int | None = None,
+        max_token_len: int | None = None,
+        micro_batch_size: int | None = None,
+        use_dynamic_bsz: bool | None = None,
+        ep_size: int | None = None,
+        num_experts: int | None = None,
+        device: str | torch.device | None = None,
+        use_dynamic_bsz_balance: bool = True,
+        tie_break: str = "fewest_experts",
+    ) -> dict:
+        """Pre-pack the *global* batch and compute a shared expert mapping per micro-step.
+
+        Background
+        - Ray dispatch (`make_nd_compute_dataproto_dispatch_fn(mesh_name="actor")`) first splits the request
+            evenly across DP ranks.
+        - Megatron actor then performs dynamic packing (micro-batch partition) and per-micro-batch MoE expert
+            mapping on *each* DP rank independently.
+        - When one EP group spans multiple DP ranks, those ranks must use an identical expert mapping; otherwise
+            numerical correctness may break.
+
+        This helper computes:
+        1) A DP-aligned micro-batch schedule (same number of micro-steps across DP slices, like the in-worker
+            all-reduce MAX behavior).
+        2) One logical->physical expert mapping per micro-step, computed from the union of all DP slices at that
+            micro-step (therefore identical for all DP ranks).
+
+        Notes
+        - This method does *not* change execution flow by itself; it only returns
+            the packing/mapping results. Callers can invoke it right before `self.actor_wg.compute_log_prob(...)`.
+        - Requires `batch.batch["attention_mask"]` and `batch.batch["routed_experts"]`.
+
+        Returns
+        A dict containing:
+            - `dp_rank_batches`: Tuple[DataProto, ...] length == dp_size, each element is the dp-rank local batch
+            - `dp_micro_batch_indices`: Tuple[dp_size][num_micro_batches][List[int]] (indices are local within dp slice)
+            - `num_micro_batches`: int
+            - `logical_to_physical_mapping_list`: List[Tensor[int64]] each [num_layers, num_experts]
+            - `ep_size`, `num_experts`, `dp_size`, `use_dynamic_bsz`, `max_token_len`, `micro_batch_size`
+        """
+        if "attention_mask" not in batch.batch:
+            raise KeyError("pack_and_compute_expert_mapping_for_recompute_log_prob requires batch.batch['attention_mask']")
+        if "routed_experts" not in batch.batch:
+            raise KeyError("pack_and_compute_expert_mapping_for_recompute_log_prob requires batch.batch['routed_experts']")
+
+        if dp_size is None:
+            dp_size = self._get_dp_size()
+        if dp_size <= 0:
+            raise ValueError(f"Invalid dp_size={dp_size}")
+
+        # Resolve packing knobs from meta_info/config if not explicitly provided.
+        if use_dynamic_bsz is None:
+            use_dynamic_bsz = bool(batch.meta_info.get("use_dynamic_bsz", False))
+        if max_token_len is None:
+            max_token_len = batch.meta_info.get("max_token_len", None)
+        if micro_batch_size is None:
+            micro_batch_size = batch.meta_info.get("micro_batch_size", None)
+
+        if use_dynamic_bsz:
+            if max_token_len is None:
+                raise ValueError("max_token_len must be provided (or exist in batch.meta_info) when use_dynamic_bsz=True")
+        else:
+            if micro_batch_size is None:
+                raise ValueError(
+                    "micro_batch_size must be provided (or exist in batch.meta_info) when use_dynamic_bsz=False"
+                )
+
+        if ep_size is None:
+            # Best-effort: use megatron expert_model_parallel_size if present.
+            ep_size = int(
+                self.config.train_actor_rollout_ref.actor.get("megatron", {}).get("expert_model_parallel_size", 1)
+            )
+        if ep_size <= 0:
+            raise ValueError(f"Invalid ep_size={ep_size}")
+
+        routed_experts = batch.batch["routed_experts"]
+        if num_experts is None:
+            # Infer from routed_experts; round up to a multiple of ep_size.
+            max_id = int(routed_experts.max().item()) if routed_experts.numel() > 0 else -1
+            inferred = max_id + 1
+            if inferred <= 0:
+                raise ValueError("Cannot infer num_experts from empty routed_experts")
+            num_experts = ((inferred + ep_size - 1) // ep_size) * ep_size
+
+        if device is None:
+            # Driver might not have GPU even if workers do.
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+
+        # Split the batch as Ray's DP dispatch would (equal contiguous chunks).
+        batch_size = batch.batch["attention_mask"].shape[0]
+        if batch_size % dp_size != 0:
+            raise ValueError(f"Batch size {batch_size} must be divisible by dp_size {dp_size}")
+        dp_batches = batch.chunk(dp_size)
+        dp_attn_mask = batch.batch["attention_mask"].to("cuda").chunk(dp_size)
+        dp_routed_experts = batch.batch["routed_experts"].to("cuda").chunk(dp_size)
+
+        local_num_micro_list: list[int] = []
+        if use_dynamic_bsz:
+            for attn in dp_attn_mask:
+                seq_len_effective = attn.sum(dim=1)
+                total_seqlen = int(seq_len_effective.sum().item())
+                local_num_micro = min(len(seq_len_effective), int(ceildiv(total_seqlen, int(max_token_len))))
+                local_num_micro_list.append(max(1, local_num_micro))
+            num_micro_batches = max(local_num_micro_list) if local_num_micro_list else 1
+        else:
+            per_dp_bsz = batch_size // dp_size
+            num_micro_batches = int((per_dp_bsz + int(micro_batch_size) - 1) // int(micro_batch_size))
+
+        dp_micro_batch_indices: list[list[list[int]]] = []
+        dp_micro_batches: list[list[dict]] = []
+
+        for attn, rex in zip(dp_attn_mask, dp_routed_experts):
+            bsz = attn.shape[0]
+            if use_dynamic_bsz:
+                seq_len_effective = attn.sum(dim=1)
+                workloads = calculate_workload(seq_len_effective).cpu().tolist()
+                # Partition indices into `num_micro_batches` buckets (not necessarily equal-size).
+                partitions = get_seqlen_balanced_partitions(workloads, k_partitions=num_micro_batches, equal_size=False)
+                if use_dynamic_bsz_balance:
+                    partitions.sort(
+                        key=lambda part: (
+                            sum(workloads[idx] for idx in part),
+                            part[0] if part else 0,
+                        ),
+                        reverse=True,
+                    )
+                    partitions = partitions[::2][::-1] + partitions[1::2]
+            else:
+                # Fixed micro-bsz: contiguous partitions.
+                partitions = []
+                mbs = int(micro_batch_size)
+                for start in range(0, bsz, mbs):
+                    partitions.append(list(range(start, min(bsz, start + mbs))))
+                # Pad with empty partitions if needed (shouldn't happen), to keep alignment.
+                while len(partitions) < num_micro_batches:
+                    partitions.append([])
+                partitions = partitions[:num_micro_batches]
+
+            dp_micro_batch_indices.append(partitions)
+
+            # Only keep keys needed for mapping to minimize host memory.
+            mb_list: list[dict] = []
+            for part in partitions:
+                mb_list.append(
+                    {
+                        "attention_mask": attn[part],
+                        "routed_experts": rex[part],
+                    }
+                )
+            dp_micro_batches.append(mb_list)
+
+        global_micro_batches: list[dict] = []
+        for mb_idx in range(num_micro_batches):
+            attn_list = []
+            rex_list = []
+            for dp in range(dp_size):
+                mb = dp_micro_batches[dp][mb_idx]
+                attn_list.append(mb["attention_mask"])
+                rex_list.append(mb["routed_experts"])
+            global_micro_batches.append(
+                {
+                    "attention_mask": torch.cat(attn_list, dim=0),
+                    "routed_experts": torch.cat(rex_list, dim=0),
+                }
+            )
+
+        logical_to_physical_mapping_list = compute_micro_batch_logical_to_physical_mapping_list(
+            global_micro_batches,
+            ep_size=int(ep_size),
+            num_experts=int(num_experts),
+            tie_break=tie_break,
+        )
+
+        out = {
+            "dp_batches": tuple(dp_batches),
+            "dp_micro_batch_indices": tuple(dp_micro_batch_indices),
+            "num_micro_batches": int(num_micro_batches),
+            "logical_to_physical_mapping_list": logical_to_physical_mapping_list,
+            "ep_size": int(ep_size),
+            "num_experts": int(num_experts),
+            "dp_size": int(dp_size),
+            "use_dynamic_bsz": bool(use_dynamic_bsz),
+            "max_token_len": int(max_token_len) if max_token_len is not None else None,
+            "micro_batch_size": int(micro_batch_size) if micro_batch_size is not None else None,
+        }
+
+        return out
+    
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1518,6 +1725,11 @@ class PSRL_RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        if self.config.eplb.enable_batch_level_eplb:
+            self.expert_load_monitor = ExpertLoadMonitor.remote(
+                eplb_config=self.config.eplb
+            )
+
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1533,6 +1745,49 @@ class PSRL_RayPPOTrainer:
             is_last_step = self.global_steps == self.total_training_steps
 
             with marked_timer("step", timing_raw):
+                with marked_timer("call_analyze_expert_load", timing_raw, color="green"):
+                    if (
+                        self.expert_load_monitor is not None and
+                        self.last_routed_experts is not None and
+                        self.last_attention_mask is not None
+                    ):
+                        ep_size = OmegaConf.select(
+                            self.config,
+                            "train_actor_rollout_ref.actor.megatron.expert_model_parallel_size",
+                        )
+                        if ep_size is None:
+                            ep_size = OmegaConf.select(
+                                self.config,
+                                "train_actor_rollout_ref.rollout.expert_model_parallel_size",
+                            )
+                        if ep_size is None:
+                            ep_size = 1
+
+                        routed_experts = self.last_routed_experts
+                        num_experts = int(routed_experts.max().item()) + 1
+
+                        self.expert_load_monitor.analyze_expert_load.remote(
+                            routed_experts=routed_experts,
+                            attention_mask=self.last_attention_mask,
+                            ep_size=int(ep_size),
+                            logical_to_physical_mapping=self.latest_logical_to_physical_mapping,
+                            num_experts=num_experts,
+                        )
+                with marked_timer("get_and_maybe_change_mapping", timing_raw, color="blue"):
+                    if self.expert_load_monitor is not None:
+                        new_mapping = ray.get(self.expert_load_monitor.get_new_mapping.remote())
+                        if new_mapping is not None:
+                            self.actor_wg.change_expert_mapping(new_mapping)
+                            self.critic_wg.change_expert_mapping(new_mapping)
+                            self.latest_logical_to_physical_mapping = new_mapping
+
+                # if self.config.eplb.enable_micro_batch_level_eplb:
+                #     start_time = time.time()
+                #     self.actor_wg.update_moe_cpu_weights()
+                #     self.critic_wg.update_moe_cpu_weights()
+                #     end_time = time.time()
+                #     print(f"eplbdebug, update_moe_cpu_weights took {end_time - start_time} seconds")
+
                 # Wait for the training batch to be ready
                 with marked_timer("wait_for_gen", timing_raw, color="gray"):
                     if not self.config.psrl.colocate:
@@ -1591,6 +1846,9 @@ class PSRL_RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                self.last_routed_experts = batch.batch["routed_experts"] if batch is not None and "routed_experts" in batch.batch else None
+                self.last_attention_mask = batch.batch["attention_mask"] if batch is not None and "attention_mask" in batch.batch else None
+
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1632,13 +1890,28 @@ class PSRL_RayPPOTrainer:
                     batch.batch.pop("rollout_log_probs")
                 else:
                     # recompute log_probs in the training side
+                    with marked_timer("pack_and_compute_expert_mapping", timing_raw, color="blue"):
+                        if self.config.eplb.enable_micro_batch_level_eplb:
+                            pack_out = self._pack_and_compute_expert_mapping(batch)
+                            dp_batches = pack_out["dp_batches"]
+                            dp_micro_batch_indices = pack_out["dp_micro_batch_indices"]
+                            logical_to_physical_mapping_list = pack_out["logical_to_physical_mapping_list"]
+                            dp_size = pack_out["dp_size"]
+                            dp_logical_to_physical_mapping_list = tuple(
+                                logical_to_physical_mapping_list for _ in range(dp_size)
+                            )
+
+                            recompute_args = (dp_batches, dp_micro_batch_indices, dp_logical_to_physical_mapping_list)
+                        else:
+                            recompute_args = (batch, )
+                    # recompute log_probs in the training side
                     with marked_timer("recompute_log_prob", timing_raw, color="orange"):
                         with log_dual_events(
                             "Recompute log_prob on training side",
                             psrl_logger,
                             event_type=EventType.OTHER,
                         ):
-                            recomputed_log_prob = self.actor_wg.compute_log_prob(batch)
+                            recomputed_log_prob = self.actor_wg.compute_log_prob(*recompute_args)
                             entropys = recomputed_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.train_actor_rollout_ref.actor.loss_agg_mode

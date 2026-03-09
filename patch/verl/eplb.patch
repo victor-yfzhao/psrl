@@ -1,0 +1,206 @@
+diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
+index 466402ca..72032bbb 100644
+--- a/verl/workers/actor/megatron_actor.py
++++ b/verl/workers/actor/megatron_actor.py
+@@ -38,6 +38,7 @@ from torch import nn
+ 
+ from verl import DataProto
+ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
++from verl.utils import tensordict_utils as tu
+ from verl.utils.device import get_device_id, get_torch_device
+ from verl.utils.megatron.pipeline_parallel import make_batch_generator
+ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
+@@ -178,7 +179,13 @@ class MegatronPPOActor(BasePPOActor):
+         self.config = config
+ 
+     @GPUMemoryLogger(role="megatron actor", logger=logger)
+-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
++    def compute_log_prob(
++        self, 
++        data: DataProto, 
++        calculate_entropy=False,
++        micro_batch_indices: list[list[int]] | None = None,
++        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
++    ) -> torch.Tensor:
+         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
+ 
+         Args:
+@@ -240,6 +247,8 @@ class MegatronPPOActor(BasePPOActor):
+                     use_dynamic_bsz=use_dynamic_bsz,
+                     micro_batch_size=micro_batch_size,
+                     max_token_len=max_token_len,
++                    micro_batch_indices=micro_batch_indices,
++                    logical_to_physical_mapping_list=logical_to_physical_mapping_list,
+                 )
+                 if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                     # only on last rank. It should be on every tp rank
+@@ -378,6 +387,8 @@ class MegatronPPOActor(BasePPOActor):
+         micro_batch_size=None,
+         max_token_len=None,
+         mini_batch_size=None,
++        micro_batch_indices: list[list[int]] | None = None,
++        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
+     ):
+         """
+         We assume:
+@@ -411,7 +422,16 @@ class MegatronPPOActor(BasePPOActor):
+ 
+         indices = None
+         temperature = data.meta_info["temperature"]
+-        if use_dynamic_bsz:
++        if micro_batch_indices is not None:
++            assert use_dynamic_bsz
++            assert max_token_len is not None
++            micro_batches = []
++            for partition in micro_batch_indices:
++                curr_micro_batch = tu.index_select_tensor_dict(mini_batch.batch, partition)
++                micro_batches.append(curr_micro_batch)
++            indices = micro_batch_indices
++            total_seqlen = max_token_len
++        elif use_dynamic_bsz:
+             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
+             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+             if vpp_size is not None and vpp_size > 1:
+@@ -438,6 +458,13 @@ class MegatronPPOActor(BasePPOActor):
+         # compute input shapes for pp stages
+         n_micro_batch = len(micro_batches)
+ 
++        if forward_only and n_micro_batch > 0:
++            try:
++                if logical_to_physical_mapping_list is not None:
++                    self.actor_module[0].module._modules['module'].decoder.set_expert_mapping(logical_to_physical_mapping_list)
++            except Exception as e:
++                print(f"moedebug, skip per-micro-batch expert placement due to {type(e).__name__}: {e}")
++
+         forward_backward_func = get_forward_backward_func()
+ 
+         def loss_func(output, data, meta_info):
+diff --git a/verl/workers/critic/megatron_critic.py b/verl/workers/critic/megatron_critic.py
+index 781f92b0..475b74d1 100644
+--- a/verl/workers/critic/megatron_critic.py
++++ b/verl/workers/critic/megatron_critic.py
+@@ -31,6 +31,7 @@ from torch import nn
+ 
+ from verl import DataProto
+ from verl.trainer.ppo import core_algos
++from verl.utils import tensordict_utils as tu
+ from verl.utils.device import get_device_id, get_torch_device
+ from verl.utils.megatron.pipeline_parallel import make_batch_generator
+ from verl.utils.profiler import GPUMemoryLogger
+@@ -86,7 +87,12 @@ class MegatronPPOCritic(BasePPOCritic):
+         self.config = config
+ 
+     @GPUMemoryLogger("megatron critic", logger=logger)
+-    def compute_values(self, data: DataProto) -> DataProto:
++    def compute_values(
++        self, 
++        data: DataProto,
++        micro_batch_indices: list[list[int]] | None = None,
++        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
++    ) -> DataProto:
+         responses = data.batch["responses"]
+         attention_mask = data.batch["attention_mask"]
+         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
+@@ -105,6 +111,8 @@ class MegatronPPOCritic(BasePPOCritic):
+                 micro_batch_size=micro_batch_size,
+                 max_token_len=max_token_len,
+                 mini_batch_size=None,
++                micro_batch_indices=micro_batch_indices,
++                logical_to_physical_mapping_list=logical_to_physical_mapping_list,
+             )
+             if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                 # only on last rank. It should be on every tp rank
+@@ -159,6 +167,8 @@ class MegatronPPOCritic(BasePPOCritic):
+         micro_batch_size=None,
+         max_token_len=None,
+         mini_batch_size=None,
++        micro_batch_indices: list[list[int]] | None = None,
++        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
+     ):
+         # broadcast from last pp rank to all other pp ranks
+         data.to(get_device_id())
+@@ -174,7 +184,16 @@ class MegatronPPOCritic(BasePPOCritic):
+         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
+ 
+         indices = None
+-        if use_dynamic_bsz:
++        if micro_batch_indices is not None:
++            assert use_dynamic_bsz
++            assert max_token_len is not None
++            micro_batches = []
++            for partition in micro_batch_indices:
++                curr_micro_batch = tu.index_select_tensor_dict(mini_batch.batch, partition)
++                micro_batches.append(curr_micro_batch)
++            indices = micro_batch_indices
++            total_seqlen = max_token_len
++        elif use_dynamic_bsz:
+             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
+             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+             if vpp_size is not None and vpp_size > 1:
+@@ -200,6 +219,13 @@ class MegatronPPOCritic(BasePPOCritic):
+             total_seqlen = micro_batch_size * seq_len
+         n_micro_batch = len(micro_batches)
+ 
++        if forward_only and n_micro_batch > 0:
++            try:
++                if logical_to_physical_mapping_list is not None:
++                    self.critic_module[0].module._modules['module'].decoder.set_expert_mapping(logical_to_physical_mapping_list)
++            except Exception as e:
++                print(f"moedebug, skip per-micro-batch expert placement due to {type(e).__name__}: {e}")
++
+         forward_backward_func = get_forward_backward_func()
+ 
+         def loss_func(output, data, meta_info):
+diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
+index db2e3fb1..1a993a15 100644
+--- a/verl/workers/megatron_workers.py
++++ b/verl/workers/megatron_workers.py
+@@ -1208,7 +1208,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
+     @DistProfiler.annotate(color="cyan")
+-    def compute_values(self, data: DataProto):
++    def compute_values(
++        self, 
++        data: DataProto,
++        micro_batch_indices: list[list[int]] | None = None,
++        logical_to_physical_mapping_list: list[torch.Tensor] | None = None,
++    ):
+         micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+         data.meta_info["micro_batch_size"] = micro_batch_size
+         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
+@@ -1216,7 +1221,11 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         data = data.to(get_device_id())
+         if self._is_offload_param:
+             load_megatron_model_to_gpu(self.critic_module)
+-        values = self.critic.compute_values(data=data)
++        values = self.critic.compute_values(
++            data=data,
++            micro_batch_indices=micro_batch_indices,
++            logical_to_physical_mapping_list=logical_to_physical_mapping_list
++        )
+         output = DataProto.from_dict(tensors={"values": values})
+         output = output.to("cpu")
+         if self._is_offload_param:
+@@ -1276,6 +1285,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         if self._is_offload_param:
+             offload_megatron_model_to_cpu(self.critic_module)
+ 
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def change_expert_mapping(self, new_logical_to_physical_expert_mapping):
++        # megatron param change
++        self.critic_module[0].module._modules['module'].decoder.change_expert_mapping(new_logical_to_physical_expert_mapping)
++        # megatron optimizer change
++        if self._is_offload_optimizer:
++            load_megatron_optimizer(self.critic_optimizer)
++        self.critic_optimizer.chained_optimizers[1].change_expert_mapping(new_logical_to_physical_expert_mapping)
++        if self._is_offload_optimizer:
++            offload_megatron_optimizer(self.critic_optimizer)
++
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def update_moe_cpu_weights(self):
++        self.critic_module[0].module._modules['module'].decoder.update_moe_cpu_weights()
++
+ 
+ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+     """

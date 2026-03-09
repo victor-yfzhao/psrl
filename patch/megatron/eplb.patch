@@ -1,0 +1,1933 @@
+diff --git a/core/extensions/transformer_engine.py b/core/extensions/transformer_engine.py
+index 5bf25ad..2c262ff 100644
+--- a/core/extensions/transformer_engine.py
++++ b/core/extensions/transformer_engine.py
+@@ -1324,9 +1324,30 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+             num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
+             local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
+             ep_axis = len(sharded_offsets)
++
++            physical_to_logical = getattr(self, "_physical_to_logical_expert_idx", None)
++
++            def _map_expert_global_idx(physical_expert_idx: int) -> int:
++                if physical_to_logical is None:
++                    return physical_expert_idx
++                if isinstance(physical_to_logical, Tensor):
++                    if physical_to_logical.numel() != num_global_experts:
++                        raise ValueError(
++                            "Invalid _physical_to_logical_expert_idx length for TEGroupedLinear "
++                            f"(expected {num_global_experts}, got {physical_to_logical.numel()})."
++                        )
++                    return int(physical_to_logical.view(-1)[physical_expert_idx].item())
++                if len(physical_to_logical) != num_global_experts:
++                    raise ValueError(
++                        "Invalid _physical_to_logical_expert_idx length for TEGroupedLinear "
++                        f"(expected {num_global_experts}, got {len(physical_to_logical)})."
++                    )
++                return int(physical_to_logical[physical_expert_idx])
++
+             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
+             for gemm_idx in range(self.num_gemms):
+-                global_expert_idx = local_expert_indices_offset + gemm_idx
++                physical_expert_idx = local_expert_indices_offset + gemm_idx
++                global_expert_idx = _map_expert_global_idx(physical_expert_idx)
+                 state_dict = {
+                     f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
+diff --git a/core/optimizer/distrib_optimizer.py b/core/optimizer/distrib_optimizer.py
+index aca60bc..cebd50a 100644
+--- a/core/optimizer/distrib_optimizer.py
++++ b/core/optimizer/distrib_optimizer.py
+@@ -5,6 +5,7 @@
+ 
+ import gc
+ import itertools
++import re
+ from collections import ChainMap
+ from dataclasses import replace
+ from logging import getLogger
+@@ -924,6 +925,354 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+             for key in dst_tensors:
+                 dst_tensors[key].copy_(tensors[key])
+ 
++    @staticmethod
++    def _invert_permutation(logical_to_physical: torch.Tensor) -> torch.Tensor:
++        """Invert a permutation mapping.
++
++        Args:
++            logical_to_physical: 1D int64 tensor where mapping[l] = p.
++
++        Returns:
++            physical_to_logical: 1D int64 tensor where inv[p] = l.
++        """
++        if logical_to_physical.dtype != torch.int64:
++            logical_to_physical = logical_to_physical.to(dtype=torch.int64)
++        num_experts = int(logical_to_physical.numel())
++        physical_to_logical = torch.empty_like(logical_to_physical)
++        physical_to_logical.scatter_(
++            0,
++            logical_to_physical,
++            torch.arange(num_experts, device=logical_to_physical.device, dtype=torch.int64),
++        )
++        return physical_to_logical
++
++
++    @torch.no_grad()
++    def change_expert_mapping(
++        self,
++        logical_to_physical_expert_mapping: torch.Tensor,
++        *,
++        current_logical_to_physical_expert_mapping: Optional[torch.Tensor] = None,
++        moe_layer_cls_path: str = "megatron.core.transformer.moe.moe_layer.MoELayer",
++        strict: bool = True,
++    ) -> None:
++        """Migrate optimizer states for MoE expert placement changes (DP=1 only).
++
++        This implementation is intentionally DP=1-specific:
++        - It assumes each parameter's optimizer state tensors are *full* (unsharded).
++        - It assumes expert parameters are per-local-slot, with names ending in an integer
++          slot suffix, e.g. `linear_fc1.weight0`, `linear_fc2.weight3` (TEGroupedMLP style).
++        - It packs all optimizer tensors for a layer into a single contiguous buffer and runs
++          exactly one `all_to_all_single` per MoE layer.
++
++        Supported optimizer tensors: float32 `param`, `exp_avg`, `exp_avg_sq`.
++        """
++        if logical_to_physical_expert_mapping is None:
++            raise ValueError("logical_to_physical_expert_mapping must not be None")
++        if logical_to_physical_expert_mapping.dim() != 2:
++            raise ValueError(
++                f"Expected mapping shape [num_layers, num_experts], got {tuple(logical_to_physical_expert_mapping.shape)}"
++            )
++        if logical_to_physical_expert_mapping.dtype != torch.int64:
++            logical_to_physical_expert_mapping = logical_to_physical_expert_mapping.to(
++                dtype=torch.int64
++            )
++
++        if current_logical_to_physical_expert_mapping is not None:
++            if current_logical_to_physical_expert_mapping.shape != logical_to_physical_expert_mapping.shape:
++                raise ValueError(
++                    "current_logical_to_physical_expert_mapping must have same shape as logical_to_physical_expert_mapping"
++                )
++            if current_logical_to_physical_expert_mapping.dtype != torch.int64:
++                current_logical_to_physical_expert_mapping = current_logical_to_physical_expert_mapping.to(
++                    dtype=torch.int64
++                )
++
++        # Track current mapping per layer for successive remaps.
++        if not hasattr(self, "_logical_to_physical_expert_mapping_by_layer"):
++            self._logical_to_physical_expert_mapping_by_layer = {}
++
++        module_path, cls_name = moe_layer_cls_path.rsplit(".", 1)
++        moe_mod = __import__(module_path, fromlist=[cls_name])
++        MoELayerCls = getattr(moe_mod, cls_name)
++
++        moe_layers = []
++        for chunk in getattr(self, "model_chunks", []):
++            for m in chunk.modules():
++                if isinstance(m, MoELayerCls):
++                    moe_layers.append(m)
++
++        if len(moe_layers) == 0:
++            if strict:
++                raise RuntimeError("No MoELayer modules found in model_chunks")
++            return
++
++        state_keys = ("param", "exp_avg", "exp_avg_sq")
++        name_re = re.compile(r"^(.*?)(\\d+)$")
++
++        for moe_layer in moe_layers:
++            layer_no = int(getattr(moe_layer, "layer_number", -1))
++            if layer_no <= 0:
++                if strict:
++                    raise RuntimeError("MoELayer.layer_number is not set")
++                continue
++            layer_idx = layer_no - 1
++            if layer_idx >= logical_to_physical_expert_mapping.shape[0]:
++                if strict:
++                    raise IndexError(
++                        f"Mapping num_layers={logical_to_physical_expert_mapping.shape[0]} does not cover layer_number={layer_no}"
++                    )
++                continue
++
++            ep_group = getattr(moe_layer, "ep_group", None)
++            if ep_group is None:
++                if strict:
++                    raise RuntimeError("MoELayer.ep_group is missing")
++                continue
++
++            ep_size = torch.distributed.get_world_size(group=ep_group)
++            ep_rank = torch.distributed.get_rank(group=ep_group)
++            num_local_experts = int(getattr(moe_layer, "num_local_experts", 0))
++            if num_local_experts <= 0:
++                if strict:
++                    raise RuntimeError("MoELayer.num_local_experts is missing/invalid")
++                continue
++            num_global_experts = ep_size * num_local_experts
++
++            new_l2p = logical_to_physical_expert_mapping[layer_idx].contiguous().view(-1)
++            if new_l2p.numel() != num_global_experts:
++                if strict:
++                    raise ValueError(
++                        f"Mapping row length mismatch for layer {layer_no}: expected {num_global_experts}, got {new_l2p.numel()}"
++                    )
++                continue
++            if strict:
++                if new_l2p.min().item() < 0 or new_l2p.max().item() >= num_global_experts:
++                    raise ValueError("Mapping entries out of range")
++                if torch.unique(new_l2p).numel() != num_global_experts:
++                    raise ValueError("Mapping must be a permutation")
++
++            if current_logical_to_physical_expert_mapping is not None:
++                cur_l2p = current_logical_to_physical_expert_mapping[layer_idx].contiguous().view(-1)
++            else:
++                cur_l2p = self._logical_to_physical_expert_mapping_by_layer.get(layer_idx, None)
++            if cur_l2p is None:
++                cur_l2p = torch.arange(
++                    num_global_experts, dtype=torch.int64, device=new_l2p.device
++                )
++            else:
++                cur_l2p = cur_l2p.to(dtype=torch.int64, device=new_l2p.device)
++
++            cur_p2l = self._invert_permutation(cur_l2p)
++            new_p2l = self._invert_permutation(new_l2p)
++
++            send_plan: list[list[tuple[int, int]]] = [[] for _ in range(ep_size)]
++            recv_plan: list[list[tuple[int, int]]] = [[] for _ in range(ep_size)]
++
++            for src_slot in range(num_local_experts):
++                physical_id = ep_rank * num_local_experts + src_slot
++                logical_id = int(cur_p2l[physical_id].item())
++                dst_physical = int(new_l2p[logical_id].item())
++                dst_rank = dst_physical // num_local_experts
++                dst_slot = dst_physical % num_local_experts
++                send_plan[dst_rank].append((src_slot, int(dst_slot)))
++
++            for dst_slot in range(num_local_experts):
++                physical_id = ep_rank * num_local_experts + dst_slot
++                logical_id = int(new_p2l[physical_id].item())
++                src_physical = int(cur_l2p[logical_id].item())
++                src_rank = src_physical // num_local_experts
++                src_slot = src_physical % num_local_experts
++                recv_plan[src_rank].append((int(src_slot), dst_slot))
++
++            for peer in range(ep_size):
++                send_plan[peer].sort(key=lambda x: x[1])
++                recv_plan[peer].sort(key=lambda x: x[1])
++
++            experts_module = getattr(moe_layer, "experts", None)
++            if experts_module is None:
++                if strict:
++                    raise RuntimeError("MoELayer.experts is missing")
++                continue
++
++            # Collect per-slot expert parameters.
++            # Preferred: detect TEGroupedMLP / TE GroupedLinear style attributes `weight{i}` / `bias{i}`.
++            named_mods = dict(experts_module.named_modules())
++            per_slot_template: list[tuple[str, str]] = []  # (module_name, base_attr)
++            for mod_name, mod in named_mods.items():
++                for base_attr in ("weight", "bias"):
++                    attr0 = f"{base_attr}0"
++                    if not hasattr(mod, attr0):
++                        continue
++                    p0 = getattr(mod, attr0)
++                    if isinstance(p0, torch.nn.Parameter) and p0.requires_grad:
++                        per_slot_template.append((mod_name, base_attr))
++
++            slot_to_params: dict[int, list[torch.nn.Parameter]] = {}
++            if len(per_slot_template) > 0:
++                per_slot_template.sort(key=lambda x: (x[0], x[1]))
++                for slot in range(num_local_experts):
++                    params_this_slot: list[torch.nn.Parameter] = []
++                    for mod_name, base_attr in per_slot_template:
++                        mod = named_mods[mod_name]
++                        attr = f"{base_attr}{slot}"
++                        if not hasattr(mod, attr):
++                            if strict:
++                                raise RuntimeError(
++                                    f"Missing per-slot attribute {attr} on module '{mod_name}' in layer {layer_no}"
++                                )
++                            continue
++                        p = getattr(mod, attr)
++                        if not isinstance(p, torch.nn.Parameter) or not p.requires_grad:
++                            if strict:
++                                raise RuntimeError(
++                                    f"Attribute {attr} on module '{mod_name}' is not a trainable Parameter in layer {layer_no}"
++                                )
++                            continue
++                        params_this_slot.append(p)
++                    slot_to_params[slot] = params_this_slot
++            else:
++                # Fallback: try parsing names that end with digits.
++                slot_to_base_to_param: dict[int, dict[str, torch.nn.Parameter]] = {}
++                for name, p in experts_module.named_parameters(recurse=True):
++                    if not isinstance(p, torch.nn.Parameter) or not p.requires_grad:
++                        continue
++                    m = name_re.match(name)
++                    if m is None:
++                        continue
++                    base, slot_s = m.group(1), m.group(2)
++                    slot = int(slot_s)
++                    if slot < 0 or slot >= num_local_experts:
++                        continue
++                    slot_to_base_to_param.setdefault(slot, {})
++                    if base in slot_to_base_to_param[slot]:
++                        if strict:
++                            raise RuntimeError(
++                                f"Duplicate per-slot param base '{base}' for slot {slot} in layer {layer_no}"
++                            )
++                        continue
++                    slot_to_base_to_param[slot][base] = p
++                if 0 in slot_to_base_to_param:
++                    base_names = sorted(slot_to_base_to_param[0].keys())
++                    if strict:
++                        for s in range(num_local_experts):
++                            if sorted(slot_to_base_to_param.get(s, {}).keys()) != base_names:
++                                raise RuntimeError(
++                                    f"Per-slot param sets differ across slots in layer {layer_no}; expected identical param structure per slot"
++                                )
++                    for s in range(num_local_experts):
++                        slot_to_params[s] = [slot_to_base_to_param[s][b] for b in base_names]
++
++            if strict:
++                missing_slots = [
++                    s for s in range(num_local_experts) if s not in slot_to_params or len(slot_to_params[s]) == 0
++                ]
++                if len(missing_slots) > 0:
++                    raise RuntimeError(
++                        f"Missing per-slot expert params for slots {missing_slots} in layer {layer_no}; expected per-slot Parameters like weight{{i}}/bias{{i}} (or names ending with digits)"
++                    )
++
++            # Build ordered flat tensor views per slot.
++            slot_state_views: list[list[torch.Tensor]] = [[] for _ in range(num_local_experts)]
++            payload_per_slot: Optional[int] = None
++            device: Optional[torch.device] = None
++
++            for slot in range(num_local_experts):
++                total = 0
++                for model_param in slot_to_params[slot]:
++                    tensors = self._get_main_param_and_optimizer_states(model_param)
++                    for k in state_keys:
++                        if k not in tensors:
++                            if strict:
++                                raise KeyError(
++                                    f"Optimizer state key {k} missing for expert param in layer {layer_no}"
++                                )
++                            continue
++                        t = tensors[k]
++                        if t.dtype != torch.float32:
++                            raise ValueError(
++                                f"Only float32 supported for optimizer tensor '{k}', got dtype={t.dtype}"
++                            )
++                        if not t.is_contiguous():
++                            raise ValueError(
++                                f"Optimizer tensor '{k}' is non-contiguous; DP=1 path expects contiguous tensors"
++                            )
++                        if t.dim() != 1:
++                            t = t.view(-1)
++                        slot_state_views[slot].append(t)
++                        total += int(t.numel())
++                        if device is None:
++                            device = t.device
++
++                if payload_per_slot is None:
++                    payload_per_slot = total
++                elif strict and total != payload_per_slot:
++                    raise RuntimeError(
++                        f"Per-slot optimizer-state payload size differs across slots in layer {layer_no}: slot0={payload_per_slot} slot{slot}={total}"
++                    )
++
++            if payload_per_slot is None or payload_per_slot == 0:
++                if strict:
++                    raise RuntimeError(f"No optimizer tensors collected for layer {layer_no}")
++                continue
++            assert device is not None
++
++            input_split_sizes: list[int] = [0 for _ in range(ep_size)]
++            output_split_sizes: list[int] = [0 for _ in range(ep_size)]
++            for peer in range(ep_size):
++                input_split_sizes[peer] = len(send_plan[peer]) * payload_per_slot
++                output_split_sizes[peer] = len(recv_plan[peer]) * payload_per_slot
++
++            total_send = sum(input_split_sizes)
++            total_recv = sum(output_split_sizes)
++            if total_send == 0 and total_recv == 0:
++                self._logical_to_physical_expert_mapping_by_layer[layer_idx] = new_l2p.detach().clone().to(
++                    device="cpu"
++                )
++                continue
++
++            sendbuf = torch.empty((total_send,), dtype=torch.float32, device=device)
++            recvbuf = torch.empty((total_recv,), dtype=torch.float32, device=device)
++
++            # Pack: by peer, then by dst_slot order.
++            cursor = 0
++            for peer in range(ep_size):
++                for (src_slot, _dst_slot) in send_plan[peer]:
++                    for t in slot_state_views[src_slot]:
++                        n = int(t.numel())
++                        sendbuf[cursor : cursor + n].copy_(t)
++                        cursor += n
++            if cursor != total_send:
++                raise RuntimeError(
++                    f"Internal packing error: cursor={cursor} total_send={total_send}"
++                )
++
++            torch.distributed.all_to_all_single(
++                recvbuf,
++                sendbuf,
++                output_split_sizes=output_split_sizes,
++                input_split_sizes=input_split_sizes,
++                group=ep_group,
++            )
++
++            # Unpack: by peer, then by dst_slot order.
++            cursor = 0
++            for peer in range(ep_size):
++                for (_src_slot, dst_slot) in recv_plan[peer]:
++                    for t in slot_state_views[dst_slot]:
++                        n = int(t.numel())
++                        t.copy_(recvbuf[cursor : cursor + n])
++                        cursor += n
++            if cursor != total_recv:
++                raise RuntimeError(
++                    f"Internal unpacking error: cursor={cursor} total_recv={total_recv}"
++                )
++
++            self._logical_to_physical_expert_mapping_by_layer[layer_idx] = new_l2p.detach().clone().to(
++                device="cpu"
++            )
++
++
+     def get_parameter_state_dp_reshardable(self):
+         """Get internal representation of parameter state without any copies and modifications.
+ 
+diff --git a/core/transformer/moe/expert_weight_manager.py b/core/transformer/moe/expert_weight_manager.py
+new file mode 100644
+index 0000000..9a8de3b
+--- /dev/null
++++ b/core/transformer/moe/expert_weight_manager.py
+@@ -0,0 +1,425 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Dict, Optional, Tuple
++
++import threading
++
++import torch
++import torch.distributed
++
++@dataclass
++class _TEGroupedMLPExpertState:
++    fc1_weight: torch.Tensor
++    fc2_weight: torch.Tensor
++
++
++class MoEExpertWeightManager:
++    """Manages per-layer MoE expert weights cached on CPU and supports async CPU<->GPU copies.
++
++    This manager is intentionally lightweight and inference-only:
++    - No optimizer/grad support.
++    - Copies are done via a dedicated CUDA stream to overlap with compute.
++
++    Notes/assumptions (can be extended later):
++    - Currently supports experts implementations where per-expert weights can be sliced/assigned
++      efficiently (GroupedMLP, SequentialMLP).
++    - The CPU cache stores this-rank's TP shard for each expert.
++    """
++
++    def __init__(self, device: Optional[torch.device] = None):
++        self._device = device
++        self._copy_stream: Optional[torch.cuda.Stream] = None
++        self._refresh_stream: Optional[torch.cuda.Stream] = None
++
++        # layer_number -> (logical_expert_id -> state)
++        self._cpu_cache: Dict[int, Dict[int, object]] = {}
++
++        # layer_number -> (microbatch_id last scheduled, cuda event)
++        self._layer_load_event: Dict[int, Tuple[int, torch.cuda.Event]] = {}
++
++        # CPU refresh event (global)
++        self._cpu_refresh_event: Optional[torch.cuda.Event] = None
++        self._cpu_refresh_pending: bool = False
++
++        # Background refresh task state (thread-based to share _cpu_cache).
++        self._cpu_refresh_thread: Optional[threading.Thread] = None
++        self._cpu_refresh_thread_exc: Optional[BaseException] = None
++
++    def start_cpu_refresh_background(self, refresh_fn) -> None:
++        """Run a refresh function in a background thread and return immediately.
++
++        Note: we use a thread (not a process) because the refresh populates this manager's
++        in-memory `_cpu_cache`, which must be visible to the main process.
++        """
++
++        # If a refresh is already running, do not start another one.
++        if self._cpu_refresh_thread is not None and self._cpu_refresh_thread.is_alive():
++            return
++
++        self._cpu_refresh_thread_exc = None
++        self._cpu_refresh_pending = True
++
++        def _runner():
++            try:
++                refresh_fn()
++            except BaseException as e:
++                self._cpu_refresh_thread_exc = e
++            finally:
++                # Pending stays True until wait_for_cpu_refresh_if_needed consumes it.
++                return
++
++        self._cpu_refresh_thread = threading.Thread(
++            target=_runner, name='MoEExpertWeightManager.cpu_refresh', daemon=True
++        )
++        self._cpu_refresh_thread.start()
++
++    def _ensure_streams(self):
++        if not torch.cuda.is_available():
++            raise RuntimeError("MoEExpertWeightManager requires CUDA")
++        if self._copy_stream is None:
++            self._copy_stream = torch.cuda.Stream()
++        if self._refresh_stream is None:
++            # self._refresh_stream = torch.cuda.Stream()
++            self._refresh_stream = torch.cuda.current_stream()
++
++    def is_layer_load_scheduled(self, *, layer_number: int, microbatch_id: int) -> bool:
++        pair = self._layer_load_event.get(int(layer_number), None)
++        if pair is None:
++            return False
++        scheduled_mb, _ = pair
++        return int(scheduled_mb) == int(microbatch_id)
++
++    def wait_for_cpu_refresh_if_needed(self) -> None:
++        # # If a background refresh thread exists, wait for it to finish first.
++        # if self._cpu_refresh_thread is not None:
++        #     self._cpu_refresh_thread.join()
++        #     self._cpu_refresh_thread = None
++
++        # if self._cpu_refresh_thread_exc is not None:
++        #     exc = self._cpu_refresh_thread_exc
++        #     self._cpu_refresh_thread_exc = None
++        #     self._cpu_refresh_pending = False
++        #     raise RuntimeError('CPU refresh background task failed') from exc
++
++        if not self._cpu_refresh_pending:
++            return
++        if self._cpu_refresh_event is not None:
++            torch.cuda.current_stream().wait_event(self._cpu_refresh_event)
++        self._cpu_refresh_pending = False
++
++
++    def _start_cpu_refresh_te_grouped_mlp_all_experts(
++        self,
++        *,
++        layer_number: int,
++        experts_module,
++        ep_group,
++        num_local_experts: int,
++        physical_to_logical: Optional[torch.Tensor] = None,
++    ) -> None:
++        """Async refresh CPU cache for all global experts in this layer (TEGroupedMLP).
++
++        Gathers TE GroupedLinear weights (fc1/fc2) across EP ranks, storing on pinned CPU.
++        """
++        if getattr(experts_module, 'config', None) is not None and getattr(
++            experts_module.config, 'fp8', False
++        ):
++            raise NotImplementedError(
++                "TEGroupedMLP fp8 mode is not supported for expert weight swapping yet"
++            )
++
++        self._ensure_streams()
++
++        if layer_number not in self._cpu_cache:
++            self._cpu_cache[layer_number] = {}
++
++        ep_size = ep_group.size()
++        num_local_experts = int(num_local_experts)
++        num_global_experts = ep_size * num_local_experts
++
++        def _stack_weights(linear_module) -> torch.Tensor:
++            ws = [getattr(linear_module, f'weight{i}').detach().contiguous() for i in range(num_local_experts)]
++            return torch.stack(ws, dim=0)
++
++        with torch.cuda.stream(self._refresh_stream):
++            fc1_local = _stack_weights(experts_module.linear_fc1)
++            fc2_local = _stack_weights(experts_module.linear_fc2)
++
++            fc1_gather = [torch.empty_like(fc1_local) for _ in range(ep_size)]
++            fc2_gather = [torch.empty_like(fc2_local) for _ in range(ep_size)]
++            torch.distributed.all_gather(fc1_gather, fc1_local, group=ep_group)
++            torch.distributed.all_gather(fc2_gather, fc2_local, group=ep_group)
++
++            for ep_rank in range(ep_size):
++                cpu_fc1_rank = torch.empty(
++                    fc1_gather[ep_rank].shape,
++                    dtype=fc1_gather[ep_rank].dtype,
++                    device='cpu',
++                    pin_memory=True,
++                )
++                cpu_fc2_rank = torch.empty(
++                    fc2_gather[ep_rank].shape,
++                    dtype=fc2_gather[ep_rank].dtype,
++                    device='cpu',
++                    pin_memory=True,
++                )
++                cpu_fc1_rank.copy_(fc1_gather[ep_rank], non_blocking=False)
++                cpu_fc2_rank.copy_(fc2_gather[ep_rank], non_blocking=False)
++
++                base_global = ep_rank * num_local_experts
++                for local_slot in range(num_local_experts):
++                    physical_expert_id = base_global + local_slot
++                    logical_expert_id = (
++                        int(physical_to_logical[physical_expert_id].item())
++                        if physical_to_logical is not None
++                        else int(physical_expert_id)
++                    )
++                    self._cpu_cache[layer_number][logical_expert_id] = _TEGroupedMLPExpertState(
++                        fc1_weight=cpu_fc1_rank[local_slot],
++                        fc2_weight=cpu_fc2_rank[local_slot],
++                    )
++
++        #     event = torch.cuda.Event()
++        #     event.record(self._refresh_stream)
++        #     self._cpu_refresh_event = event
++
++        # self._cpu_refresh_pending = True
++
++    def start_cpu_refresh_all_experts(
++        self,
++        *,
++        layer_number: int,
++        experts_module,
++        ep_group,
++        num_local_experts: int,
++        physical_to_logical: Optional[torch.Tensor] = None,
++    ) -> None:
++        from megatron.core.transformer.moe.experts import TEGroupedMLP
++
++        if isinstance(experts_module, TEGroupedMLP):
++            self._start_cpu_refresh_te_grouped_mlp_all_experts(
++                layer_number=layer_number,
++                experts_module=experts_module,
++                ep_group=ep_group,
++                num_local_experts=num_local_experts,
++                physical_to_logical=physical_to_logical,
++            )
++        else:
++            raise NotImplementedError(
++                "CPU refresh currently supports GroupedMLP and TEGroupedMLP only"
++            )
++
++    @staticmethod
++    def invert_logical_to_physical(logical_to_physical: torch.Tensor) -> torch.Tensor:
++        """Compute physical_to_logical from logical_to_physical.
++
++        Expects a 1D int64 mapping of length num_experts.
++        """
++        assert logical_to_physical.dim() == 1
++        if logical_to_physical.dtype != torch.int64:
++            logical_to_physical = logical_to_physical.to(dtype=torch.int64)
++        num_experts = logical_to_physical.numel()
++        device = logical_to_physical.device
++        physical_to_logical = torch.empty((num_experts,), dtype=torch.int64, device=device)
++        physical_to_logical.scatter_(0, logical_to_physical, torch.arange(num_experts, device=device, dtype=torch.int64))
++        return physical_to_logical
++
++
++    @torch.no_grad()
++    def _schedule_te_grouped_mlp_load_for_microbatch(
++        self,
++        *,
++        layer_number: int,
++        experts_module,
++        local_expert_global_ids: torch.Tensor,
++        physical_to_logical: torch.Tensor,
++        microbatch_id: int,
++        compute_event = None
++    ) -> None:
++        """Schedule async CPU->GPU copies for TEGroupedMLP expert weights."""
++        if getattr(experts_module, 'config', None) is not None and getattr(
++            experts_module.config, 'fp8', False
++        ):
++            raise NotImplementedError(
++                "TEGroupedMLP fp8 mode is not supported for expert weight swapping yet"
++            )
++
++        self._ensure_streams()
++        assert self._copy_stream is not None
++
++        if layer_number not in self._cpu_cache:
++            raise RuntimeError(f"No CPU cache for MoE layer {layer_number}")
++
++        desired_logical_global_ids = physical_to_logical.index_select(0, local_expert_global_ids)
++        desired_logical_list = desired_logical_global_ids.tolist()
++        for logical_id in desired_logical_list:
++            if logical_id not in self._cpu_cache[layer_number]:
++                raise KeyError(
++                    f"CPU cache miss for layer {layer_number} logical_expert_id {logical_id}. "
++                    f"Initialize/refresh the CPU cache for all experts first."
++                )
++
++        with torch.cuda.stream(self._copy_stream):
++            if compute_event is not None:
++                self._copy_stream.wait_event(compute_event)
++            for local_slot, logical_id in enumerate(desired_logical_list):
++                state = self._cpu_cache[layer_number][logical_id]
++                if not isinstance(state, _TEGroupedMLPExpertState):
++                    raise TypeError(
++                        f"Unsupported expert state type for TEGroupedMLP load: {type(state).__name__}"
++                    )
++                fc1 = getattr(experts_module.linear_fc1, f'weight{local_slot}')
++                fc2 = getattr(experts_module.linear_fc2, f'weight{local_slot}')
++                fc1.copy_(state.fc1_weight, non_blocking=True)
++                fc2.copy_(state.fc2_weight, non_blocking=True)
++
++            event = torch.cuda.Event()
++            event.record(self._copy_stream)
++            self._layer_load_event[layer_number] = (int(microbatch_id), event)
++
++    @torch.no_grad()
++    def schedule_experts_load_for_microbatch(
++        self,
++        *,
++        layer_number: int,
++        experts_module,
++        local_expert_global_ids: torch.Tensor,
++        physical_to_logical: torch.Tensor,
++        microbatch_id: int,
++        compute_event = None
++    ) -> None:
++        from megatron.core.transformer.moe.experts import TEGroupedMLP
++
++        if isinstance(experts_module, TEGroupedMLP):
++            self._schedule_te_grouped_mlp_load_for_microbatch(
++                layer_number=layer_number,
++                experts_module=experts_module,
++                local_expert_global_ids=local_expert_global_ids,
++                physical_to_logical=physical_to_logical,
++                microbatch_id=microbatch_id,
++                compute_event=compute_event,
++            )
++        else:
++            raise NotImplementedError(
++                "Per-micro-batch expert weight reload currently supports GroupedMLP and TEGroupedMLP only"
++            )
++
++
++    @torch.no_grad()
++    def schedule_experts_load_for_microbatch_all_to_all(
++        self,
++        *,
++        layer_number: int,
++        experts_module,
++        local_expert_global_ids: torch.Tensor,
++        next_p2l: torch.Tensor,
++        next_l2p: torch.Tensor,
++        cur_p2l: torch.Tensor,
++        cur_l2p: torch.Tensor,
++        microbatch_id: int,
++        ep_group,
++        ep_size: int,
++        ep_rank: int,
++        compute_event = None
++    ) -> None:
++        # 假设本函数接受的tensor均位于cpu上，避免不必要的同步
++        self._ensure_streams()
++        assert self._copy_stream is not None
++
++        num_local_experts = int(local_expert_global_ids.numel())
++
++        # send_slots_by_dst_rank[dst_rank] = list of local src_slot (in increasing order)
++        send_slots_by_dst_rank: list[list[int]] = [[] for _ in range(ep_size)]
++        base_old = ep_rank * num_local_experts
++        for src_slot in range(num_local_experts):
++            physical_old = base_old + src_slot
++            logical_id = int(cur_p2l[physical_old].item())
++            physical_new = int(next_l2p[logical_id].item())
++            dst_rank = physical_new // num_local_experts
++            send_slots_by_dst_rank[int(dst_rank)].append(int(src_slot))
++
++        # recv_pairs_by_src_rank[src_rank] = list[(src_slot, dst_slot)] sorted by src_slot
++        recv_pairs_by_src_rank: list[list[tuple]] = [[] for _ in range(ep_size)]
++        base_new = ep_rank * num_local_experts
++        for dst_slot in range(num_local_experts):
++            physical_new = base_new + dst_slot
++            logical_needed = int(next_p2l[physical_new].item())
++            physical_old = int(cur_l2p[logical_needed].item())
++            src_rank = physical_old // num_local_experts
++            src_slot = physical_old % num_local_experts
++            recv_pairs_by_src_rank[int(src_rank)].append((int(src_slot), int(dst_slot)))
++        for src_rank in range(ep_size):
++            recv_pairs_by_src_rank[src_rank].sort(key=lambda x: x[0])
++
++        def _permute_te_grouped_linear_weights_inplace(linear_module) -> None:
++            # Gather per-slot parameters.
++            slot_params = [getattr(linear_module, f'weight{i}') for i in range(num_local_experts)]
++            if len(slot_params) == 0:
++                return
++            dtype = slot_params[0].dtype
++            device = slot_params[0].device
++            chunk_numel = int(slot_params[0].numel())
++            total_elems = num_local_experts * chunk_numel
++            sendbuf = torch.empty((total_elems,), dtype=dtype, device=device)
++            recvbuf = torch.empty((total_elems,), dtype=dtype, device=device)
++
++            input_split_sizes = [len(send_slots_by_dst_rank[r]) * chunk_numel for r in range(ep_size)]
++            output_split_sizes = [len(recv_pairs_by_src_rank[r]) * chunk_numel for r in range(ep_size)]
++            if sum(input_split_sizes) != total_elems or sum(output_split_sizes) != total_elems:
++                raise RuntimeError(
++                    "Invalid all-to-all split sizes for expert permutation "
++                    f"(send={sum(input_split_sizes)}, recv={sum(output_split_sizes)}, expected={total_elems})"
++                )
++
++            # Pack send buffer: grouped by dst_rank, preserving increasing src_slot order.
++            offset = 0
++            for dst_rank in range(ep_size):
++                for src_slot in send_slots_by_dst_rank[dst_rank]:
++                    src_flat = slot_params[src_slot].detach().contiguous().view(-1)
++                    sendbuf[offset : offset + chunk_numel].copy_(src_flat)
++                    offset += chunk_numel
++
++            torch.distributed.all_to_all_single(
++                recvbuf,
++                sendbuf,
++                output_split_sizes=output_split_sizes,
++                input_split_sizes=input_split_sizes,
++                group=ep_group,
++                async_op=False
++            )
++
++            # Unpack recv buffer: grouped by src_rank, in increasing src_slot order.
++            offset = 0
++            for src_rank in range(ep_size):
++                for _, dst_slot in recv_pairs_by_src_rank[src_rank]:
++                    dst_param = slot_params[dst_slot]
++                    dst_param.copy_(recvbuf[offset : offset + chunk_numel].view_as(dst_param))
++                    offset += chunk_numel
++
++        with torch.cuda.stream(self._copy_stream):
++            if compute_event is not None:
++                self._copy_stream.wait_event(compute_event)
++
++            _permute_te_grouped_linear_weights_inplace(experts_module.linear_fc1)
++            _permute_te_grouped_linear_weights_inplace(experts_module.linear_fc2)
++
++            event = torch.cuda.Event()
++            event.record(self._copy_stream)
++            self._layer_load_event[layer_number] = (int(microbatch_id), event)
++
++
++
++    def wait_for_layer_load(self, *, layer_number: int, microbatch_id: int) -> None:
++        pair = self._layer_load_event.get(layer_number, None)
++        if pair is None:
++            return
++        scheduled_mb, event = pair
++        if scheduled_mb != int(microbatch_id):
++            return
++        torch.cuda.current_stream().wait_event(event)
++        del self._layer_load_event[layer_number]
++
++    def clear_cpu_cache(self) -> None:
++        self._cpu_cache.clear()
++    
+diff --git a/core/transformer/moe/experts.py b/core/transformer/moe/experts.py
+index fc741aa..f7c99d3 100644
+--- a/core/transformer/moe/experts.py
++++ b/core/transformer/moe/experts.py
+@@ -327,6 +327,44 @@ class GroupedMLP(MegatronModule):
+         num_global_experts = ep_size * self.num_local_experts
+         local_expert_indices_offset = ep_rank * self.num_local_experts
+ 
++        local_expert_indices = getattr(self, '_local_expert_indices', None)
++        physical_to_logical = getattr(self, '_physical_to_logical_expert_idx', None)
++
++        def _physical_expert_idx_for_local(local_expert_idx: int) -> int:
++            if local_expert_indices is None:
++                return local_expert_indices_offset + local_expert_idx
++            if isinstance(local_expert_indices, torch.Tensor):
++                if local_expert_indices.numel() != self.num_local_experts:
++                    raise ValueError(
++                        'Invalid _local_expert_indices length for GroupedMLP '
++                        f'(expected {self.num_local_experts}, got {local_expert_indices.numel()}).'
++                    )
++                return int(local_expert_indices.view(-1)[local_expert_idx].item())
++            if len(local_expert_indices) != self.num_local_experts:
++                raise ValueError(
++                    'Invalid _local_expert_indices length for GroupedMLP '
++                    f'(expected {self.num_local_experts}, got {len(local_expert_indices)}).'
++                )
++            return int(local_expert_indices[local_expert_idx])
++
++        def _map_expert_global_idx(physical_expert_idx: int) -> int:
++            if physical_to_logical is None:
++                return physical_expert_idx
++            if isinstance(physical_to_logical, torch.Tensor):
++                if physical_to_logical.numel() != num_global_experts:
++                    raise ValueError(
++                        'Invalid _physical_to_logical_expert_idx length for GroupedMLP '
++                        f'(expected {num_global_experts}, got {physical_to_logical.numel()}).'
++                    )
++                return int(physical_to_logical.view(-1)[physical_expert_idx].item())
++            # Accept list/tuple as well.
++            if len(physical_to_logical) != num_global_experts:
++                raise ValueError(
++                    'Invalid _physical_to_logical_expert_idx length for GroupedMLP '
++                    f'(expected {num_global_experts}, got {len(physical_to_logical)}).'
++                )
++            return int(physical_to_logical[physical_expert_idx])
++
+         prepend_axis_num = len(sharded_offsets)
+         replica_id = (0, 0, dp_rank)
+ 
+@@ -347,7 +385,8 @@ class GroupedMLP(MegatronModule):
+                 self.num_local_experts,
+             )
+             for local_expert_idx, expert_ten in enumerate(experts_ten):
+-                global_expert_idx = local_expert_indices_offset + local_expert_idx
++                physical_expert_idx = _physical_expert_idx_for_local(local_expert_idx)
++                global_expert_idx = _map_expert_global_idx(physical_expert_idx)
+                 expert_key = key.replace(
+                     f'{prefix}experts.', f'{prefix}experts.{global_expert_idx}.'
+                 )
+@@ -495,7 +534,8 @@ class GroupedMLP(MegatronModule):
+                         v_tensors = []
+                         w_lens = []
+                         v_lens = []
+-                        expert_global_idx = local_expert_indices_offset + local_expert_idx
++                        physical_expert_idx = _physical_expert_idx_for_local(local_expert_idx)
++                        expert_global_idx = _map_expert_global_idx(physical_expert_idx)
+                         for input_dim_idx in range(self.config.hidden_size):
+                             for glu_idx in range(2):
+                                 local_idx = (
+@@ -619,7 +659,8 @@ class GroupedMLP(MegatronModule):
+                                 == local_flattened_range.stop - local_flattened_range.start
+                             )
+                             start_pos += len(local_tensor)
+-                            expert_global_idx = local_expert_indices_offset + local_expert_idx
++                            physical_expert_idx = _physical_expert_idx_for_local(local_expert_idx)
++                            expert_global_idx = _map_expert_global_idx(physical_expert_idx)
+                             sub_states.append(
+                                 ShardedTensor.from_rank_offsets_flat(
+                                     key,
+@@ -715,7 +756,8 @@ class GroupedMLP(MegatronModule):
+         replica_id = (0, tp_rank, dp_rank)
+         # Add fake _extra_state to be compatible with SequentialMLP
+         for expert_local_idx in range(self.num_local_experts):
+-            expert_global_idx = local_expert_indices_offset + expert_local_idx
++            physical_expert_idx = _physical_expert_idx_for_local(expert_local_idx)
++            expert_global_idx = _map_expert_global_idx(physical_expert_idx)
+             if singleton_local_shards:
+                 expert_sharded_offsets = sharded_offsets
+             else:
+@@ -960,19 +1002,65 @@ class TEGroupedMLP(MegatronModule):
+         """
+         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+         sharded_state_dict = {}
++
++        num_global_experts = self.ep_group.size() * self.num_local_experts
++        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
++        local_expert_indices = getattr(self, '_local_expert_indices', None)
++        physical_to_logical = getattr(self, '_physical_to_logical_expert_idx', None)
++
++
++        def _physical_expert_idx_for_local(local_expert_idx: int) -> int:
++            if local_expert_indices is None:
++                return local_expert_indices_offset + local_expert_idx
++            if isinstance(local_expert_indices, torch.Tensor):
++                if local_expert_indices.numel() != self.num_local_experts:
++                    raise ValueError(
++                        'Invalid _local_expert_indices length for TEGroupedMLP '
++                        f'(expected {self.num_local_experts}, got {local_expert_indices.numel()}).'
++                    )
++                return int(local_expert_indices.view(-1)[local_expert_idx].item())
++            if len(local_expert_indices) != self.num_local_experts:
++                raise ValueError(
++                    'Invalid _local_expert_indices length for TEGroupedMLP '
++                    f'(expected {self.num_local_experts}, got {len(local_expert_indices)}).'
++                )
++            return int(local_expert_indices[local_expert_idx])
++
++        def _map_expert_global_idx(physical_expert_idx: int) -> int:
++            if physical_to_logical is None:
++                return physical_expert_idx
++            if isinstance(physical_to_logical, torch.Tensor):
++                if physical_to_logical.numel() != num_global_experts:
++                    raise ValueError(
++                        'Invalid _physical_to_logical_expert_idx length for TEGroupedMLP '
++                        f'(expected {num_global_experts}, got {physical_to_logical.numel()}).'
++                    )
++                return int(physical_to_logical.view(-1)[physical_expert_idx].item())
++            if len(physical_to_logical) != num_global_experts:
++                raise ValueError(
++                    'Invalid _physical_to_logical_expert_idx length for TEGroupedMLP '
++                    f'(expected {num_global_experts}, got {len(physical_to_logical)}).'
++                )
++            return int(physical_to_logical[physical_expert_idx])
++
++        # NOTE： 对于TEGroupedMLP而言，下面的逻辑只是处理linear_fc1的gate_up参数切分，
++        # 基本的local_expert -> global_expert是在TEGroupedLinear里处理的，
++        # 因此在TEGroupedLinear里也要加入类似的physical_to_logical映射逻辑以支持专家重排后的checkpoint加载！
+         for name, module in self._modules.items():
++            if physical_to_logical is not None:
++                setattr(module, '_physical_to_logical_expert_idx', physical_to_logical)
+             sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
+             if name == 'linear_fc1' and self.config.gated_linear_unit:
+-                num_global_experts = self.ep_group.size() * self.num_local_experts
+-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                 ep_axis = len(sharded_offsets)
+                 for i in range(self.num_local_experts):
+                     if singleton_local_shards:
+                         new_sharded_offsets = sharded_offsets
+                     else:
++                        physical_expert_idx = _physical_expert_idx_for_local(i)
++                        expert_global_idx = _map_expert_global_idx(physical_expert_idx)
+                         new_sharded_offsets = (
+                             *sharded_offsets,
+-                            (ep_axis, local_expert_indices_offset + i, num_global_experts),
++                            (ep_axis, expert_global_idx, num_global_experts),
+                         )
+                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
+                         if k in sub_sd:
+@@ -1126,10 +1214,48 @@ class SequentialMLP(MegatronModule):
+         num_global_experts = self.ep_group.size() * self.num_local_experts
+         local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+ 
++        local_expert_indices = getattr(self, '_local_expert_indices', None)
++        physical_to_logical = getattr(self, '_physical_to_logical_expert_idx', None)
++
++        def _physical_expert_idx_for_local(local_expert_idx: int) -> int:
++            if local_expert_indices is None:
++                return local_expert_indices_offset + local_expert_idx
++            if isinstance(local_expert_indices, torch.Tensor):
++                if local_expert_indices.numel() != self.num_local_experts:
++                    raise ValueError(
++                        'Invalid _local_expert_indices length for SequentialMLP '
++                        f'(expected {self.num_local_experts}, got {local_expert_indices.numel()}).'
++                    )
++                return int(local_expert_indices.view(-1)[local_expert_idx].item())
++            if len(local_expert_indices) != self.num_local_experts:
++                raise ValueError(
++                    'Invalid _local_expert_indices length for SequentialMLP '
++                    f'(expected {self.num_local_experts}, got {len(local_expert_indices)}).'
++                )
++            return int(local_expert_indices[local_expert_idx])
++
++        def _map_expert_global_idx(physical_expert_idx: int) -> int:
++            if physical_to_logical is None:
++                return physical_expert_idx
++            if isinstance(physical_to_logical, torch.Tensor):
++                if physical_to_logical.numel() != num_global_experts:
++                    raise ValueError(
++                        'Invalid _physical_to_logical_expert_idx length for SequentialMLP '
++                        f'(expected {num_global_experts}, got {physical_to_logical.numel()}).'
++                    )
++                return int(physical_to_logical.view(-1)[physical_expert_idx].item())
++            if len(physical_to_logical) != num_global_experts:
++                raise ValueError(
++                    'Invalid _physical_to_logical_expert_idx length for SequentialMLP '
++                    f'(expected {num_global_experts}, got {len(physical_to_logical)}).'
++                )
++            return int(physical_to_logical[physical_expert_idx])
++
+         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+ 
+         for expert_local_idx, expert in enumerate(self.local_experts):
+-            expert_global_idx = local_expert_indices_offset + expert_local_idx
++            physical_expert_idx = _physical_expert_idx_for_local(expert_local_idx)
++            expert_global_idx = _map_expert_global_idx(physical_expert_idx)
+             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
+             if singleton_local_shards:
+                 expert_sharded_prefix = f'{prefix}experts.{expert_global_idx}.'
+diff --git a/core/transformer/moe/moe_layer.py b/core/transformer/moe/moe_layer.py
+index bbb5fce..6a8f4f6 100644
+--- a/core/transformer/moe/moe_layer.py
++++ b/core/transformer/moe/moe_layer.py
+@@ -2,7 +2,8 @@
+ 
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import Optional, Union
++import os
++from typing import List, Optional, Union
+ 
+ import torch
+ 
+@@ -11,6 +12,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+ from megatron.core.transformer.moe.router import TopKRouter
++from megatron.core.transformer.moe.expert_weight_manager import MoEExpertWeightManager
+ from megatron.core.transformer.moe.token_dispatcher import (
+     MoEAllGatherTokenDispatcher,
+     MoEAlltoAllTokenDispatcher,
+@@ -29,6 +31,8 @@ try:
+ except ImportError:
+     HAVE_TE = False
+ 
++import time
++
+ 
+ @dataclass
+ class MoESubmodules:
+@@ -59,6 +63,8 @@ class BaseMoELayer(MegatronModule, ABC):
+         self.attn_tp_group = pg_collection.tp
+         ep_size = utils.get_pg_size(self.ep_group)
+         ep_rank = utils.get_pg_rank(self.ep_group)
++        self.ep_size = ep_size
++        self.ep_rank = ep_rank
+         assert ep_size > 0, "Expected non-negative expert parallel size"
+ 
+         assert self.config.num_moe_experts % ep_size == 0
+@@ -72,12 +78,36 @@ class BaseMoELayer(MegatronModule, ABC):
+             local_expert_indices_offset + i for i in range(self.num_local_experts)
+         ]
+         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
++
++        # Tensor view of local physical expert slots -> global physical expert ids.
++        # Registered as a (non-persistent) buffer so it is moved to GPU together with
++        # the module, avoiding per-forward allocations.
++        self.register_buffer(
++            'local_expert_indices_tensor',
++            torch.tensor(self.local_expert_indices, dtype=torch.int64),
++            persistent=False,
++        )
++        self.local_expert_indices_tensor_cpu = torch.tensor(self.local_expert_indices, dtype=torch.int64, device="cpu")
++
+         self.router: TopKRouter = None
+         self.experts = None
+         self.shared_experts = None
+         self.token_dispatcher: Optional[MoETokenDispatcher] = None
+         self.layer_number = layer_number
+ 
++        # micro-batch level expert mapping (forward only)
++        self._logical_to_physical_mapping_list: Optional[List[torch.Tensor]] = None
++        self._logical_to_physical_mapping_list_cpu: Optional[List[torch.Tensor]] = None
++        self._physical_to_logical_mapping_list: Optional[List[torch.Tensor]] = None
++        self._physical_to_logical_mapping_list_cpu: Optional[List[torch.Tensor]] = None
++        self._mapping_microbatch_idx: int = 0
++        self._expert_weight_manager: Optional[MoEExpertWeightManager] = None
++
++        # Training-time expert placement state.
++        # If set, this represents the mapping that matches the *current physical placement*
++        # of expert weights in this module.
++        self._current_logical_to_physical_expert_mapping: Optional[torch.Tensor] = None
++
+     @abstractmethod
+     def forward(self, hidden_states):
+         """Forward method for the MoE layer."""
+@@ -120,6 +150,12 @@ class MoELayer(BaseMoELayer):
+             and "shared_experts" in config.recompute_modules
+         )
+ 
++        # batch-level expert mapping
++        self._logical_to_physical_expert_idx: Optional[torch.Tensor] = None
++        self._logical_to_physical_expert_idx_cpu: Optional[torch.Tensor] = None
++        self._physical_to_logical_expert_idx: Optional[torch.Tensor] = None
++        self._physical_to_logical_expert_idx_cpu: Optional[torch.Tensor] = None
++
+         # Initialize router
+         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+ 
+@@ -176,11 +212,156 @@ class MoELayer(BaseMoELayer):
+         """
+         residual = hidden_states
+         probs, routing_map = self.router(hidden_states)
++
++        if self._physical_to_logical_mapping_list is not None:
++            if self._expert_weight_manager is None:
++                raise RuntimeError(
++                    "Expert mapping is enabled but no MoEExpertWeightManager is attached"
++                )
++
++            self._expert_weight_manager.wait_for_cpu_refresh_if_needed()
++
++            mb_idx = self._mapping_microbatch_idx
++            if mb_idx >= len(self._physical_to_logical_mapping_list):
++                raise IndexError(
++                    f"microbatch idx {mb_idx} out of range for mapping list len {len(self._physical_to_logical_mapping_list)}"
++                )
++
++            physical_to_logical = self._physical_to_logical_mapping_list[mb_idx]
++            if physical_to_logical.device != probs.device:
++                physical_to_logical = physical_to_logical.to(
++                    device=probs.device, non_blocking=True
++                )
++
++            layer_no = int(self.layer_number) if self.layer_number is not None else -1
++            if layer_no <= 0:
++                raise RuntimeError("MoELayer.layer_number is not set")
++
++            # Ensure the local physical expert slots have loaded the expected logical experts.
++            assert self._expert_weight_manager.is_layer_load_scheduled(
++                layer_number=layer_no, microbatch_id=mb_idx
++            )
++
++            self._expert_weight_manager.wait_for_layer_load(
++                layer_number=layer_no, microbatch_id=mb_idx
++            )
++
++            probs = probs.index_select(dim=1, index=physical_to_logical)
++            routing_map = routing_map.index_select(dim=1, index=physical_to_logical)
++
++        elif self._physical_to_logical_expert_idx is not None:
++            layer_no = int(self.layer_number) if self.layer_number is not None else -1
++            if layer_no <= 0:
++                raise RuntimeError("MoELayer.layer_number is not set")
++
++            self._expert_weight_manager.wait_for_layer_load(
++                layer_number=layer_no, microbatch_id=-1
++            )
++
++            idx = self._physical_to_logical_expert_idx
++
++            probs = probs.index_select(dim=1, index=idx)
++            routing_map = routing_map.index_select(dim=1, index=idx)
++
+         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+             hidden_states, routing_map, probs
+         )
+         return hidden_states, probs, residual
+ 
++    def _maybe_load_expert_mapping(self) -> None:
++        """Load logic->physical expert mapping if configured.
++
++        Expected mapping format: a 1D tensor/list of length `num_moe_experts` where
++        `mapping[logical_expert] = physical_expert`.
++
++        The mapping must be a permutation of [0, num_experts) for correctness.
++
++        Supported sources (minimal-intrusion):
++        - config.moe_logic_to_physical_mapping_path (if present)
++        - env var MEGATRON_MOE_LOGIC_TO_PHYSICAL_MAPPING_PATH
++
++        Used for static expert mapping, called before init_model.
++        Deprecated after supporting dynamic change_expert_mapping
++        """
++
++        # mapping_path = getattr(self.config, 'moe_logic_to_physical_mapping_path', None)
++        mapping_path = None
++        # if mapping_path is None:
++        #     mapping_path = os.environ.get('MEGATRON_MOE_LOGIC_TO_PHYSICAL_MAPPING_PATH')
++        if not mapping_path:
++            return
++
++        loaded = torch.load(mapping_path, map_location='cpu')
++
++        # Support either a single mapping [E] or per-layer mappings [L, E].
++        if loaded.dim() == 1:
++            mapping = loaded
++        elif loaded.dim() == 2:
++            if self.layer_number is None:
++                raise ValueError(
++                    'Per-layer _logical_to_physical_expert_idx requires layer_number to be set.'
++                )
++            # layer_number in Megatron is 1-based.
++            mapping = loaded[int(self.layer_number) - 1]
++        else:
++            raise ValueError(
++                'Unsupported mapping tensor shape. Expected [num_experts] or [num_layers, num_experts]. '
++                f'Got shape={tuple(loaded.shape)}'
++            )
++
++        mapping = mapping.to(dtype=torch.long, device=torch.cuda.current_device()).view(-1)
++
++        num_experts = int(self.config.num_moe_experts)
++        if mapping.numel() != num_experts:
++            raise ValueError(
++                '_logical_to_physical_expert_idx must have shape [num_experts]. '
++                f'Got numel={mapping.numel()}, num_experts={num_experts}.'
++            )
++
++        if mapping.min().item() < 0 or mapping.max().item() >= num_experts:
++            raise ValueError(
++                f'_logical_to_physical_expert_idx entries must be in [0, {num_experts}).'
++            )
++        if torch.unique(mapping).numel() != num_experts:
++            raise ValueError('_logical_to_physical_expert_idx must be a permutation (one-to-one).')
++
++        # Invert to build a column-index tensor for index_select.
++        # physical_to_logical[p] = l such that mapping[l] == p.
++        physical_to_logical = torch.empty_like(mapping)
++        physical_to_logical[mapping] = torch.arange(
++            num_experts, dtype=torch.long, device=mapping.device
++        )
++
++        # # Fast-path: identity mapping.
++        # if torch.equal(mapping, torch.arange(num_experts, dtype=torch.long, device=mapping.device)):
++        #     return
++
++        self._logical_to_physical_expert_idx = mapping
++        self._logical_to_physical_expert_idx_cpu = mapping.cpu()
++        self._physical_to_logical_expert_idx = physical_to_logical
++        self._physical_to_logical_expert_idx_cpu = physical_to_logical.cpu()
++
++    def set_layer_number(self, layer_number: int):
++        """Set the layer number for the MoE layer.
++
++        Note: MoELayer is instantiated inside TransformerLayer before TransformerLayer finalizes
++        `self.layer_number`. TransformerLayer then calls `self.mlp.set_layer_number(...)`.
++        We hook this moment to lazily load any per-layer expert mapping.
++        """
++        super().set_layer_number(layer_number)
++        if self._physical_to_logical_expert_idx is None:
++            self._maybe_load_expert_mapping()
++
++        # Set the following attributes for static expert mapping
++        # Make the mapping available to expert modules for distributed checkpointing.
++        if self._physical_to_logical_expert_idx is not None and hasattr(self, 'experts'):
++            setattr(self.experts, '_physical_to_logical_expert_idx', self._physical_to_logical_expert_idx)
++
++        # NOTE: 现在仍假设local_expert_indices是连续均匀分配的。目前TEGroupedLinear并不支持自定义local_expert_indices
++        # 实际上目前也没有必要设置其他的local_expert_indices
++        if hasattr(self, 'experts') and hasattr(self, 'local_expert_indices'):
++            setattr(self.experts, '_local_expert_indices', self.local_expert_indices)
++
+     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+         """Dispatches tokens to assigned expert ranks via communication.
+         This method performs the actual communication (e.g., All-to-All) to distribute
+@@ -264,11 +445,77 @@ class MoELayer(BaseMoELayer):
+         # MoE forward: route -> dispatch -> compute -> combine
+         def custom_forward(hidden_states):
+             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
++
+             dispatched_input, probs = self.dispatch(hidden_states, probs)
++
+             output, shared_expert_output, mlp_bias = self.experts_compute(
+                 dispatched_input, probs, residual
+             )
++
+             output = self.combine(output, shared_expert_output)
++
++            compute_event = torch.cuda.Event()
++            compute_event.record(torch.cuda.current_stream())
++
++            # Prefetch next microbatch expert weights asynchronously to overlap with subsequent
++            # transformer layers.
++            if self._physical_to_logical_mapping_list is not None:
++                assert self._expert_weight_manager is not None, "expert_weight_manager must be set if expert mapping is used"
++                next_mb = self._mapping_microbatch_idx + 1
++                cur_physical_to_logical = self._physical_to_logical_mapping_list_cpu[next_mb - 1]
++                cur_logical_to_physical = self._logical_to_physical_mapping_list_cpu[next_mb - 1]
++                if next_mb < len(self._physical_to_logical_mapping_list):
++                    next_physical_to_logical = self._physical_to_logical_mapping_list_cpu[next_mb]
++                    next_logical_to_physical = self._logical_to_physical_mapping_list_cpu[next_mb]
++                    layer_no = int(self.layer_number)
++                    local_ids = self.local_expert_indices_tensor_cpu
++                    self._expert_weight_manager.schedule_experts_load_for_microbatch_all_to_all(
++                        layer_number=layer_no,
++                        experts_module=self.experts,
++                        local_expert_global_ids=local_ids,
++                        next_p2l=next_physical_to_logical,
++                        next_l2p=next_logical_to_physical,
++                        cur_p2l=cur_physical_to_logical,
++                        cur_l2p=cur_logical_to_physical,
++                        ep_group=self.ep_group,
++                        ep_size=self.ep_size,
++                        ep_rank=self.ep_rank,
++                        microbatch_id=next_mb,
++                        compute_event=compute_event,
++                    )
++
++                    # Advance microbatch index after scheduling prefetch.
++                    self._mapping_microbatch_idx += 1
++                elif next_mb == len(self._physical_to_logical_mapping_list):
++                    self._mapping_microbatch_idx += 1
++                    # no more microbatches to prefetch
++
++                    # prefetch self._physical_to_logical_expert_idx for update pass
++                    if self._physical_to_logical_expert_idx is not None:
++                        next_physical_to_logical = self._physical_to_logical_expert_idx_cpu
++                        next_logical_to_physical = self._logical_to_physical_expert_idx_cpu
++                    else:
++                        next_physical_to_logical = torch.arange(self.config.num_moe_experts, dtype=torch.int64, device="cpu")
++                        next_logical_to_physical = torch.arange(self.config.num_moe_experts, dtype=torch.int64, device="cpu")
++                    layer_no = int(self.layer_number)
++                    local_ids = self.local_expert_indices_tensor_cpu
++                    self._expert_weight_manager.schedule_experts_load_for_microbatch_all_to_all(
++                        layer_number=layer_no,
++                        experts_module=self.experts,
++                        local_expert_global_ids=local_ids,
++                        next_p2l=next_physical_to_logical,
++                        next_l2p=next_logical_to_physical,
++                        cur_p2l=cur_physical_to_logical,
++                        cur_l2p=cur_logical_to_physical,
++                        ep_group=self.ep_group,
++                        ep_size=self.ep_size,
++                        ep_rank=self.ep_rank,
++                        microbatch_id=-1,
++                        compute_event=compute_event,
++                    )
++                else:
++                    raise RuntimeError(f"next_mb {next_mb} is larger than {len(self._physical_to_logical_mapping_list)=}")
++
+             return output, mlp_bias
+ 
+         if self.moe_layer_recompute:
+@@ -293,6 +540,219 @@ class MoELayer(BaseMoELayer):
+         if self.use_shared_expert and not self.shared_expert_overlap:
+             self.shared_experts.backward_dw()
+ 
++    @staticmethod
++    def _invert_logical_to_physical(logical_to_physical: torch.Tensor) -> torch.Tensor:
++        """Return physical_to_logical given a 1D logical_to_physical permutation."""
++        if logical_to_physical.dtype != torch.int64:
++            logical_to_physical = logical_to_physical.to(dtype=torch.int64)
++        logical_to_physical = logical_to_physical.view(-1)
++        num_experts = int(logical_to_physical.numel())
++        physical_to_logical = torch.empty((num_experts,), dtype=torch.int64, device=logical_to_physical.device)
++        physical_to_logical.scatter_(
++            0,
++            logical_to_physical,
++            torch.arange(num_experts, dtype=torch.int64, device=logical_to_physical.device),
++        )
++        return physical_to_logical
++
++    @staticmethod
++    def _is_permutation_0_to_n_minus_1(x: torch.Tensor) -> bool:
++        x = x.view(-1)
++        if x.numel() == 0:
++            return False
++        if x.min().item() < 0 or x.max().item() >= x.numel():
++            return False
++        return torch.unique(x).numel() == x.numel()
++
++    @torch.no_grad()
++    def change_expert_mapping(
++        self,
++        logical_to_physical_expert_mapping: torch.Tensor,
++        *,
++        current_logical_to_physical_expert_mapping: Optional[torch.Tensor] = None,
++    ) -> None:
++        """Physically move TEGroupedMLP expert parameters to match a new mapping.
++
++        This updates the *actual weights* stored in local physical expert slots by performing
++        an all-to-all within the expert-parallel process group.
++
++        Args:
++            logical_to_physical_expert_mapping: int64 tensor [num_experts] where
++                mapping[logical_expert] = physical_expert.
++            current_logical_to_physical_expert_mapping: optional int64 tensor [num_experts]
++                describing the mapping that matches the module's current physical placement.
++                If not provided, will use an internally cached mapping, falling back to identity.
++
++        Notes:
++            - Only supports TEGroupedMLP experts.
++            - Assumes physical expert ids are laid out as contiguous blocks per EP rank, i.e.
++              physical_id = ep_rank * num_local_experts + local_slot.
++            - Must be called at a safe boundary (e.g., after optimizer.step and before the next
++              forward that will use the new mapping).
++        """
++
++        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
++            raise RuntimeError("torch.distributed must be initialized to change expert mapping")
++
++        ep_group = self.ep_group
++        ep_size = utils.get_pg_size(ep_group)
++        ep_rank = utils.get_pg_rank(ep_group)
++
++        # Fast path: EP=1 still needs mapping update for routing/checkpointing.
++        num_local_experts = int(self.num_local_experts)
++        num_global_experts = int(ep_size * num_local_experts)
++
++        # Validate and move mappings to CPU for planning.
++        if logical_to_physical_expert_mapping.dim() != 1:
++            raise ValueError(
++                "logical_to_physical_expert_mapping must be 1D [num_experts], "
++                f"got shape={tuple(logical_to_physical_expert_mapping.shape)}"
++            )
++        new_l2p_cpu = logical_to_physical_expert_mapping.to(device='cpu', dtype=torch.int64).view(-1)
++        if new_l2p_cpu.numel() != num_global_experts:
++            raise ValueError(
++                f"logical_to_physical_expert_mapping must have length {num_global_experts}, got {new_l2p_cpu.numel()}"
++            )
++        if not self._is_permutation_0_to_n_minus_1(new_l2p_cpu):
++            raise ValueError("logical_to_physical_expert_mapping must be a permutation of [0, num_experts)")
++
++        if current_logical_to_physical_expert_mapping is None:
++            current_logical_to_physical_expert_mapping = self._current_logical_to_physical_expert_mapping
++        if current_logical_to_physical_expert_mapping is None:
++            cur_l2p_cpu = torch.arange(num_global_experts, dtype=torch.int64, device='cpu')
++        else:
++            if current_logical_to_physical_expert_mapping.dim() != 1:
++                raise ValueError(
++                    "current_logical_to_physical_expert_mapping must be 1D [num_experts], "
++                    f"got shape={tuple(current_logical_to_physical_expert_mapping.shape)}"
++                )
++            cur_l2p_cpu = current_logical_to_physical_expert_mapping.to(device='cpu', dtype=torch.int64).view(-1)
++            if cur_l2p_cpu.numel() != num_global_experts:
++                raise ValueError(
++                    f"current_logical_to_physical_expert_mapping must have length {num_global_experts}, got {cur_l2p_cpu.numel()}"
++                )
++            if not self._is_permutation_0_to_n_minus_1(cur_l2p_cpu):
++                raise ValueError("current_logical_to_physical_expert_mapping must be a permutation of [0, num_experts)")
++
++        # Cache the new mapping (CPU) for subsequent calls.
++        self._current_logical_to_physical_expert_mapping = new_l2p_cpu.clone()
++
++        # Update mapping used by router/dispatcher (physical_to_logical index_select).
++        # Keep these on the same device as parameters to avoid device mismatch in forward.
++        try:
++            any_param = next(self.experts.parameters())
++            mapping_device = any_param.device
++        except StopIteration:
++            mapping_device = torch.device('cpu')
++
++        new_l2p_dev = new_l2p_cpu.to(device=mapping_device, non_blocking=True)
++        new_p2l_dev = self._invert_logical_to_physical(new_l2p_dev)
++        self._logical_to_physical_expert_idx = new_l2p_dev
++        self._logical_to_physical_expert_idx_cpu = new_l2p_dev.cpu()
++        self._physical_to_logical_expert_idx = new_p2l_dev
++        self._physical_to_logical_expert_idx_cpu = new_p2l_dev.cpu()
++
++        # Make mapping visible for distributed checkpointing.
++        if hasattr(self, 'experts'):
++            setattr(self.experts, '_physical_to_logical_expert_idx', new_p2l_dev)
++            if hasattr(self.experts, 'linear_fc1'):
++                setattr(self.experts.linear_fc1, '_physical_to_logical_expert_idx', new_p2l_dev)
++            if hasattr(self.experts, 'linear_fc2'):
++                setattr(self.experts.linear_fc2, '_physical_to_logical_expert_idx', new_p2l_dev)
++
++        if ep_size == 1:
++            return
++
++        # Only handle TEGroupedMLP experts.
++        from megatron.core.transformer.moe.experts import TEGroupedMLP
++
++        if not isinstance(self.experts, TEGroupedMLP):
++            raise NotImplementedError(
++                f"change_expert_mapping currently supports TEGroupedMLP only, got {type(self.experts).__name__}"
++            )
++        if getattr(self.experts.config, 'fp8', False):
++            raise NotImplementedError("change_expert_mapping for TEGroupedMLP fp8 is not supported")
++
++        # Build send/recv plans based on (current_mapping -> new_mapping) movement.
++        # Expert logical id l is currently at physical p_old = cur_l2p[l] and should move to
++        # physical p_new = new_l2p[l].
++        cur_p2l_cpu = self._invert_logical_to_physical(cur_l2p_cpu)
++        new_p2l_cpu = self._invert_logical_to_physical(new_l2p_cpu)
++
++        # send_slots_by_dst_rank[dst_rank] = list of local src_slot (in increasing order)
++        send_slots_by_dst_rank: List[List[int]] = [[] for _ in range(ep_size)]
++        base_old = ep_rank * num_local_experts
++        for src_slot in range(num_local_experts):
++            physical_old = base_old + src_slot
++            logical_id = int(cur_p2l_cpu[physical_old].item())
++            physical_new = int(new_l2p_cpu[logical_id].item())
++            dst_rank = physical_new // num_local_experts
++            send_slots_by_dst_rank[int(dst_rank)].append(int(src_slot))
++
++        # recv_pairs_by_src_rank[src_rank] = list[(src_slot, dst_slot)] sorted by src_slot
++        recv_pairs_by_src_rank: List[List[tuple]] = [[] for _ in range(ep_size)]
++        base_new = ep_rank * num_local_experts
++        for dst_slot in range(num_local_experts):
++            physical_new = base_new + dst_slot
++            logical_needed = int(new_p2l_cpu[physical_new].item())
++            physical_old = int(cur_l2p_cpu[logical_needed].item())
++            src_rank = physical_old // num_local_experts
++            src_slot = physical_old % num_local_experts
++            recv_pairs_by_src_rank[int(src_rank)].append((int(src_slot), int(dst_slot)))
++        for src_rank in range(ep_size):
++            recv_pairs_by_src_rank[src_rank].sort(key=lambda x: x[0])
++
++        def _permute_te_grouped_linear_weights_inplace(linear_module) -> None:
++            # Gather per-slot parameters.
++            slot_params = [getattr(linear_module, f'weight{i}') for i in range(num_local_experts)]
++            if len(slot_params) == 0:
++                return
++            dtype = slot_params[0].dtype
++            device = slot_params[0].device
++            chunk_numel = int(slot_params[0].numel())
++            for p in slot_params:
++                if p.dtype != dtype or p.device != device or int(p.numel()) != chunk_numel:
++                    raise RuntimeError("Inconsistent TEGroupedLinear per-expert weight tensors")
++
++            total_elems = num_local_experts * chunk_numel
++            sendbuf = torch.empty((total_elems,), dtype=dtype, device=device)
++            recvbuf = torch.empty((total_elems,), dtype=dtype, device=device)
++
++            input_split_sizes = [len(send_slots_by_dst_rank[r]) * chunk_numel for r in range(ep_size)]
++            output_split_sizes = [len(recv_pairs_by_src_rank[r]) * chunk_numel for r in range(ep_size)]
++            if sum(input_split_sizes) != total_elems or sum(output_split_sizes) != total_elems:
++                raise RuntimeError(
++                    "Invalid all-to-all split sizes for expert permutation "
++                    f"(send={sum(input_split_sizes)}, recv={sum(output_split_sizes)}, expected={total_elems})"
++                )
++
++            # Pack send buffer: grouped by dst_rank, preserving increasing src_slot order.
++            offset = 0
++            for dst_rank in range(ep_size):
++                for src_slot in send_slots_by_dst_rank[dst_rank]:
++                    src_flat = slot_params[src_slot].detach().contiguous().view(-1)
++                    sendbuf[offset : offset + chunk_numel].copy_(src_flat)
++                    offset += chunk_numel
++
++            torch.distributed.all_to_all_single(
++                recvbuf,
++                sendbuf,
++                output_split_sizes=output_split_sizes,
++                input_split_sizes=input_split_sizes,
++                group=ep_group,
++            )
++
++            # Unpack recv buffer: grouped by src_rank, in increasing src_slot order.
++            offset = 0
++            for src_rank in range(ep_size):
++                for _, dst_slot in recv_pairs_by_src_rank[src_rank]:
++                    dst_param = slot_params[dst_slot]
++                    dst_param.copy_(recvbuf[offset : offset + chunk_numel].view_as(dst_param))
++                    offset += chunk_numel
++
++        _permute_te_grouped_linear_weights_inplace(self.experts.linear_fc1)
++        _permute_te_grouped_linear_weights_inplace(self.experts.linear_fc2)
++
+     def set_for_recompute_pre_mlp_layernorm(self):
+         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8."""
+         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
+@@ -301,3 +761,88 @@ class MoELayer(BaseMoELayer):
+             from megatron.core.extensions.transformer_engine import set_save_original_input
+ 
+             set_save_original_input(self.shared_experts.linear_fc1)
++
++    def set_expert_mapping_list(self, expert_mapping_list: List[torch.Tensor]):
++        """Set per-micro-batch logical->physical mappings for this MoE layer.
++
++        This precomputes and stores physical->logical mappings to keep forward() minimal.
++        """
++        if expert_mapping_list is None:
++            self._logical_to_physical_mapping_list = None
++            self._logical_to_physical_mapping_list_cpu = None
++            self._physical_to_logical_mapping_list = None
++            self._physical_to_logical_mapping_list_cpu = None
++            self._mapping_microbatch_idx = 0
++            return
++
++        if self._expert_weight_manager is None:
++            raise RuntimeError(
++                "set_expert_mapping_list() called before expert weight manager is attached"
++            )
++
++        self._logical_to_physical_mapping_list = expert_mapping_list
++        self._logical_to_physical_mapping_list_cpu = expert_mapping_list.cpu()
++        self._mapping_microbatch_idx = 0
++
++        physical_to_logical_list: List[torch.Tensor] = []
++        for logical_to_physical in expert_mapping_list:
++            if logical_to_physical.dtype != torch.int64:
++                logical_to_physical = logical_to_physical.to(dtype=torch.int64)
++            physical_to_logical = self._expert_weight_manager.invert_logical_to_physical(
++                logical_to_physical
++            )
++            physical_to_logical_list.append(physical_to_logical)
++
++        self._physical_to_logical_mapping_list_cpu = physical_to_logical_list
++
++        # Keep mappings on CUDA if available to avoid per-forward host->device transfers.
++        if torch.cuda.is_available():
++            dev = torch.device('cuda', torch.cuda.current_device())
++            physical_to_logical_list = [t.to(device=dev, non_blocking=True) for t in physical_to_logical_list]
++
++        self._physical_to_logical_mapping_list = physical_to_logical_list
++
++        self._expert_weight_manager.wait_for_cpu_refresh_if_needed()
++        # prefetch experts for the first micro-batch
++        next_physical_to_logical = self._physical_to_logical_mapping_list_cpu[0]
++        next_logical_to_physical = self._logical_to_physical_mapping_list_cpu[0]
++        cur_physical_to_logical = self._physical_to_logical_expert_idx_cpu if self._physical_to_logical_expert_idx_cpu is not None else torch.arange(self.config.num_moe_experts, dtype=torch.int64, device="cpu")
++        cur_logical_to_physical = self._logical_to_physical_expert_idx_cpu if self._logical_to_physical_expert_idx_cpu is not None else torch.arange(self.config.num_moe_experts, dtype=torch.int64, device="cpu")
++        layer_no = int(self.layer_number)
++        local_ids = self.local_expert_indices_tensor_cpu
++        # self._expert_weight_manager.schedule_experts_load_for_microbatch(
++        #     layer_number=layer_no,
++        #     experts_module=self.experts,
++        #     local_expert_global_ids=local_ids,
++        #     physical_to_logical=next_physical_to_logical,
++        #     microbatch_id=0,
++        # )
++        self._expert_weight_manager.schedule_experts_load_for_microbatch_all_to_all(
++            layer_number=layer_no,
++            experts_module=self.experts,
++            local_expert_global_ids=local_ids,
++            next_p2l=next_physical_to_logical,
++            next_l2p=next_logical_to_physical,
++            cur_p2l=cur_physical_to_logical,
++            cur_l2p=cur_logical_to_physical,
++            ep_group=self.ep_group,
++            ep_size=self.ep_size,
++            ep_rank=self.ep_rank,
++            microbatch_id=0,
++        )
++
++    def set_expert_weight_manager(self, manager: MoEExpertWeightManager):
++        self._expert_weight_manager = manager
++
++    def reset_expert_mapping_list(self) -> None:
++        # This function is used for correctness checking: 
++        # it verifies that all provided micro-batch mappings have been consumed, 
++        # then clears the mapping lists and resets the micro-batch index. 
++        # This ensures that stale mappings are not accidentally reused in subsequent iterations. 
++        if self._physical_to_logical_mapping_list is not None:
++            assert self._mapping_microbatch_idx == len(self._physical_to_logical_mapping_list), f"Expected to have consumed all micro-batch mappings. Got {self._mapping_microbatch_idx} consumed but {len(self._physical_to_logical_mapping_list)} provided. {self.layer_number=}"
++
++        self._logical_to_physical_mapping_list = None
++        self._physical_to_logical_mapping_list = None
++        self._mapping_microbatch_idx = 0
++
+diff --git a/core/transformer/moe/token_dispatcher.py b/core/transformer/moe/token_dispatcher.py
+index 82fb7b0..bdd65ba 100644
+--- a/core/transformer/moe/token_dispatcher.py
++++ b/core/transformer/moe/token_dispatcher.py
+@@ -547,6 +547,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+             self.cuda_sync_point_priority[self.cuda_dtoh_point]
+             <= self.cuda_sync_point_priority[self.cuda_sync_point]
+         ), "cuda_sync_point must be after cuda_dtoh_point."
++
+         return num_tokens_per_local_expert
+ 
+     def dispatch_preprocess(
+diff --git a/core/transformer/transformer_block.py b/core/transformer/transformer_block.py
+index c14f8ea..75934dd 100644
+--- a/core/transformer/transformer_block.py
++++ b/core/transformer/transformer_block.py
+@@ -20,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer.enums import LayerType
+ from megatron.core.transformer.module import MegatronModule
++from megatron.core.transformer.moe.moe_layer import MoELayer
+ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ from megatron.core.transformer.transformer_layer import (
+@@ -34,6 +35,10 @@ from megatron.core.utils import (
+     make_viewless_tensor,
+ )
+ 
++from megatron.core.transformer.moe.expert_weight_manager import MoEExpertWeightManager
++import time
++
++
+ try:
+     import transformer_engine.pytorch as te  # pylint: disable=unused-import
+ 
+@@ -324,6 +329,221 @@ class TransformerBlock(MegatronModule):
+         self._build_layers()
+         self.num_layers_per_pipeline_rank = len(self.layers)
+ 
++        self.original_logical_to_physical_expert_mapping = None
++        # mapping_path = "/jizhicfs/pkuhetu/zym/psrl-new/psrl/zz_experts/dapo_ep16_logical_to_physical_expert_mapping.pt"
++        # mapping_path = "/jizhicfs/pkuhetu/zym/psrl-new/psrl/zz_experts/identity_logical_to_physical_expert_mapping.pt"
++        mapping_path = None
++        if mapping_path:
++            mapping = torch.load(mapping_path, map_location='cpu')
++            assert mapping.dim() == 2, f"Expected mapping tensor to be 2D [num_layers, num_experts], got {mapping.shape}"
++            self.original_logical_to_physical_expert_mapping = mapping
++
++        # RL/inference-only: per-micro-batch expert remapping support.
++        self._rl_logical_to_physical_expert_mapping_list = None
++
++        # CPU-side MoE weight cache (per-rank) and async copy manager.
++        self._moe_weight_manager = MoEExpertWeightManager(
++            device=torch.device('cuda', torch.cuda.current_device())
++            if torch.cuda.is_available()
++            else None
++        )
++        self._attach_moe_weight_manager()
++
++    def _attach_moe_weight_manager(self) -> None:
++        """Find all MoELayer modules under this block and attach weight manager."""
++        try:
++            from megatron.core.transformer.moe.moe_layer import MoELayer
++        except Exception:
++            return
++
++        for layer in self.layers:
++            for module in layer.modules():
++                if isinstance(module, MoELayer):
++                    module.set_expert_weight_manager(self._moe_weight_manager)
++
++    def set_expert_mapping(self, logical_to_physical_expert_mapping_list: List[Tensor]) -> None:
++        """Set per-micro-batch expert placement mapping.
++
++        Args:
++            logical_to_physical_expert_mapping_list: list length = num_micro_batches.
++                Each element is an int64 tensor of shape [num_layers, num_experts] and represents
++                logical_expert_id -> physical_expert_id mapping.
++
++        Notes:
++            This feature is intended for forward-only execution. It does not support gradient/
++            optimizer states.
++        """
++        if logical_to_physical_expert_mapping_list is None:
++            self._rl_logical_to_physical_expert_mapping_list = None
++            return
++
++        if not isinstance(logical_to_physical_expert_mapping_list, list) or len(
++            logical_to_physical_expert_mapping_list
++        ) == 0:
++            raise ValueError("logical_to_physical_expert_mapping_list must be a non-empty list")
++
++        self._rl_logical_to_physical_expert_mapping_list = logical_to_physical_expert_mapping_list
++
++        # Fan-out: for each local transformer layer, extract the corresponding row by global
++        # layer_number (1-based) and pass a per-micro-batch list of 1D tensors into MoELayer.
++        from megatron.core.transformer.moe.moe_layer import MoELayer
++
++        for layer in self.layers:
++            global_layer_idx = int(layer.layer_number) - 1
++            per_mb_layer_rows = []
++            for mb_map in logical_to_physical_expert_mapping_list:
++                if mb_map.dtype != torch.int64:
++                    mb_map = mb_map.to(dtype=torch.int64)
++                if mb_map.dim() != 2:
++                    raise ValueError(
++                        f"Expected each mapping tensor to be 2D [num_layers, num_experts], got {mb_map.shape}"
++                    )
++                if global_layer_idx < 0 or global_layer_idx >= mb_map.shape[0]:
++                    raise IndexError(
++                        f"global layer idx {global_layer_idx} out of range for mapping shape {mb_map.shape}"
++                    )
++                per_mb_layer_rows.append(mb_map[global_layer_idx])
++
++            for module in layer.modules():
++                if isinstance(module, MoELayer):
++                    module.set_expert_mapping_list(per_mb_layer_rows)
++
++    def reset_expert_mapping(self) -> None:
++        from megatron.core.transformer.moe.moe_layer import MoELayer
++
++        for layer in self.layers:
++            for module in layer.modules():
++                if isinstance(module, MoELayer):
++                    module.reset_expert_mapping_list()
++
++        self._moe_weight_manager.clear_cpu_cache()
++
++    def change_expert_mapping(
++        self,
++        logical_to_physical_expert_mapping: Tensor,
++        *,
++        current_logical_to_physical_expert_mapping: Optional[Tensor] = None,
++    ) -> None:
++        """Physically move MoE expert parameters according to a new mapping.
++
++        Args:
++            logical_to_physical_expert_mapping: int64 tensor [num_layers, num_experts] where
++                mapping[layer, logical_expert] = physical_expert.
++            current_logical_to_physical_expert_mapping: optional int64 tensor [num_layers, num_experts]
++                describing the current physical placement mapping.
++
++        Notes:
++            This calls MoELayer.change_expert_mapping() for each MoE layer on this pipeline rank.
++            The caller must ensure this is invoked at a safe training boundary.
++        """
++
++        if logical_to_physical_expert_mapping is None:
++            raise ValueError("logical_to_physical_expert_mapping must not be None")
++        if logical_to_physical_expert_mapping.dtype != torch.int64:
++            logical_to_physical_expert_mapping = logical_to_physical_expert_mapping.to(dtype=torch.int64)
++        if logical_to_physical_expert_mapping.dim() != 2:
++            raise ValueError(
++                "logical_to_physical_expert_mapping must be 2D [num_layers, num_experts], "
++                f"got shape={tuple(logical_to_physical_expert_mapping.shape)}"
++            )
++
++        if current_logical_to_physical_expert_mapping is not None:
++            if current_logical_to_physical_expert_mapping.dtype != torch.int64:
++                current_logical_to_physical_expert_mapping = current_logical_to_physical_expert_mapping.to(
++                    dtype=torch.int64
++                )
++            if current_logical_to_physical_expert_mapping.dim() != 2:
++                raise ValueError(
++                    "current_logical_to_physical_expert_mapping must be 2D [num_layers, num_experts], "
++                    f"got shape={tuple(current_logical_to_physical_expert_mapping.shape)}"
++                )
++            if current_logical_to_physical_expert_mapping.shape != logical_to_physical_expert_mapping.shape:
++                raise ValueError(
++                    "current_logical_to_physical_expert_mapping must have the same shape as logical_to_physical_expert_mapping, "
++                    f"got {tuple(current_logical_to_physical_expert_mapping.shape)} vs {tuple(logical_to_physical_expert_mapping.shape)}"
++                )
++
++        from megatron.core.transformer.moe.moe_layer import MoELayer
++
++        for layer in self.layers:
++            global_layer_idx = int(layer.layer_number) - 1
++            if global_layer_idx < 0 or global_layer_idx >= logical_to_physical_expert_mapping.shape[0]:
++                raise IndexError(
++                    f"global layer idx {global_layer_idx} out of range for mapping shape {tuple(logical_to_physical_expert_mapping.shape)}"
++                )
++            new_row = logical_to_physical_expert_mapping[global_layer_idx]
++            cur_row = (
++                current_logical_to_physical_expert_mapping[global_layer_idx]
++                if current_logical_to_physical_expert_mapping is not None
++                else None
++            )
++            for module in layer.modules():
++                if isinstance(module, MoELayer):
++                    module.change_expert_mapping(
++                        new_row,
++                        current_logical_to_physical_expert_mapping=cur_row,
++                    )
++
++        self.original_logical_to_physical_expert_mapping = logical_to_physical_expert_mapping
++
++
++    def update_moe_cpu_weights(self, current_logical_to_physical_by_layer: Optional[Tensor] = None) -> None:
++        """Refresh the CPU-side cached MoE weights from the current model weights.
++
++        Intended to be called by an external RL system after model weights are updated.
++        The refresh is asynchronous; the next forward will synchronize before the first MoE layer.
++        """
++        # If caller doesn't provide a mapping, fall back to the static/original mapping (if any).
++        if current_logical_to_physical_by_layer is None:
++            current_logical_to_physical_by_layer = self.original_logical_to_physical_expert_mapping
++
++        if current_logical_to_physical_by_layer is not None:
++            if current_logical_to_physical_by_layer.dtype != torch.int64:
++                current_logical_to_physical_by_layer = current_logical_to_physical_by_layer.to(
++                    dtype=torch.int64
++                )
++            if current_logical_to_physical_by_layer.dim() != 2:
++                raise ValueError(
++                    f"current_logical_to_physical_by_layer must be 2D [num_layers, num_experts], got {tuple(current_logical_to_physical_by_layer.shape)}"
++                )
++
++        def _refresh_impl():
++            for layer in self.layers:
++                for module in layer.modules():
++                    if not isinstance(module, MoELayer):
++                        continue
++
++                    layer_no = int(module.layer_number)
++                    physical_to_logical = None
++                    if current_logical_to_physical_by_layer is not None:
++                        global_layer_idx = layer_no - 1
++                        if (
++                            global_layer_idx < 0
++                            or global_layer_idx >= current_logical_to_physical_by_layer.shape[0]
++                        ):
++                            raise IndexError(
++                                f"layer {layer_no} out of range for current_logical_to_physical_by_layer shape {tuple(current_logical_to_physical_by_layer.shape)}"
++                            )
++                        logical_to_physical = current_logical_to_physical_by_layer[
++                            global_layer_idx
++                        ].to(device='cpu')
++                        physical_to_logical = self._moe_weight_manager.invert_logical_to_physical(
++                            logical_to_physical
++                        ).to(device='cpu')
++
++                    self._moe_weight_manager.start_cpu_refresh_all_experts(
++                        layer_number=layer_no,
++                        experts_module=module.experts,
++                        ep_group=module.ep_group,
++                        num_local_experts=module.num_local_experts,
++                        physical_to_logical=physical_to_logical,
++                    )
++
++        # Offload refresh so external RL caller is not blocked.
++        # self._moe_weight_manager.start_cpu_refresh_background(_refresh_impl)
++        _refresh_impl()
++        torch.cuda.synchronize()
++
+     def _build_layers(self):
+         # Transformer layers.
+         # @jcasper can we improve how we deal with layer_number?
