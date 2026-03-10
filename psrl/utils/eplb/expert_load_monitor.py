@@ -6,7 +6,7 @@ import ray
 import torch
 from omegaconf import OmegaConf
 
-from psrl.utils.eplb import compute_layerwise_logical_to_physical_mapping
+from .expert_placement import compute_layerwise_logical_to_physical_mapping
 
 
 @ray.remote
