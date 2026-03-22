@@ -140,3 +140,5 @@ outputs
 
 /models/
 /data/
+
+vllm_bench_results/

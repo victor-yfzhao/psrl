@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -16,7 +17,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.single_controller.ray.base import create_colocated_worker_cls_fused
+from verl.single_controller.ray.base import SubRayResourcePool, create_colocated_worker_cls_fused
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -47,6 +48,8 @@ from psrl.trainer.ppo.utils import (
     record_rollout_rm_metrics,
 )
 from psrl.utils.dataset import DataProcessor, DatasetType
+from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
+from psrl.utils.common.tms_env import build_ray_train_worker_tms_env
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -54,6 +57,7 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+from psrl.utils.server.command import Command, CommandType
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.ps import (
@@ -83,7 +87,6 @@ class PSRL_RayPPOTrainer:
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
         reward_fn=None,
-        val_reward_fn=None,
         collate_fn=None,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
@@ -101,7 +104,6 @@ class PSRL_RayPPOTrainer:
             ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
             processor: Optional data processor, used for multimodal data.
             reward_fn: Function to compute rewards for the training data.
-            val_reward_fn: Function to compute rewards for the validation data.
             collate_fn: Optional function to collate data into batches.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
@@ -110,7 +112,6 @@ class PSRL_RayPPOTrainer:
         self.processor = processor
         self.config = config
         self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
         self.collate_fn = collate_fn
         self.group_post_process_fn = group_post_process_fn
         self.buffer_post_process_fn = buffer_post_process_fn
@@ -118,8 +119,6 @@ class PSRL_RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
-
-        # self.use_rm = need_reward_model(self.role_worker_mapping)
 
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls  # NOTE(lhy): ray_worker_group_cls is used only in train side
@@ -140,6 +139,10 @@ class PSRL_RayPPOTrainer:
 
         self.reward_model_status_queues_mapping = {}
         self.reward_model_manager_mapping = {}
+
+        # Elastic rm
+        self.elastic_rm_mode = config.psrl.deployment.elastic_rm.enable
+        self.elastic_executor = None
 
         # Parameter server handle for other workers to access
         self.ps_manager_handle = None
@@ -202,6 +205,15 @@ class PSRL_RayPPOTrainer:
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
         # The number of status queues is the same as the number of rollout instances.
         self.status_queues = [RayQueue() for _ in range(self.config.psrl.deployment.n_rollout_instances)]
+
+        for reward_model in self.config.reward_models_config.reward_models:
+            if reward_model.reward_loop_type != "gen":
+                continue
+            reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
+            reward_model_replica_num = reward_model.get("num_replicas", 1)
+            self.reward_model_status_queues_mapping[reward_model_name] = [
+                RayQueue() for _ in range(reward_model_replica_num)
+            ]
 
         psrl_logger.debug(
             "Initialized data_queue, and status_queue with sizes: %d, and unlimited respectively.",
@@ -397,6 +409,17 @@ class PSRL_RayPPOTrainer:
             assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
             assert self.config.psrl.staleness == 0, "staleness must be 0 when using colocate mode"
 
+        # Validate / TMS layout (aligned with main_psrl agentic_rl)
+        if OmegaConf.select(self.config.psrl, "colocate_validate_and_train", default=False):
+            tms_range_v = OmegaConf.select(self.config.psrl, "tms.range", default=None)
+            assert tms_range_v in ("train", "all"), (
+                "TMS range must be 'train' or 'all' when using colocate_validate_and_train"
+            )
+        else:
+            assert OmegaConf.select(self.config.psrl, "fuse_rollout_with_validate", default=True), (
+                "fuse_rollout_with_validate must be enabled when not colocate_validate_and_train"
+            )
+
         # Check rollout mode
         if self.config.psrl.gen_mode == "batch":
             assert self.config.gen_actor_rollout_ref.rollout.mode == "sync", (
@@ -423,6 +446,26 @@ class PSRL_RayPPOTrainer:
             assert self.config.psrl.status_collection.enable, (
                 "status collection must be enabled when using "
                 "request num balance or throughput balance routing strategy"
+            )
+
+        # TMS configuration (aligned with main_psrl agentic_rl)
+        if bool(OmegaConf.select(self.config.psrl, "tms.enable_cuda_graph", default=False)):
+            assert OmegaConf.select(self.config.psrl, "tms.range", default=None) == "all", (
+                "TMS CUDA graph can only be enabled when TMS range is 'all'"
+            )
+        tms_range_check = OmegaConf.select(self.config.psrl, "tms.range", default=None)
+        if tms_range_check not in ("train", "all"):
+            actor = self.config.train_actor_rollout_ref.actor
+            strategy = actor.strategy
+            megatron_ok = strategy == "megatron" and bool(
+                OmegaConf.select(actor, "megatron.optimizer_offload", default=False)
+            )
+            fsdp2_ok = strategy == "fsdp2" and bool(
+                OmegaConf.select(actor, "fsdp_config.optimizer_offload", default=False)
+            )
+            assert megatron_ok or fsdp2_ok, (
+                "Optimizer offload must be enabled when TMS is not enabled for training workers "
+                "(tms.range not in ['train', 'all'])"
             )
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
@@ -543,6 +586,194 @@ class PSRL_RayPPOTrainer:
             psrl_logger.debug("Rollout coordinator stopped successfully.")
         else:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
+
+    @staticmethod
+    def _collect_instance_gpu_mapping(worker_group) -> tuple[list[int], str | None]:
+        gpu_ids_nested = worker_group.execute_all_sync("get_runtime_gpu_ids")
+        node_ids = worker_group.execute_all_sync("get_node_id")
+        gpu_ids = sorted({int(gpu_id) for ids in gpu_ids_nested for gpu_id in ids})
+        node_id = node_ids[0] if node_ids else None
+        return gpu_ids, node_id
+
+    def _init_elastic_rm_runtime(self):
+        if not self.elastic_rm_mode:
+            return
+        if self.rollout_coordinator is None:
+            raise RuntimeError("Rollout coordinator must be initialized before elastic_rm init.")
+
+        psrl_logger.info("Initializing elastic_rm runtime (coordinator sleep/wake, ElasticExecutor).")
+        rollout_model_name = self.config.gen_actor_rollout_ref.model.path.split("/")[-1]
+        rollout_instance_num = len(self.rollout_wg_list)
+        psrl_logger.info(
+            "elastic_rm rollout: model_name=%s, n_instances=%d",
+            rollout_model_name,
+            rollout_instance_num,
+        )
+        rollout_all_ids = list(range(rollout_instance_num))
+
+        # Enable coordinator command handling before elastic sleep/wake orchestration.
+        self.start_rollout_coordinator()
+        psrl_logger.info("Rollout coordinator busy loop started for elastic_rm command handling.")
+
+        if rollout_all_ids:
+            psrl_logger.info(
+                "elastic_rm: putting all rollout instances to sleep (instance_ids=%s).",
+                rollout_all_ids,
+            )
+            ray.get(
+                self.rollout_coordinator.exec_command.remote(
+                    Command(type=CommandType.SLEEP, instance_ids=rollout_all_ids),
+                    blocking=True,
+                )
+            )
+            psrl_logger.info("elastic_rm: all rollout instances slept.")
+
+        registrations = [
+            {
+                "role_name": PSRL_Role.Rollout,
+                "model_name": rollout_model_name,
+                "num_instances": rollout_instance_num,
+            }
+        ]
+        gpu_mappings = []
+        for instance_id, rollout_wg in enumerate(self.rollout_wg_list):
+            gpu_ids, node_id = self._collect_instance_gpu_mapping(rollout_wg)
+            gpu_mappings.append(
+                {
+                    "role_name": PSRL_Role.Rollout,
+                    "model_name": rollout_model_name,
+                    "instance_id": instance_id,
+                    "gpu_ids": gpu_ids,
+                    "node_id": node_id,
+                }
+            )
+
+        psrl_logger.info(
+            "elastic_rm: collected rollout GPU mappings (%d entries).",
+            len(gpu_mappings),
+        )
+
+        import time; time.sleep(10000000)
+
+        reward_coordinators: dict[str, ray.actor.ActorHandle] = {}
+        for reward_model_name, manager in self.reward_model_manager_mapping.items():
+            rm_instance_num = len(manager.reward_model_wg_list)
+            rm_all_ids = list(range(rm_instance_num))
+
+            psrl_logger.info(
+                "elastic_rm: putting reward model replicas to sleep (name=%s, instance_ids=%s).",
+                reward_model_name,
+                rm_all_ids,
+            )
+            ray.get(
+                manager.reward_model_coordinator.exec_command.remote(
+                    Command(type=CommandType.SLEEP, instance_ids=rm_all_ids),
+                    blocking=True,
+                )
+            )
+            psrl_logger.info("elastic_rm: reward model %s replicas slept.", reward_model_name)
+
+            reward_coordinators[reward_model_name] = manager.reward_model_coordinator
+            registrations.append(
+                {
+                    "role_name": PSRL_Role.RewardModel,
+                    "model_name": reward_model_name,
+                    "num_instances": rm_instance_num,
+                }
+            )
+            for instance_id, reward_wg in enumerate(manager.reward_model_wg_list):
+                gpu_ids, node_id = self._collect_instance_gpu_mapping(reward_wg)
+                gpu_mappings.append(
+                    {
+                        "role_name": PSRL_Role.RewardModel,
+                        "model_name": reward_model_name,
+                        "instance_id": instance_id,
+                        "gpu_ids": gpu_ids,
+                        "node_id": node_id,
+                    }
+                )
+
+        psrl_logger.info(
+            "elastic_rm: total GPU mapping entries (rollout + reward)=%d, registration_roles=%d.",
+            len(gpu_mappings),
+            len(registrations),
+        )
+
+        rollout_awake_num = min(int(math.ceil(rollout_instance_num / 2.0)), rollout_instance_num)
+        awaken_instances = [
+            {
+                "role_name": PSRL_Role.Rollout,
+                "model_name": rollout_model_name,
+                "instance_id": instance_id,
+            }
+            for instance_id in range(rollout_awake_num)
+        ]
+        if rollout_awake_num > 0:
+            awake_ids = list(range(rollout_awake_num))
+            psrl_logger.info(
+                "elastic_rm: waking up rollout instances (count=%d, instance_ids=%s).",
+                rollout_awake_num,
+                awake_ids,
+            )
+            ray.get(
+                self.rollout_coordinator.exec_command.remote(
+                    Command(type=CommandType.WAKE_UP, instance_ids=awake_ids),
+                    blocking=True,
+                )
+            )
+            psrl_logger.info("elastic_rm: rollout wake_up completed.")
+
+        for reward_model_name, manager in self.reward_model_manager_mapping.items():
+            rm_instance_num = len(manager.reward_model_wg_list)
+            rm_awake_num = int(math.ceil(rm_instance_num / 2.0))
+            if rm_awake_num > 0:
+                rm_awake_ids = list(range(rm_awake_num))
+                psrl_logger.info(
+                    "elastic_rm: waking up reward model replicas (name=%s, count=%d, instance_ids=%s).",
+                    reward_model_name,
+                    rm_awake_num,
+                    rm_awake_ids,
+                )
+                ray.get(
+                    manager.reward_model_coordinator.exec_command.remote(
+                        Command(type=CommandType.WAKE_UP, instance_ids=rm_awake_ids),
+                        blocking=True,
+                    )
+                )
+                psrl_logger.info("elastic_rm: reward model %s wake_up completed.", reward_model_name)
+            awaken_instances.extend(
+                [
+                    {
+                        "role_name": PSRL_Role.RewardModel,
+                        "model_name": reward_model_name,
+                        "instance_id": instance_id,
+                    }
+                    for instance_id in range(rm_awake_num)
+                ]
+            )
+
+        roles = [(PSRL_Role.Rollout, rollout_model_name)]
+        roles.extend([(PSRL_Role.RewardModel, reward_model_name) for reward_model_name in reward_coordinators.keys()])
+        coordinators = {
+            PSRL_Role.Rollout: {rollout_model_name: self.rollout_coordinator},
+            PSRL_Role.RewardModel: reward_coordinators,
+        }
+        psrl_logger.info(
+            "elastic_rm: creating ElasticExecutor (roles=%s, awaken_instances=%d).",
+            [(r.name, m) for r, m in roles],
+            len(awaken_instances),
+        )
+        self.elastic_executor = ElasticExecutor.remote(roles=roles, coordinators=coordinators)
+        ray.get(
+            self.elastic_executor.initialize_runtime.remote(
+                registrations=registrations,
+                gpu_mappings=gpu_mappings,
+                awaken_instances=awaken_instances,
+            )
+        )
+        psrl_logger.info("elastic_rm: ElasticExecutor.initialize_runtime done.")
+        ray.get(self.elastic_executor.start_busy_loop.remote())
+        psrl_logger.info("elastic_rm: ElasticExecutor busy loop started; elastic_rm runtime ready.")
 
     def init_reward_manager(self, validation: bool = False):
         """Initialize the reward manager for computing rewards during training."""
@@ -844,20 +1075,8 @@ class PSRL_RayPPOTrainer:
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
-            # if self.val_reward_fn is None:
-            #     raise ValueError("val_reward_fn must be provided for validation.")
             if self.val_reward_manager is None:
                 raise ValueError("Reward manager must be provided for validation.")
-            
-            # result = self.val_reward_fn(test_batch, return_dict=True)
-            # reward_tensor = result["reward_tensor"]
-            # scores = reward_tensor.sum(-1).cpu().tolist()
-            # sample_scores.extend(scores)
-
-            # reward_extra_infos_dict["reward"].extend(scores)
-            # if "reward_extra_info" in result:
-            #     for key, lst in result["reward_extra_info"].items():
-            #         reward_extra_infos_dict[key].extend(lst)
 
             request_id_to_reward = ray.get(self.val_reward_manager.compute_score_for_validation.remote(test_batch))
             _request_ids = test_batch.non_tensor_batch["uid"].tolist()
@@ -946,6 +1165,77 @@ class PSRL_RayPPOTrainer:
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
+        elastic_shared_pool = None
+        elastic_subpool_group_idx = 0
+
+        if self.elastic_rm_mode:
+            elastic_shared_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, 0)
+            # Materialize placement groups once and reuse them across all elastic sub resource pools.
+            elastic_shared_pool.get_placement_groups(strategy="STRICT_PACK", device_name=self.device_name)
+            psrl_logger.info(
+                "Elastic RM shared RayResourcePool: name_prefix=%s world_size=%d store=%s max_colocate_count=%s",
+                elastic_shared_pool.name_prefix,
+                elastic_shared_pool.world_size,
+                list(elastic_shared_pool.store),
+                elastic_shared_pool.max_colocate_count,
+            )
+
+        def _register_resource_pool(resource_pool):
+            self.resource_pool_to_cls.setdefault(resource_pool, {})
+
+        def _build_elastic_sub_resource_pool(subgroup_world_size: int, tag: str) -> SubRayResourcePool:
+            nonlocal elastic_subpool_group_idx
+            assert elastic_shared_pool is not None, "elastic_shared_pool must be initialized in elastic_rm_mode"
+            if subgroup_world_size <= 0:
+                raise ValueError(f"subgroup_world_size must be > 0, but got {subgroup_world_size} ({tag})")
+            if subgroup_world_size > elastic_shared_pool.world_size:
+                raise ValueError(
+                    f"subgroup_world_size={subgroup_world_size} exceeds shared pool world_size="
+                    f"{elastic_shared_pool.world_size} ({tag})"
+                )
+
+            # SubRayResourcePool requires a contiguous bundle range [start, start + subgroup_world_size).
+            # We rotate start index to reduce collisions while allowing controlled oversubscription.
+            max_start = elastic_shared_pool.world_size - subgroup_world_size
+            if max_start == 0:
+                start_bundle_index = 0
+            else:
+                start_bundle_index = (
+                    elastic_subpool_group_idx * subgroup_world_size
+                ) % (max_start + 1)
+            elastic_subpool_group_idx += 1
+
+            sub_rp = SubRayResourcePool(
+                process_on_nodes=elastic_shared_pool.store,
+                use_gpu=elastic_shared_pool.use_gpu,
+                name_prefix=f"{elastic_shared_pool.name_prefix}_{tag}",
+                max_colocate_count=elastic_shared_pool.max_colocate_count,
+                detached=elastic_shared_pool.detached,
+                accelerator_type=elastic_shared_pool.accelerator_type,
+                resource_num_per_bundle=elastic_shared_pool.resource_num_per_bundle,
+                placement_groups=elastic_shared_pool.pgs,
+                start_bundle_index=start_bundle_index,
+                subgroup_world_size=subgroup_world_size,
+            )
+            end_bundle = start_bundle_index + subgroup_world_size
+            pg_ids = [getattr(pg, "id", None) for pg in (elastic_shared_pool.pgs or [])]
+            psrl_logger.info(
+                "Elastic SubRayResourcePool[%s]: type=%s name_prefix=%s subgroup_world_size=%d "
+                "start_bundle_index=%d bundle_range=[%d, %d) shared_world_size=%d shared_store=%s pg_count=%s pg_ids=%s",
+                tag,
+                type(sub_rp).__name__,
+                sub_rp.name_prefix,
+                subgroup_world_size,
+                start_bundle_index,
+                start_bundle_index,
+                end_bundle,
+                elastic_shared_pool.world_size,
+                list(elastic_shared_pool.store),
+                len(elastic_shared_pool.pgs) if elastic_shared_pool.pgs is not None else 0,
+                pg_ids,
+            )
+            return sub_rp
+
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
@@ -982,8 +1272,8 @@ class PSRL_RayPPOTrainer:
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             gen_interface = GenInterface(
                 rollout_instance_id=i,
-                ps_manager_handle=self.ps_manager_handle,
                 status_queue=self.status_queues[i],
+                ps_manager_handle=self.ps_manager_handle,
             )
             rollout_config = self.config.gen_actor_rollout_ref
             if self.config.psrl.deployment.heterogeneous_rollout.enable:
@@ -1002,7 +1292,19 @@ class PSRL_RayPPOTrainer:
                 gen_interface=gen_interface,
                 nixl_interface=nixl_interface,
             )
-            rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
+            if self.elastic_rm_mode:
+                rollout_world_size = (
+                    rollout_config.rollout.tensor_model_parallel_size
+                    * rollout_config.rollout.pipeline_model_parallel_size
+                    * rollout_config.rollout.get("data_parallel_size", 1)
+                )
+                rollout_resource_pool = _build_elastic_sub_resource_pool(
+                    subgroup_world_size=rollout_world_size,
+                    tag=f"rollout_{i}",
+                )
+            else:
+                rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
+            _register_resource_pool(rollout_resource_pool)
             self.resource_pool_to_cls[rollout_resource_pool][f"rollout_{i}"] = rollout_cls
 
         # create actor (train only)
@@ -1037,16 +1339,42 @@ class PSRL_RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
-        # create a reward model if reward_fn is None
-        # self.rm_wg = None
-        # if self.use_rm:
-        #     resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.RewardModel)
-        #     rm_cls = RayClassWithInitArgs(
-        #         self.role_worker_mapping[PSRL_Role.RewardModel],
-        #         config=self.config.reward_model,
-        #     )
-        #     self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+        # create reward model instances
+        for reward_model in self.config.reward_models_config.reward_models:
+            if reward_model.reward_loop_type != "gen":
+                continue
+            reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
+            reward_model_cfg = reward_model
+            for i in range(reward_model.num_replicas):
+                if self.elastic_rm_mode:
+                    reward_model_world_size = (
+                        reward_model_cfg.rollout.tensor_model_parallel_size
+                        * reward_model_cfg.rollout.pipeline_model_parallel_size
+                        * reward_model_cfg.rollout.get("data_parallel_size", 1)
+                    )
+                    reward_model_resource_pool = _build_elastic_sub_resource_pool(
+                        subgroup_world_size=reward_model_world_size,
+                        tag=f"reward_model_{reward_model_name}_{i}",
+                    )
+                else:
+                    reward_model_resource_pool = self.resource_pool_manager.resource_pool_dict[f"reward_pool_{reward_model_name}_{i}"]
+                _register_resource_pool(reward_model_resource_pool)
 
+                reward_model_gen_if = GenInterface(
+                    rollout_instance_id=i,
+                    status_queue=self.reward_model_status_queues_mapping[reward_model_name][i],
+                )
+                reward_model_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[PSRL_Role.RewardModel],
+                    config=reward_model_cfg,
+                    psrl_config=self.config.psrl,
+                    instance_id=i,
+                    gen_interface=reward_model_gen_if,
+                    reward_model_name=reward_model_name,
+                )
+
+                self.resource_pool_to_cls[reward_model_resource_pool][f"reward_model_{reward_model_name}_{i}"] = reward_model_cls
+        
         if not self.use_critic and not self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.DummyPolicy)
             dummy_policy_cls = RayClassWithInitArgs(
@@ -1156,17 +1484,20 @@ class PSRL_RayPPOTrainer:
                 assert class_dict.keys() == {"ps"}, "PS resource pool should only have PS role."
                 continue
             if any("rollout" in key for key in class_dict.keys()):
-                assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
+                if not self.elastic_rm_mode:
+                    assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
                 gen_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
-                # NOTE(linsh): adapt wg_kwargs for fused train worker
-                # if want to add specific env args.
-                train_tasks.append((resource_pool, class_dict, wg_kwargs))
+                # TMS LD_PRELOAD for train / fused workers (aligned with main_psrl agentic_rl ray_trainer)
+                train_wg_kwargs = wg_kwargs.copy()
+                tms_worker_env = build_ray_train_worker_tms_env(self.config.psrl)
+                if tms_worker_env is not None:
+                    train_wg_kwargs["worker_env"] = tms_worker_env
+                psrl_logger.info(f"train_wg_kwargs (TMS worker_env applied={tms_worker_env is not None}): {train_wg_kwargs}")
+                train_tasks.append((resource_pool, class_dict, train_wg_kwargs))
         # We must execute train tasks first because rollout instances may occupy
         # the resources randomly and no structured resources are available for training
-        with ThreadPoolExecutor(
-            max_workers=len(train_tasks)
-        ) as executor:  # max_workers is the number of threads to use
+        with ThreadPoolExecutor(max_workers=len(train_tasks)) as executor:  # max_workers is the number of threads to use
             futures = {}
             for resource_pool, class_dict, train_wg_kwargs in train_tasks:
                 future = executor.submit(create_worker_group, resource_pool, class_dict, train_wg_kwargs)
@@ -1199,22 +1530,14 @@ class PSRL_RayPPOTrainer:
             if reward_model.reward_loop_type != "gen":
                 continue
             reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
-            reward_model_resource_pools = []
-            for i in range(reward_model.num_replicas):
-                reward_model_resource_pools.append(
-                    self.resource_pool_manager.resource_pool_dict[f"reward_pool_{reward_model_name}_{i}"]
-                )
-            for pool in reward_model_resource_pools:
-                self.resource_pool_to_cls.pop(pool, None)
-            self.reward_model_status_queues_mapping[reward_model_name] = [
-                RayQueue() for _ in range(reward_model.num_replicas)
-            ]
+            reward_model_wg_list = [all_wg[f"reward_model_{reward_model_name}_{i}"] for i in range(reward_model.num_replicas)]
+            reward_model_status_queues = [self.reward_model_status_queues_mapping[reward_model_name][i] for i in range(reward_model.num_replicas)]
             self.reward_model_manager_mapping[reward_model_name] = PSRL_RewardModelManager(
                 reward_model_name=reward_model_name,
                 config=self.config,
                 reward_model_config=reward_model,
-                resource_pools=reward_model_resource_pools,
-                status_queues=self.reward_model_status_queues_mapping[reward_model_name],
+                reward_model_wg_list=reward_model_wg_list,
+                status_queues=reward_model_status_queues,
             )
         psrl_logger.info(f"reward_model_manager_mapping: {self.reward_model_manager_mapping}")
         
@@ -1361,6 +1684,8 @@ class PSRL_RayPPOTrainer:
             trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False)
         )
         psrl_logger.info("Evaluation rollout built successfully!")
+
+        self._init_elastic_rm_runtime()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1577,8 +1902,6 @@ class PSRL_RayPPOTrainer:
 
         self.init_reward_manager(validation=True)
         # perform validation before training
-        # currently, we only support validation using the reward_function.
-        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
         if self.val_reward_manager is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -1913,7 +2236,7 @@ class PSRL_RayPPOTrainer:
                                     #     if not isinstance(value, list):
                                     #         value = [value]
                                     #         reward_extra_infos_dict[key].extend(value)
-                                    if key == "data_source" or key == "original_reward_score":
+                                    if key in ("data_source", "original_reward_score"):
                                         if not isinstance(value, list):
                                             value = [value]
                                         reward_extra_infos_dict[key].extend(value)
@@ -2042,7 +2365,6 @@ class PSRL_RayPPOTrainer:
 
                 # validate
                 if (
-                    # self.val_reward_fn is not None
                     self.val_reward_manager is not None
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
@@ -2115,6 +2437,19 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Stopping all data pipeline components...")
         self.stop_reward_manager()
         self.stop_agent_loop_manager()
+        if self.elastic_executor is not None:
+            ray.get(self.elastic_executor.stop.remote())
+            self.elastic_executor = None
+        self.stop_rollout_coordinator()
+        self.stop_data_processor()
+
+        psrl_logger.info("Training completed successfully!")
+
+        psrl_logger.info("Training completed successfully!")
+        self.stop_agent_loop_manager()
+        if self.elastic_executor is not None:
+            ray.get(self.elastic_executor.stop.remote())
+            self.elastic_executor = None
         self.stop_rollout_coordinator()
         self.stop_data_processor()
 

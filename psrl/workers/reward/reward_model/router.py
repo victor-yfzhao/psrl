@@ -24,7 +24,6 @@ class PSRL_RewardModelRouter:
     def __init__(
         self,
         worker_handles: list[ray.actor.ActorHandle],
-        max_attempts: int = 3,
         retry_delay: float = 2.0,
         verbose: bool = False,
     ) -> None:
@@ -33,7 +32,6 @@ class PSRL_RewardModelRouter:
 
         Args:
             worker_handles: List of Ray ActorHandles for RewardModelWorker instances.
-            max_attempts: Maximum retry attempts for failed requests.
             retry_delay: Delay between retries (in seconds).
             verbose: Enable verbose logging.
         """
@@ -41,7 +39,6 @@ class PSRL_RewardModelRouter:
         self.worker_handles = worker_handles
         self.request_counts = {i: 0 for i in range(len(worker_handles))}
 
-        self.max_attempts = max_attempts
         self.retry_delay = retry_delay
 
         psrl_logger.info(f"RewardModelRouter initialized with {len(worker_handles)} workers")
@@ -67,25 +64,20 @@ class PSRL_RewardModelRouter:
             self.request_counts[worker_idx],
         )
 
-        for attempt in range(self.max_attempts):
-            try:
-                result = await worker_handle.generate_async.remote(request)
-                self._release_worker(worker_idx)
-                psrl_logger.info(
-                    "[router] Reward request %s finished on worker %d", request_uids, worker_idx
+        result = await worker_handle.generate_async.remote(request)
+        if result is None:
+            psrl_logger.info(
+                f"Request {request.non_tensor_batch['uid'][0]} is interrupted (instance sleep), "
+                "need to requeue."
                 )
-                return result
-            except asyncio.TimeoutError:
-                psrl_logger.warning(f"Request to worker {worker_idx} timed out (attempt {attempt + 1})")
-            except Exception as e:
-                psrl_logger.error(f"Request to worker {worker_idx} failed: {e}")
-                if attempt == self.max_attempts - 1:
-                    raise
-
-            if attempt < self.max_attempts - 1:
-                await asyncio.sleep(self.retry_delay * (2**attempt))
-
-        raise RuntimeError(f"Failed to complete request after {self.max_attempts} attempts")
+            result = await self.generate(request)
+        else:
+            psrl_logger.info(f"Request {request.non_tensor_batch['uid'][0]} is completed (finished generation)")
+        self._release_worker(worker_idx)
+        psrl_logger.info(
+            "[router] Reward request %s finished on worker %d", request_uids, worker_idx
+        )
+        return result
 
     async def generate_async(self, request: DataProto) -> DataProto | None:
         """
@@ -148,7 +140,6 @@ def launch_router_process(
     reward_model_roter_cls = ray.remote(PSRL_RewardModelRouter)
     router_handle = reward_model_roter_cls.remote(
         worker_handles=worker_handles,
-        max_attempts=max_attempts,
         retry_delay=retry_delay,
         verbose=verbose,
     )

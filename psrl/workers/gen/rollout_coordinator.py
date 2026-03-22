@@ -103,20 +103,47 @@ class RolloutCoordinator(CommandExtension):
         return sum([rollout_wg.world_size for rollout_wg in self.rollout_wg_list])
 
     async def init_model(self):
-        futures = []
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            if self.rank_0_is_model_owner:
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_model"))
-            else:
-                futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
-        await asyncio.gather(*futures)
-        # Register rollout instances after initializing the model
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            if self.rank_0_is_model_owner:
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance"))
-            else:
-                futures.extend(self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
-        await asyncio.gather(*futures)
+        # In elastic mode, initializing all rollout engines concurrently can easily
+        # OOM because each vLLM engine tries to reserve a large chunk of GPU memory
+        # before the PSRL-level sleep command is applied.
+        #
+        # To make memory consumption predictable, we initialize instance engines
+        # sequentially and immediately put each instance to sleep after init+register.
+        if getattr(self.config.psrl.deployment, "enable_elastic_rm", False):
+            for i in range(self.config.psrl.deployment.n_rollout_instances):
+                if self.rank_0_is_model_owner:
+                    await self.rollout_wg_list[i].execute_rank_zero_async("init_model")
+                else:
+                    await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("init_model"))
+
+                # Register rollout instances after initializing the model
+                if self.rank_0_is_model_owner:
+                    await self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance")
+                else:
+                    await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
+
+                # # Immediately sleep to free GPU memory for the next instance init.
+                # if self.rank_0_is_model_owner:
+                #     await self.rollout_wg_list[i].execute_rank_zero_async("sleep")
+                # else:
+                #     await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("sleep"))
+        else:
+            futures = []
+            for i in range(self.config.psrl.deployment.n_rollout_instances):
+                if self.rank_0_is_model_owner:
+                    futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_model"))
+                else:
+                    futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
+            await asyncio.gather(*futures)
+
+            # Register rollout instances after initializing the model
+            futures = []
+            for i in range(self.config.psrl.deployment.n_rollout_instances):
+                if self.rank_0_is_model_owner:
+                    futures.append(self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance"))
+                else:
+                    futures.extend(self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
+            await asyncio.gather(*futures)
         self._is_init_model.set()
 
     async def init_route_strategy(self):
@@ -395,6 +422,66 @@ class RolloutCoordinator(CommandExtension):
                         # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
                         self._complete_command(command_id, interrupted_request_nums)
                         await asyncio.gather(*sync_futures)  # Wait for the sync to complete
+                
+                elif command_type == CommandType.SLEEP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if instance_ids is None:
+                        raise ValueError("SLEEP command must contain 'instance_ids' in args.")
+                    
+                    abort_futures = []
+                    sleep_futures = []
+
+                    # First, abort the instance
+                    if instance_ids is not None:
+                        for instance_id in instance_ids:
+                            if self.rank_0_is_model_owner:
+                                abort_futures.append(
+                                    self.rollout_wg_list[instance_id].execute_rank_zero_async(
+                                        "interrupt_requests", None
+                                    )
+                                )
+                            else:
+                                warnings.warn(
+                                    f"Interrupt requests on instance {instance_id} in SPMD-style "
+                                    "may cause undefined behavior, need to check the behavior",
+                                    stacklevel=2,
+                                )
+                                abort_futures.append(
+                                    self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", None)[0]
+                                )
+
+                    if not abort_futures:
+                        interrupted_request_num = 0
+                    else:
+                        interrupted_request_nums = await asyncio.gather(*abort_futures)
+                        interrupted_request_num = np.sum(interrupted_request_nums)
+                    
+                    psrl_logger.info(f"Received SLEEP command for instances {instance_ids}, "
+                                    f"interrupted {interrupted_request_num} requests")
+
+                    # second, sleep the instance
+                    for instance_id in instance_ids:
+                        if self.rank_0_is_model_owner:
+                            sleep_futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_sleep"))
+                        else:
+                            sleep_futures.extend(self.rollout_wg_list[instance_id].execute_all_async("nixl_sleep"))
+
+                    await asyncio.gather(*sleep_futures)
+
+                    self._complete_command(command_id, True)
+                
+                elif command_type == CommandType.WAKE_UP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if instance_ids is None:
+                        raise ValueError("WAKE_UP command must contain 'instance_ids' in args.")
+                    wake_up_futures = []
+                    for instance_id in instance_ids:
+                        if self.rank_0_is_model_owner:
+                            wake_up_futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up"))
+                        else:
+                            wake_up_futures.extend(self.rollout_wg_list[instance_id].execute_all_async("nixl_wake_up"))
+                    await asyncio.gather(*wake_up_futures)
+                    self._complete_command(command_id, True)
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 

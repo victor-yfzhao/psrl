@@ -1,14 +1,18 @@
 import asyncio
+import json
 import logging
 import os
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
+from pprint import pprint
 from typing import Any, cast
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, ListConfig
+import vllm
+import vllm.entrypoints.cli.serve
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
 from verl import DataProto
@@ -17,9 +21,11 @@ from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
-from vllm.pooling_params import PoolingParams
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 try:
@@ -69,6 +75,9 @@ class PSRL_vLLMRollout:
             self.reward_model_name = kwargs.get("reward_model_name")
         else:
             self.reward_model_name = None
+        # Align with agentic_rl: only validation workers use vLLM sleep mode by default.
+        self.is_validate = kwargs.get("is_validate", False)
+        self._server_args = None
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
@@ -147,7 +156,12 @@ class PSRL_vLLMRollout:
                              please increase max_num_batched_tokens or disable chunked prefill"
             )
 
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        # Load dummy format for meta init mode to save init time
+        load_format = (
+            "dummy"
+            if (config.load_format.startswith("dummy") or kwargs.get("init_mode", "full") == "empty")
+            else config.load_format
+        )
 
         # LoRA configuration
         lora_kwargs = (
@@ -197,10 +211,9 @@ class PSRL_vLLMRollout:
 
         runner = config.get("runner", "generate")
         task = config.get("task", "generate")
-        
+
         llm_kwargs = dict(
-            model=model_path,
-            enable_sleep_mode=False,
+            enable_sleep_mode=True,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             enable_expert_parallel=enable_expert_parallel,
@@ -229,7 +242,7 @@ class PSRL_vLLMRollout:
             **engine_kwargs,
         )
 
-                # Support for pooling models (e.g., reward models)
+        # Support for pooling models (e.g., reward models)
         self.is_pooling_model = (runner == "pooling")
 
         """
@@ -252,6 +265,17 @@ class PSRL_vLLMRollout:
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
 
+        prom = getattr(config, "prometheus", None)
+        if prom is not None and getattr(prom, "enable", False):
+            assert bool(OmegaConf.select(psrl_config, "server_rollout.enable", default=False)), (
+                "Prometheus monitoring requires server_rollout to be enabled."
+            )
+            served_model_name = getattr(prom, "served_model_name", None)
+            if served_model_name:
+                if "/" in served_model_name:
+                    served_model_name = served_model_name.split("/")[-1]
+                llm_kwargs["served_model_name"] = served_model_name
+
         # Initialize abort queue, events, and request ids for psrl_async mode
         self.scheduler_abort_queue = RayQueue()
         self.scheduler_abort_events = {}
@@ -259,21 +283,30 @@ class PSRL_vLLMRollout:
         self._scheduler_abort_processor_task = None
 
         if config.mode == "psrl_async":
-            engine_args = AsyncEngineArgs(**llm_kwargs)
+            server_rollout = bool(OmegaConf.select(psrl_config, "server_rollout.enable", default=False))
+            if server_rollout:
+                server_args = self._build_server_args(model_path=model_path, args=llm_kwargs)
+                self._server_args = server_args
+                engine_args = AsyncEngineArgs.from_cli_args(server_args)
+                usage_context = UsageContext.OPENAI_API_SERVER
+                vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+            else:
+                llm_kwargs["model"] = model_path
+                engine_args = AsyncEngineArgs(**llm_kwargs)
+                usage_context = UsageContext.ENGINE_CONTEXT
+                vllm_config = engine_args.create_engine_config()
+
             stat_loggers = None
-            # Status collection requires status_queue.
             if (
                 not config.disable_log_stats
                 and psrl_config.status_collection.enable
                 and "status_queue" in kwargs
             ):
                 psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
-                # Use custom stat loggers to collect engine stats
-                vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
                 self.stat_collector = StatCollector(
-                    vllm_config, 
-                    psrl_config, 
+                    vllm_config,
+                    psrl_config,
                     instance_id=kwargs.get("instance_id", 0),
                     is_reward_model=self.is_reward_model,
                     reward_model_name=self.reward_model_name,
@@ -284,8 +317,13 @@ class PSRL_vLLMRollout:
                 self.stat_collector.record_model_version_update(0)
                 stat_loggers = [self.stat_collector]
             psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
-            self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
+            self.inference_engine = AsyncLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=usage_context,
+                stat_loggers=stat_loggers,
+            )
         else:
+            llm_kwargs["model"] = model_path
             psrl_logger.info(f"Initialize LLM for rollout instance {kwargs.get('instance_id', 0)}")
             self.inference_engine = LLM(**llm_kwargs)
 
@@ -296,25 +334,6 @@ class PSRL_vLLMRollout:
         if load_format == "dummy" and config.free_cache_engine:
             self.inference_engine.sleep(level=1)
         """
-
-        # kwargs = dict(
-        #     n=1,
-        #     logprobs=0,  # can be set to 0 and let actor to recompute
-        #     max_tokens=config.response_length,
-        #     repetition_penalty=config.get("repetition_penalty", 1.0),
-        #     output_kind=RequestOutputKind.CUMULATIVE,
-        # )
-
-        # # we may detokenize the result all together later
-        # kwargs["detokenize"] = False
-
-        # # supporting adding any sampling params from the config file
-        # for k in config.keys():
-        #     if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
-        #         kwargs[k] = config.get(k)
-        # kwargs["n"] = 1  # already repeat in ray_trainer
-        # psrl_logger.info(f"kwargs: {kwargs}")
-        # self.sampling_params = SamplingParams(**kwargs)
 
         # Initialize parameters based on model type
         if self.is_pooling_model:
@@ -375,6 +394,37 @@ class PSRL_vLLMRollout:
             self._scheduler_abort_processor_task.add_done_callback(
                 lambda f: f.result()
             )  # To avoid silent error in async tasks
+
+    def _build_server_args(self, model_path: str, args: dict[str, Any]):
+        """Build a CLI-like args Namespace compatible with vLLM OpenAI server."""
+        server_args = ["serve", model_path]
+        for k, v in args.items():
+            if isinstance(v, bool):
+                if v:
+                    server_args.append(f"--{k}")
+            elif v is not None:
+                server_args.append(f"--{k}")
+                server_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
+
+        pprint(server_args)
+
+        parser = FlexibleArgumentParser(description="vLLM CLI")
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd in vllm.entrypoints.cli.serve.cmd_init():
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+
+        parsed = parser.parse_args(args=server_args)
+        parsed.model = getattr(parsed, "model_tag", model_path)
+        if getattr(parsed, "subparser", None) in cmds:
+            cmds[parsed.subparser].validate(parsed)
+        return parsed
+
+    @property
+    def server_args(self):
+        """Cached vLLM OpenAI server args when server_rollout is enabled."""
+        return self._server_args
 
     async def _scheduler_abort_processor_loop(self):
         """Background loop that processes abort requests from the queue."""
@@ -590,6 +640,8 @@ class PSRL_vLLMRollout:
                 # Pooling models don't generate tokens, so use empty response
                 response_ids = []
                 response_len = 0
+                # TODO(zyf): need to check the finish_reason of the pooling model
+                # interrupted = vllm_output.outputs[0].finish_reason == "abort"
                 interrupted = False
             else:
                 assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."

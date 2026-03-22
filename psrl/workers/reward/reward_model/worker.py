@@ -8,9 +8,9 @@ from collections import defaultdict
 from typing import Any
 
 import numpy as np
+import ray
 import torch
 import torch.distributed as dist
-from ray.util.queue import Queue as RayQueue
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoConfig
 from verl import DataProto
@@ -31,7 +31,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.workers.config import HFModelConfig, RolloutConfig
-from psrl.workers.gen import PSRL_vLLMRollout
+from psrl.workers.gen import GenInterface, PSRL_vLLMRollout
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -48,6 +48,7 @@ class PSRL_RewardModelWorker(Worker):
     @staticmethod
     def configure_worker(
         config,
+        psrl_config,
         num_gpus: int | float,
         dp_idx: int,
         bundle_indices: list[int] | None,
@@ -58,6 +59,7 @@ class PSRL_RewardModelWorker(Worker):
 
         Args:
             config (DictConfig): The configuration for the worker.
+            psrl_config (DictConfig): The PSRL configuration.
             num_gpus (int | float): The number of GPUs available for the worker.
             dp_idx (int): The data parallel index of the worker.
             bundle_indices (list[int]): Indices of the bundles to which this worker belongs.
@@ -77,7 +79,7 @@ class PSRL_RewardModelWorker(Worker):
             return resources, env_vars, init_kwargs
         
         resources["num_gpus"] = num_gpus
-        psrl_logger.info("Configuring PSRL RewardModelWorker...")
+        psrl_logger.info(f"Configuring PSRL RewardModelWorker({num_gpus=}, {dp_idx=}, {bundle_indices=})...")
 
         # Initialize configuration
         if bundle_indices is not None:
@@ -114,9 +116,8 @@ class PSRL_RewardModelWorker(Worker):
     def __init__(
         self,
         config: DictConfig,
-        role: str,
         psrl_config: DictConfig,
-        status_queue: RayQueue,
+        gen_interface: GenInterface,
         reward_model_name: str | None = None,
         **kwargs,
     ) -> None:
@@ -125,17 +126,18 @@ class PSRL_RewardModelWorker(Worker):
 
         Args:
             config (DictConfig): The configuration for the worker.
-            role (str): The role of the worker (e.g., "gen").
             psrl_config (DictConfig): The PSRL configuration.
+            gen_interface (GenInterface): Same shape as rollout (rollout_instance_id, status_queue); ps_manager_handle omitted.
             **kwargs: Additional keyword arguments, including 'seed'.
         """
         super().__init__()
         self.config = config
         self.psrl_config = psrl_config
-        self.status_queue = status_queue
+        self.gen_interface = gen_interface
+        self.status_queue = gen_interface.status_queue
         self.reward_model_name = reward_model_name
         self.seed = kwargs.get("seed", 0)
-        self.instance_id = kwargs.get("instance_id", 0)
+        self.instance_id = kwargs.get("instance_id", gen_interface.rollout_instance_id)
         self.rollout: PSRL_vLLMRollout | None = None
         self.rollout_config: RolloutConfig | None = None
         self.model_config: HFModelConfig | None = None
@@ -188,7 +190,25 @@ class PSRL_RewardModelWorker(Worker):
         return getattr(self, "rank", 0) == 0
     
     def get_instance_id(self) -> int:
-        return self.instance_id
+        return self.gen_interface.rollout_instance_id
+
+    def get_node_id(self) -> str:
+        return ray.get_runtime_context().get_node_id()
+
+    def get_runtime_gpu_ids(self) -> list[int]:
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+        raw_gpu_ids = accelerator_ids.get("GPU", accelerator_ids.get("NPU", []))
+        return [int(gpu_id) for gpu_id in raw_gpu_ids]
+
+    async def sleep(self):
+        self._ensure_model_ready()
+        await self.rollout.inference_engine.sleep(level=2)
+        psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} sleeping.")
+
+    async def wake_up(self):
+        self._ensure_model_ready()
+        await self.rollout.inference_engine.wake_up(tags=["weights", "kv_cache"])
+        psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} waking up.")
 
     def _build_rollout(self, trust_remote_code: bool = False) -> PSRL_vLLMRollout:
         """
@@ -330,9 +350,17 @@ class PSRL_RewardModelWorker(Worker):
         with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
             result = await self.rollout.generate_sequences_async(request)
 
-            assert len(result) == 1, (
-                f"Expected 1 output for single request, got {len(result)} outputs."
-            )
+        assert len(result) == 1, (
+            f"Expected 1 output for single request, got {len(result)} outputs."
+        )
+
+        interrupted = result.non_tensor_batch["interrupted"][0]
+
+        if interrupted:
+            psrl_logger.info(f"Request {request.non_tensor_batch['uid'][0]} is interrupted (instance sleep)")
+            return None
+        else:
+            psrl_logger.info(f"Request {request.non_tensor_batch['uid'][0]} is completed (finished generation)")
             
         return result
     
@@ -344,6 +372,39 @@ class PSRL_RewardModelWorker(Worker):
             self.log_active_tasks(task_done=True)
 
         return task_done_callback
+
+    async def _async_interrupt_requests(self, request_ids=None) -> int:
+        """Interrupt queued/running requests in reward model engine.
+
+        If `request_ids` is None, interrupt all requests.
+        Otherwise only interrupt requests whose uid is in `request_ids`.
+        """
+        self._ensure_model_ready()
+        if not request_ids:
+            interrupted_request_num = await self.rollout.interrupt_all_requests_async()
+            psrl_logger.debug(f"Interrupted all {interrupted_request_num} reward-model requests")
+            return interrupted_request_num
+
+        request_tasks = set()
+        for request_id in request_ids:
+            if request_id in self.request_id_to_active_tasks:
+                request_tasks.update(self.request_id_to_active_tasks[request_id])
+            else:
+                psrl_logger.warning(f"Request ID {request_id} not found in active tasks.")
+        if request_tasks:
+            await self.rollout.interrupt_requests_async(request_ids)
+            psrl_logger.debug(f"Interrupted reward-model requests with IDs: {request_ids}")
+        return len(request_tasks)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def interrupt_requests(self, request_ids):
+        """Interrupt specific reward-model requests."""
+        return await self._async_interrupt_requests(request_ids)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def interrupt_all_requests(self):
+        """Interrupt all reward-model requests."""
+        return await self._async_interrupt_requests()
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):

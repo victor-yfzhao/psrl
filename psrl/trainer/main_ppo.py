@@ -142,23 +142,20 @@ class TaskRunner:
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
         deployment_config = config.psrl.deployment
-        train_pool_id = "train_pool"
-        rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
+        train_pool_id = "train_pool"        
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
         }
-
-        # # Reward model resource pool
-        # if config.reward_model.enable_resource_pool:
-        #     if config.reward_model.n_gpus_per_node <= 0:
-        #         raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-        #     if config.reward_model.nnodes <= 0:
-        #         raise ValueError("config.reward_model.nnodes must be greater than 0")
-
-        #     reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
-        #     resource_pool_spec["reward_pool"] = reward_pool
+        self.mapping[PSRL_Role.Actor] = [train_pool_id]
+        self.mapping[PSRL_Role.Critic] = [train_pool_id]
 
         # Set the resource pool spec for each rollout instance.
+        total_rollout_gpus = 0
+        if deployment_config.elastic_rm.enable:
+            rollout_pool_id_list = ["shared_rollout_pool"]
+        else:
+            rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
+
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
         if deployment_config.heterogeneous_rollout.enable:
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
@@ -184,6 +181,21 @@ class TaskRunner:
                 resource_pool_spec[rollout_pool_id] = [
                     heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance[i]
                 ] * heterogeneous_deployment_config.rollout_nnodes_per_instance[i]
+        elif deployment_config.elastic_rm.enable:
+            total_rollout_gpus = (deployment_config.elastic_rm.shared_ngpus_per_node
+                                * deployment_config.elastic_rm.shared_nnodes)
+            deployment_config.n_rollout_instances = (
+                total_rollout_gpus // (
+                    config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size 
+                    * config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
+                    * config.gen_actor_rollout_ref.rollout.data_parallel_size
+                )
+            )
+            print(f"[Elastic RM] Maximum number of rollout instances = {deployment_config.n_rollout_instances}")
+            resource_pool_spec["shared_rollout_pool"] = [
+                deployment_config.elastic_rm.shared_ngpus_per_node
+            ] * deployment_config.elastic_rm.shared_nnodes 
+            rollout_pool_id_list = ["shared_rollout_pool"] * deployment_config.n_rollout_instances       
         else:
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
@@ -191,37 +203,42 @@ class TaskRunner:
                     deployment_config.rollout_ngpus_per_node_per_instance
                 ] * deployment_config.rollout_nnodes_per_instance
 
-        self.mapping[PSRL_Role.Actor] = [train_pool_id]
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
-        self.mapping[PSRL_Role.Critic] = [train_pool_id]
 
         # Reward model resource pool
-        total_reward_pool_id_list = []
+        total_reward_pool_id_list = [] if not deployment_config.elastic_rm.enable else ["shared_rollout_pool"]
         reward_models_config = config.reward_models_config
         for reward_model in reward_models_config.reward_models:
             if reward_model.reward_loop_type != "gen":
                 continue
-            if reward_model.enable_resource_pool:
+            if deployment_config.elastic_rm.enable:
+                reward_model.num_replicas = (
+                    total_rollout_gpus // (
+                        reward_model.rollout.tensor_model_parallel_size 
+                        * reward_model.rollout.pipeline_model_parallel_size
+                        * reward_model.rollout.data_parallel_size
+                    )
+                )
+                print(f"[Elastic RM] Maximum number of reward model"
+                    f"({reward_model.reward_model_name}) instances = {reward_model.num_replicas}")
+            elif reward_model.enable_resource_pool:
                 if reward_model.n_gpus_per_node <= 0:
                     raise ValueError("reward_model.n_gpus_per_node must be greater than 0")
                 if reward_model.nnodes <= 0:
                     raise ValueError("reward_model.nnodes must be greater than 0")
 
-                reward_loop_instances = getattr(
-                    reward_model,
-                    "n_rollout_instances",
-                    reward_model.get("num_replicas", 1),
-                )
+                reward_model_instances = reward_model.get("num_replicas", 1)
                 reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
                 reward_pool_id_list = [
-                    f"reward_pool_{reward_model_name}_{i}" 
-                    for i in range(reward_loop_instances)
+                    f"reward_pool_{reward_model_name}_{i}" for i in range(reward_model_instances)
                 ]
-                for i in range(reward_loop_instances):
+                for i in range(reward_model_instances):
                     resource_pool_spec[reward_pool_id_list[i]] = [
                         reward_model.rollout_ngpus_per_instance_per_node
                     ] * reward_model.rollout_nnodes_per_instance
                 total_reward_pool_id_list.extend(reward_pool_id_list)
+            else:
+                raise ValueError("reward_model.enable_resource_pool must be True when elastic_rm.enable is False")
 
         self.mapping[PSRL_Role.RewardModel] = total_reward_pool_id_list
 
@@ -246,20 +263,6 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
-        # if config.reward_model.enable:
-        #     if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-        #         from verl.workers.fsdp_workers import RewardModelWorker
-        #     elif config.reward_model.strategy == "megatron":
-        #         from verl.workers.megatron_workers import RewardModelWorker
-        #     else:
-        #         raise NotImplementedError
-
-        #     self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
-        #     if config.reward_model.enable_resource_pool:
-        #         self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
-        #     else:
-        #         self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
-
         from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)  
 
@@ -327,24 +330,6 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # Load the reward manager for training and validation.
-        # reward_fn = load_reward_manager(
-        #     config,
-        #     tokenizer,
-        #     num_examine=0,
-        #     **config.reward_model.get("reward_kwargs", {}),
-        # )
-        reward_fn = None
-        
-        # val_reward_fn = load_reward_manager(
-        #     config,
-        #     tokenizer,
-        #     num_examine=1,
-        #     **config.reward_model.get("reward_kwargs", {}),
-        # )
-
-        val_reward_fn = None
-
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
@@ -365,8 +350,6 @@ class TaskRunner:
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
             collate_fn=collate_fn,
             group_post_process_fn=group_post_process_fn,
             buffer_post_process_fn=buffer_post_process_fn,

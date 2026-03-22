@@ -1,4 +1,4 @@
-from .data_logger import log_data_protocol
+from .data_logger import log_data_protocol, log_tensor
 from .deprecated import deprecated
 from .env_logger import log_env_info
 from .ps_logger import get_ps_logger, setup_ps_logger
@@ -23,6 +23,7 @@ __all__ = [
     "log_end_event",
     "EventType",
     "log_data_protocol",
+    "log_tensor",
     "log_env_info",
     "deprecated",
     "get_ps_logger",

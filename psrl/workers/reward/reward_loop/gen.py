@@ -130,6 +130,21 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         if isinstance(rm_inputs, torch.Tensor):
             rm_inputs = {"input_ids": rm_inputs}
 
+        # Compute RM input length in tokens (non-padding tokens if attention_mask is available)
+        rm_input_len = None
+        input_ids_tensor = rm_inputs.get("input_ids")
+        attention_mask_tensor = rm_inputs.get("attention_mask", None)
+        if isinstance(attention_mask_tensor, torch.Tensor):
+            if attention_mask_tensor.dim() == 2:
+                rm_input_len = int(attention_mask_tensor[0].sum().item())
+            else:
+                rm_input_len = int(attention_mask_tensor.sum().item())
+        elif isinstance(input_ids_tensor, torch.Tensor):
+            if input_ids_tensor.dim() == 2:
+                rm_input_len = int(input_ids_tensor[0].numel())
+            else:
+                rm_input_len = int(input_ids_tensor.numel())
+
         # Build DataProto for RM inference
         rm_data_proto = self._build_rm_data_proto(rm_inputs, request_uid)
 
@@ -139,6 +154,8 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         rm_output_value = rm_output_dict.get("rm_output_value")
 
         reward_metrics = rm_output_dict.get("reward_metrics", {})
+        if not isinstance(reward_metrics, dict):
+            reward_metrics = {}
 
         # Compute final reward score using custom scoring function
         # Pass both rm_output_str and rm_output_logits, let compute_score choose which one to use
@@ -181,6 +198,13 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         if rm_output_value is not None:
             reward_extra_info["rm_output_value"] = rm_output_value
         reward_extra_info["agent_response"] = response_str
+
+        # Attach RM input/output token lengths to reward_extra_info
+        if rm_input_len is not None:
+            reward_extra_info["rm_input_len"] = rm_input_len
+        rm_output_len = rm_output_dict.get("rm_output_len", None)
+        if rm_output_len is not None:
+            reward_extra_info["rm_output_len"] = rm_output_len
 
         psrl_logger.info(
             "Reward computed uid=%s score=%.4f extra=%s",
@@ -327,6 +351,7 @@ class GenRewardLoopManager(RewardLoopManagerBase):
                     lambda: self.reward_model_tokenizer.decode(generated_ids, skip_special_tokens=True),
                 )
                 result["rm_output_str"] = generated_str
+                result["rm_output_len"] = len(generated_ids)
                 psrl_logger.info(
                     "Reward model response ready uid=%s tokens=%d", request_uid, len(generated_ids)
                 )

@@ -25,9 +25,9 @@ reward_models:
     reward_model_name: Qwen3-8B
 
     enable_resource_pool: True
-    n_gpus_per_node: 1
+    n_gpus_per_node: 8
     num_replicas: 4
-    nnodes: 1
+    nnodes: 2
     rollout_ngpus_per_instance_per_node: 1
     rollout_nnodes_per_instance: 1
 
@@ -42,15 +42,15 @@ reward_models:
       mode: psrl_async
       disable_attn: False
       dtype: bfloat16
-      gpu_memory_utilization: 0.5
-      enforce_eager: false
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
       cudagraph_capture_sizes: null
       free_cache_engine: true
       data_parallel_size: 1
       expert_parallel_size: 1
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
-      max_num_batched_tokens: 81920
+      max_num_batched_tokens: 204800
       max_num_seqs: 1024
       load_format: auto
       engine_kwargs: {}
@@ -60,9 +60,9 @@ reward_models:
       disable_log_stats: false
       skip_tokenizer_init: false
 
-      prompt_length: 8192
-      response_length: 4096
-      max_model_len: 16384
+      prompt_length: 16384
+      response_length: 16384
+      max_model_len: 32768
 
       runner: generate
       task: generate
@@ -79,7 +79,7 @@ reward_models:
 
   #   enable_resource_pool: True
   #   n_gpus_per_node: 1
-  #   num_replicas: 1
+  #   num_replicas: 4
   #   nnodes: 1
   #   rollout_ngpus_per_instance_per_node: 1
   #   rollout_nnodes_per_instance: 1

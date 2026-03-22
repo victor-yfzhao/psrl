@@ -91,12 +91,18 @@ class RewardModelCoordinator(CommandExtension):
         assert (
             self.reward_model_wg_list is not None
         ), "Reward model worker group list must be set before initializing the model."
-
-        futures = []
+        init_futures = []
         for i in range(self.reward_model_wg_size):
-            # execute_all_async returns a list of futures; extend instead of append
-            futures.extend(self.reward_model_wg_list[i].execute_all_async("init_model"))
-        await asyncio.gather(*futures)
+            init_futures.extend(self.reward_model_wg_list[i].execute_all_async("init_model"))
+        await asyncio.gather(*init_futures)
+        psrl_logger.info(f"Reward model {self.reward_model_name} initialized.")
+
+        if self.config.psrl.deployment.elastic_rm.enable:
+            sleep_futures = []
+            for i in range(self.reward_model_wg_size):
+                sleep_futures.extend(self.reward_model_wg_list[i].execute_all_async("sleep"))
+            await asyncio.gather(*sleep_futures)
+            psrl_logger.info(f"Reward model {self.reward_model_name} sleeping.")
 
         self._is_init_model.set()
     
@@ -221,17 +227,18 @@ class RewardModelCoordinator(CommandExtension):
                             if not isinstance(uids, (list, set)):
                                 uids = [uids]
                             abort_requests = set(uids)  # Ensure uniqueness
-                            # futures.append(
-                            #     self.reward_model_wg_list[instance_id].execute_all_async(
-                            #         "interrupt_requests", abort_requests
-                            #     )[0]
-                            # )
+                            futures.append(
+                                self.reward_model_wg_list[instance_id].execute_all_async(
+                                    "interrupt_requests", abort_requests
+                                )[0]
+                            )
                     if instance_ids is not None:
                         for instance_id in instance_ids:
-                            pass
-                            # futures.append(
-                            #     self.reward_model_wg_list[instance_id].execute_all_async("interrupt_requests", None)[0]
-                            # )
+                            futures.append(
+                                self.reward_model_wg_list[instance_id].execute_all_async(
+                                    "interrupt_requests", None
+                                )[0]
+                            )
 
                     if not futures:
                         interrupted_request_num = 0
@@ -243,6 +250,44 @@ class RewardModelCoordinator(CommandExtension):
                     psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
                     # Post process the command result
                     self._complete_command(command_id, result)
+                elif command_type == CommandType.SLEEP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if instance_ids is None:
+                        raise ValueError("SLEEP command must contain 'instance_ids' in args.")
+                    
+                    abort_futures = []
+                    sleep_futures = []
+
+                    # First, abort the instance
+                    if instance_ids is not None:
+                        for instance_id in instance_ids:
+                            abort_futures.append(
+                                self.reward_model_wg_list[instance_id].execute_all_async(
+                                    "interrupt_requests", None
+                                )[0]
+                            )
+
+                    if not abort_futures:
+                        interrupted_request_num = 0
+                    else:
+                        interrupted_request_nums = await asyncio.gather(*abort_futures)
+                        interrupted_request_num = np.sum(interrupted_request_nums)
+
+                    # second, sleep the instance
+                    for instance_id in instance_ids:
+                        sleep_futures.append(self.reward_model_wg_list[instance_id].execute_all_async("sleep")[0])
+                    await asyncio.gather(*sleep_futures)
+                    self._complete_command(command_id, True)
+                
+                elif command_type == CommandType.WAKE_UP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if instance_ids is None:
+                        raise ValueError("WAKE_UP command must contain 'instance_ids' in args.")
+                    wake_up_futures = []
+                    for instance_id in instance_ids:
+                        wake_up_futures.append(self.reward_model_wg_list[instance_id].execute_all_async("wake_up")[0])
+                    await asyncio.gather(*wake_up_futures)
+                    self._complete_command(command_id, True)
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 

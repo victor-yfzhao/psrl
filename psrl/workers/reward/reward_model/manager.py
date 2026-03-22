@@ -31,7 +31,7 @@ class PSRL_RewardModelManager:
         reward_model_name: str,
         config: DictConfig,
         reward_model_config: DictConfig,
-        resource_pools: RayResourcePool | list[RayResourcePool],
+        reward_model_wg_list: list[ray.actor.ActorHandle],
         status_queues: list[RayQueue],
     ):
         """
@@ -41,16 +41,11 @@ class PSRL_RewardModelManager:
         self.config = config
         self.reward_model_name = reward_model_name
         self.reward_model_config = reward_model_config
-        if isinstance(resource_pools, RayResourcePool):
-            resource_pools = [resource_pools]
-        if not resource_pools:
-            raise ValueError("At least one RayResourcePool is required to launch reward model replicas")
-        self.resource_pools: list[RayResourcePool] = list(resource_pools)
+        self.reward_model_wg_list = reward_model_wg_list
         self.replicas: list[PSRL_RewardModelReplica] = []
         self.router_process: ray.actor.ActorHandle | None = None
         self.status_queues: list[RayQueue] = status_queues
 
-        self.reward_model_wg_list = []
         # self.router_address: str | None = None
 
         self.reward_model_coordinator = RewardModelCoordinator.remote(
@@ -74,16 +69,10 @@ class PSRL_RewardModelManager:
             trust_remote_code=self.reward_model_config.model.get("trust_remote_code", False),
         )
         self.reward_model_tokenizer = model_config.tokenizer
-        requested_replicas = self.reward_model_config.get("num_replicas", len(self.resource_pools))
-        if requested_replicas > len(self.resource_pools):
-            raise ValueError(
-                f"Reward model requires {requested_replicas} replicas but only {len(self.resource_pools)} "
-                "resource pools are available."
-            )
 
         self.replicas = []
-        for i in range(requested_replicas):
-            resource_pool = self.resource_pools[i]
+        for i in range(len(self.reward_model_wg_list)):
+            reward_model_wg = self.reward_model_wg_list[i]
             status_queue = self.status_queues[i]
             self.replicas.append(
                 PSRL_RewardModelReplica(
@@ -92,47 +81,24 @@ class PSRL_RewardModelManager:
                     rollout_config=rollout_config,
                     model_config=model_config,
                     psrl_config=self.config.psrl,
-                    resource_pool=resource_pool,
+                    reward_model_wg=reward_model_wg,
                     reward_model_name=self.reward_model_name,
                     status_queue=status_queue,
                 )
             )
 
-        self._run_coroutines_blocking([self._init_all_replicas()])
+        self._init_all_replicas()
 
-    async def _init_all_replicas(self):
+    def _init_all_replicas(self):
         """
         Initialize all replicas and their models in parallel.
         """
-        await asyncio.gather(*[replica.init_replica() for replica in self.replicas])
-        # await asyncio.gather(*[replica.init_model() for replica in self.replicas])
-        for i in range(len(self.replicas)):
-            self.reward_model_wg_list.append(self.replicas[i].worker_group)
-
         ray.get(self.reward_model_coordinator.set_reward_model_wg_list.remote(self.reward_model_wg_list))
         ray.get(self.reward_model_coordinator.init_model.remote())
         ray.get(self.reward_model_coordinator.start_busy_loop.remote())
         psrl_logger.info(f"Reward model coordinator started!")
 
         psrl_logger.info(f"All {len(self.replicas)} reward model replicas initialized.")
-
-    def _run_coroutines_blocking(self, coroutines: list[asyncio.Future]):
-        if not coroutines:
-            return
-        try:
-            previous_loop = asyncio.get_event_loop()
-        except RuntimeError:
-            previous_loop = None
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(asyncio.gather(*coroutines))
-        finally:
-            loop.close()
-            if previous_loop is not None:
-                asyncio.set_event_loop(previous_loop)
-            else:
-                asyncio.set_event_loop(None)
 
     def _initialize_router(self):
         """
