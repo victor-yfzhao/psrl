@@ -3,6 +3,7 @@ import json
 import os
 from dataclasses import dataclass
 
+import ray
 import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
@@ -10,11 +11,12 @@ from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 from verl.utils.fs import copy_to_local
 
+from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.hf_converter import convert_hf_inplace
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.nixl import (
-    GLOBAL_META_SERVER_NAME,
-    GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
     NIXLInterface,
     NIXLMultiStorageClients,
@@ -62,6 +64,14 @@ class PSStorageWorker:
         self.train_meta_hf_model: torch.nn.Module | None = None
         self.gen_meta_hf_model: torch.nn.Module | None = None
 
+        # Map: canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
+        # Built by init_model(); used by write_checkpoint_to_registered_tensors()
+        # to handle tied-weight models (e.g. tie_word_embeddings=True).
+        self._tied_weights_alias_map: dict[str, list[str]] = {}
+
+        # Cache for non-persistent named buffers (e.g. inv_freq), populated lazily.
+        self._cached_non_persistent_buffers: dict[str, torch.Tensor] | None = None
+
         # NIXL
         self.nixl_multi_storage_clients = None
 
@@ -91,33 +101,28 @@ class PSStorageWorker:
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.train_meta_hf_model and self.gen_meta_hf_model, \
         #     "The HuggingFace models must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
-            # TODO(lhy): maybe support train and gen use different ps mode
-            self.agent_name = f"{GLOBAL_PS_CLIENT_NAME}_{self.rank}"
-            self.client_for_push_name = f"{self.agent_name}_for_push"
-            self.client_for_pull_name = f"{self.agent_name}_for_pull"
-            self.nixl_multi_storage_clients = NIXLMultiStorageClients(
-                agent_name=self.agent_name,
-                multi_client_names=[
-                    self.client_for_push_name,
-                    self.client_for_pull_name,
-                ],
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=self.use_gpu,
-                multi_client_types=[
-                    NIXLClientType.PS_FOR_PUSH,
-                    NIXLClientType.PS_FOR_PULL,
-                ],
-                nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id(),
-                logging_path=self.psrl_config.logging_path,
-            )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
+        # TODO(lhy): maybe support train and gen use different ps mode
+        self.agent_name = ps_agent_name(self.rank)
+        self.client_for_push_name = ps_client_push_name(self.rank)
+        self.client_for_pull_name = ps_client_pull_name(self.rank)
+        self.nixl_multi_storage_clients = NIXLMultiStorageClients(
+            agent_name=self.agent_name,
+            multi_client_names=[
+                self.client_for_push_name,
+                self.client_for_pull_name,
+            ],
+            server_name=NIXL_META_SERVER_NAME,
+            use_gpu=self.use_gpu,
+            multi_client_types=[
+                NIXLClientType.PS_FOR_PUSH,
+                NIXLClientType.PS_FOR_PULL,
+            ],
+            nixl_config=self.psrl_config.nixl,
+            nixl_interface=self.nixl_interface,
+            # client_group_id=self.get_replica_id(),
+            logging_path=self.psrl_config.logging_path,
+        )
         psrl_logger.info(
             f"NIXL multi storage clients initialized on port {self.nixl_multi_storage_clients.client_port}."
         )
@@ -125,8 +130,15 @@ class PSStorageWorker:
     def _nixl_protocol_phase1(self):
         """Execute protocol phase 1: from step 0 to step 3 (before register_local_tensors)."""
         psrl_logger.info("nixl client protocol step 0: convert_hf_inplace")
-        unified_train_meta_state_dict, local_train_sharding_dict = convert_hf_inplace(self.train_meta_hf_model)
-        unified_gen_meta_state_dict, local_gen_sharding_dict = convert_hf_inplace(self.gen_meta_hf_model)
+        parameter_mapping = create_parameter_mapping("HuggingFace", self.train_meta_hf_model.config)
+        unified_train_meta_state_dict, local_train_sharding_dict = convert_hf_inplace(
+            parameter_mapping,
+            self.train_meta_hf_model,
+        )
+        unified_gen_meta_state_dict, local_gen_sharding_dict = convert_hf_inplace(
+            parameter_mapping,
+            self.gen_meta_hf_model,
+        )
         unified_multi_meta_state_dicts = {
             self.client_for_push_name: unified_train_meta_state_dict,
             self.client_for_pull_name: unified_gen_meta_state_dict,
@@ -212,15 +224,65 @@ class PSStorageWorker:
         """Get the name of the NIXL gen storage client."""
         return self.client_for_pull_name
 
+    def get_node_id(self) -> str:
+        """Return the Ray node ID of this PS storage worker."""
+        return ray.get_runtime_context().get_node_id()
+
+    def get_non_persistent_named_buffers(self) -> dict[str, torch.Tensor]:
+        """
+        Return CPU tensors for all non-persistent named buffers of the train model.
+
+        Non-persistent buffers (e.g. RotaryEmbedding.inv_freq, registered with
+        persistent=False) are not stored in state_dict() and are therefore not
+        transferred by NIXL. They are needed by train workers after TMS resume.
+
+        NOTE(lhy): init_empty_weights() only moves parameters to meta device;
+        register_buffer() calls are not intercepted, so non-persistent buffers
+        on train_meta_hf_model already hold correct CPU values. No extra model
+        instantiation is required.
+
+        The result is computed once and cached; subsequent calls return the cache.
+
+        Returns:
+            dict[str, torch.Tensor]: Mapping of dotted buffer name to CPU tensor.
+        """
+        if self._cached_non_persistent_buffers is not None:
+            return self._cached_non_persistent_buffers
+
+        assert self.train_meta_hf_model is not None, (
+            "train_meta_hf_model is not initialized; call init_model() first."
+        )
+        # Identify non-persistent buffer names: in named_buffers() but not state_dict().
+        persistent_names = set(self.train_meta_hf_model.state_dict().keys())
+        result: dict[str, torch.Tensor] = {}
+        for name, buf in self.train_meta_hf_model.named_buffers():
+            if name not in persistent_names:
+                # buf is already a real CPU tensor (not on meta device).
+                result[name] = buf.detach().clone()
+
+        psrl_logger.info(
+            f"[get_non_persistent_named_buffers] Cached {len(result)} non-persistent "
+            f"buffer(s): {list(result.keys())[:5]}{'...' if len(result) > 5 else ''}."
+        )
+        self._cached_non_persistent_buffers = result
+        return result
+
     def init_model(self):
         """
         Initialize the model skeleton on the meta device.
 
         Only the parameter shapes / dtypes are materialised here; no actual
-        weight data is loaded.  Call ``load_weights_to_registered_tensors()``
-        *after* the full NIXL protocol (``nixl_protocol()``) has completed so
-        that all meta-device tensors have been replaced by real allocated
-        buffers, and only then copy the checkpoint weights into them.
+        weight data is loaded.  After the full NIXL protocol (``nixl_protocol()``)
+        completes, call ``preload_checkpoint_to_cpu()`` followed by
+        ``write_checkpoint_to_registered_tensors()`` to copy checkpoint weights
+        into the real allocated buffers.
+
+        Side effect: builds ``self._tied_weights_alias_map`` (canonical_key ->
+        list[alias_key]) while the meta model is still alive.  This map is
+        required by ``write_checkpoint_to_registered_tensors`` to handle models
+        that use tied embeddings (e.g. ``tie_word_embeddings=True``), where
+        ``lm_head.weight`` is not saved to disk but must still be filled from
+        ``model.embed_tokens.weight``.
         """
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         model_config = AutoConfig.from_pretrained(
@@ -249,73 +311,191 @@ class PSStorageWorker:
                     )
         else:
             raise ValueError(f"Invalid PS mode: {self.psrl_config.ps_mode}")
+
+        # Build the tied-weights alias map while the meta model is alive.
+        # train and gen share the same architecture, so one model suffices.
+        self._tied_weights_alias_map = self._build_tied_weights_alias_map(
+            self.train_meta_hf_model, local_path
+        )
+        if self._tied_weights_alias_map:
+            psrl_logger.info(
+                f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}"
+            )
         psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
+
+    @staticmethod
+    def _build_tied_weights_alias_map(
+        meta_model: torch.nn.Module,
+        local_path: str,
+    ) -> dict[str, list[str]]:
+        """Build a map canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
+
+        Currently only handles the tie_word_embeddings case:
+        model.embed_tokens.weight (canonical) <- lm_head.weight (alias).
+        """
+        cfg = getattr(meta_model, "config", None)
+        if cfg is None or not getattr(cfg, "tie_word_embeddings", False):
+            return {}
+
+        ckpt_keys = PSStorageWorker._get_checkpoint_keys(local_path)
+        canonical = "model.embed_tokens.weight"
+        alias = "lm_head.weight"
+
+        # If lm_head.weight is already in the checkpoint, no alias mapping needed.
+        if alias in ckpt_keys:
+            return {}
+
+        assert canonical in ckpt_keys, (
+            f"_build_tied_weights_alias_map: tie_word_embeddings=True but "
+            f"'{canonical}' not found in checkpoint under '{local_path}'."
+        )
+        psrl_logger.info(
+            f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical)"
+        )
+        return {canonical: [alias]}
+
+    @staticmethod
+    def _get_checkpoint_keys(local_path: str) -> set[str]:
+        """
+        Return the set of parameter names actually stored in the checkpoint.
+
+        Uses the safetensors index.json weight_map when present (O(1) scan),
+        otherwise opens the single shard and lists its keys.
+        """
+        index_json = os.path.join(local_path, "model.safetensors.index.json")
+        single_sf = os.path.join(local_path, "model.safetensors")
+
+        if os.path.isfile(index_json):
+            with open(index_json) as fh:
+                index = json.load(fh)
+            return set(index.get("weight_map", index).keys())
+
+        if os.path.isfile(single_sf):
+            with safe_open(single_sf, framework="pt", device="cpu") as f:
+                return set(f.keys())
+
+        raise FileNotFoundError(
+            f"No safetensors checkpoint found under '{local_path}' for key scanning."
+        )
 
     # ------------------------------------------------------------------
     # Post-protocol weight loading
     # ------------------------------------------------------------------
 
-    def load_weights_to_registered_tensors(self):
+    def preload_checkpoint_to_cpu(self) -> None:
         """
-        Stream HuggingFace checkpoint weights into the already-registered NIXL
-        buffers (``_original_tensor_mapping`` entries inside each sub-client).
+        Preload all checkpoint tensors into CPU memory ahead of NIXL buffer allocation.
 
-        Must be called **after** ``nixl_protocol()`` has completed so that all
-        meta-device tensors have been replaced by real allocated slices.
+        Must be called after init_model() (needs _tied_weights_alias_map).
+        Does NOT require nixl_protocol() or init_nixl_client() to have run.
 
-        Memory strategy
-        ---------------
-        * Checkpoint shards are opened lazily with ``safetensors.safe_open``
-          (one file at a time, one tensor at a time).
-        * Each source tensor is immediately deleted after being copied into the
-          registered destination(s), so peak extra RAM equals roughly the size
-          of a single parameter tensor.
-        * When train and gen clients share the same underlying buffers
-          (``train_gen_model_share() == True``) the copy is done only once.
-        * The HF meta-model references are released at the end to free any
-          remaining structure overhead.
+        Stores every tensor found in the checkpoint into self._checkpoint_cpu_cache
+        (dict[str, torch.Tensor]).  Tied-weight aliases are expanded here so that
+        write_checkpoint_to_registered_tensors() can do a single-pass write without
+        re-reading shards.  The cache is consumed and released by
+        write_checkpoint_to_registered_tensors().
         """
-        assert self.nixl_multi_storage_clients is not None, (
-            "NIXL clients must be initialized (call init_nixl_client()) before loading weights."
+        assert hasattr(self, "_tied_weights_alias_map"), (
+            "preload_checkpoint_to_cpu: _tied_weights_alias_map not found — "
+            "init_model() must be called before this method."
         )
 
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         shard_files = self._discover_safetensors_shards(local_path)
-        psrl_logger.info(f"load_weights_to_registered_tensors: {len(shard_files)} shard file(s) under {local_path}")
+        psrl_logger.info(
+            f"[preload_checkpoint_to_cpu] Reading {len(shard_files)} shard file(s) under {local_path}."
+        )
+
+        cache: dict[str, torch.Tensor] = {}
+
+        for shard_file in shard_files:
+            psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
+            with safe_open(shard_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    cache[key] = f.get_tensor(key)
+
+        # Expand tied-weight aliases so phase 2 can do a direct key lookup.
+        alias_count = 0
+        for canonical, aliases in self._tied_weights_alias_map.items():
+            if canonical not in cache:
+                continue
+            for alias_key in aliases:
+                cache[alias_key] = cache[canonical].clone()
+                alias_count += 1
+
+        self._checkpoint_cpu_cache = cache
+        psrl_logger.info(
+            f"[preload_checkpoint_to_cpu] Cached {len(cache)} key(s) "
+            f"({alias_count} tied-weight alias expansion(s))."
+        )
+
+    def write_checkpoint_to_registered_tensors(self) -> None:
+        """
+        Copy preloaded CPU tensors into NIXL-registered buffers.
+
+        Must be called after nixl_protocol() has completed (registered tensors exist)
+        and after preload_checkpoint_to_cpu() has run (_checkpoint_cpu_cache populated).
+        Releases self._checkpoint_cpu_cache on completion.
+        """
+        assert self.nixl_multi_storage_clients is not None, (
+            "NIXL clients must be initialized (call init_nixl_client()) before writing weights."
+        )
+        assert hasattr(self, "_checkpoint_cpu_cache"), (
+            "write_checkpoint_to_registered_tensors: _checkpoint_cpu_cache not found — "
+            "preload_checkpoint_to_cpu() must be called before this method."
+        )
 
         push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
         pull_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_pull_name)
         shared = self.storage_plan.train_gen_model_share()
 
-        # Collect all keys expected by every sub-client so we can warn about missing ones.
+        # Collect all keys expected by every sub-client (registered parameter names).
         expected_keys: set[str] = set(push_client.local_client_info.tensor_infos.keys())
         if not shared:
             expected_keys |= set(pull_client.local_client_info.tensor_infos.keys())
 
+        # Alias keys are NOT in the checkpoint; they were pre-expanded into the cache.
+        all_alias_keys: set[str] = set()
+        for aliases in self._tied_weights_alias_map.values():
+            all_alias_keys.update(aliases)
+
+        # Keys we expect to find directly in checkpoint files (non-alias).
+        direct_expected_keys: set[str] = expected_keys - all_alias_keys
+
         loaded_keys: set[str] = set()
 
-        for shard_file in shard_files:
-            psrl_logger.info(f"load_weights_to_registered_tensors: opening {shard_file}")
-            with safe_open(shard_file, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key not in expected_keys:
-                        continue  # this PS worker doesn't hold this key
-                    src_tensor = f.get_tensor(key)  # loaded to CPU
-                    # Delegate slicing + copy to each client
-                    push_client.load_state_dict_into_registered_tensors({key: src_tensor})
-                    if not shared:
-                        pull_client.load_state_dict_into_registered_tensors({key: src_tensor})
-                    del src_tensor
-                    loaded_keys.add(key)
+        for key, src_tensor in self._checkpoint_cpu_cache.items():
+            if key in direct_expected_keys:
+                push_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                if not shared:
+                    pull_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                loaded_keys.add(key)
+            elif key in all_alias_keys and key in expected_keys:
+                # Alias was pre-expanded during preload; write to registered buffer.
+                psrl_logger.info(
+                    f"[write_checkpoint_to_registered_tensors] Writing alias '{key}' from pre-expanded cache."
+                )
+                push_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                if not shared:
+                    pull_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                loaded_keys.add(key)
 
+        # All expected keys should be loaded (direct or via alias).
         missing = expected_keys - loaded_keys
         if missing:
             raise RuntimeError(
-                f"load_weights_to_registered_tensors: {len(missing)} key(s) not found in checkpoint: "
+                f"write_checkpoint_to_registered_tensors: {len(missing)} key(s) not found "
+                f"in checkpoint (and not covered by any tied-weight alias): "
                 f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
             )
-        psrl_logger.info(f"load_weights_to_registered_tensors: loaded {len(loaded_keys)}/{len(expected_keys)} key(s).")
 
+        alias_loaded = loaded_keys & all_alias_keys
+        psrl_logger.info(
+            f"[write_checkpoint_to_registered_tensors] Wrote {len(loaded_keys)}/{len(expected_keys)} key(s) "
+            f"({len(alias_loaded)} via tied-weight alias)."
+        )
+
+        del self._checkpoint_cpu_cache
         gc.collect()
 
     @staticmethod
@@ -373,8 +553,16 @@ class PSStorageWorker:
             if k not in self._transfer_key_cache:
                 self._transfer_key_cache[k] = []
             self._transfer_key_cache[k].append((k, shard_idx))
+            
+    def transfer_train_to_gen_merged(self, key_and_shards_list: list[tuple[str, list[tuple[int, ...]]]]):
+        if self.storage_plan.train_gen_model_share():
+            return
+        for key, shards in key_and_shards_list:
+            self.transfer_train_to_gen(key, shards, sync=False)
+        if self.use_gpu:
+            torch.cuda.synchronize()
 
-    def transfer_train_to_gen(self, key: str, shards_to_transfer: list[tuple[int, ...]] | None = None):
+    def transfer_train_to_gen(self, key: str, shards: list[tuple[int, ...]] | None = None, sync: bool = True):
         if self.storage_plan.train_gen_model_share():
             return
         src_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
@@ -390,10 +578,10 @@ class PSStorageWorker:
             self._build_transfer_key_cache(src_original_state_dict)
         matching_keys = self._transfer_key_cache.get(key, [])
         for key_shard_idx_tuple in matching_keys:
-            if shards_to_transfer is not None and key_shard_idx_tuple[1] not in shards_to_transfer:
+            if shards is not None and key_shard_idx_tuple[1] not in shards:
                 continue
             target_original_state_dict[key_shard_idx_tuple].copy_(src_original_state_dict[key_shard_idx_tuple])
-        if self.use_gpu:
+        if sync and self.use_gpu:
             torch.cuda.synchronize()
 
     def shutdown(self):

@@ -1,7 +1,5 @@
 import warnings
 
-from transformers import AutoConfig
-
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
@@ -22,9 +20,6 @@ except ImportError as e:
 class VllmQwen2ParameterMapping(ParameterMapping):
     """Parameter mapping for Qwen2 model."""
 
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
-
     def get_mappings(self):
         return [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
@@ -33,14 +28,6 @@ class VllmQwen2ParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }
 
 
 # Qwen2Moe
@@ -56,9 +43,6 @@ except ImportError as e:
 @register_model(["VllmQwen2MoeForCausalLM", "VllmQwen2MoeModel"] + vllm_qwen2_moe_classes)
 class VllmQwen2MoeParameterMapping(ParameterMapping):
     """Parameter mapping for Qwen2Moe model."""
-
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
 
     def get_mappings(self):
         mapping = [
@@ -97,13 +81,9 @@ class VllmQwen2MoeParameterMapping(ParameterMapping):
         return mapping
 
     def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-            "num_experts": self.config.num_experts,
-        }
+        info = super().get_model_info()
+        info["num_experts"] = self.config.num_experts
+        return info
 
 
 # Qwen3Moe
@@ -119,9 +99,6 @@ except ImportError as e:
 @register_model(["VllmQwen3MoeForCausalLM", "VllmQwen3MoeModel"] + vllm_qwen3_moe_classes)
 class VllmQwen3MoeParameterMapping(ParameterMapping):
     """Parameter mapping for Qwen3Moe model."""
-
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
 
     def get_mappings(self):
         mapping = [
@@ -161,18 +138,65 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
 
     def get_model_info(self):
         # NOTE(zym): qwen3_moe directly provides head_dim,
-        #  which isn't equal to hidden_size // num_attention_heads
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": getattr(
-                self.config,
-                "head_dim",
-                self.config.hidden_size // self.config.num_attention_heads,
-            ),
-            "intermediate_size": self.config.intermediate_size,
-            "num_experts": self.config.num_experts,
-        }
+        # which isn't equal to hidden_size // num_attention_heads.
+        # The default get_model_info already handles head_dim via getattr fallback.
+        info = super().get_model_info()
+        info["num_experts"] = self.config.num_experts
+        return info
+
+
+# Mixtral
+vllm_mixtral_classes = []
+try:
+    from vllm.model_executor.models.mixtral import MixtralForCausalLM, MixtralModel
+
+    vllm_mixtral_classes = [MixtralForCausalLM, MixtralModel]
+except ImportError as e:
+    warnings.warn(f"Could not import Mixtral classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmMixtralForCausalLM", "VllmMixtralModel"] + vllm_mixtral_classes)
+class VllmMixtralParameterMapping(ParameterMapping):
+    """Parameter mapping for Mixtral model."""
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+        ]
+        expert_num = self.config.num_local_experts
+        for expert_id in range(expert_num):
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.w1.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
+            )
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.w3.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
+            )
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.w2.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
+        return mapping
+
+    def get_model_info(self):
+        info = super().get_model_info()
+        info["num_experts"] = self.config.num_local_experts
+        return info
 
 
 # Llama
@@ -199,9 +223,6 @@ except ImportError as e:
 class VllmLlamaParameterMapping(ParameterMapping):
     """Parameter mapping for Llama model."""
 
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
-
     def get_mappings(self):
         return [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
@@ -210,14 +231,6 @@ class VllmLlamaParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }
 
 
 # Mistral (implemented as LlamaForCausalLM in vLLM)
@@ -231,9 +244,6 @@ class VllmLlamaParameterMapping(ParameterMapping):
 class VllmMistralParameterMapping(ParameterMapping):
     """Parameter mapping for Mistral model (uses Llama implementation)."""
 
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
-
     def get_mappings(self):
         return [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
@@ -242,14 +252,6 @@ class VllmMistralParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }
 
 
 # Phi
@@ -266,9 +268,6 @@ except ImportError as e:
 class VllmPhiParameterMapping(ParameterMapping):
     """Parameter mapping for Phi model."""
 
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
-
     def get_mappings(self):
         return [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
@@ -277,14 +276,6 @@ class VllmPhiParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }
 
 
 # Gemma
@@ -301,9 +292,6 @@ except ImportError as e:
 class VllmGemmaParameterMapping(ParameterMapping):
     """Parameter mapping for Gemma model."""
 
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
-
     def get_mappings(self):
         return [
             ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
@@ -312,14 +300,6 @@ class VllmGemmaParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }
 
 
 # OLMoE
@@ -335,9 +315,6 @@ except ImportError as e:
 @register_model(vllm_olmoe_classes)
 class VllmOLMoEParameterMapping(ParameterMapping):
     """Parameter mapping for OLMoE model."""
-
-    def __init__(self, config_path: str):
-        self.config = AutoConfig.from_pretrained(config_path)
 
     def get_mappings(self):
         mapping = [
@@ -374,11 +351,3 @@ class VllmOLMoEParameterMapping(ParameterMapping):
                 )
             )
         return mapping
-
-    def get_model_info(self):
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
-            "head_size": self.config.hidden_size // self.config.num_attention_heads,
-            "intermediate_size": self.config.intermediate_size,
-        }

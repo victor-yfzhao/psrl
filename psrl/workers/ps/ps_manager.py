@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -79,9 +80,10 @@ class PSManager(RequestStatusTracker):
         self.rollout_instance_tracker: dict[
             int, RolloutInstanceStatus
         ] = {}  # Maps rollout instance IDs to their corresponding info
-        self.model_store: ModelStore | None = (
-            None  # The current model store, which contains the model state dict and version tag
-        )
+        # NOTE(lhy): Initialized at version 0 (representing the loaded checkpoint before any
+        # training step). This avoids a None check in pull_model_state_dict_nixl during the
+        # initial pull that happens before the first training push.
+        self.model_store: ModelStore = ModelStore(version_tag=0)
 
         # Staleness buffer management for training
         self.staleness_inventory: StalenessInventory | None = (
@@ -97,9 +99,6 @@ class PSManager(RequestStatusTracker):
         self.check_abort_versions = set()
         # Set to track the maximum version that has been aborted
         self.max_aborted_version = -1
-
-        # Set for buffer ids ready for deletion
-        self.ready_for_delete_buffer_ids = set()
 
         # Initialize the staleness inventory
         if self.psrl_config.redundant_rollout.enable:
@@ -131,6 +130,12 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names: list[str] | None = None
         self.ps_nixl_train_storage_client_names: list[str] | None = None
         self.ps_nixl_gen_storage_client_names: list[str] | None = None
+
+        # Lock state for push/pull operations
+        # _exclusive_push_locked: True if a push operation is in progress (exclusive lock)
+        # _shared_pull_count: Number of concurrent pull operations (shared lock)
+        self._exclusive_push_locked = False
+        self._shared_pull_count = 0
 
         # The log is now merged with the request status tracker
         """    
@@ -228,6 +233,14 @@ class PSManager(RequestStatusTracker):
             new_instance_id=new_instance_id,
         )
 
+    def move_occupied_entries(
+        self,
+        prompt_ids: int | list[int],
+        buffer_id: int,
+    ):
+        """Move occupied entries to a specific buffer."""
+        self.staleness_inventory.move_occupied_entries(prompt_ids, buffer_id)
+
     def clear_occupied_entries(
         self,
         prompt_ids: int | list[int],
@@ -280,12 +293,12 @@ class PSManager(RequestStatusTracker):
             self.val_staleness_inventory.delete_buffer(buffer_id)
             return
 
-        if buffer_id in self.ready_for_delete_buffer_ids:
-            for bid in sorted(list(self.ready_for_delete_buffer_ids)):
+        ready_for_delete_buffer_ids = self.staleness_inventory.get_ready_for_delete_buffer_ids()
+        if buffer_id in ready_for_delete_buffer_ids:
+            for bid in sorted(list(ready_for_delete_buffer_ids)):
                 if bid <= buffer_id:
-                    psrl_logger.debug(f"Clearing buffer {bid} after model version {buffer_id} is pushed.")
+                    psrl_logger.info(f"Clearing ready for deletion buffer {bid} after model version {buffer_id} is pushed.")
                     self.staleness_inventory.delete_buffer(bid)
-                    self.ready_for_delete_buffer_ids.discard(bid)
                 else:
                     break
 
@@ -487,6 +500,32 @@ class PSManager(RequestStatusTracker):
             buffer_ids.append(buffer_id)
 
         return buffer_ids, entry_ids
+    
+    def abort_reserved_requests(self, buffer_id: int) -> tuple[int, list[int]]:
+        """Abort the reserved requests for a specific buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is waiting for consumption.
+        Returns:
+            A tuple of (number of aborted entry ids, list of request ids that are aborted).
+        """
+        reserved_entry_ids = self.staleness_inventory.buffers[buffer_id].get_reserved_entry_ids()
+        abort_request_ids = list()
+        for entry_id in reserved_entry_ids:
+            entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
+            prompt_id = entry_info.prompt_id
+            # NOTE(lhy): we should abort all requests of the prompt, not just the recorded ones
+            abort_request_ids.extend([prompt_id * self.rollout_n + i for i in range(self.rollout_n)])
+            '''
+            request_idxs = entry_info.request_idx
+            if not isinstance(request_idxs, list):
+                request_idxs = [request_idxs]
+            for request_idx in request_idxs:
+                request_id = prompt_id * self.rollout_n + request_idx
+                abort_request_ids.append(request_id)
+            '''
+        self.abort_requests(abort_request_ids)
+        return len(reserved_entry_ids), abort_request_ids
 
     def abort_requests(
         self,
@@ -527,7 +566,7 @@ class PSManager(RequestStatusTracker):
             if abort_group and len(rest_requests_of_entry) < self.alg_rollout_n:
                 abort_request_ids = abort_request_ids.union(set(rest_requests_of_entry))
                 clear_entries.append(entry_info.prompt_id)
-                psrl_logger.info(f"Abort (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}")
+                psrl_logger.info(f"Abort entire entry: (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}")
             else:
                 # Update the entry_info to remove aborted request idxs
                 update_idxs = []
@@ -540,7 +579,7 @@ class PSManager(RequestStatusTracker):
                 if isinstance(entry_info.model_version, list):
                     entry_info.model_version = [entry_info.model_version[i] for i in update_idxs]
                 psrl_logger.info(
-                    f"Abort and update (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}, "
+                    f"Abort some requests of entry: (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}, "
                     f"requests changed from {entry_info.request_idx} to "
                     f"{[entry_info.request_idx[i] for i in update_idxs]}."
                 )
@@ -578,8 +617,15 @@ class PSManager(RequestStatusTracker):
             return self._check_aborted_request(request_ids, remove)
         return [self._check_aborted_request(request_id, remove) for request_id in request_ids]
 
-    def abort_after_buffer_ready(self, buffer_id: int):
-        """Check and interrupt rollout instances if necessary based on ready buffers."""
+    def _abort_after_buffer_ready(self, buffer_id: int) -> set[int]:
+        """
+        Check and interrupt rollout instances if necessary based on the ready buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
+        Returns:
+            A set of request ids that are aborted.
+        """
         curr_ps_model_version = self.get_ps_model_version(debug_info="ps_manager")
         ready_buffer_ids = self.staleness_inventory.ready_buffer_ids().copy()
         abort_request_ids = set()
@@ -611,9 +657,6 @@ class PSManager(RequestStatusTracker):
             # When `buffer_id` buffer is READY, we need to check related versions
             # [version_to_abort, version_to_abort + staleness]
             # that may need to be aborted due to the READY status of `buffer_id`.
-            # Because `version_to_abort` can be aborted, for the following continuous buffers,
-            # we only need to check whether `curr_buffer_id + staleness`
-            # is READY to decide whether to abort `curr_buffer_id`.
             if buffer_range.issubset(ready_buffer_ids):
                 curr_abort_versions.add(version_to_abort)
                 self.check_abort_versions.discard(version_to_abort)
@@ -630,7 +673,7 @@ class PSManager(RequestStatusTracker):
         for abort_version in curr_abort_versions:
             self.max_aborted_version = max(self.max_aborted_version, abort_version)
             requests_of_abort_version = self.get_requests_of_abort_version(abort_version)
-            psrl_logger.debug(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
+            psrl_logger.info(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
             abort_request_ids = abort_request_ids.union(requests_of_abort_version)
 
         if abort_request_ids:
@@ -640,20 +683,20 @@ class PSManager(RequestStatusTracker):
                 level=logging.INFO,
                 event_type=EventType.OTHER,
             ):
-                self.abort_requests(list(abort_request_ids), blocking=True)
+                self.abort_requests(list(abort_request_ids))
 
         # If the buffer has no RESERVE entries after clearing entries, delete it or mark for deletion
         for buffer_id in ready_buffer_ids:
             if self.staleness_inventory.buffers[buffer_id].get_reserve_entry_num() == 0:
                 if curr_ps_model_version > buffer_id:
-                    psrl_logger.debug(
+                    psrl_logger.info(
                         f"Deleting buffer {buffer_id} immediately after aborting requests "
                         f"due to larger ps version {curr_ps_model_version}."
                     )
                     self.staleness_inventory.delete_buffer(buffer_id)
                 else:
-                    psrl_logger.debug(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
-                    self.ready_for_delete_buffer_ids.add(buffer_id)
+                    psrl_logger.info(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
+                    self.staleness_inventory.mark_buffer_for_deletion(buffer_id)
 
         psrl_logger.debug(
             f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
@@ -661,12 +704,26 @@ class PSManager(RequestStatusTracker):
             f"abort {len(abort_request_ids)} requests. "
             f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}."
         )
-
+        
+        return abort_request_ids
+        
+    def handle_ready_buffer(self, buffer_id: int) -> set[int]:
+        """
+        Handle the ready buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
+        Returns:
+            A set of request ids that are aborted.
+        """
+        self.rollout_coordinator.update_ready_buffer.remote(buffer_id)
+        abort_request_ids = self._abort_after_buffer_ready(buffer_id)
+        return abort_request_ids
+        
     def occupy_rollout_instance_request(
         self,
         prompt_id: int,
         request_ids: int | list[int] | None = None,
-        accumulate_sample: bool = True,
         is_validate: bool = False,
     ) -> tuple[int | None, BufferStatus | None, EntryInfo]:
         """
@@ -679,7 +736,6 @@ class PSManager(RequestStatusTracker):
         Args:
             prompt_id (int): The prompt id of the request
             request_ids (Optional[Union[int, List[int]]]): The request ids to occupy
-            accumulate_sample (Optional[bool]): Whether to accumulate samples for group sampling
             is_validate (bool): Whether to use the validation staleness inventory
         Returns:
             Tuple[Optional[int], Optional[BufferStatus], EntryInfo]: A tuple containing:
@@ -712,9 +768,6 @@ class PSManager(RequestStatusTracker):
             # staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
             # return None, None, entry_info
 
-        # Update ready num entries if not accumulate_sample, requiring more data to occupy
-        if not accumulate_sample:
-            staleness_inventory.buffers[buffer_id].ready_num_entries += 1
         entry_info = staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
         return buffer_id, occupy_num, entry_info
 
@@ -758,11 +811,13 @@ class PSManager(RequestStatusTracker):
         assert rollout_instance_id in self.rollout_instance_tracker, (
             f"Rollout instance {rollout_instance_id} is not registered."
         )
-        assert self.rollout_coordinator is not None, (
-            "Rollout coordinator is not set. Please set it before updating rollout instance model version."
-        )
 
         if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
+            # NOTE(lhy): rollout_coordinator is only used when the version actually changes.
+            # At init-time (version 0 → 0), this branch is skipped, so coordinator need not be bound yet.
+            assert self.rollout_coordinator is not None, (
+                "Rollout coordinator is not set. Please set it before updating rollout instance model version."
+            )
             self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
             # Sync the rollout instance model version in the rollout coordinator
             self.rollout_coordinator.set_rollout_instance_model_version.remote(
@@ -780,17 +835,9 @@ class PSManager(RequestStatusTracker):
 
         Args:
             expected_agents (int): Number of expected NIXL clients to connect
-
-        Raises:
-            ValueError: If server_mode is invalid or deprecated
         """
         self.expected_agents = expected_agents
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
 
     def nixl_protocol(self):
         """Execute the NIXL protocol for distributed communication setup.
@@ -900,12 +947,73 @@ class PSManager(RequestStatusTracker):
         )
         return self.ps_nixl_gen_storage_client_names
 
+    def get_ps_nixl_train_storage_client_name_for_node(
+        self, node_id: str
+    ) -> str | None:
+        """
+        Return the NIXL train storage client name for the PS worker on the given node.
+
+        Builds a node_id → client_name mapping lazily on first call and caches it.
+        Returns None if no PS worker is found on the given node (caller should fall back).
+
+        Args:
+            node_id (str): Ray node ID of the requesting worker.
+
+        Returns:
+            str | None: The NIXL train storage client name, or None if not found.
+        """
+        if not hasattr(self, "_ps_node_id_to_train_client_name"):
+            self._ps_node_id_to_train_client_name: dict[str, str] = {}
+            for worker in self.ps_worker_group._workers:
+                worker_node_id = ray.get(worker.get_node_id.remote())
+                client_name = ray.get(worker.get_nixl_train_storage_client_name.remote())
+                self._ps_node_id_to_train_client_name[worker_node_id] = client_name
+        return self._ps_node_id_to_train_client_name.get(node_id, None)
+
     # ------- MODEL PUSH/PULL -------
     # Now we separate the control plane and data plane (ps_model = "nixl_cpu" or "nixl_gpu"),
     # all the dataflow is handled by PSWorkerGroup.
     # And PSManager is only responsible for the control plane
     # (i.e., PUSH/PULL methods only need to update the version tag,
     # the actual model state dict is stored in the PS worker group).
+
+    def _try_acquire_exclusive_push_lock(self) -> bool:
+        """
+        Try to acquire the exclusive push lock.
+        Returns True if acquired, False if already locked.
+        
+        This method ensures that:
+        - No push is in progress (_exclusive_push_locked == False)
+        - No pull is in progress (_shared_pull_count == 0)
+        """
+        if self._exclusive_push_locked or self._shared_pull_count > 0:
+            return False
+        self._exclusive_push_locked = True
+        return True
+
+    def _release_exclusive_push_lock(self):
+        """Release the exclusive push lock."""
+        assert self._exclusive_push_locked, "Exclusive push lock is not locked"
+        self._exclusive_push_locked = False
+
+    def _try_acquire_shared_pull_lock(self) -> bool:
+        """
+        Try to acquire the shared pull lock.
+        Returns True if acquired, False if a push is in progress.
+        
+        This method ensures that:
+        - No push is in progress (_exclusive_push_locked == False)
+        Multiple pull operations can run concurrently.
+        """
+        if self._exclusive_push_locked:
+            return False
+        self._shared_pull_count += 1
+        return True
+
+    def _release_shared_pull_lock(self):
+        """Release the shared pull lock."""
+        assert self._shared_pull_count > 0, "Shared pull lock count is already 0"
+        self._shared_pull_count -= 1
 
     def push_model_state_dict_cpu(self, version_tag: int, model_state_dict: Mapping[str, Tensor | DTensor] | None):
         """

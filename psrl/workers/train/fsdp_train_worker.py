@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import ray
 import torch
+from contextlib import nullcontext
 from omegaconf import DictConfig
 from torch.distributed.tensor import DTensor
 from verl import DataProto
@@ -23,6 +24,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.common.utils import lazy_import_to_globals
+from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -34,9 +36,10 @@ from psrl.utils.logger import (
     log_dual_events,
     log_tensor,
 )
+from psrl.utils.ray import exclusive_push_model_context
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.nixl import (
-    GLOBAL_META_SERVER_NAME,
-    GLOBAL_TRAIN_CLIENT_NAME,
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
@@ -159,28 +162,32 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module_fsdp, "The actor module must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"{GLOBAL_TRAIN_CLIENT_NAME}_{self.rank}",
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=True,
-                client_type=NIXLClientType.PUSH_SIDE,
-                nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id()
-                logging_path=self.psrl_config.logging_path,
-            )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_storage_client = NIXLStorageClient(
+            client_name=train_client_name(self.rank),
+            server_name=NIXL_META_SERVER_NAME,
+            use_gpu=True,
+            client_type=NIXLClientType.PUSH_SIDE,
+            nixl_config=self.psrl_config.nixl,
+            nixl_interface=self.nixl_interface,
+            # client_group_id=self.get_replica_id()
+            logging_path=self.psrl_config.logging_path,
+        )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_convert_params(self):
         """Convert the FSDP model parameters for NIXL storage client."""
+        from transformers import AutoConfig
+        from verl.utils.fs import copy_to_local
+
+        model_config = AutoConfig.from_pretrained(
+            copy_to_local(self.config.model.path),
+            trust_remote_code=self.config.model.get("trust_remote_code", False),
+        )
+        parameter_mapping = create_parameter_mapping("FSDP", model_config)
         self.unified_state_dict, self.local_sharding_dict = convert_fsdp_inplace(
-            self.config.actor.strategy,
+            parameter_mapping,
             self.actor_module_fsdp,
+            fsdp_strategy=self.config.actor.strategy,
         )
 
     def nixl_protocol(self, mode: str = "full"):
@@ -284,9 +291,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
 
-        for buffer in self.actor_module_fsdp.buffers():
-            buffer.data = buffer.data.to("cpu")
-
         # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
         # so torch won't trigger cudaFree from the mempool side
         # otherwise it will cause double cuMemRelease (first pause, then free) in tms
@@ -357,11 +361,34 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self._wake_up_fsdp_model(self.actor_module_fsdp)
         # aggressive_empty_cache(force_sync=True)
 
-        for buffer in self.actor_module_fsdp.buffers():
-            buffer.data = buffer.data.to(get_device_id())
-
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} wake_up")
+
+    def _restore_non_persistent_buffers_from_ps(self) -> None:
+        """
+        Restore non-persistent named buffers (e.g. inv_freq) from PS after pull.
+        """
+        ps_buffers = self._get_non_persistent_buffers_from_ps()
+        if not ps_buffers:
+            return
+        device = get_device_id()
+        model = self.actor_module_fsdp
+        # Apply each buffer by navigating the module tree with its dotted name.
+        for full_name, cpu_tensor in ps_buffers.items():
+            *module_path_parts, buf_attr = full_name.split(".")
+            module = model
+            for part in module_path_parts:
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if module is not None and hasattr(module, buf_attr):
+                existing = getattr(module, buf_attr)
+                if isinstance(existing, torch.Tensor):
+                    existing.data.copy_(cpu_tensor.to(device=device, dtype=existing.dtype))
+        psrl_logger.info(
+            f"[_restore_non_persistent_buffers_from_ps] Restored {len(ps_buffers)} "
+            f"non-persistent buffers to FSDP model."
+        )
 
     @deprecated(
         "This method is deprecated, it's reserved as an example "
@@ -462,9 +489,10 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-            # Support all hardwares
-            from contextlib import nullcontext
+                
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
 
             is_lora = data.meta_info.pop("is_lora", False)
             adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
@@ -495,8 +523,10 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
         torch.cuda.synchronize()
-        with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-            PSRL_BaseTrainWorker.push_model(self)
+        context_manager = exclusive_push_model_context(self.train_interface.ps_manager_handle) if self.is_train_representative_rank else nullcontext()
+        with context_manager:
+            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+                PSRL_BaseTrainWorker.push_model(self)
         return output
 
     def _debug_log_train_model_info(self, label: str, max_elements: int = 10):

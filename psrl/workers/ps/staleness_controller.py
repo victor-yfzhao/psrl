@@ -152,6 +152,10 @@ class StalenessBuffer:
         """Count number of RESERVED entries in the buffer"""
         return np.sum([1 for entry in self.entries if entry.category == EntryCategory.RESERVED])
 
+    def get_reserved_entry_ids(self) -> list[int]:
+        """Get all RESERVED entry IDs in the buffer"""
+        return [idx for idx, entry in enumerate(self.entries) if entry.category == EntryCategory.RESERVED]
+
     def insert(
         self,
         entry_id: int,
@@ -271,6 +275,9 @@ class StalenessInventory:
         # Status tracking for buffer IDs
         # this can reduce the need to iterate through all buffers and call `get_status` frequently
         self._buffer_ids_by_status: dict[BufferStatus, set[int]] = {status: set() for status in BufferStatus}
+        
+        # This is used to track buffers that are ready for deletion after aborting requests
+        self._ready_for_delete_buffer_ids: set[int] = set()
 
         # Validation inventory constraints
         # 1. staleness must be None
@@ -317,7 +324,7 @@ class StalenessInventory:
 
         buffer = StalenessBuffer(self.num_entries, self.ready_num_entries, self.staleness)
         self.buffers[buffer_id] = buffer
-        psrl_logger.info(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
+        psrl_logger.debug(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
         self._update_buffer_status(buffer_id)
         self.buffer_id += 1
 
@@ -343,7 +350,25 @@ class StalenessInventory:
             status_set.discard(buffer_id)
         # Remove buffer from inventory
         del self.buffers[buffer_id]
+        # Remove from ready for deletion tracking
+        if buffer_id in self._ready_for_delete_buffer_ids:
+            self._ready_for_delete_buffer_ids.remove(buffer_id)
         psrl_logger.debug(f"[Buffer Delete]: buffer {buffer_id} deleted, current buffer IDs: {self.buffers.keys()}")
+        
+    def mark_buffer_for_deletion(self, buffer_id: int):
+        """
+        Mark a buffer for deletion.
+        """
+        assert self.get_buffer_status(buffer_id) == BufferStatus.READY or self.get_buffer_status(buffer_id) == BufferStatus.READY_WITH_CAPACITY, (
+            f"Buffer {buffer_id} must be in READY or READY_WITH_CAPACITY state to be marked for deletion"
+        )
+        self._ready_for_delete_buffer_ids.add(buffer_id)
+        
+    def get_ready_for_delete_buffer_ids(self) -> set[int]:
+        """
+        Get all buffer IDs that are ready for deletion.
+        """
+        return self._ready_for_delete_buffer_ids
 
     def get_buffer_status(self, buffer_id: int) -> BufferStatus:
         """
@@ -537,7 +562,9 @@ class StalenessInventory:
         self.ensure_buffer_exists(model_version + self.staleness)
         # Get all PENDING buffers within the staleness limit
         pending_buffers = self.get_buffers_with_capacity()
-        candidate_ids = [bid for bid in pending_buffers if model_version <= bid <= model_version + self.staleness]
+        candidate_ids = [
+            bid for bid in pending_buffers if model_version <= bid <= model_version + self.staleness and bid not in self._ready_for_delete_buffer_ids
+        ]
         if not candidate_ids:
             # Cases where no PENDING buffers are available
             return False
@@ -562,7 +589,7 @@ class StalenessInventory:
         if entry_info.prompt_id in self.data_tracker:
             buffer_id, entry_id = self.data_tracker[entry_info.prompt_id]
             psrl_logger.debug(
-                f"[Entry Reserve Update]: entry {entry_info} already reserved in "
+                f"[Reserved Entry Update]: entry {entry_info} already reserved in "
                 f"(buffer {buffer_id}, entry {entry_id})"
             )
             tracked_entry_info = self.buffers[buffer_id].entries[entry_id].entry_info
@@ -611,16 +638,19 @@ class StalenessInventory:
         # Get all PENDING buffers within the staleness limit
         pending_buffers = self.get_buffers_with_capacity()
         if not max_staleness_buffer_id:
+            # Validation
             assert len(pending_buffers) == 1, (
                 f"Only one PENDING buffer should exist when max_staleness_buffer_id is None, "
                 f"but got {pending_buffers}, and current buffers are {self.buffers.keys()}."
             )
             candidate_ids = list(pending_buffers)
         else:
+            # Training
             candidate_ids = [
                 bid
                 for bid in pending_buffers
-                if max_staleness_buffer_id - self.staleness <= bid <= max_staleness_buffer_id
+                if max_staleness_buffer_id - self.staleness <= bid <= max_staleness_buffer_id 
+                and bid not in self._ready_for_delete_buffer_ids
             ]
 
         if not candidate_ids:
@@ -753,6 +783,29 @@ class StalenessInventory:
         for entry_info in entry_infos:
             del self.data_tracker[entry_info.prompt_id]
         self._update_buffer_status(buffer_id)
+        
+    def move_occupied_entries(
+        self,
+        entry_infos: EntryInfo | list[EntryInfo],
+        buffer_id: int,
+    ):
+        """
+        Move occupied entries to a specific buffer.
+        
+        During moving, clear the occupied entries from the current buffer and re-occupy them in the earliest available buffer.
+        NOTE(lhy): The buffer id is not used for moving, but only for assertion.
+        
+        Args:
+            entry_infos (Union[EntryInfo, List[EntryInfo]]): The entry infos to move.
+            buffer_id (int): The ID of the buffer to move the occupied entries to.
+        """
+        if not isinstance(entry_infos, list):
+            entry_infos = [entry_infos]
+        prompt_ids = [entry_info.prompt_id for entry_info in entry_infos]
+        self.clear_occupied_entries(prompt_ids)
+        for entry_info in entry_infos:
+            occupied_buffer_id, occupied_entry_id, occupy_num = self.occupy_data_without_reserve(entry_info)
+            assert occupied_buffer_id == buffer_id, f"Occupied buffer ID {occupied_buffer_id} must be the same as the target buffer ID {buffer_id}"
 
     def clear_occupied_entries(
         self,
@@ -779,7 +832,7 @@ class StalenessInventory:
             )
             # Delete the entry from the buffer
             psrl_logger.debug(
-                f"[Entry Clear]: entry {buffer.entries[entry_id].entry_info} cleared from "
+                f"[Occupied Entry Clear]: entry {buffer.entries[entry_id].entry_info} cleared from "
                 f"(buffer {buffer_id}, entry {entry_id})"
             )
             buffer.delete(entry_id)
@@ -794,7 +847,7 @@ class StalenessInventory:
                 # Update data tracker with the new position
                 self.data_tracker[moved_entry_info.prompt_id] = (buffer_id, entry_id)
                 psrl_logger.debug(
-                    f"[Entry Move]: entry {moved_entry_info} moved "
+                    f"[Occupied Entry Move]: entry {moved_entry_info} moved "
                     f"from (buffer {buffer_id}, entry {last_occupied_entry_id}) "
                     f"to (buffer {buffer_id}, entry {entry_id})"
                 )
@@ -838,7 +891,7 @@ class StalenessInventory:
                 buffer.delete(entry_id)
                 del self.data_tracker[prompt_id]
                 psrl_logger.debug(
-                    f"[Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
+                    f"[Reserved Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
                 )
                 changed_buffer_ids.add(buffer_id)
                 # Move the last RESERVED entry to the position of the deleted (i.e., EMPTY) entry
@@ -853,7 +906,7 @@ class StalenessInventory:
                         entry_id,
                     )
                     psrl_logger.debug(
-                        f"[Entry Move (1/1)]: entry {moved_entry_info} moved "
+                        f"[Reserved Entry Move (1/1)]: entry {moved_entry_info} moved "
                         f"from (buffer {buffer_id}, entry {last_reserved_entry_id}) "
                         f"to (buffer {buffer_id}, entry {entry_id})"
                     )
@@ -899,7 +952,7 @@ class StalenessInventory:
                     buffer.delete(entry_id)
                     del self.data_tracker[prompt_id]
                     psrl_logger.debug(
-                        f"[Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
+                        f"[Reserved Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
                     )
                     changed_buffer_ids.add(buffer_id)
                     first_reserved_entry_info = exchange_buffer.entries[first_reserved_entry_id].entry_info
@@ -913,7 +966,7 @@ class StalenessInventory:
                         entry_id,
                     )
                     psrl_logger.debug(
-                        f"[Entry Move (1/2)]: entry {first_reserved_entry_info} moved "
+                        f"[Reserved Entry Move (1/2)]: entry {first_reserved_entry_info} moved "
                         f"from (buffer {exchange_buffer_id}, entry {first_reserved_entry_id}) "
                         f"to (buffer {buffer_id}, entry {entry_id})"
                     )
@@ -933,7 +986,7 @@ class StalenessInventory:
                             first_reserved_entry_id,
                         )
                         psrl_logger.debug(
-                            f"[Entry Move (2/2)]: entry {moved_entry_info} moved "
+                            f"[Reserved Entry Move (2/2)]: entry {moved_entry_info} moved "
                             f"from (buffer {exchange_buffer_id}, entry {last_reserved_entry_id}) "
                             f"to (buffer {exchange_buffer_id}, entry {first_reserved_entry_id})"
                         )
@@ -945,57 +998,58 @@ class StalenessInventory:
                     buffer.delete(entry_id)
                     del self.data_tracker[prompt_id]
                     psrl_logger.debug(
-                        f"[Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
+                        f"[Reserved Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})"
                     )
                     changed_buffer_ids.add(buffer_id)
 
         for buffer_id in changed_buffer_ids:
             self._update_buffer_status(buffer_id)
 
-    @deprecated("This method is deprecated. Use `occupy_data_with_reserve` instead.")
     def occupy_data_without_reserve(
         self,
         entry_info: EntryInfo,
     ):
         """
         Append data to an appropriate buffer, occupying it.
-        NOTE: Since we simplified the reserve process as `set_version_tag` in rollout server,
-        this method is used to occupy the data in the buffer directly, such that the data tracker
-        is not used.
 
         Args:
             entry_info (EntryInfo): The entry metadata to occupy.
         """
 
         # Get all PENDING buffers within the staleness limit
+        model_version = entry_info.get_entry_version()
         pending_buffers = self.get_buffers_with_capacity()
-        candidate_ids = list(pending_buffers)
-        if not candidate_ids:
-            buffer_id = self.buffer_id
-            self.create_buffer(buffer_id)
-            candidate_ids = [buffer_id]
+        candidate_ids = [
+            bid
+            for bid in pending_buffers
+            if (
+                model_version <= bid <= model_version + self.staleness
+                and self.buffers[bid].get_first_non_occupied() < self.buffers[bid].ready_num_entries 
+            )
+        ]
         assert candidate_ids, "No suitable PENDING buffer found."
 
         # Select the lowest PENDING buffer + EMPTY entry to insert
-        target_buffer_id = min(candidate_ids)
-
-        # Check staleness constraint
-        if entry_info.model_version + self.staleness < target_buffer_id:
-            raise ValueError(
-                f"Entry {entry_info} is too stale for buffer {target_buffer_id} "
-                f"with model version {entry_info.model_version}."
-            )
-
-        buffer = self.buffers[target_buffer_id]
+        buffer_id = min(candidate_ids)
+        buffer = self.buffers[buffer_id]
         entry_id = buffer.get_first_non_occupied()
-        assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, (
+        assert (
+            entry_id < self.buffers[buffer_id].ready_num_entries
+            and buffer.entries[entry_id].category == EntryCategory.EMPTY
+        ), (
             f"Found non-occupied entry must be EMPTY, but got {buffer.entries[entry_id]} "
-            f"in (buffer {target_buffer_id}, entry {entry_id})"
+            f"in (buffer {buffer_id}, entry {entry_id})."
         )
 
-        # Create entry info and update buffer
+        # Insert the entry into the buffer
         buffer.insert(entry_id, EntryCategory.OCCUPIED, entry_info=entry_info)
-        self._update_buffer_status(target_buffer_id)
+        self.data_tracker[entry_info.prompt_id] = (buffer_id, entry_id)
+        psrl_logger.debug(f"[Entry Occupy (without reserve)]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})")
+        occupy_num = buffer.get_first_non_occupied()
+        self._update_buffer_status(buffer_id)
+        # NOTE(lhy): seems occupy_num is exactly entry_id + 1
+        # need to check
+        return buffer_id, entry_id, occupy_num
 
     def occupy_data_with_reserve(
         self,
@@ -1046,6 +1100,7 @@ class StalenessInventory:
         # Clean up old entry (may cause entry movement)
         self.clear_reserved_entries(prompt_id, move_across_buffer=(not self.is_validate))
 
+        # ---------------------------------- No redundant rollout ----------------------------------
         if old_entry_id < self.buffers[old_buffer_id].ready_num_entries:
             # It is not a redundant rollout
             # Get all PENDING buffers within the staleness limit
@@ -1083,16 +1138,17 @@ class StalenessInventory:
                 f"in (buffer {buffer_id}, entry {entry_id})."
             )
 
-            # Create entry info and update buffer
+            # Insert the entry into the buffer
             buffer.insert(entry_id, EntryCategory.OCCUPIED, entry_info=entry_info)
             self.data_tracker[entry_info.prompt_id] = (buffer_id, entry_id)
-            psrl_logger.debug(f"[Entry Occupy]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})")
+            psrl_logger.debug(f"[Entry Occupy (with reserve)]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})")
             occupy_num = buffer.get_first_non_occupied()
             self._update_buffer_status(buffer_id)
             # NOTE(lhy): seems occupy_num is exactly entry_id + 1
             # need to check
             return buffer_id, entry_id, occupy_num
 
+        # ---------------------------------- Redundant rollout ----------------------------------
         else:
             # It is a redundant rollout but not aborted
             # Meaning it may be occupied in a buffer id that is larger than the originally reserved one
@@ -1137,7 +1193,7 @@ class StalenessInventory:
                     )
                     # Move the RESERVED entry to the position of the last EMPTY entry
                     available_buffers = sorted(
-                        [bid for bid in pending_buffers if bid < buffer_id],
+                        [bid for bid in pending_buffers if bid < buffer_id and bid not in self._ready_for_delete_buffer_ids],
                         reverse=True,
                     )
                     if len(available_buffers) == 0:
@@ -1159,7 +1215,7 @@ class StalenessInventory:
                         last_empty_entry_id,
                     )
                     psrl_logger.debug(
-                        f"[Entry Move (Redundant Rollout)]: entry {original_entry_info} moved "
+                        f"[Reserved Entry Move (Due to Redundant Rollout)]: entry {original_entry_info} moved "
                         f"from (buffer {buffer_id}, entry {entry_id}) "
                         f"to (buffer {exchange_buffer_id}, entry {last_empty_entry_id})"
                     )
@@ -1169,7 +1225,7 @@ class StalenessInventory:
                 buffer.insert(entry_id, EntryCategory.OCCUPIED, entry_info=entry_info)
                 self.data_tracker[entry_info.prompt_id] = (buffer_id, entry_id)
                 psrl_logger.debug(
-                    f"[Entry Occupy]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})"
+                    f"[Entry Occupy (Redundant Rollout Becomes Useful)]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})"
                 )
                 occupy_num = buffer.get_first_non_occupied()
                 self._update_buffer_status(buffer_id)
@@ -1202,7 +1258,7 @@ class StalenessInventory:
             )
             buffer.insert(entry_id, EntryCategory.OCCUPIED, entry_info=entry_info)
             self.data_tracker[entry_info.prompt_id] = (buffer_id, entry_id)
-            psrl_logger.debug(f"[Entry Occupy]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})")
+            psrl_logger.debug(f"[Entry Occupy (Redundant Rollout is Wasted)]: entry {entry_info} occupied in (buffer {buffer_id}, entry {entry_id})")
             occupy_num = buffer.get_first_non_occupied()
             self._update_buffer_status(buffer_id)
             return buffer_id, entry_id, occupy_num

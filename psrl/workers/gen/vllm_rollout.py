@@ -16,7 +16,6 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
 from verl import DataProto
-from verl.utils.debug import GPUMemoryLogger
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -84,19 +83,15 @@ class PSRL_vLLMRollout:
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
         model_parallel_size = tensor_parallel_size * pipeline_parallel_size
-        assert pipeline_parallel_size == 1 or config.mode == "psrl_async", (
-            "pipeline parallel is only supported in psrl_async mode"
-        )
         expert_parallel_size = config.get("expert_parallel_size", 1)
         enable_expert_parallel = expert_parallel_size > 1
 
         enable_return_routed_experts = config.get("enable_rollout_routing_replay", False)
 
-        # For async engine and model parallel, we only run the inference engine on the first rank.
+        # For model parallel, we only run the inference engine on the first rank.
         # The inner parallel workers are handled by vLLM + Ray.
-        if config.mode == "psrl_async" and model_parallel_size > 1:
+        if model_parallel_size > 1:
             import os
-
             if os.environ.get("LOCAL_RANK") != "0":
                 self.inference_engine = None
                 return
@@ -201,13 +196,11 @@ class PSRL_vLLMRollout:
             else:
                 psrl_logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
-        if config.mode == "psrl_async" and model_parallel_size > 1:
+        if model_parallel_size > 1:
             # Configure vLLM for tensor/pipeline parallelism within Ray
             # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             distributed_executor_backend = "ray"
-        elif config.mode == "sync":
-            distributed_executor_backend = "external_launcher"
         else:
             distributed_executor_backend = None  # auto detect
 
@@ -226,6 +219,7 @@ class PSRL_vLLMRollout:
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
+            # max_seq_len_to_capture=max_model_len, # deprecated
             max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
@@ -269,46 +263,30 @@ class PSRL_vLLMRollout:
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
 
-        prom = getattr(config, "prometheus", None)
-        if prom is not None and getattr(prom, "enable", False):
-            assert bool(OmegaConf.select(psrl_config, "server_rollout.enable", default=False)), (
-                "Prometheus monitoring requires server_rollout to be enabled."
-            )
-            served_model_name = getattr(prom, "served_model_name", None)
-            if served_model_name:
-                if "/" in served_model_name:
-                    served_model_name = served_model_name.split("/")[-1]
-                llm_kwargs["served_model_name"] = served_model_name
-
-        # Initialize abort queue, events, and request ids for psrl_async mode
+        # Initialize abort queue, events, and request ids
         self.scheduler_abort_queue = RayQueue()
         self.scheduler_abort_events = {}
         self.scheduler_abort_requests = set()
         self._scheduler_abort_processor_task = None
 
-        if config.mode == "psrl_async":
-            if self.psrl_config.server_rollout.enable:
-                # Build and cache OpenAI server args at engine init time.
-                # GenWorker will reuse these to start an in-process OpenAI-compatible server
-                # without re-parsing or drifting defaults.
-                server_args = self._build_server_args(model_path=model_path, args=llm_kwargs)
-                self._server_args = server_args
+        if self.psrl_config.server_rollout.enable:
+            # Build and cache OpenAI server args at engine init time.
+            # GenWorker will reuse these to start an in-process OpenAI-compatible server
+            # without re-parsing or drifting defaults.
+            server_args = self._build_server_args(model_path=model_path, args=llm_kwargs)
+            self._server_args = server_args
 
-                engine_args = AsyncEngineArgs.from_cli_args(server_args)
-                usage_context = UsageContext.OPENAI_API_SERVER
-                vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-            else:
-                llm_kwargs["model"] = model_path
-                engine_args = AsyncEngineArgs(**llm_kwargs)
-                usage_context = UsageContext.ENGINE_CONTEXT
-                vllm_config = engine_args.create_engine_config()
+            engine_args = AsyncEngineArgs.from_cli_args(server_args)
+            usage_context = UsageContext.OPENAI_API_SERVER
+            vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+        else:
+            llm_kwargs["model"] = model_path
+            engine_args = AsyncEngineArgs(**llm_kwargs)
+            usage_context = UsageContext.ENGINE_CONTEXT
+            vllm_config = engine_args.create_engine_config()
 
             stat_loggers = None
-            if (
-                not config.disable_log_stats
-                and psrl_config.status_collection.enable
-                and "status_queue" in kwargs
-            ):
+            if not config.disable_log_stats and psrl_config.status_collection.enable:
                 psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
                 # Use custom stat loggers to collect engine stats
                 status_queue = kwargs["status_queue"]
@@ -330,10 +308,6 @@ class PSRL_vLLMRollout:
                 usage_context=usage_context,
                 stat_loggers=stat_loggers,
             )
-        else:
-            llm_kwargs["model"] = model_path
-            psrl_logger.info(f"Initialize LLM for rollout instance {kwargs.get('instance_id', 0)}")
-            self.inference_engine = LLM(**llm_kwargs)
 
         # NOTE(lhy): sleep mode is not supported when using NIXL
         # Because it will cause illegal memory registration
@@ -393,17 +367,16 @@ class PSRL_vLLMRollout:
 
         self.pad_token_id = tokenizer.pad_token_id
 
-        # Start abort processor task for async mode
-        if config.mode == "psrl_async":
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
-            self._scheduler_abort_processor_task.add_done_callback(
-                lambda f: f.result()
-            )  # To avoid silent error in async tasks
+        # Start abort processor task
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
+        self._scheduler_abort_processor_task.add_done_callback(
+            lambda f: f.result()
+        )  # To avoid silent error in async tasks
 
     def _build_server_args(self, model_path: str, args: dict[str, Any]):
         """Build a CLI-like args Namespace compatible with vLLM OpenAI server.
@@ -469,7 +442,7 @@ class PSRL_vLLMRollout:
             return
         # Wait until queue is empty
         while not self.scheduler_abort_queue.empty():
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
 
         # Wait for all pending abort requests to complete
         if self.scheduler_abort_events:
@@ -628,7 +601,7 @@ class PSRL_vLLMRollout:
                 interrupted_by_scheduler_list.append(True)
                 self.scheduler_abort_requests.remove(str(uid))
             else:
-                psrl_logger.info(
+                psrl_logger.debug(
                     f"Request {uid} is not interrupted by the scheduler (not in {self.scheduler_abort_requests}). "
                     f"It is interrupted by the synchronization (i.e., partial rollout)."
                 )
@@ -692,7 +665,8 @@ class PSRL_vLLMRollout:
         # Update rollout_log_probs
         if not self.is_pooling_model and self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+                curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+                curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
             else:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
             curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
@@ -717,9 +691,7 @@ class PSRL_vLLMRollout:
     def add_requests(self, prompts: DataProto, sampling_params: dict[str, Any]):
         """
         Add generation requests to the vLLM inference engine.
-
         This method converts prompts to vLLM format and queues them for generation.
-        Used primarily for async/streaming generation modes.
 
         Args:
             prompts: DataProto containing input prompts
@@ -741,71 +713,8 @@ class PSRL_vLLMRollout:
                 priority=0,
             )
 
-    @deprecated("vllm_rollout.step_all is not used.")
     @torch.no_grad()
-    def step_all(self) -> list[RequestOutput | PoolingRequestOutput]:
-        outputs: list[RequestOutput | PoolingRequestOutput] = []
-        while self.inference_engine.llm_engine.has_unfinished_requests():
-            step_outputs = self.inference_engine.llm_engine.step()
-            for output in step_outputs:
-                if output.finished:
-                    outputs.append(output)
-        return sorted(outputs, key=lambda x: int(x.request_id))
-
-    @deprecated("vllm_rollout.step is not used.")
-    @torch.no_grad()
-    def step(self) -> list[RequestOutput | PoolingRequestOutput]:
-        return self.inference_engine.llm_engine.step()
-
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
-    @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, sampling_params: dict[str, Any]) -> DataProto:
-        """
-        Generate sequences from prompts using synchronous vLLM generation.
-
-        This is the main synchronous generation method that:
-        1. Pre-processes inputs for vLLM
-        2. Runs generation with specified sampling parameters
-        3. Post-processes outputs back to DataProto format
-
-        Args:
-            prompts: DataProto containing input prompts and metadata
-            sampling_params: Sampling parameters for generation
-
-        Returns:
-            DataProto with generated sequences and updated metadata
-        """
-        vllm_inputs = self.pre_process_inputs(prompts)
-        # users can customize different sampling_params at different run
-        if self.is_pooling_model:
-            # Convert vllm_inputs to prompt format for encode
-            if isinstance(vllm_inputs[0], dict):
-                prompts_list = [TokensPrompt(**inp) for inp in vllm_inputs]
-            else:
-                prompts_list = vllm_inputs
-            
-            outputs = self.inference_engine.encode(
-                prompts=prompts_list,
-                pooling_params=self.pooling_params,
-                pooling_task=self.pooling_params.task,
-            )
-            
-            return self.post_process_outputs(prompts, outputs)
-        else:
-            sampling_params = SamplingParams(**sampling_params)
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-            return self.post_process_outputs(prompts, outputs)
-
-    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
-    @torch.no_grad()
-    async def generate_sequences_async(
-        self, prompts: DataProto, sampling_params: dict[str, Any]
-    ) -> DataProto:
+    async def generate_sequences_async(self, prompts: DataProto, sampling_params: dict[str, Any]) -> DataProto:
         """
         Generate sequences from prompts using asynchronous vLLM generation.
 
@@ -876,30 +785,9 @@ class PSRL_vLLMRollout:
 
             return DataProto.concat(completed_rollout)
 
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
+ 
     @torch.no_grad()
-    def raw_generate_sequences(self, prompts: DataProto, sampling_params: dict[str, Any]):
-        """Generate sequences from the prompts using vLLM without post-processing."""
-        assert "response_unpadded_len" not in prompts.non_tensor_batch, (
-            "partial rollout is currently not supported in sync mode"
-        )
-
-        vllm_inputs = self.pre_process_inputs(prompts)
-        # users can customize different sampling_params at different run
-        sampling_params = SamplingParams(**sampling_params)
-        # the inference_engine will handle the request_id internally
-        outputs = self.inference_engine.generate(
-            prompts=vllm_inputs,  # because we have already convert it to prompt token id
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )
-        return outputs
-
-    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
-    @torch.no_grad()
-    async def raw_generate_sequences_async(
-        self, prompts: DataProto, sampling_params: dict[str, Any]
-    ):
+    async def raw_generate_sequences_async(self, prompts: DataProto, sampling_params: dict[str, Any]):
         """Generate sequences from the prompts using vLLM asynchronously without post-processing."""
         vllm_inputs = self.pre_process_inputs(prompts)
         sample_ids = prompts.non_tensor_batch.get("uid", None)

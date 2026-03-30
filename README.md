@@ -36,7 +36,6 @@ You can find training examples in the `examples` directory. We provide examples 
 
 - **Algorithms**: PPO, GRPO
 - **Training Backends**: FSDP, Megatron-LM
-- **Rollout Modes**: Batch, Streaming
 - **Synchronous/Asynchronous Training**: controlled by `staleness` parameter (0 for synchronous, >0 for asynchronous)
 - **Rollout Strategies**: Heterogeneous, Homogeneous TP/PP
 

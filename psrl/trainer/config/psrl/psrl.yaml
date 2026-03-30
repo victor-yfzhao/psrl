@@ -16,9 +16,6 @@ staleness_buffer_entries: 512
 # number of responses (i.e. num sample times). > 1 for grpo
 rollout_n: 1
 
-# Generate mode: batch or stream
-gen_mode: batch
-
 # Weight synchronization mode for parameter server: cpu_ref or nixl_cpu
 ps_mode: cpu_ref
 
@@ -92,6 +89,13 @@ deployment:
 
   # GPU number for trainer in every node
   train_ngpus_per_node: 1
+
+  # Total number of GPU nodes this job needs across all roles.
+  # When set, excess nodes in the Ray cluster are blocked from scheduling
+  # so that colocated validate workers cannot spill onto idle nodes.
+  # Set to the same value as NNODES in the launch script.
+  # null means no restriction (default).
+  total_nnodes: null
   
   # Rollout with heterogeneous strategies across different instances
   heterogeneous_rollout:
@@ -128,21 +132,21 @@ status_collection:
   dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
-  # Here 10 means sync every 0.01 second
-  engine_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  engine_sync_interval_in_ms: 100
 
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
-  # Here 10 means sync every 0.01 second
-  coordinator_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  coordinator_sync_interval_in_ms: 100
 
 # Memory logger config
 memory_logger:
 
   # Whether to enable memory logger
-  enable: True
+  enable: False
 
   # Logging interval in seconds
-  interval_seconds: 20
+  interval_seconds: 30
 
 # Redundant rollout config
 redundant_rollout:
@@ -157,10 +161,10 @@ redundant_rollout:
   alg_rollout_n: ${psrl.rollout_n}
 
   # Actual global batch size (>= algorithm requirement)
-  redundant_global_batch_size: null
+  redundant_global_batch_size: ${psrl.staleness_buffer_entries}
 
   # Actual number of responses (>= algorithm requirement)
-  redundant_rollout_n: null
+  redundant_rollout_n: ${psrl.rollout_n}
 
 # Partial rollout config
 partial_rollout:
@@ -180,16 +184,15 @@ routing_strategy:
   method: request_num_balance
 
   # Check interval in millisecond for rollout routing
-  check_interval_in_ms: 1000
+  check_interval_in_ms: 500
 
   # Whether to prioritize short requests
-  short_request_first: False
+  # Available options: "short_length", "long_length", "small_id"
+  request_sort_indicator: small_id
 
   # Whether to sort the candidates by indicator 
-  sort_candidate_by_indicator: False
-
-  # Whether to allocate the version tag dynamically (first routing to the instance, then allocate the version tag)
-  enable_dynamic_version_tag: False
+  # Available options: "version", "reserve_capability"
+  candidate_sort_indicator: version
 
   # Whether to enable multiple priority queues for routing requests
   enable_multi_priority_queue: False
@@ -251,6 +254,13 @@ sync_and_mig_strategy:
     # When indicator is "hypothesis_test", threshold is not used.
     threshold: null
 
+    # Whether to check the request that can be routed to the instance before synchronization
+    check_req_before_sync: True
+
+    # All versions in [0, seamless_train_version] satisfy that:
+    # - After pulling the model from the PS, the next buffer is already ready, so the training can be continued seamlessly without waiting for rollout
+    seamless_train_version: 0
+
   # Rollout migration config
   mig:
     # Whether to enable rollout migration
@@ -272,12 +282,21 @@ sync_and_mig_strategy:
     # Threshold for stopping migration
     stop_threshold: null
 
+# Filter strategy
+proactive_filter_strategy:
+
+  # Method for proactive filter strategy
+  # Available options: "null", "retry", "truncate"
+  method: null
+
+  # Threshold of retry/truncate requests per buffer
+  # When the buffer is not ready but the training side is waiting for it
+  # We will trigger the retry/truncate strategy when the number of remaining reserved entries is smaller than this value
+  threshold: 0
+
 # NIXL config for `nixl_cpu` weight synchronization
 # NOTE: With ps_mode nixl_*, GenWorker does not use TMS LD_PRELOAD (incompatible with UCX registerMem).
 nixl:
-
-  # Parameter server mode: storage_server or meta_server
-  server_mode: meta_server
 
   # Server IP address
   server_ip: ${psrl.ps_manager_ip}
@@ -286,7 +305,7 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 16
+  max_pinned_temp_memory_slots: 64
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
@@ -313,13 +332,7 @@ buffer_post_process:
   # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
   name: null
 
-# Buffer bound for retry mechanism
-retry_bound: -1
-
-# Ratio over retry bound
-retry_ratio: 1.0
-
-# Whether to colocate validate and training workers (agentic_rl / validate-on-psrl layout)
+# Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
 # Whether to dispatch requests to both rollout and validate instances (when validate workers exist)
@@ -342,5 +355,4 @@ tms:
   # Whether to enable TMS on NIXL temp buffers
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
-  enable_nixl: False
-  
+  enable_nixl: True

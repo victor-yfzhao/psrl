@@ -20,6 +20,8 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutCoordinator(CommandExtension):
+    DEFAULT_AWAIT_TIMEOUT_S = 500
+
     def __init__(
         self,
         config,
@@ -52,7 +54,12 @@ class RolloutCoordinator(CommandExtension):
 
         self.config = config
         self.staleness = self.config.psrl.staleness
-        self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
+        if self.config.psrl.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        else:
+            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
+            self.alg_rollout_n = self.rollout_n
 
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
@@ -98,7 +105,9 @@ class RolloutCoordinator(CommandExtension):
         self.stop_broadcast_status_to_router = False
 
         # Asyncio event loop order control
-        self._is_init_model = asyncio.Event()
+        # Track model initialization per worker group to support partial init on
+        # rollout/validate subsets independently.
+        self._is_init_model_events = [asyncio.Event() for _ in range(self.gen_wg_size)]
         self._is_init_nixl_client = asyncio.Event()
 
         # Version tracking
@@ -107,6 +116,7 @@ class RolloutCoordinator(CommandExtension):
         ] = {}  # The latest stale model version of each instance
         self.instance_to_model_version: dict[int, int] = {}  # Track the model version of each instance
         self.ps_model_version = 0  # Current model version in the parameter server
+        self.ready_buffers = set() # The set of ready buffers
 
         # Engine status tracking
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
@@ -119,22 +129,83 @@ class RolloutCoordinator(CommandExtension):
         """Get the total world size (number of rollout and validate instances)."""
         return sum([rollout_wg.world_size for rollout_wg in self.gen_wg_list])
 
-    def _get_wg_list_and_size(self, tag: str):
-        """Get the worker group list and size based on the given tag.
+    def resume_instances(self, instance_ids: list[int]):
+        """Notify that the given instances have resumed processing.
+
+        Args:
+            instance_ids (list[int]): List of instance IDs that have resumed processing.
+        """
+        for instance_id in instance_ids:
+            self.stop_process_status_queue[instance_id] = False
+
+    def pause_instances(self, instance_ids: list[int]):
+        """Notify that the given instances have paused processing.
+
+        Args:
+            instance_ids (list[int]): List of instance IDs that have paused processing.
+        """
+        for instance_id in instance_ids:
+            self.stop_process_status_queue[instance_id] = True
+
+    def _get_wgs(self, tag: str):
+        """Get worker groups and their global indices based on tag.
 
         Args:
             tag (str): Tag to specify which instances to get ('rollout', 'validate', 'all')
         Returns:
-            tuple: (worker group list, worker group size)
+            tuple: (worker group list, global wg indices)
         """
         if tag == "rollout":
-            return self.rollout_wg_list, self.rollout_wg_size
+            return self.rollout_wg_list, list(range(self.rollout_wg_size))
         elif tag == "validate":
-            return self.validate_wg_list, self.validate_wg_size
+            return self.validate_wg_list, list(range(self.rollout_wg_size, self.gen_wg_size))
         elif tag == "all":
-            return self.gen_wg_list, self.gen_wg_size
+            return self.gen_wg_list, list(range(self.gen_wg_size))
         else:
-            raise ValueError(f"Unknown tag {tag} for getting worker group list and size")
+            raise ValueError(f"Unknown tag {tag} for getting worker groups")
+
+    async def _wait_for_init_model(self, tag: str, func_name: str):
+        """Wait until all worker groups under the tag finish model init."""
+        _, wg_indices = self._get_wgs(tag)
+        if not wg_indices:
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(self._is_init_model_events[idx].wait() for idx in wg_indices)),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                f"while waiting model init for tag={tag}, wg={wg_indices}"
+            ) from e
+
+    async def _await_futures_with_timeout(self, futures, func_name: str, tag: str, wg_indices: list[int]):
+        """Await futures with a unified timeout and detailed context on timeout."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.gather(*futures),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                f"while waiting futures for tag={tag}, wg={wg_indices}"
+            ) from e
+
+    async def _wait_for_nixl_client(self, func_name: str):
+        """Wait until NIXL client initialization is complete."""
+        try:
+            await asyncio.wait_for(
+                self._is_init_nixl_client.wait(),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                "while waiting NIXL client initialization"
+            ) from e
 
     async def init_model(self, tag: str = "rollout", init_mode: str = "full"):
         """Init the model on rollout instances and register to ps manager.
@@ -145,15 +216,13 @@ class RolloutCoordinator(CommandExtension):
                 'full' mode will load the full model weights,
                 'empty' mode will load dummy model weights.
         """
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(wg_list[i].execute_rank_zero_async("init_and_register_model", init_mode))
-            else:
-                futures.extend(wg_list[i].execute_all_async("init_and_register_model", init_mode))
-        await asyncio.gather(*futures)
-        self._is_init_model.set()
+        for i in range(len(wg_list)):
+            futures.append(wg_list[i].execute_rank_zero_async("init_and_register_model", init_mode))
+        await self._await_futures_with_timeout(futures, "init_model", tag, wg_indices)
+        for idx in wg_indices:
+            self._is_init_model_events[idx].set()
 
     async def init_route_strategy(self, tag: str = "rollout"):
         """Init the route strategy on rollout instances.
@@ -165,32 +234,31 @@ class RolloutCoordinator(CommandExtension):
             tag (str): Tag to specify which instances to initialize ('rollout', 'validate', 'all')
         """
         assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
-        await self._is_init_model.wait()
+        await self._wait_for_init_model(tag, "init_route_strategy")
 
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
-            else:
-                futures.extend(wg_list[i].execute_all_async("estimate_max_model_len"))
-        max_model_lens = await asyncio.gather(*futures)
+        for i in range(len(wg_list)):
+            futures.append(wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
+        max_model_lens = await self._await_futures_with_timeout(
+            futures, "init_route_strategy", tag, wg_indices
+        )
         psrl_logger.info(f"Max model lens on {tag} instances: {max_model_lens}")
-        wg_idx_range = range(self.rollout_wg_size, self.gen_wg_size) if tag == "validate" else range(wg_size)
-        instance_to_max_model_len = {i: max(max_model_lens[j]) for i, j in zip(wg_idx_range, range(wg_size))}
+        instance_to_max_model_len = {
+            wg_idx: max(max_model_lens[j]) for j, wg_idx in enumerate(wg_indices)
+        }
         # Use the max model len to budget the kv cache size for each instance
         await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
     async def init_nixl_client(self):
         """Init the NIXL client on rollout and validate instances."""
-        await self._is_init_model.wait()
+        await self._wait_for_init_model("all", "init_nixl_client")
         futures = []
         for i in range(self.gen_wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(self.gen_wg_list[i].execute_rank_zero_async("init_nixl_client"))
-            else:
-                futures.extend(self.gen_wg_list[i].execute_all_async("init_nixl_client"))
-        await asyncio.gather(*futures)
+            futures.append(self.gen_wg_list[i].execute_rank_zero_async("init_nixl_client"))
+        await self._await_futures_with_timeout(
+            futures, "init_nixl_client", "all", self._get_wgs("all")[1]
+        )
         psrl_logger.info(f"Initialized NIXL client on all {self.gen_wg_size} instances.")
         self._is_init_nixl_client.set()
 
@@ -201,7 +269,7 @@ class RolloutCoordinator(CommandExtension):
             full_tag (str): Tag to specify which instances to run the protocol
                             in 'full' mode ('rollout', 'validate', 'all')
         """
-        await self._is_init_nixl_client.wait()
+        await self._wait_for_nixl_client("nixl_protocol")
 
         if full_tag == "all":
             full_tag_list = ["full"] * self.gen_wg_size
@@ -214,22 +282,41 @@ class RolloutCoordinator(CommandExtension):
 
         futures = []
         for i in range(self.gen_wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_protocol", full_tag_list[i]))
-            else:
-                futures.extend(self.gen_wg_list[i].execute_all_async("nixl_protocol", full_tag_list[i]))
-        await asyncio.gather(*futures)
+            futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_protocol", full_tag_list[i]))
+        await self._await_futures_with_timeout(
+            futures, "nixl_protocol", "all", self._get_wgs("all")[1]
+        )
 
     async def nixl_convert_params(self):
         """Convert the model parameters to unified format on rollout and validate instances."""
-        await self._is_init_nixl_client.wait()
+        await self._wait_for_nixl_client("nixl_convert_params")
         futures = []
         for i in range(self.gen_wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_convert_params"))
-            else:
-                futures.extend(self.gen_wg_list[i].execute_all_async("nixl_convert_params"))
-        await asyncio.gather(*futures)
+            futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_convert_params"))
+        await self._await_futures_with_timeout(
+            futures, "nixl_convert_params", "all", self._get_wgs("all")[1]
+        )
+
+    async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
+        """
+        Force an initial weight pull from PS to all specified gen workers via NIXL.
+
+        This is called exactly once at initialization, after the NIXL protocol
+        completes and PS buffers are populated via preload_checkpoint_to_cpu() and
+        write_checkpoint_to_registered_tensors().
+        Because both the PS and workers start at version 0, the version-based skip
+        check inside GenWorker.sync_with_ps (curr_version >= ps_version) would
+        incorrectly suppress the pull — so we call nixl_pull_model_async directly
+        on each worker group instead of going through the SYNC command path.
+
+        Args:
+            tag (str): Which instances to pull into ('rollout', 'validate', 'all').
+        """
+        await self._wait_for_init_model(tag, "initial_pull_from_ps")
+        wg_list, wg_indices = self._get_wgs(tag)
+        futures = [wg_list[i].execute_rank_zero_async("nixl_pull_model_async") for i in range(len(wg_list))]
+        await self._await_futures_with_timeout(futures, "initial_pull_from_ps", tag, wg_indices)
+        psrl_logger.info(f"Initial PS pull complete for {len(wg_list)} {tag!r} instance(s).")
 
     async def sleep(self, tag: str = "all"):
         """Make rollout instances sleep and release GPU memory.
@@ -237,16 +324,13 @@ class RolloutCoordinator(CommandExtension):
         Args:
             tag (str): Tag to specify which instances to sleep ('rollout', 'validate', 'all')
         """
-        await self._is_init_model.wait()
+        await self._wait_for_init_model(tag, "sleep")
 
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
-            if self.rank_0_is_model_owner:
-                futures.append(wg_list[i].execute_rank_zero_async("sleep"))
-            else:
-                futures.extend(wg_list[i].execute_all_async("sleep"))
-        await asyncio.gather(*futures)
+        for i in range(len(wg_list)):
+            futures.append(wg_list[i].execute_rank_zero_async("sleep"))
+        await self._await_futures_with_timeout(futures, "sleep", tag, wg_indices)
 
     async def start_busy_loop(self):
         """
@@ -258,7 +342,7 @@ class RolloutCoordinator(CommandExtension):
         3. Starts a task to broadcast the engine status to the agent loop workers (i.e., router).
         4. Starts a task to synchronize rollout instances with PS.
         """
-        await self._is_init_model.wait()
+        await self._wait_for_init_model("rollout", "start_busy_loop")
 
         if self.command_handler_task is not None and not self.command_handler_task.done():
             return
@@ -268,43 +352,42 @@ class RolloutCoordinator(CommandExtension):
         self.command_handler_task = self.running_loop.create_task(self._command_handler_loop())
         self.command_handler_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
-        if self.config.psrl.gen_mode == "stream":
-            # Start the status collection tasks
-            if self.config.psrl.status_collection.enable:
-                for instance_id in range(self.gen_wg_size):
-                    self.process_status_queue_tasks.append(
-                        self.running_loop.create_task(self._process_status_queue(instance_id))
-                    )
-                    self.process_status_queue_tasks[instance_id].add_done_callback(
-                        lambda f: f.result()
-                    )  # To avoid silent error in async tasks
-            # Start the task to broadcast the engine status to the router
-            self.broadcast_status_to_router_task = self.running_loop.create_task(self._broadcast_status_to_router())
-            self.broadcast_status_to_router_task.add_done_callback(
-                lambda f: f.result()
-            )  # To avoid silent error in async tasks
-            # Start the model synchronization and rollout migration loop
-            if self.config.psrl.sync_and_mig_strategy.method == "greedy":
-                self.sync_task = self.running_loop.create_task(self._greedy_sync_and_migrate_loop())
-                self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
-            elif self.config.psrl.sync_and_mig_strategy.method == "status_based":
-                assert self.config.psrl.status_collection.enable, (
-                    "Status-based sync strategy is only supported when status collection is enabled"
+        # Start the status collection tasks
+        if self.config.psrl.status_collection.enable:
+            for instance_id in range(self.gen_wg_size):
+                self.process_status_queue_tasks.append(
+                    self.running_loop.create_task(self._process_status_queue(instance_id))
                 )
-                self.sync_task = self.running_loop.create_task(self._status_based_sync_and_migrate_loop())
-                self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
-            else:
-                raise NotImplementedError(
-                    f"Sync strategy {self.config.psrl.sync_and_mig_strategy.method} is not supported"
-                )
-            # Check if rollout migration is enabled
-            if self.config.psrl.sync_and_mig_strategy.mig.enable:
-                assert self.config.psrl.status_collection.enable, (
-                    "Rollout migration is only supported when status collection is enabled"
-                )
-                assert self.config.psrl.partial_rollout.enable, (
-                    "Rollout migration is only supported when partial rollout is enabled"
-                )
+                self.process_status_queue_tasks[instance_id].add_done_callback(
+                    lambda f: f.result()
+                )  # To avoid silent error in async tasks
+        # Start the task to broadcast the engine status to the router
+        self.broadcast_status_to_router_task = self.running_loop.create_task(self._broadcast_status_to_router())
+        self.broadcast_status_to_router_task.add_done_callback(
+            lambda f: f.result()
+        )  # To avoid silent error in async tasks
+        # Start the model synchronization and rollout migration loop
+        if self.config.psrl.sync_and_mig_strategy.method == "greedy":
+            self.sync_task = self.running_loop.create_task(self._greedy_sync_and_migrate_loop())
+            self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        elif self.config.psrl.sync_and_mig_strategy.method == "status_based":
+            assert self.config.psrl.status_collection.enable, (
+                "Status-based sync strategy is only supported when status collection is enabled"
+            )
+            self.sync_task = self.running_loop.create_task(self._status_based_sync_and_migrate_loop())
+            self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        else:
+            raise NotImplementedError(
+                f"Sync strategy {self.config.psrl.sync_and_mig_strategy.method} is not supported"
+            )
+        # Check if rollout migration is enabled
+        if self.config.psrl.sync_and_mig_strategy.mig.enable:
+            assert self.config.psrl.status_collection.enable, (
+                "Rollout migration is only supported when status collection is enabled"
+            )
+            assert self.config.psrl.partial_rollout.enable, (
+                "Rollout migration is only supported when partial rollout is enabled"
+            )
 
     async def stop_busy_loop(self):
         """
@@ -324,11 +407,10 @@ class RolloutCoordinator(CommandExtension):
         self.stop_broadcast_status_to_router = True
 
         tasks_to_wait = [self.command_handler_task]
-        if self.config.psrl.gen_mode == "stream":
-            tasks_to_wait.append(self.sync_task)
-            if self.process_status_queue_tasks:
-                tasks_to_wait.extend(self.process_status_queue_tasks)
-            tasks_to_wait.append(self.broadcast_status_to_router_task)
+        tasks_to_wait.append(self.sync_task)
+        if self.process_status_queue_tasks:
+            tasks_to_wait.extend(self.process_status_queue_tasks)
+        tasks_to_wait.append(self.broadcast_status_to_router_task)
 
         # Wait for tasks to finish with timeout
         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
@@ -354,7 +436,7 @@ class RolloutCoordinator(CommandExtension):
                 command_type = command.type
                 command_id = command.get_kwargs()["id"]
                 command_args = command.get_args()
-                psrl_logger.debug(
+                psrl_logger.info(
                     f"Receive command: type = {command_type}, kwargs = {command.get_kwargs()}, args = {command_args}"
                 )
 
@@ -383,40 +465,18 @@ class RolloutCoordinator(CommandExtension):
                                 f"Validate instance should not be interrupted, but got instance_id {instance_id} "
                                 f"which is out of rollout instance range [0, {len(self.rollout_wg_list)})."
                             )
-                            if self.rank_0_is_model_owner:
-                                futures.append(
-                                    self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                        "interrupt_requests", abort_requests
-                                    )
+                            futures.append(
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                    "interrupt_requests", abort_requests
                                 )
-                            else:
-                                warnings.warn(
-                                    f"Interrupt requests on instance {instance_id} in SPMD-style "
-                                    "may cause undefined behavior, need to check the behavior",
-                                    stacklevel=2,
-                                )
-                                futures.append(
-                                    self.gen_wg_list[instance_id].execute_all_async(
-                                        "interrupt_requests", abort_requests
-                                    )[0]
-                                )
+                            )
                     if instance_ids is not None:
                         for instance_id in instance_ids:
-                            if self.rank_0_is_model_owner:
-                                futures.append(
-                                    self.rollout_wg_list[instance_id].execute_rank_zero_async(
-                                        "interrupt_requests", None
-                                    )
+                            futures.append(
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                    "interrupt_requests", None
                                 )
-                            else:
-                                warnings.warn(
-                                    f"Interrupt requests on instance {instance_id} in SPMD-style "
-                                    "may cause undefined behavior, need to check the behavior",
-                                    stacklevel=2,
-                                )
-                                futures.append(
-                                    self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", None)[0]
-                                )
+                            )
 
                     if not futures:
                         interrupted_request_num = 0
@@ -444,21 +504,15 @@ class RolloutCoordinator(CommandExtension):
                         f"Received SYNC command for instances {instance_ids} "
                         f"with PS model version {curr_ps_model_version}"
                     )
-                    assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", (
-                        "SYNC command is only supported in 'psrl_async' rollout mode."
-                    )
 
                     # Sync with PS (interrupt, pull model, and resume generation)
                     interrupt_futures = []
                     sync_futures = []
 
                     for instance_id in instance_ids:
-                        if self.rank_0_is_model_owner:
-                            interrupt_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                "interrupt_generation"
-                            )
-                        else:
-                            raise ValueError("SYNC command in SPMD-style is not supported yet.")
+                        interrupt_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
+                            "interrupt_generation"
+                        )
                         interrupt_futures.append(interrupt_future)
                     interrupted_request_nums = await asyncio.gather(*interrupt_futures)
                     for i, instance_id in enumerate(instance_ids):
@@ -468,12 +522,9 @@ class RolloutCoordinator(CommandExtension):
                         )
 
                     for instance_id in instance_ids:
-                        if self.rank_0_is_model_owner:
-                            sync_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                "sync_with_ps", curr_ps_model_version
-                            )
-                        else:
-                            raise ValueError("SYNC command in SPMD-style is not supported yet.")
+                        sync_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
+                            "sync_with_ps", curr_ps_model_version
+                        )
                         sync_futures.append(sync_future)
 
                     # Post process the command result
@@ -615,6 +666,10 @@ class RolloutCoordinator(CommandExtension):
                 if not self.config.psrl.partial_rollout.enable:
                     if not await self.check_no_activate_tasks(instance_id):
                         continue
+                # Check whether the training side can seamlessly continue to train after the synchronization
+                if self.config.psrl.sync_and_mig_strategy.sync.seamless_train_version >= self.ps_model_version:
+                    if self.ps_model_version not in self.ready_buffers:
+                        continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
 
@@ -666,11 +721,17 @@ class RolloutCoordinator(CommandExtension):
                 else:
                     if engine_stats.get_waiting_and_running_queue_size() > 0:
                         continue
+                # Check whether the training side can seamlessly continue to train after the synchronization
+                if self.config.psrl.sync_and_mig_strategy.sync.seamless_train_version >= self.ps_model_version:
+                    if self.ps_model_version not in self.ready_buffers:
+                        continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
+                '''
                 # NOTE(lhy): currently, we only synchronize with PS for one instance at a time
                 # But the model pulling time can be overlapped
                 break
+                '''
 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
@@ -693,6 +754,9 @@ class RolloutCoordinator(CommandExtension):
             version (int): The new PS model version to set.
         """
         self.ps_model_version = version
+        assert self.ps_model_version > 0, "PS model version must be greater than 0"
+        assert (self.ps_model_version - 1) in self.ready_buffers, "PS model version must be greater than the ready buffers"
+        self.ready_buffers.remove(self.ps_model_version - 1)
         psrl_logger.info(f"Updated PS model version to {version}")
 
     # This is called by the PS manager to update the rollout instance model version after pulling
@@ -708,6 +772,15 @@ class RolloutCoordinator(CommandExtension):
         self.instance_to_model_version[rollout_instance_id] = version_tag
         psrl_logger.info(
             f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}"
+        )
+        
+    def update_ready_buffer(self, ready_buffer: int):
+        """
+        Update the ready buffer.
+        """
+        self.ready_buffers.add(ready_buffer)
+        psrl_logger.info(
+            f"Updated ready buffers to: {self.ready_buffers}"
         )
 
     async def sync_with_ps(
@@ -740,9 +813,10 @@ class RolloutCoordinator(CommandExtension):
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                     instance_id, 0
                 )
-            await self.rollout_router.interrupt_routing.remote()
-            psrl_logger.info("Interrupted routing for synchronization")
+            await self.rollout_router.pause_routing.remote()
+            psrl_logger.info("Paused routing for synchronization")
             await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
+            psrl_logger.info("Updated currently syncing instances")
             await self.exec_command(
                 Command(
                     type=CommandType.SYNC,
@@ -752,7 +826,9 @@ class RolloutCoordinator(CommandExtension):
                 ),
                 blocking=True,
             )
+            psrl_logger.info("Executed SYNC command")
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                psrl_logger.info("Waiting for interrupted partial requests loop back")
                 await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
@@ -764,18 +840,8 @@ class RolloutCoordinator(CommandExtension):
         """
         Check whether the instance has no active tasks.
         """
-        futures = []
-        if self.rank_0_is_model_owner:
-            futures.append(self.gen_wg_list[instance_id].execute_rank_zero_async("get_active_task_num"))
-        else:
-            warnings.warn(
-                f"Check no active tasks on instance {instance_id} in SPMD-style may "
-                f"cause undefined behavior, need to check the behavior",
-                stacklevel=2,
-            )
-            futures.extend(self.gen_wg_list[instance_id].execute_all_async("get_active_task_num"))
-        active_task_nums = await asyncio.gather(*futures)
-        return all(active_task_num == 0 for active_task_num in active_task_nums)
+        active_task_num = await self.gen_wg_list[instance_id].execute_rank_zero_async("get_active_task_num")
+        return active_task_num == 0
 
     async def check_should_sync(self, instance_id: int) -> bool:
         """
@@ -806,20 +872,27 @@ class RolloutCoordinator(CommandExtension):
         # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
         migrate_instance_ids = await self.rollout_router.check_should_migrate.remote()
         if migrate_instance_ids:
-            psrl_logger.info(f"Migrating instances {migrate_instance_ids}")
-            await self.rollout_router.interrupt_routing.remote()
-            psrl_logger.info("Interrupted routing for migration")
-            await self.exec_command(
-                Command(
-                    type=CommandType.ABORT,
-                    instance_ids=migrate_instance_ids,
-                ),
-                blocking=True,
-            )
-            if wait_interrupted_partial_requests_loop_back:
-                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
-                psrl_logger.info(
-                    f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
+            with log_dual_events(
+                f"Migrating instances {migrate_instance_ids}",
+                psrl_logger,
+                level=logging.INFO,
+                event_type=EventType.OTHER,
+            ):
+                await self.rollout_router.pause_routing.remote()
+                psrl_logger.info("Interrupted routing for migration")
+                await self.exec_command(
+                    Command(
+                        type=CommandType.ABORT,
+                        instance_ids=migrate_instance_ids,
+                    ),
+                    blocking=True,
                 )
-            await self.rollout_router.resume_routing.remote()
-            psrl_logger.info("Resumed routing after migration")
+                if wait_interrupted_partial_requests_loop_back:
+                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(
+                        migrate_instance_ids
+                    )
+                    psrl_logger.info(
+                        f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
+                    )
+                await self.rollout_router.resume_routing.remote()
+                psrl_logger.info("Resumed routing after migration")

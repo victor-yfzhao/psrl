@@ -1,10 +1,11 @@
 import logging
 import os
-from typing import TYPE_CHECKING
-
 import ray
 import torch
+from contextlib import nullcontext
 from omegaconf import DictConfig, OmegaConf, open_dict
+from typing import TYPE_CHECKING
+
 from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
@@ -29,9 +30,10 @@ from psrl.utils.logger import (
     log_dual_events,
     log_tensor,
 )
+from psrl.utils.ray import exclusive_push_model_context
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.nixl import (
-    GLOBAL_META_SERVER_NAME,
-    GLOBAL_TRAIN_CLIENT_NAME,
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
@@ -142,27 +144,28 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"{GLOBAL_TRAIN_CLIENT_NAME}_{self.rank}",
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=True,
-                client_type=NIXLClientType.PUSH_SIDE,
-                nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id()
-                logging_path=self.psrl_config.logging_path,
-            )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_storage_client = NIXLStorageClient(
+            client_name=train_client_name(self.rank),
+            server_name=NIXL_META_SERVER_NAME,
+            use_gpu=True,
+            client_type=NIXLClientType.PUSH_SIDE,
+            nixl_config=self.psrl_config.nixl,
+            nixl_interface=self.nixl_interface,
+            # client_group_id=self.get_replica_id()
+            logging_path=self.psrl_config.logging_path,
+        )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_convert_params(self):
         """Convert the Megatron model parameters for NIXL storage client."""
+        from transformers import AutoConfig
+
         lazy_import_to_globals("psrl.utils.converter.megatron_converter", "convert_megatron_inplace")
-        parameter_mapping = create_parameter_mapping("Megatron", copy_to_local(self.config.model.path))
+        model_config = AutoConfig.from_pretrained(
+            copy_to_local(self.config.model.path),
+            trust_remote_code=self.config.model.get("trust_remote_code", False),
+        )
+        parameter_mapping = create_parameter_mapping("Megatron", model_config)
         self.unified_state_dict, self.local_sharding_dict = convert_megatron_inplace(
             parameter_mapping,
             self.actor_module,
@@ -345,6 +348,50 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                         param.grad.untyped_storage().resize_(param._sleep_grad_storage_size)
                         param.grad.zero_()
 
+    def _restore_non_persistent_buffers_from_ps(self) -> None:
+        """
+        Restore inv_freq for all RotaryEmbedding modules from PS after pull
+        and clear lru_cache to discard stale cos/sin tensors.
+
+        NOTE(lhy): Megatron's RotaryEmbedding.inv_freq is a plain tensor attribute
+        (not register_buffer), so it is not covered by named_buffers(). We extract
+        inv_freq from the HF-named buffers returned by PS and apply directly.
+        """
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        ps_buffers = self._get_non_persistent_buffers_from_ps()
+
+        # Extract inv_freq tensors from PS buffers (HF naming).
+        inv_freq_tensors = {
+            name: tensor
+            for name, tensor in ps_buffers.items()
+            if name.endswith(".inv_freq") or name == "inv_freq"
+        }
+        if not inv_freq_tensors:
+            psrl_logger.warning(
+                "[_restore_non_persistent_buffers_from_ps] No inv_freq found in PS buffers."
+            )
+            return
+
+        # Use the first available inv_freq (all layers share the same value for standard RoPE).
+        reference_inv_freq = next(iter(inv_freq_tensors.values()))
+        device = torch.cuda.current_device()
+        restored = 0
+        for model_chunk in self.actor_module:
+            for module in model_chunk.modules():
+                if isinstance(module, RotaryEmbedding) and hasattr(module, "inv_freq"):
+                    # Clear lru_cache: cached cos/sin point to freed/garbage GPU memory.
+                    if hasattr(module.forward, "cache_clear"):
+                        module.forward.cache_clear()
+                    module.inv_freq = reference_inv_freq.to(
+                        device=device, dtype=module.inv_freq.dtype
+                    )
+                    restored += 1
+        psrl_logger.info(
+            f"[_restore_non_persistent_buffers_from_ps] Restored inv_freq and cleared "
+            f"lru_cache for {restored} RotaryEmbedding module(s)."
+        )
+
     def ray_push_model(self) -> None:
         """
         Push the model weights to the PS.
@@ -452,6 +499,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+            
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+            
             for k, v in data.batch.items():
                 if k != "routed_experts":
                     data.batch[k] = v.to(get_device_id())
@@ -485,8 +537,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
         torch.cuda.synchronize()
-        with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-            PSRL_BaseTrainWorker.push_model(self)
+        context_manager = exclusive_push_model_context(self.train_interface.ps_manager_handle) if self.is_train_representative_rank else nullcontext()
+        with context_manager:
+            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+                PSRL_BaseTrainWorker.push_model(self)
         return output
 
     def _debug_log_train_model_info(self, label: str, max_elements: int = 10):
