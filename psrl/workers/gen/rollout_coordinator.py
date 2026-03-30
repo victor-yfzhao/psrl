@@ -23,7 +23,9 @@ class RolloutCoordinator(CommandExtension):
     def __init__(
         self,
         config,
+        rollout_router,
         rollout_wg_list,
+        validate_wg_list,
         agent_loop_workers,
         status_queues,
     ):
@@ -40,7 +42,9 @@ class RolloutCoordinator(CommandExtension):
 
         Args:
             config: Configuration object containing PSRL settings
+            rollout_router: Handle to the rollout router actor
             rollout_wg_list: List of rollout worker groups
+            validate_wg_list: List of validation worker groups
             agent_loop_workers: List of agent loop worker handles
             status_queues: Queues for receiving status updates from different rollout instances
         """
@@ -48,26 +52,38 @@ class RolloutCoordinator(CommandExtension):
 
         self.config = config
         self.staleness = self.config.psrl.staleness
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
-        else:
-            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
-            self.alg_rollout_n = self.rollout_n
-
         self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
 
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
-        assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, (
-            "The number of rollout worker groups must be the same as the number of rollout instances."
+        self.validate_wg_list = validate_wg_list
+        self.validate_wg_size = len(validate_wg_list)
+
+        # All rollout and validate worker groups
+        self.gen_wg_list = self.rollout_wg_list + self.validate_wg_list
+        self.gen_wg_size = self.rollout_wg_size + self.validate_wg_size
+
+        self.n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
+        self.n_validate_instances = (
+            self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
+        )
+
+        assert self.rollout_wg_size == self.n_rollout_instances, (
+            "The number of rollout worker groups must be the same as the number of rollout instances, "
+            f"but got {self.rollout_wg_size} and {self.n_rollout_instances}."
+        )
+        assert self.validate_wg_size == self.n_validate_instances, (
+            "The number of validate worker groups must be the same as the number of validate instances, "
+            f"but got {self.validate_wg_size} and {self.n_validate_instances}."
         )
         self.agent_loop_workers = agent_loop_workers
+        self.rollout_router = rollout_router
 
         # Stats collection
         self.status_queues = status_queues
-        assert len(self.status_queues) == self.config.psrl.deployment.n_rollout_instances, (
-            "The number of status queues must be the same as the number of rollout instances."
+        assert len(self.status_queues) == self.gen_wg_size, (
+            "The number of status queues must be the same as the number of rollout instances, "
+            f"but got {len(self.status_queues)} and {self.gen_wg_size}."
         )
 
         # Background event handler
@@ -78,7 +94,7 @@ class RolloutCoordinator(CommandExtension):
         self.broadcast_status_to_router_task = None
         self.stop_command_handler = False
         self.stop_sync_and_migrate = False
-        self.stop_process_status_queue = [False] * self.config.psrl.deployment.n_rollout_instances
+        self.stop_process_status_queue = [False] * self.gen_wg_size
         self.stop_broadcast_status_to_router = False
 
         # Asyncio event loop order control
@@ -100,94 +116,136 @@ class RolloutCoordinator(CommandExtension):
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def world_size(self):
-        return sum([rollout_wg.world_size for rollout_wg in self.rollout_wg_list])
+        """Get the total world size (number of rollout and validate instances)."""
+        return sum([rollout_wg.world_size for rollout_wg in self.gen_wg_list])
 
-    async def init_model(self):
-        # In elastic mode, initializing all rollout engines concurrently can easily
-        # OOM because each vLLM engine tries to reserve a large chunk of GPU memory
-        # before the PSRL-level sleep command is applied.
-        #
-        # To make memory consumption predictable, we initialize instance engines
-        # sequentially and immediately put each instance to sleep after init+register.
-        if getattr(self.config.psrl.deployment, "enable_elastic_rm", False):
-            for i in range(self.config.psrl.deployment.n_rollout_instances):
-                if self.rank_0_is_model_owner:
-                    await self.rollout_wg_list[i].execute_rank_zero_async("init_model")
-                else:
-                    await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("init_model"))
+    def _get_wg_list_and_size(self, tag: str):
+        """Get the worker group list and size based on the given tag.
 
-                # Register rollout instances after initializing the model
-                if self.rank_0_is_model_owner:
-                    await self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance")
-                else:
-                    await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
-
-                # # Immediately sleep to free GPU memory for the next instance init.
-                # if self.rank_0_is_model_owner:
-                #     await self.rollout_wg_list[i].execute_rank_zero_async("sleep")
-                # else:
-                #     await asyncio.gather(*self.rollout_wg_list[i].execute_all_async("sleep"))
+        Args:
+            tag (str): Tag to specify which instances to get ('rollout', 'validate', 'all')
+        Returns:
+            tuple: (worker group list, worker group size)
+        """
+        if tag == "rollout":
+            return self.rollout_wg_list, self.rollout_wg_size
+        elif tag == "validate":
+            return self.validate_wg_list, self.validate_wg_size
+        elif tag == "all":
+            return self.gen_wg_list, self.gen_wg_size
         else:
-            futures = []
-            for i in range(self.config.psrl.deployment.n_rollout_instances):
-                if self.rank_0_is_model_owner:
-                    futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_model"))
-                else:
-                    futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
-            await asyncio.gather(*futures)
+            raise ValueError(f"Unknown tag {tag} for getting worker group list and size")
 
-            # Register rollout instances after initializing the model
-            futures = []
-            for i in range(self.config.psrl.deployment.n_rollout_instances):
-                if self.rank_0_is_model_owner:
-                    futures.append(self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance"))
-                else:
-                    futures.extend(self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
-            await asyncio.gather(*futures)
+    async def init_model(self, tag: str = "rollout", init_mode: str = "full"):
+        """Init the model on rollout instances and register to ps manager.
+
+        Args:
+            tag (str): Tag to specify which instances to initialize ('rollout', 'validate', 'all')
+            init_mode (str): Initialization mode ('full', 'empty', etc.)
+                'full' mode will load the full model weights,
+                'empty' mode will load dummy model weights.
+        """
+        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        futures = []
+        for i in range(wg_size):
+            if self.rank_0_is_model_owner:
+                futures.append(wg_list[i].execute_rank_zero_async("init_and_register_model", init_mode))
+            else:
+                futures.extend(wg_list[i].execute_all_async("init_and_register_model", init_mode))
+        await asyncio.gather(*futures)
         self._is_init_model.set()
 
-    async def init_route_strategy(self):
+    async def init_route_strategy(self, tag: str = "rollout"):
+        """Init the route strategy on rollout instances.
+
+        This method estimates the maximum model length on each instance
+        and uses it to budget the kv cache size for each instance.
+
+        Args:
+            tag (str): Tag to specify which instances to initialize ('rollout', 'validate', 'all')
+        """
+        assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
         await self._is_init_model.wait()
+
+        wg_list, wg_size = self._get_wg_list_and_size(tag)
         futures = []
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
+        for i in range(wg_size):
             if self.rank_0_is_model_owner:
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
+                futures.append(wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
             else:
-                futures.extend(self.rollout_wg_list[i].execute_all_async("estimate_max_model_len"))
+                futures.extend(wg_list[i].execute_all_async("estimate_max_model_len"))
         max_model_lens = await asyncio.gather(*futures)
-        psrl_logger.info(f"Max model lens: {max_model_lens}")
-        instance_to_max_model_len = {
-            i: max(max_model_lens[i]) for i in range(self.config.psrl.deployment.n_rollout_instances)
-        }
+        psrl_logger.info(f"Max model lens on {tag} instances: {max_model_lens}")
+        wg_idx_range = range(self.rollout_wg_size, self.gen_wg_size) if tag == "validate" else range(wg_size)
+        instance_to_max_model_len = {i: max(max_model_lens[j]) for i, j in zip(wg_idx_range, range(wg_size))}
         # Use the max model len to budget the kv cache size for each instance
-        futures = []
-        for agent_worker in self.agent_loop_workers:
-            futures.append(
-                agent_worker.init_route_strategy.remote(
-                    instance_to_max_model_len=instance_to_max_model_len,
-                )
-            )
-        await asyncio.gather(*futures)
+        await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
     async def init_nixl_client(self):
+        """Init the NIXL client on rollout and validate instances."""
         await self._is_init_model.wait()
         futures = []
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
+        for i in range(self.gen_wg_size):
             if self.rank_0_is_model_owner:
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_nixl_client"))
+                futures.append(self.gen_wg_list[i].execute_rank_zero_async("init_nixl_client"))
             else:
-                futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
+                futures.extend(self.gen_wg_list[i].execute_all_async("init_nixl_client"))
         await asyncio.gather(*futures)
+        psrl_logger.info(f"Initialized NIXL client on all {self.gen_wg_size} instances.")
         self._is_init_nixl_client.set()
 
-    async def nixl_protocol(self):
+    async def nixl_protocol(self, full_tag: str = "all"):
+        """Run the NIXL server protocol on rollout and validate instances.
+
+        Args:
+            full_tag (str): Tag to specify which instances to run the protocol
+                            in 'full' mode ('rollout', 'validate', 'all')
+        """
+        await self._is_init_nixl_client.wait()
+
+        if full_tag == "all":
+            full_tag_list = ["full"] * self.gen_wg_size
+        elif full_tag == "rollout":
+            full_tag_list = ["full"] * self.rollout_wg_size + ["meta"] * self.validate_wg_size
+        elif full_tag == "validate":
+            full_tag_list = ["meta"] * self.rollout_wg_size + ["full"] * self.validate_wg_size
+        else:
+            raise ValueError(f"Unknown full_tag {full_tag} for nixl_convert_params")
+
+        futures = []
+        for i in range(self.gen_wg_size):
+            if self.rank_0_is_model_owner:
+                futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_protocol", full_tag_list[i]))
+            else:
+                futures.extend(self.gen_wg_list[i].execute_all_async("nixl_protocol", full_tag_list[i]))
+        await asyncio.gather(*futures)
+
+    async def nixl_convert_params(self):
+        """Convert the model parameters to unified format on rollout and validate instances."""
         await self._is_init_nixl_client.wait()
         futures = []
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
+        for i in range(self.gen_wg_size):
             if self.rank_0_is_model_owner:
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("nixl_protocol"))
+                futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_convert_params"))
             else:
-                futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
+                futures.extend(self.gen_wg_list[i].execute_all_async("nixl_convert_params"))
+        await asyncio.gather(*futures)
+
+    async def sleep(self, tag: str = "all"):
+        """Make rollout instances sleep and release GPU memory.
+
+        Args:
+            tag (str): Tag to specify which instances to sleep ('rollout', 'validate', 'all')
+        """
+        await self._is_init_model.wait()
+
+        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        futures = []
+        for i in range(wg_size):
+            if self.rank_0_is_model_owner:
+                futures.append(wg_list[i].execute_rank_zero_async("sleep"))
+            else:
+                futures.extend(wg_list[i].execute_all_async("sleep"))
         await asyncio.gather(*futures)
 
     async def start_busy_loop(self):
@@ -213,7 +271,7 @@ class RolloutCoordinator(CommandExtension):
         if self.config.psrl.gen_mode == "stream":
             # Start the status collection tasks
             if self.config.psrl.status_collection.enable:
-                for instance_id in range(self.config.psrl.deployment.n_rollout_instances):
+                for instance_id in range(self.gen_wg_size):
                     self.process_status_queue_tasks.append(
                         self.running_loop.create_task(self._process_status_queue(instance_id))
                     )
@@ -262,7 +320,7 @@ class RolloutCoordinator(CommandExtension):
         # Stop the background tasks
         self.stop_command_handler = True
         self.stop_sync_and_migrate = True
-        self.stop_process_status_queue = [True] * self.config.psrl.deployment.n_rollout_instances
+        self.stop_process_status_queue = [True] * self.gen_wg_size
         self.stop_broadcast_status_to_router = True
 
         tasks_to_wait = [self.command_handler_task]
@@ -321,9 +379,13 @@ class RolloutCoordinator(CommandExtension):
                             if not isinstance(uids, (list, set)):
                                 uids = [uids]
                             abort_requests = set(uids)  # Ensure uniqueness
+                            assert instance_id < len(self.rollout_wg_list), (
+                                f"Validate instance should not be interrupted, but got instance_id {instance_id} "
+                                f"which is out of rollout instance range [0, {len(self.rollout_wg_list)})."
+                            )
                             if self.rank_0_is_model_owner:
                                 futures.append(
-                                    self.rollout_wg_list[instance_id].execute_rank_zero_async(
+                                    self.gen_wg_list[instance_id].execute_rank_zero_async(
                                         "interrupt_requests", abort_requests
                                     )
                                 )
@@ -334,7 +396,7 @@ class RolloutCoordinator(CommandExtension):
                                     stacklevel=2,
                                 )
                                 futures.append(
-                                    self.rollout_wg_list[instance_id].execute_all_async(
+                                    self.gen_wg_list[instance_id].execute_all_async(
                                         "interrupt_requests", abort_requests
                                     )[0]
                                 )
@@ -392,7 +454,7 @@ class RolloutCoordinator(CommandExtension):
 
                     for instance_id in instance_ids:
                         if self.rank_0_is_model_owner:
-                            interrupt_future = self.rollout_wg_list[instance_id].execute_rank_zero_async(
+                            interrupt_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
                                 "interrupt_generation"
                             )
                         else:
@@ -407,7 +469,7 @@ class RolloutCoordinator(CommandExtension):
 
                     for instance_id in instance_ids:
                         if self.rank_0_is_model_owner:
-                            sync_future = self.rollout_wg_list[instance_id].execute_rank_zero_async(
+                            sync_future = self.gen_wg_list[instance_id].execute_rank_zero_async(
                                 "sync_with_ps", curr_ps_model_version
                             )
                         else:
@@ -504,15 +566,12 @@ class RolloutCoordinator(CommandExtension):
         """
         Broadcast the engine status to the router.
         """
+        assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
+
         while not self.stop_broadcast_status_to_router:
             # Broadcast the engine status to the router every coordinator sync interval
             await asyncio.sleep(self.config.psrl.status_collection.coordinator_sync_interval_in_ms / 1000)
-            futures = []
-            # Send to all agent loop workers to update the instance status
-            # TODO(lhy): change it to a global router
-            for agent_worker in self.agent_loop_workers:
-                futures.append(agent_worker.update_instance_status.remote(self.instance_to_engine_status))
-            await asyncio.gather(*futures)
+            await self.rollout_router.update_instance_status.remote(self.instance_to_engine_status)
 
     async def _is_routing(self) -> bool:
         """Check if any agent loop worker is currently routing requests
@@ -522,11 +581,8 @@ class RolloutCoordinator(CommandExtension):
             bool: True if any agent loop worker is currently routing requests,
                 False otherwise.
         """
-        is_routing = await asyncio.gather(
-            *[agent_worker.is_routing.remote() for agent_worker in self.agent_loop_workers]
-        )
-        # psrl_logger.info(f"Is routing: {is_routing}")
-        return any(is_routing)
+        is_routing = await self.rollout_router.is_routing.remote()
+        return is_routing
 
     async def _greedy_sync_and_migrate_loop(self):
         """
@@ -545,7 +601,7 @@ class RolloutCoordinator(CommandExtension):
 
             have_syncing_instance = False
             sync_instance_ids = []
-            for instance_id in range(self.config.psrl.deployment.n_rollout_instances):
+            for instance_id in range(self.rollout_wg_size):
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(
                     instance_id, 0
@@ -587,6 +643,9 @@ class RolloutCoordinator(CommandExtension):
             have_syncing_instance = False
             sync_instance_ids = []
             for instance_id, engine_stats in self.instance_to_engine_status.items():
+                # Ignore validate instances for weight synchronization
+                if instance_id >= self.rollout_wg_size:
+                    continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if engine_stats.model_version <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
                     have_syncing_instance = True
@@ -681,11 +740,9 @@ class RolloutCoordinator(CommandExtension):
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                     instance_id, 0
                 )
-            await self.agent_loop_workers[0].interrupt_routing.remote()
+            await self.rollout_router.interrupt_routing.remote()
             psrl_logger.info("Interrupted routing for synchronization")
-            await self.agent_loop_workers[0].update_currently_syncing_instances.remote(
-                instance_ids, self.ps_model_version
-            )
+            await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
             await self.exec_command(
                 Command(
                     type=CommandType.SYNC,
@@ -696,11 +753,11 @@ class RolloutCoordinator(CommandExtension):
                 blocking=True,
             )
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
-                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(instance_ids)
+                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
                 )
-            await self.agent_loop_workers[0].resume_routing.remote()
+            await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after synchronization")
 
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
@@ -709,14 +766,14 @@ class RolloutCoordinator(CommandExtension):
         """
         futures = []
         if self.rank_0_is_model_owner:
-            futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("get_active_task_num"))
+            futures.append(self.gen_wg_list[instance_id].execute_rank_zero_async("get_active_task_num"))
         else:
             warnings.warn(
                 f"Check no active tasks on instance {instance_id} in SPMD-style may "
                 f"cause undefined behavior, need to check the behavior",
                 stacklevel=2,
             )
-            futures.extend(self.rollout_wg_list[instance_id].execute_all_async("get_active_task_num"))
+            futures.extend(self.gen_wg_list[instance_id].execute_all_async("get_active_task_num"))
         active_task_nums = await asyncio.gather(*futures)
         return all(active_task_num == 0 for active_task_num in active_task_nums)
 
@@ -736,7 +793,7 @@ class RolloutCoordinator(CommandExtension):
         #     f"Checking whether to synchronize with PS for instance {instance_id}, "
         #     f"ps model version: {self.ps_model_version}"
         # )
-        return await self.agent_loop_workers[0].check_should_sync.remote(instance_id, self.ps_model_version)
+        return await self.rollout_router.check_should_sync.remote(instance_id, self.ps_model_version)
 
     async def check_and_migrate(self, wait_interrupted_partial_requests_loop_back: bool = True):
         """
@@ -747,10 +804,10 @@ class RolloutCoordinator(CommandExtension):
             "Rollout migration is only supported when status collection is enabled"
         )
         # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
-        migrate_instance_ids = await self.agent_loop_workers[0].check_should_migrate.remote()
+        migrate_instance_ids = await self.rollout_router.check_should_migrate.remote()
         if migrate_instance_ids:
             psrl_logger.info(f"Migrating instances {migrate_instance_ids}")
-            await self.agent_loop_workers[0].interrupt_routing.remote()
+            await self.rollout_router.interrupt_routing.remote()
             psrl_logger.info("Interrupted routing for migration")
             await self.exec_command(
                 Command(
@@ -760,11 +817,9 @@ class RolloutCoordinator(CommandExtension):
                 blocking=True,
             )
             if wait_interrupted_partial_requests_loop_back:
-                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(
-                    migrate_instance_ids
-                )
+                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
                 )
-            await self.agent_loop_workers[0].resume_routing.remote()
+            await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after migration")

@@ -102,6 +102,7 @@ class ActorConfig(BaseConfig):
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
         "ppo_infer_micro_batch_size_per_gpu",
+        "engine",
     }
 
     strategy: str = MISSING
@@ -119,19 +120,21 @@ class ActorConfig(BaseConfig):
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
+    loss_scale_factor: int | None = None
     entropy_coeff: float = 0
+    calculate_entropy: bool = False
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
     shuffle: bool = False
+    data_loader_seed: int = 1
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
-    data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
@@ -225,6 +228,11 @@ class McoreActorConfig(ActorConfig):
     load_weight: bool = True
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate FSDP actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.megatron
 
 
 @dataclass

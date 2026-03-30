@@ -17,9 +17,10 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
         config,
         tokenizer,
         compute_score=None,
+        is_validate=False,
         **reward_kwargs,
     ):
-        super().__init__(config, tokenizer)
+        super().__init__(config, tokenizer, is_validate)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
@@ -34,6 +35,10 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
+        rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+        extra_info["num_turns"] = num_turns
+        extra_info["rollout_reward_scores"] = rollout_reward_scores
 
         response_str = await self.loop.run_in_executor(
             None,

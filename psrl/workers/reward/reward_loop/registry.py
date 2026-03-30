@@ -73,6 +73,7 @@ def load_reward_loop_manager(
     reward_loop_type: str,
     reward_fn: str | dict,
     reward_model_manager: PSRL_RewardModelManager = None,
+    is_validate: bool = False,
     **reward_kwargs: Any,
 ) -> RewardLoopManagerBase:
     """Load the reward loop manager based on the configuration.
@@ -86,6 +87,8 @@ def load_reward_loop_manager(
             The reward model router.
         reward_model_tokenizer: `(Any)`
             The tokenizer for the reward model.
+        is_validate: `(bool)`
+            Whether to load the reward loop manager for validation.
         **reward_kwargs: `(Any)`
             Additional keyword arguments for the reward loop manager.
     Returns:
@@ -170,6 +173,7 @@ def load_reward_loop_manager(
         reward_model_config,
         input_tokenizer,
         final_compute_score,
+        is_validate,
         **reward_kwargs,
     )
 

@@ -34,14 +34,17 @@ class RolloutScheduler(Scheduler):
         connector_stats_payload = kv_connector_stats.data if kv_connector_stats else None
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
+        req_id_in_waiting = [req.request_id for req in self.waiting]
         # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
         # 1. `need_to_abort_reqs` field. This is a set of request IDs that need to be aborted.
         # 2. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
         # 3. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
+        # 4. `req_id_in_waiting` field. This is a list of request IDs in the waiting queue.
         return SchedulerStats(
             need_to_abort_reqs=self.need_to_abort_reqs,
             req_id_to_prompt_token_num=req_id_to_prompt_token_num,
             req_id_to_response_token_num=req_id_to_response_token_num,
+            req_id_in_waiting=req_id_in_waiting,
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,

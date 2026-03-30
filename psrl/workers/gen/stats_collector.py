@@ -34,6 +34,7 @@ class EngineStats:
                 "need_to_abort_reqs": None,
                 "req_id_to_prompt_token_num": {},
                 "req_id_to_response_token_num": {},
+                "req_id_in_waiting": [],
                 "num_running_reqs": 0,
                 "num_waiting_reqs": 0,
                 "kv_cache_usage": 0.0,
@@ -112,6 +113,7 @@ class StatCollector(StatLoggerBase):
                 self.log_prefix = f"StatCollector_RM_{self.reward_model_name}_I{self.instance_id}"
             else:
                 self.log_prefix = f"StatCollector_I{self.instance_id}"
+            psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized StatCollector for instance {self.instance_id}.")
 
@@ -212,6 +214,9 @@ class StatCollector(StatLoggerBase):
                     scheduler_stats.req_id_to_response_token_num
                     if scheduler_stats.req_id_to_response_token_num
                     else {}
+                ),
+                "req_id_in_waiting": (
+                    scheduler_stats.req_id_in_waiting if scheduler_stats.req_id_in_waiting else []
                 ),
                 "num_running_reqs": scheduler_stats.num_running_reqs,
                 "num_waiting_reqs": scheduler_stats.num_waiting_reqs,

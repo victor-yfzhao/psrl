@@ -282,6 +282,44 @@ class PSRL_RewardModelWorker(Worker):
     def _ensure_model_ready(self) -> None:
         if not self._is_init_model.is_set() or self.rollout is None:
             raise RuntimeError("RewardModelWorker is not initialized. Call init_model() first.")
+
+    def _extract_sampling_params_dict(self, request: DataProto) -> dict[str, Any]:
+        """
+        Extract sampling params for vLLM rollout.
+
+        Preferred order:
+        1) `request.non_tensor_batch["sampling_params"]` (per-request override)
+        2) `request.meta_info["sampling_params"]`
+        3) fallback to `self.rollout.sampling_params` (rollout default)
+        """
+        # Try per-request override from non-tensor batch.
+        if "sampling_params" in request.non_tensor_batch:
+            sp = request.non_tensor_batch["sampling_params"]
+            # Usually non-tensor batch stores python objects inside numpy array (dtype=object).
+            if isinstance(sp, np.ndarray):
+                if sp.size == 1:
+                    sp = sp.item()
+                else:
+                    sp = sp[0]
+            if isinstance(sp, dict):
+                return sp
+
+        # Try meta info override.
+        if "sampling_params" in request.meta_info and isinstance(request.meta_info["sampling_params"], dict):
+            return request.meta_info["sampling_params"]
+
+        # Fallback: use rollout default sampling params.
+        rollout_sp = getattr(self.rollout, "sampling_params", None)
+        if rollout_sp is None:
+            return {}
+        if isinstance(rollout_sp, dict):
+            return rollout_sp
+        # Common cases: vLLM SamplingParams has __dict__ with primitive fields.
+        if hasattr(rollout_sp, "to_dict"):
+            return rollout_sp.to_dict()
+        if hasattr(rollout_sp, "model_dump"):
+            return rollout_sp.model_dump()
+        return dict(vars(rollout_sp))
     
     def get_active_task_num(self) -> int:
         """
@@ -348,7 +386,8 @@ class PSRL_RewardModelWorker(Worker):
 
         # Start the generation
         with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
-            result = await self.rollout.generate_sequences_async(request)
+            sampling_params = self._extract_sampling_params_dict(request)
+            result = await self.rollout.generate_sequences_async(request, sampling_params)
 
         assert len(result) == 1, (
             f"Expected 1 output for single request, got {len(result)} outputs."
@@ -449,7 +488,8 @@ class PSRL_RewardModelWorker(Worker):
         )
 
         with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
-            outputs = self.rollout.raw_generate_sequences(requests)
+            sampling_params = self._extract_sampling_params_dict(requests)
+            outputs = self.rollout.raw_generate_sequences(requests, sampling_params)
 
             if return_only_on_representative_rank and not self.is_instance_representative_rank:
                 return None
