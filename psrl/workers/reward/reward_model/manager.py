@@ -33,6 +33,7 @@ class PSRL_RewardModelManager:
         reward_model_config: DictConfig,
         reward_model_wg_list: list[ray.actor.ActorHandle],
         status_queues: list[RayQueue],
+        max_concurrency: int = 1,
     ):
         """
         Initialize the reward model manager.
@@ -45,6 +46,8 @@ class PSRL_RewardModelManager:
         self.replicas: list[PSRL_RewardModelReplica] = []
         self.router_process: ray.actor.ActorHandle | None = None
         self.status_queues: list[RayQueue] = status_queues
+
+        self.max_concurrency = max_concurrency
 
         # self.router_address: str | None = None
 
@@ -111,12 +114,17 @@ class PSRL_RewardModelManager:
 
         # Collect worker handles from all replicas
         worker_handles = [replica.worker_handle for replica in self.replicas if replica.worker_handle is not None]
-        if len(worker_handles) <= 1:
+        if len(worker_handles) == 0:
             psrl_logger.warning("No worker handles available; skipping router initialization.")
             return
 
         # Launch the router as a separate Ray actor or process
-        self.router_process = launch_router_process(worker_handles=worker_handles)
+        self.router_process = launch_router_process(
+            worker_handles=worker_handles,
+            config=self.config,
+            max_concurrency=self.max_concurrency,
+        )
+        ray.get(self.reward_model_coordinator.set_reward_model_router.remote(self.router_process))
         psrl_logger.info(f"RewardModelRouter launched!")
 
     # def get_router_address(self) -> str | None:

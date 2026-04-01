@@ -348,8 +348,16 @@ class PSRL_GenWorker(Worker):
         # deregister local tensors
         await self._collective_rpc("nixl_deregister", args=())
 
+    async def _nixl_log_shard_info(self, stage: str, max_elements: int = 8):
+        """Log NIXL shard info via vLLM extension for sleep/wake_up debugging."""
+        label = f"I{self.get_instance_id()}_{stage}"
+        await self._collective_rpc("nixl_log_shard_info", args=(label, max_elements))
+
     async def sleep(self):
         """Put model weights to sleep state (free up GPU memory)."""
+        psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
+        interrupted_request_num = await self.interrupt_generation()
+        psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
         await self.rollout.inference_engine.sleep(level=2)
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
@@ -362,6 +370,13 @@ class PSRL_GenWorker(Worker):
         if self.psrl_config.tms.enable_cuda_graph:
             wake_up_tags.append("graph")
         await self.rollout.inference_engine.wake_up(tags=wake_up_tags)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def is_rollout_engine_sleeping(self) -> bool:
+        """True if vLLM engine is sleeping (weights released); coordinator should not SYNC these instances."""
+        await self._is_init_model.wait()
+        assert self.rollout is not None
+        return await self.rollout.inference_engine.is_sleeping()
 
     async def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
         """
@@ -814,7 +829,7 @@ class PSRL_GenWorker(Worker):
 
     # @ray.method(concurrency_group="control")
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def sync_with_ps(self, ps_version: int, interrupt_generation: bool = False) -> int:
+    async def sync_with_ps(self, ps_version: int, interrupt_generation: bool = False, sync_after_wake_up: bool = False) -> int:
         """
         Synchronize the rollout instance with the parameter server.
 
@@ -826,7 +841,7 @@ class PSRL_GenWorker(Worker):
         Returns:
             int: The number of requests that were interrupted during the sync process.
         """
-        if self.curr_rollout_instance_model_version >= ps_version:
+        if self.curr_rollout_instance_model_version >= ps_version and not sync_after_wake_up:
             psrl_logger.warning(
                 f"No need to sync with PS for instance {self.get_instance_id()}, "
                 f"current model version {self.curr_rollout_instance_model_version} "

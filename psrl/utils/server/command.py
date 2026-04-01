@@ -245,11 +245,16 @@ class CommandExtension:
 
     def _complete_command(self, command_id: int, result: Any):
         """Set the command result, mark it as completed and notify the event waiter."""
-        if command_id in self._command_results:
-            self._command_results[command_id] = result
-            psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
-            # Set event to notify that the command has completed
-            if command_id in self._command_events:
-                self._command_events[command_id].set()
-        else:
-            raise ValueError(f"Command ID {command_id} not found in results.")
+        if command_id not in self._command_results:
+            # Waiter may have timed out in exec_command and removed this id; handler still finishes later.
+            psrl_logger.warning(
+                "Command ID %s: late _complete_command after waiter released (timeout/cancel); "
+                "dropping result=%r to avoid crashing the coordinator loop.",
+                command_id,
+                result,
+            )
+            return
+        self._command_results[command_id] = result
+        psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
+        if command_id in self._command_events:
+            self._command_events[command_id].set()

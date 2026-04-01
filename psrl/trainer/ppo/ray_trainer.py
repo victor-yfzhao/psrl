@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import uuid
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -668,17 +669,44 @@ class PSRL_RayPPOTrainer:
         node_id = node_ids[0] if node_ids else None
         return gpu_ids, node_id
 
+    @staticmethod
+    def _build_gpu_keys(node_id: str | None, gpu_ids: list[int]) -> set[tuple[str | None, int]]:
+        return {(node_id, int(gpu_id)) for gpu_id in gpu_ids}
+
+    @staticmethod
+    def _select_non_conflicting_awake_ids(
+        instance_to_gpu_keys: dict[int, set[tuple[str | None, int]]],
+        target_awake_num: int,
+        occupied_gpu_keys: set[tuple[str | None, int]],
+        min_awake_num: int = 1,
+    ) -> tuple[list[int], set[tuple[str | None, int]]]:
+        selected_ids: list[int] = []
+        for instance_id in sorted(instance_to_gpu_keys.keys()):
+            gpu_keys = instance_to_gpu_keys[instance_id]
+            if not gpu_keys.isdisjoint(occupied_gpu_keys):
+                continue
+            selected_ids.append(instance_id)
+            occupied_gpu_keys.update(gpu_keys)
+            if len(selected_ids) >= target_awake_num:
+                break
+        if len(selected_ids) < min_awake_num:
+            raise RuntimeError(
+                "Cannot select non-conflicting awake instances "
+                f"(target={target_awake_num}, selected={len(selected_ids)}, min_required={min_awake_num})."
+            )
+        return selected_ids, occupied_gpu_keys
+
     def _init_elastic_rm_runtime(self):
         if not self.elastic_rm_mode:
             return
         if self.rollout_coordinator is None:
             raise RuntimeError("Rollout coordinator must be initialized before elastic_rm init.")
 
-        psrl_logger.info("Initializing elastic_rm runtime (coordinator sleep/wake, ElasticExecutor).")
+        psrl_logger.info("Initializing elastic_executor runtime (coordinator sleep/wake, ElasticExecutor).")
         rollout_model_name = self.config.gen_actor_rollout_ref.model.path.split("/")[-1]
         rollout_instance_num = len(self.rollout_wg_list)
         psrl_logger.info(
-            "elastic_rm rollout: model_name=%s, n_instances=%d",
+            "Elastic_RM: rollout model_name=%s, n_instances=%d",
             rollout_model_name,
             rollout_instance_num,
         )
@@ -690,7 +718,7 @@ class PSRL_RayPPOTrainer:
 
         if rollout_all_ids:
             psrl_logger.info(
-                "elastic_rm: putting all rollout instances to sleep (instance_ids=%s).",
+                "Elastic_RM: putting all rollout instances to sleep (instance_ids=%s).",
                 rollout_all_ids,
             )
             ray.get(
@@ -699,7 +727,7 @@ class PSRL_RayPPOTrainer:
                     blocking=True,
                 )
             )
-            psrl_logger.info("elastic_rm: all rollout instances slept.")
+            psrl_logger.info("Elastic_RM: all rollout instances slept.")
 
         registrations = [
             {
@@ -709,8 +737,10 @@ class PSRL_RayPPOTrainer:
             }
         ]
         gpu_mappings = []
+        rollout_instance_to_gpu_keys: dict[int, set[tuple[str | None, int]]] = {}
         for instance_id, rollout_wg in enumerate(self.rollout_wg_list):
             gpu_ids, node_id = self._collect_instance_gpu_mapping(rollout_wg)
+            rollout_instance_to_gpu_keys[instance_id] = self._build_gpu_keys(node_id, gpu_ids)
             gpu_mappings.append(
                 {
                     "role_name": PSRL_Role.Rollout,
@@ -722,19 +752,18 @@ class PSRL_RayPPOTrainer:
             )
 
         psrl_logger.info(
-            "elastic_rm: collected rollout GPU mappings (%d entries).",
+            "Elastic_RM: collected rollout GPU mappings (%d entries).",
             len(gpu_mappings),
         )
 
-        import time; time.sleep(10000000)
-
         reward_coordinators: dict[str, ray.actor.ActorHandle] = {}
+        reward_model_to_instance_gpu_keys: dict[str, dict[int, set[tuple[str | None, int]]]] = {}
         for reward_model_name, manager in self.reward_model_manager_mapping.items():
             rm_instance_num = len(manager.reward_model_wg_list)
             rm_all_ids = list(range(rm_instance_num))
 
             psrl_logger.info(
-                "elastic_rm: putting reward model replicas to sleep (name=%s, instance_ids=%s).",
+                "Elastic_RM: putting reward model replicas to sleep (name=%s, instance_ids=%s).",
                 reward_model_name,
                 rm_all_ids,
             )
@@ -744,9 +773,10 @@ class PSRL_RayPPOTrainer:
                     blocking=True,
                 )
             )
-            psrl_logger.info("elastic_rm: reward model %s replicas slept.", reward_model_name)
+            psrl_logger.info("Elastic_RM: reward model %s replicas slept.", reward_model_name)
 
             reward_coordinators[reward_model_name] = manager.reward_model_coordinator
+            reward_model_to_instance_gpu_keys[reward_model_name] = {}
             registrations.append(
                 {
                     "role_name": PSRL_Role.RewardModel,
@@ -756,6 +786,7 @@ class PSRL_RayPPOTrainer:
             )
             for instance_id, reward_wg in enumerate(manager.reward_model_wg_list):
                 gpu_ids, node_id = self._collect_instance_gpu_mapping(reward_wg)
+                reward_model_to_instance_gpu_keys[reward_model_name][instance_id] = self._build_gpu_keys(node_id, gpu_ids)
                 gpu_mappings.append(
                     {
                         "role_name": PSRL_Role.RewardModel,
@@ -767,53 +798,38 @@ class PSRL_RayPPOTrainer:
                 )
 
         psrl_logger.info(
-            "elastic_rm: total GPU mapping entries (rollout + reward)=%d, registration_roles=%d.",
+            "Elastic_RM: total GPU mapping entries (rollout + reward)=%d, registration_roles=%d.",
             len(gpu_mappings),
             len(registrations),
         )
 
-        rollout_awake_num = min(int(math.ceil(rollout_instance_num / 2.0)), rollout_instance_num)
-        awaken_instances = [
-            {
-                "role_name": PSRL_Role.Rollout,
-                "model_name": rollout_model_name,
-                "instance_id": instance_id,
-            }
-            for instance_id in range(rollout_awake_num)
-        ]
-        if rollout_awake_num > 0:
-            awake_ids = list(range(rollout_awake_num))
+        occupied_gpu_keys: set[tuple[str | None, int]] = set()
+        awaken_instances: list[dict] = []
+        min_awake_per_role = max(0, int(self.config.psrl.deployment.elastic_rm.min_awake_per_role))
+
+        # Wake reward-model replicas first so each RM keeps at least one awake instance.
+        for reward_model_name, manager in self.reward_model_manager_mapping.items():
+            rm_instance_num = len(manager.reward_model_wg_list)
+            rm_awake_num = max(min_awake_per_role, 0)
+            rm_awake_ids, occupied_gpu_keys = self._select_non_conflicting_awake_ids(
+                instance_to_gpu_keys=reward_model_to_instance_gpu_keys[reward_model_name],
+                target_awake_num=rm_awake_num,
+                occupied_gpu_keys=occupied_gpu_keys,
+                min_awake_num=min_awake_per_role if rm_instance_num > 0 else 0,
+            )
             psrl_logger.info(
-                "elastic_rm: waking up rollout instances (count=%d, instance_ids=%s).",
-                rollout_awake_num,
-                awake_ids,
+                "Elastic_RM: waking up reward model replicas (name=%s, count=%d, instance_ids=%s).",
+                reward_model_name,
+                len(rm_awake_ids),
+                rm_awake_ids,
             )
             ray.get(
-                self.rollout_coordinator.exec_command.remote(
-                    Command(type=CommandType.WAKE_UP, instance_ids=awake_ids),
+                manager.reward_model_coordinator.exec_command.remote(
+                    Command(type=CommandType.WAKE_UP, instance_ids=rm_awake_ids),
                     blocking=True,
                 )
             )
-            psrl_logger.info("elastic_rm: rollout wake_up completed.")
-
-        for reward_model_name, manager in self.reward_model_manager_mapping.items():
-            rm_instance_num = len(manager.reward_model_wg_list)
-            rm_awake_num = int(math.ceil(rm_instance_num / 2.0))
-            if rm_awake_num > 0:
-                rm_awake_ids = list(range(rm_awake_num))
-                psrl_logger.info(
-                    "elastic_rm: waking up reward model replicas (name=%s, count=%d, instance_ids=%s).",
-                    reward_model_name,
-                    rm_awake_num,
-                    rm_awake_ids,
-                )
-                ray.get(
-                    manager.reward_model_coordinator.exec_command.remote(
-                        Command(type=CommandType.WAKE_UP, instance_ids=rm_awake_ids),
-                        blocking=True,
-                    )
-                )
-                psrl_logger.info("elastic_rm: reward model %s wake_up completed.", reward_model_name)
+            psrl_logger.info("Elastic_RM: reward model %s wake_up completed.", reward_model_name)
             awaken_instances.extend(
                 [
                     {
@@ -821,9 +837,39 @@ class PSRL_RayPPOTrainer:
                         "model_name": reward_model_name,
                         "instance_id": instance_id,
                     }
-                    for instance_id in range(rm_awake_num)
+                    for instance_id in rm_awake_ids
                 ]
             )
+
+        rollout_awake_num = max(min_awake_per_role, rollout_instance_num)
+        awake_ids, occupied_gpu_keys = self._select_non_conflicting_awake_ids(
+            instance_to_gpu_keys=rollout_instance_to_gpu_keys,
+            target_awake_num=rollout_awake_num,
+            occupied_gpu_keys=occupied_gpu_keys,
+            min_awake_num=min_awake_per_role if rollout_instance_num > 0 else 0,
+        )
+        psrl_logger.info(
+            "Elastic_RM: waking up rollout instances (count=%d, instance_ids=%s).",
+            len(awake_ids),
+            awake_ids,
+        )
+        ray.get(
+            self.rollout_coordinator.exec_command.remote(
+                Command(type=CommandType.WAKE_UP, instance_ids=awake_ids),
+                blocking=True,
+            )
+        )
+        psrl_logger.info("Elastic_RM: rollout wake_up completed.")
+        awaken_instances.extend(
+            [
+                {
+                    "role_name": PSRL_Role.Rollout,
+                    "model_name": rollout_model_name,
+                    "instance_id": instance_id,
+                }
+                for instance_id in awake_ids
+            ]
+        )
 
         roles = [(PSRL_Role.Rollout, rollout_model_name)]
         roles.extend([(PSRL_Role.RewardModel, reward_model_name) for reward_model_name in reward_coordinators.keys()])
@@ -831,12 +877,19 @@ class PSRL_RayPPOTrainer:
             PSRL_Role.Rollout: {rollout_model_name: self.rollout_coordinator},
             PSRL_Role.RewardModel: reward_coordinators,
         }
+        elastic_rm_cfg = OmegaConf.to_container(self.config.psrl.deployment.elastic_rm, resolve=True)
+        assert isinstance(elastic_rm_cfg, dict), "elastic_rm config should be resolved as dict"
         psrl_logger.info(
-            "elastic_rm: creating ElasticExecutor (roles=%s, awaken_instances=%d).",
+            "Elastic_RM: creating ElasticExecutor (roles=%s, awaken_instances=%d).",
             [(r.name, m) for r, m in roles],
             len(awaken_instances),
         )
-        self.elastic_executor = ElasticExecutor.remote(roles=roles, coordinators=coordinators)
+        self.elastic_executor = ElasticExecutor.remote(
+            config=self.config,
+            roles=roles,
+            coordinators=coordinators,
+            elastic_rm_config=elastic_rm_cfg,
+        )
         ray.get(
             self.elastic_executor.initialize_runtime.remote(
                 registrations=registrations,
@@ -844,9 +897,9 @@ class PSRL_RayPPOTrainer:
                 awaken_instances=awaken_instances,
             )
         )
-        psrl_logger.info("elastic_rm: ElasticExecutor.initialize_runtime done.")
+        psrl_logger.info("Elastic_RM: ElasticExecutor.initialize_runtime done.")
         ray.get(self.elastic_executor.start_busy_loop.remote())
-        psrl_logger.info("elastic_rm: ElasticExecutor busy loop started; elastic_rm runtime ready.")
+        psrl_logger.info("Elastic_RM: ElasticExecutor busy loop started; Elastic_RM runtime ready.")
 
     def init_reward_manager(self, validation: bool = False):
         """Initialize the reward manager for computing rewards during training."""
@@ -1483,6 +1536,9 @@ class PSRL_RayPPOTrainer:
                     gen_interface=reward_model_gen_if,
                     reward_model_name=reward_model_name,
                 )
+                # max_concurrency only: Ray disallows concurrency_groups in .options() for this version;
+                # concurrency_groups is set on ray.remote(PSRL_RewardModelWorker, ...) in main_ppo.py.
+                # reward_model_cls.update_options({"max_concurrency": self.max_concurrency})
 
                 self.resource_pool_to_cls[reward_model_resource_pool][f"reward_model_{reward_model_name}_{i}"] = reward_model_cls
         
@@ -1602,18 +1658,21 @@ class PSRL_RayPPOTrainer:
         train_tasks = []
         gen_tasks = []
         val_tasks = []
+        reward_model_tasks = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             psrl_logger.info(f"Creating worker group for resource pool: {resource_pool}, classes: {class_dict}")
             if "ps" in class_dict:
                 assert class_dict.keys() == {"ps"}, "PS resource pool should only have PS role."
                 continue
             if any("rollout" in key for key in class_dict.keys()):
-                if not self.elastic_rm_mode:
-                    assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
+                assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
                 gen_tasks.append((resource_pool, class_dict, wg_kwargs))
             elif any("validate" in key for key in class_dict.keys()):
                 assert len(class_dict) == 1, "Validate resource pool should only have one worker class."
                 val_tasks.append((resource_pool, class_dict, wg_kwargs))
+            elif any("reward_model" in key for key in class_dict.keys()):
+                assert len(class_dict) == 1, "Reward model resource pool should only have one worker class."
+                reward_model_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
                 # NOTE(linsh): adapt wg_kwargs for fused train worker
                 # if want to add specific env args.
@@ -1645,6 +1704,7 @@ class PSRL_RayPPOTrainer:
         # We must execute train tasks first because rollout instances may occupy
         # the resources randomly and no structured resources are available for training
         _run_worker_group_tasks(train_tasks, label="train")
+        _run_worker_group_tasks(reward_model_tasks, label="reward_model")
         _run_worker_group_tasks(gen_tasks, label="gen")
         _run_worker_group_tasks(val_tasks, label="validate")
         """
@@ -1671,6 +1731,7 @@ class PSRL_RayPPOTrainer:
                 reward_model_config=reward_model,
                 reward_model_wg_list=reward_model_wg_list,
                 status_queues=reward_model_status_queues,
+                max_concurrency=self.max_concurrency,
             )
         psrl_logger.info(f"reward_model_manager_mapping: {self.reward_model_manager_mapping}")
         
@@ -2376,6 +2437,20 @@ class PSRL_RayPPOTrainer:
         self.init_reward_manager(validation=True)
         # perform validation before training
         if self.val_reward_manager is not None and self.config.trainer.get("val_before_train", True):
+            self.init_agent_loop_manager()
+            futures = []
+            futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
+            futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
+            for agent_loop_worker in self.agent_loop_workers:
+                futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
+                # Validation generation may still go through generation agent loops that
+                # call `reward_manager.compute_score(...)` (internally they can no-op on validate=True).
+                futures.append(agent_loop_worker.set_reward_manager.remote(self.val_reward_manager))
+            ray.get(futures)
+
+            self.start_rollout_coordinator()
+            self.start_agent_loop_manager()
+
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
@@ -2421,7 +2496,7 @@ class PSRL_RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.val_reward_manager is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
@@ -2687,6 +2762,7 @@ class PSRL_RayPPOTrainer:
                             scores = []
                             reward_extra_infos_dict_list = []
                             reward_metrics_dict_list = []
+                            rm_generated_token_nums = []
                             for request_id in request_ids:
                                 reward_score = request_id_to_reward[request_id]["reward_score"]
                                 extra_info = request_id_to_reward[request_id].get("reward_extra_info", {})
@@ -2694,6 +2770,21 @@ class PSRL_RayPPOTrainer:
                                 scores.append(reward_score)
                                 reward_extra_infos_dict_list.append(extra_info)
                                 reward_metrics_dict_list.append(reward_metrics)
+                                rm_generated_token_num = 0
+                                if isinstance(extra_info, dict):
+                                    stack = [extra_info]
+                                    while stack:
+                                        current_info = stack.pop()
+                                        for key, value in current_info.items():
+                                            if key == "rm_output_len" and isinstance(value, (int, float, np.integer, np.floating)):
+                                                rm_generated_token_num += int(value)
+                                            elif isinstance(value, dict):
+                                                stack.append(value)
+                                            elif isinstance(value, list):
+                                                for item in value:
+                                                    if isinstance(item, dict):
+                                                        stack.append(item)
+                                rm_generated_token_nums.append(rm_generated_token_num)
                             prompt_length = batch.batch["prompts"].size(1)
                             response_length = batch.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
                             rm_scores = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
@@ -2721,6 +2812,22 @@ class PSRL_RayPPOTrainer:
                                 reward_extra_infos_dict["reward_extra_info"].append(reward_extra_infos)
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                             batch.meta_info["reward_metrics"] = np.array(reward_metrics_dict_list, dtype=object)
+                            global_token_num = batch.meta_info.get("global_token_num")
+                            if (
+                                isinstance(global_token_num, list)
+                                and len(global_token_num) == len(rm_generated_token_nums)
+                            ):
+                                batch.meta_info["global_token_num"] = [
+                                    int(token_num) + int(rm_token_num)
+                                    for token_num, rm_token_num in zip(global_token_num, rm_generated_token_nums)
+                                ]
+                            else:
+                                psrl_logger.warning(
+                                    "Skip merging reward model token count to global_token_num due to shape mismatch: "
+                                    "global_token_num=%s rm_generated_token_nums=%s",
+                                    type(global_token_num),
+                                    len(rm_generated_token_nums),
+                                )
                 else:
                     reward_tensor = batch.batch.pop("rm_scores", None)
 

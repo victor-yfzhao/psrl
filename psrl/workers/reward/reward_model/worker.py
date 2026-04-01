@@ -30,6 +30,7 @@ from psrl.utils.logger import (
     log_end_event,
     log_single_event,
 )
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import GenInterface, PSRL_vLLMRollout
 
@@ -200,14 +201,16 @@ class PSRL_RewardModelWorker(Worker):
         raw_gpu_ids = accelerator_ids.get("GPU", accelerator_ids.get("NPU", []))
         return [int(gpu_id) for gpu_id in raw_gpu_ids]
 
+    # @ray.method(concurrency_group="control")
     async def sleep(self):
         self._ensure_model_ready()
-        await self.rollout.inference_engine.sleep(level=2)
+        await self.rollout.inference_engine.sleep(level=1)
         psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} sleeping.")
 
+    # @ray.method(concurrency_group="control")
     async def wake_up(self):
         self._ensure_model_ready()
-        await self.rollout.inference_engine.wake_up(tags=["weights", "kv_cache"])
+        await self.rollout.inference_engine.wake_up()
         psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} waking up.")
 
     def _build_rollout(self, trust_remote_code: bool = False) -> PSRL_vLLMRollout:
@@ -276,6 +279,7 @@ class PSRL_RewardModelWorker(Worker):
             status_queue=self.status_queue,
             reward_model_name=self.reward_model_name,
             is_reward_model=True,
+            init_mode="full",
         )
         return rollout
 
@@ -396,8 +400,13 @@ class PSRL_RewardModelWorker(Worker):
         interrupted = result.non_tensor_batch["interrupted"][0]
 
         if interrupted:
-            psrl_logger.info(f"Request {request.non_tensor_batch['uid'][0]} is interrupted (instance sleep)")
-            return None
+            # Keep partial generation payload (raw_response_ids/response_unpadded_len)
+            # so router can requeue this request as continuation instead of restarting.
+            psrl_logger.info(
+                f"Request {request.non_tensor_batch['uid'][0]} is interrupted (instance sleep), "
+                "returning partial output for continuation"
+            )
+            return result
         else:
             psrl_logger.info(f"Request {request.non_tensor_batch['uid'][0]} is completed (finished generation)")
             
@@ -424,81 +433,49 @@ class PSRL_RewardModelWorker(Worker):
             psrl_logger.debug(f"Interrupted all {interrupted_request_num} reward-model requests")
             return interrupted_request_num
 
-        request_tasks = set()
+        normalized_request_ids: set[int] = set()
         for request_id in request_ids:
+            try:
+                normalized_request_ids.add(int(request_id))
+            except (TypeError, ValueError):
+                psrl_logger.warning(f"Skip non-integer request ID during interrupt: {request_id!r}")
+
+        psrl_logger.info(f"Interrupting reward-model requests with IDs: {normalized_request_ids}")
+
+        if not normalized_request_ids:
+            return 0
+
+        request_tasks = set()
+        for request_id in normalized_request_ids:
             if request_id in self.request_id_to_active_tasks:
                 request_tasks.update(self.request_id_to_active_tasks[request_id])
             else:
                 psrl_logger.warning(f"Request ID {request_id} not found in active tasks.")
         if request_tasks:
-            await self.rollout.interrupt_requests_async(request_ids)
-            psrl_logger.debug(f"Interrupted reward-model requests with IDs: {request_ids}")
+            await self.rollout.interrupt_requests_async(normalized_request_ids)
+            psrl_logger.info(f"Interrupted reward-model requests with IDs: {normalized_request_ids}")
         return len(request_tasks)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    # @ray.method(concurrency_group="control")
     async def interrupt_requests(self, request_ids):
         """Interrupt specific reward-model requests."""
         return await self._async_interrupt_requests(request_ids)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    # @ray.method(concurrency_group="control")
     async def interrupt_all_requests(self):
         """Interrupt all reward-model requests."""
         return await self._async_interrupt_requests()
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    # @ray.method(concurrency_group="control")
     def init_model(self):
         with log_dual_events("Initialize reward model", psrl_logger, event_type=EventType.INIT):
             self.rollout = self._build_rollout()
         self._is_init_model.set()
-    
-    def generate(
-        self,
-        requests: DataProto,
-        consolidate: bool = True,
-        return_only_on_representative_rank: bool = True,
-    ):
-        """
-        Generate completions for a batch of prompts.
 
-        Args:
-            requests: Batched prompts in DataProto format.
-            consolidate: Whether to run rollout.post_process_outputs before returning.
-            return_only_on_representative_rank: If True, non-zero ranks return (None, None).
-        """
-        self._ensure_model_ready()
-        rollout_instance_id = self.get_instance_id()
-
-        request_ids = requests.non_tensor_batch["uid"]
-        psrl_logger.debug(
-            f"Reward Model Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}"
-        )
-
-        # Prepare the request for generation
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        requests.meta_info.update(meta_info)
-        requests.non_tensor_batch["rollout_instance_id"] = np.array(
-            [rollout_instance_id] * len(requests.batch)
-        )
-
-        with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
-            sampling_params = self._extract_sampling_params_dict(requests)
-            outputs = self.rollout.raw_generate_sequences(requests, sampling_params)
-
-            if return_only_on_representative_rank and not self.is_instance_representative_rank:
-                return None
-
-        final_outputs = (
-            self.rollout.post_process_outputs(requests, outputs) if consolidate else outputs
-        )
-        return final_outputs
-
+    # @rollout_trace_op
     async def generate_async(self, request: DataProto, consolidate: bool = True):
         """
         Async generation entry point. This covers the streaming RM inference path.

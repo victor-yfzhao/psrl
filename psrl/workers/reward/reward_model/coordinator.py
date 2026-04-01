@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
+import time
 import warnings
 
 import numpy as np
 import ray
 
+from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -50,6 +52,7 @@ class RewardModelCoordinator(CommandExtension):
         # will be set by the reward model manager later
         self.reward_model_wg_list = None
         self.reward_model_wg_size = None
+        self.reward_model_router = None
 
         # Stats collection
         self.status_queues = status_queues
@@ -86,6 +89,10 @@ class RewardModelCoordinator(CommandExtension):
             "The number of reward model worker groups must be the same as the number of reward model instances."
         )
         psrl_logger.info(f"Set reward model worker group list for {self.reward_model_name}, size: {self.reward_model_wg_size}")
+
+    def set_reward_model_router(self, reward_model_router):
+        self.reward_model_router = reward_model_router
+        psrl_logger.info("Set reward model router for %s", self.reward_model_name)
 
     async def init_model(self):
         assert (
@@ -136,11 +143,7 @@ class RewardModelCoordinator(CommandExtension):
                 )  # To avoid silent error in async tasks
 
         # # Start the task to broadcast the engine status to the router
-        # # TODO(zyf): need to decide whether to use the router for rm
-        # self.broadcast_status_to_router_task = self.running_loop.create_task(self._broadcast_status_to_router())
-        # self.broadcast_status_to_router_task.add_done_callback(
-        #     lambda f: f.result()
-        # )  # To avoid silent error in async tasks
+        # Keep RM router self-counting; no need to broadcast engine stats.
 
         # # Start the model synchronization and rollout migration loop
         # if self.config.psrl.sync_and_mig_strategy.method == "greedy":
@@ -176,7 +179,8 @@ class RewardModelCoordinator(CommandExtension):
         tasks_to_wait = [self.command_handler_task]
         if self.process_status_queue_tasks:
             tasks_to_wait.extend(self.process_status_queue_tasks)
-        tasks_to_wait.append(self.broadcast_status_to_router_task)
+        if self.broadcast_status_to_router_task is not None:
+            tasks_to_wait.append(self.broadcast_status_to_router_task)
 
         # Wait for tasks to finish with timeout
         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
@@ -226,7 +230,20 @@ class RewardModelCoordinator(CommandExtension):
                                 continue
                             if not isinstance(uids, (list, set)):
                                 uids = [uids]
-                            abort_requests = set(uids)  # Ensure uniqueness
+                            # Normalize request IDs to int to avoid string/int mismatch
+                            # between scheduler stats and worker-side active task map keys.
+                            abort_requests: set[int] = set()
+                            for uid in uids:
+                                try:
+                                    abort_requests.add(int(uid))
+                                except (TypeError, ValueError):
+                                    psrl_logger.warning(
+                                        "Skip non-integer uid in ABORT command for instance %s: uid=%r",
+                                        instance_id,
+                                        uid,
+                                    )
+                            if not abort_requests:
+                                continue
                             futures.append(
                                 self.reward_model_wg_list[instance_id].execute_all_async(
                                     "interrupt_requests", abort_requests
@@ -254,6 +271,11 @@ class RewardModelCoordinator(CommandExtension):
                     instance_ids = command_args.get("instance_ids", None)
                     if instance_ids is None:
                         raise ValueError("SLEEP command must contain 'instance_ids' in args.")
+                    if not isinstance(instance_ids, list):
+                        instance_ids = [instance_ids]
+
+                    if self.reward_model_router is not None:
+                        await self.reward_model_router.pause_instances.remote(instance_ids)
                     
                     abort_futures = []
                     sleep_futures = []
@@ -283,10 +305,14 @@ class RewardModelCoordinator(CommandExtension):
                     instance_ids = command_args.get("instance_ids", None)
                     if instance_ids is None:
                         raise ValueError("WAKE_UP command must contain 'instance_ids' in args.")
+                    if not isinstance(instance_ids, list):
+                        instance_ids = [instance_ids]
                     wake_up_futures = []
                     for instance_id in instance_ids:
                         wake_up_futures.append(self.reward_model_wg_list[instance_id].execute_all_async("wake_up")[0])
                     await asyncio.gather(*wake_up_futures)
+                    if self.reward_model_router is not None:
+                        await self.reward_model_router.resume_instances.remote(instance_ids)
                     self._complete_command(command_id, True)
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
@@ -306,6 +332,50 @@ class RewardModelCoordinator(CommandExtension):
                 f"Updated engine status for instance "
                 f"{recv_stats.instance_id}: {self.instance_to_engine_status[instance_id]}"
             )
+
+    def get_instance_engine_status_snapshot(self) -> dict[int, dict]:
+        """
+        Return a lightweight snapshot map for elastic scaling decisions.
+        """
+        result: dict[int, dict] = {}
+        for instance_id, engine_stats in self.instance_to_engine_status.items():
+            result[int(instance_id)] = {
+                "instance_id": int(engine_stats.instance_id),
+                "model_version": int(engine_stats.model_version),
+                "timestamp": engine_stats.snapshot.get("timestamp"),
+                "scheduler_stats": engine_stats.snapshot.get("scheduler_stats", {}),
+                "generation_throughput": float(engine_stats.snapshot.get("generation_throughput", 0.0)),
+            }
+        return result
+
+    async def get_router_backlog_size(self) -> int:
+        """Return pending request count in reward-model router queue."""
+        t_enter = time.monotonic()
+        model_tag = self.reward_model_name
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RewardModelCoordinator_enter model=%s elapsed_since_entry_s=0.000",
+            model_tag,
+        )
+        if self.reward_model_router is None:
+            return 0
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RewardModelCoordinator_before_router_rpc model=%s since_enter_s=%.3f",
+            model_tag,
+            time.monotonic() - t_enter,
+        )
+        t_rpc = time.monotonic()
+        pending = int(await self.reward_model_router.get_pending_request_count.remote())
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RewardModelCoordinator_after_router_rpc model=%s pending=%d router_rpc_s=%.3f since_enter_s=%.3f",
+            model_tag,
+            pending,
+            time.monotonic() - t_rpc,
+            time.monotonic() - t_enter,
+        )
+        return pending
 
     async def init_route_strategy(self):
         # TODO(zyf): need to decide whether to use the route strategy for rm

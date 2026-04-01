@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from vllm.sampling_params import RequestOutputKind
 
+from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
@@ -290,14 +291,37 @@ class RolloutRouter:
         # only consider the specific instance for routing
         if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.sync_and_mig_strategy.mig.enable:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
-            assert old_instance_id in candidates, f"Old rollout instance {old_instance_id} is not in the candidates"
-            candidates = [old_instance_id]
+            if old_instance_id in candidates:
+                candidates = [old_instance_id]
+            else:
+                # Elastic scale/sleep may invalidate historical rollout_instance_id.
+                # Degrade gracefully to current candidate set instead of crashing router loop.
+                psrl_logger.warning(
+                    (
+                        "Old rollout instance %s is not in candidates for request %s; "
+                        "fallback to normal routing. candidates=%s"
+                    ),
+                    old_instance_id,
+                    request_id,
+                    candidates,
+                )
 
         # 2.5. If request is in sticky session, keep the existing instance
         if self.sticky_session_requests.get(request_id, False) and "rollout_instance_id" in request.non_tensor_batch:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
-            assert old_instance_id in candidates, f"Sticky session instance {old_instance_id} is not in the candidates"
-            candidates = [old_instance_id]
+            if old_instance_id in candidates:
+                candidates = [old_instance_id]
+            else:
+                # Sticky binding can also become stale after elastic scaling.
+                psrl_logger.warning(
+                    (
+                        "Sticky session instance %s is not in candidates for request %s; "
+                        "fallback to normal routing. candidates=%s"
+                    ),
+                    old_instance_id,
+                    request_id,
+                    candidates,
+                )
 
         # 3. If forbidden group sampling on multiple instances, only consider the
         # instance that other requests in the same group are already routed to
@@ -577,6 +601,20 @@ class RolloutRouter:
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""
         return self._is_routing
+
+    @ray.method(concurrency_group="control")
+    def get_pending_request_count(self) -> int:
+        """Return current number of requests waiting in router queue."""
+        t0 = time.monotonic()
+        log_elastic_rm_backlog_diag(psrl_logger, "stage=RolloutRouter_enter")
+        n = int(self.requests_to_route.size())
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutRouter_exit pending=%d body_s=%.6f",
+            n,
+            time.monotonic() - t0,
+        )
+        return n
 
     @ray.method(concurrency_group="control")
     async def pause_routing(self):

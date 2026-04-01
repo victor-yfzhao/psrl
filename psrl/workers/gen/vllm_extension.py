@@ -286,6 +286,10 @@ class vLLMWorkerExtension:
         """
         self.nixl_storage_client.wait_for_update_infos(info_num)
 
+    def nixl_log_shard_info(self, label: str = "", max_elements: int = 8):
+        """Debug log local NIXL shard info on this vLLM worker."""
+        self.nixl_storage_client.log_shard_info(label=label, max_elements=max_elements)
+
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
         """Pull the model parameters from PS workers via NIXL.
 
