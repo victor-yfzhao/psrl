@@ -9,6 +9,9 @@ from .buffer_post_process import (
     DynamicSamplingFilterProcessor as BUFFER_DynamicSamplingFilterProcessor,
 )
 from .buffer_post_process import (
+    GigpoStepMetadataProcessor as BUFFER_GigpoStepMetadataProcessor,
+)
+from .buffer_post_process import (
     NoFilterProcessor as BUFFER_NoFilterProcessor,
 )
 from .group_post_process import (
@@ -27,5 +30,6 @@ __all__ = [
     "GROUP_DynamicSamplingFilterProcessor",
     "GROUP_NoFilterProcessor",
     "BUFFER_DynamicSamplingFilterProcessor",
+    "BUFFER_GigpoStepMetadataProcessor",
     "BUFFER_NoFilterProcessor",
 ]
