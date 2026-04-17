@@ -191,7 +191,10 @@ class StepToolAgentData(ToolAgentData):
             "response_start": np.array([[step.response_start for step in exportable_steps]], dtype=object),
             "response_end": np.array([[step.response_end for step in exportable_steps]], dtype=object),
             "step_reward": np.array(
-                [[step.reward if step.reward is not None else step.tool_reward for step in exportable_steps]],
+                # Export raw env immediate reward for GiGPO-side reconstruction.
+                # This intentionally differs from `Step.reward` in base.py, which
+                # may include model reward, reward shaping, or discounted returns.
+                [[step.tool_reward for step in exportable_steps]],
                 dtype=object,
             ),
             "step_done": np.array([[step.done for step in exportable_steps]], dtype=object),

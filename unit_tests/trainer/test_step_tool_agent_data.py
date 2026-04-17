@@ -247,6 +247,19 @@ class StepToolAgentDataTest(unittest.TestCase):
 
         self.assertEqual(output.non_tensor_batch["anchor_obs"][0], ["anchor-0"])
 
+    def test_step_reward_exports_raw_env_reward_not_adjusted_reward(self):
+        request = _make_request()
+        self.agent_data.init_trajectory(request)
+
+        asyncio.run(self.agent_data.update_from_env([{"role": "tool", "content": "obs0"}], 0.5, False, {"anchor_obs": "a0"}))
+        current_step = self.agent_data.get_current_step()
+        current_step.reward = 9.5
+        asyncio.run(self.agent_data.update_from_model_token_ids(_make_model_output([11], [-0.1])))
+
+        output = asyncio.run(self.agent_data.finalize_output(request))
+
+        self.assertEqual(output.non_tensor_batch["step_reward"][0], [0.5])
+
     def test_manager_post_process_preserves_step_sidecar(self):
         request = _make_request()
         self.agent_data.init_trajectory(request)
