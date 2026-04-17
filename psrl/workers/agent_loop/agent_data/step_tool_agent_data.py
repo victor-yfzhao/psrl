@@ -213,9 +213,14 @@ class StepToolAgentData(ToolAgentData):
         """
         reached_limit = await super().update_from_env(observation, reward, done, info, **kwargs)
         if len(self.trajectory.steps) > 0 and isinstance(self.get_current_step(), StepToolStep):
-            # Anchor state is owned by env semantics, so we capture it at the env
-            # update boundary rather than trying to infer it from tokens later.
-            self.get_current_step().anchor_obs = info.get("anchor_obs") if info is not None else None
+            # Prefer env-provided anchor state when available; otherwise fall back
+            # to the raw observation so GiGPO-specific rollout stays self-contained
+            # without requiring ToolEnvironment changes.
+            if info is not None and "anchor_obs" in info:
+                anchor_obs = info["anchor_obs"]
+            else:
+                anchor_obs = observation
+            self.get_current_step().anchor_obs = anchor_obs
         return reached_limit
 
     async def update_from_model_token_ids(self, output: DataProto, **kwargs) -> tuple[ToolAction, bool]:

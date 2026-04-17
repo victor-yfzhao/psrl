@@ -223,6 +223,30 @@ class StepToolAgentDataTest(unittest.TestCase):
         self.assertEqual(non_tensor["step_count"][0], 1)
         self.assertEqual(non_tensor["response_start"][0][0], non_tensor["response_end"][0][0])
 
+    def test_falls_back_to_observation_when_anchor_obs_missing(self):
+        request = _make_request()
+        self.agent_data.init_trajectory(request)
+
+        observation = [{"role": "tool", "content": "obs0"}]
+        asyncio.run(self.agent_data.update_from_env(observation, 0.0, False, {}))
+        asyncio.run(self.agent_data.update_from_model_token_ids(_make_model_output([11], [-0.1])))
+
+        output = asyncio.run(self.agent_data.finalize_output(request))
+
+        self.assertEqual(output.non_tensor_batch["anchor_obs"][0], [observation])
+
+    def test_preserves_explicit_anchor_obs_override(self):
+        request = _make_request()
+        self.agent_data.init_trajectory(request)
+
+        observation = [{"role": "tool", "content": "obs0"}]
+        asyncio.run(self.agent_data.update_from_env(observation, 0.0, False, {"anchor_obs": "anchor-0"}))
+        asyncio.run(self.agent_data.update_from_model_token_ids(_make_model_output([11], [-0.1])))
+
+        output = asyncio.run(self.agent_data.finalize_output(request))
+
+        self.assertEqual(output.non_tensor_batch["anchor_obs"][0], ["anchor-0"])
+
     def test_manager_post_process_preserves_step_sidecar(self):
         request = _make_request()
         self.agent_data.init_trajectory(request)
