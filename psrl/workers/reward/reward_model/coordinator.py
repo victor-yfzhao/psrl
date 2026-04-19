@@ -76,7 +76,7 @@ class RewardModelCoordinator(CommandExtension):
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
 
         # Build logger
-        self.log_prefix = f"RewardModelCoordinator-{self.reward_model_name}"
+        self.log_prefix = "RewardModelCoordinator"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def world_size(self):
@@ -105,9 +105,10 @@ class RewardModelCoordinator(CommandExtension):
         psrl_logger.info(f"Reward model {self.reward_model_name} initialized.")
 
         if self.config.psrl.deployment.elastic_rm.enable:
+            # Only rank-0 workers own vLLM AsyncLLM when TP/PP > 1 (see PSRL_vLLMRollout).
             sleep_futures = []
             for i in range(self.reward_model_wg_size):
-                sleep_futures.extend(self.reward_model_wg_list[i].execute_all_async("sleep"))
+                sleep_futures.append(self.reward_model_wg_list[i].execute_rank_zero_async("sleep"))
             await asyncio.gather(*sleep_futures)
             psrl_logger.info(f"Reward model {self.reward_model_name} sleeping.")
 
@@ -206,8 +207,11 @@ class RewardModelCoordinator(CommandExtension):
                 command_type = command.type
                 command_id = command.get_kwargs()["id"]
                 command_args = command.get_args()
-                psrl_logger.debug(
-                    f"Receive command: type = {command_type}, kwargs = {command.get_kwargs()}, args = {command_args}"
+                psrl_logger.info(
+                    "Receive command: type = %s, kwargs = %s, args_keys = %s",
+                    command_type,
+                    command.get_kwargs(),
+                    list(command_args.keys()),
                 )
 
                 result = None
@@ -219,8 +223,10 @@ class RewardModelCoordinator(CommandExtension):
                         raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
 
                     psrl_logger.info(
-                        f"Received ABORT command with instance_to_uids: "
-                        f"{instance_to_uids} and instance_ids: {instance_ids}"
+                        "Received ABORT command with instance_to_uids (count=%s) and instance_ids=%s; "
+                        "completing immediately (fire-and-forget) to avoid blocking WAKE_UP/SLEEP commands.",
+                        sum(len(v) for v in (instance_to_uids or {}).values()),
+                        instance_ids,
                     )
                     futures = []
 
@@ -245,16 +251,16 @@ class RewardModelCoordinator(CommandExtension):
                             if not abort_requests:
                                 continue
                             futures.append(
-                                self.reward_model_wg_list[instance_id].execute_all_async(
+                                self.reward_model_wg_list[instance_id].execute_rank_zero_async(
                                     "interrupt_requests", abort_requests
-                                )[0]
+                                )
                             )
                     if instance_ids is not None:
                         for instance_id in instance_ids:
                             futures.append(
-                                self.reward_model_wg_list[instance_id].execute_all_async(
+                                self.reward_model_wg_list[instance_id].execute_rank_zero_async(
                                     "interrupt_requests", None
-                                )[0]
+                                )
                             )
 
                     if not futures:
@@ -284,9 +290,9 @@ class RewardModelCoordinator(CommandExtension):
                     if instance_ids is not None:
                         for instance_id in instance_ids:
                             abort_futures.append(
-                                self.reward_model_wg_list[instance_id].execute_all_async(
-                                    "interrupt_requests", None
-                                )[0]
+                                self.reward_model_wg_list[instance_id].execute_rank_zero_async(
+                                    "interrupt_generation"
+                                )
                             )
 
                     if not abort_futures:
@@ -297,8 +303,9 @@ class RewardModelCoordinator(CommandExtension):
 
                     # second, sleep the instance
                     for instance_id in instance_ids:
-                        sleep_futures.append(self.reward_model_wg_list[instance_id].execute_all_async("sleep")[0])
+                        sleep_futures.append(self.reward_model_wg_list[instance_id].execute_rank_zero_async("sleep"))
                     await asyncio.gather(*sleep_futures)
+                    psrl_logger.info("SLEEP command for instances %s completed.", instance_ids)
                     self._complete_command(command_id, True)
                 
                 elif command_type == CommandType.WAKE_UP:
@@ -309,8 +316,9 @@ class RewardModelCoordinator(CommandExtension):
                         instance_ids = [instance_ids]
                     wake_up_futures = []
                     for instance_id in instance_ids:
-                        wake_up_futures.append(self.reward_model_wg_list[instance_id].execute_all_async("wake_up")[0])
+                        wake_up_futures.append(self.reward_model_wg_list[instance_id].execute_rank_zero_async("wake_up"))
                     await asyncio.gather(*wake_up_futures)
+                    psrl_logger.info("WAKE_UP command for instances %s completed.", instance_ids)
                     if self.reward_model_router is not None:
                         await self.reward_model_router.resume_instances.remote(instance_ids)
                     self._complete_command(command_id, True)

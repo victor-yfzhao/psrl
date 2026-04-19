@@ -22,7 +22,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutCoordinator(CommandExtension):
-    DEFAULT_AWAIT_TIMEOUT_S = 300
+    DEFAULT_AWAIT_TIMEOUT_S = 3600
 
     def __init__(
         self,
@@ -122,6 +122,20 @@ class RolloutCoordinator(CommandExtension):
 
         # Engine status tracking
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
+
+        self.enable_elastic_rm = self.config.psrl.deployment.elastic_rm.enable
+
+        # ElasticExecutor integration for swap-based sync (set via set_elastic_executor).
+        # When available, sync_with_ps will try to wake a free instance and sleep the
+        # syncing instance instead of doing an in-place weight pull.
+        self._elastic_executor = None          # ray.actor.ActorHandle | None
+        self._elastic_exec_role_name = None    # PSRL_Role for this coordinator's role
+        self._elastic_exec_model_name = None   # model name string
+
+        # Instance IDs currently under an in-place model sync (sync-lock).
+        # While locked, the command handler rejects elastic SLEEP/WAKE_UP commands for
+        # these instances so that the ElasticExecutor does not interfere mid-sync.
+        self._syncing_locked_instance_ids: set[int] = set()
 
         # Build logger
         self.log_prefix = "RolloutCoordinator"
@@ -586,7 +600,7 @@ class RolloutCoordinator(CommandExtension):
                         for instance_id in instance_ids:
                             abort_futures.append(
                                 self.rollout_wg_list[instance_id].execute_rank_zero_async(
-                                    "interrupt_requests", None
+                                    "interrupt_generation"
                                 )
                             )
 
@@ -626,11 +640,26 @@ class RolloutCoordinator(CommandExtension):
 
                     sync_futures = []
                     for instance_id in instance_ids:
+                        # Check active_tasks: normally zero after a clean wake-up, but a
+                        # duplicate WAKE_UP (e.g. from a concurrent sync_with_ps race) may
+                        # arrive when the instance already has running tasks.  In that case
+                        # interrupt first to avoid the AssertionError in gen_worker.sync_with_ps.
+                        active_tasks = await self.gen_wg_list[instance_id].execute_rank_zero_async(
+                            "get_active_task_num"
+                        )
+                        needs_interrupt = active_tasks > 0
+                        if needs_interrupt:
+                            psrl_logger.warning(
+                                "WAKE_UP for instance %d: found %d active task(s) — "
+                                "will interrupt before sync (possible duplicate WAKE_UP).",
+                                instance_id,
+                                active_tasks,
+                            )
                         sync_futures.append(
                             self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                "sync_with_ps", 
+                                "sync_with_ps",
                                 ps_version=self.ps_model_version,
-                                interrupt_generation=False,
+                                interrupt_generation=needs_interrupt,
                                 sync_after_wake_up=True,
                             )
                         )
@@ -742,6 +771,10 @@ class RolloutCoordinator(CommandExtension):
             have_syncing_instance = False
             sync_instance_ids = []
             for instance_id in range(self.rollout_wg_size):
+                # Skip instances currently under a sync_with_ps call (swap or in-place).
+                if self.enable_elastic_rm and instance_id in self._syncing_locked_instance_ids:
+                    have_syncing_instance = True
+                    continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(
                     instance_id, 0
@@ -790,6 +823,10 @@ class RolloutCoordinator(CommandExtension):
                 # Ignore validate instances for weight synchronization
                 if instance_id >= self.rollout_wg_size:
                     continue
+                # Skip instances currently under a sync_with_ps call (swap or in-place).
+                if self.enable_elastic_rm and instance_id in self._syncing_locked_instance_ids:
+                    have_syncing_instance = True
+                    continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if engine_stats.model_version <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
                     have_syncing_instance = True
@@ -833,6 +870,29 @@ class RolloutCoordinator(CommandExtension):
     # ------- FUNCTIONS FOR MODEL SYNCING -------
 
     # This is called by the PS manager to update the PS model version after pushing
+    def set_elastic_executor(
+        self,
+        elastic_executor,
+        role_name,
+        model_name: str,
+    ) -> None:
+        """Inject the ElasticExecutor handle so sync_with_ps can attempt swap-based sync.
+
+        Args:
+            elastic_executor: Ray actor handle for the ElasticExecutor.
+            role_name: PSRL_Role for this coordinator's role (e.g. PSRL_Role.Rollout).
+            model_name: Model name string used to look up this coordinator in ElasticExecutor.
+        """
+        self._elastic_executor = elastic_executor
+        self._elastic_exec_role_name = role_name
+        self._elastic_exec_model_name = model_name
+        psrl_logger.info(
+            "RolloutCoordinator: ElasticExecutor registered for swap-based sync "
+            "(role=%s model=%s).",
+            getattr(role_name, "name", role_name),
+            model_name,
+        )
+
     def set_ps_model_version(self, version: int):
         """
         Set the current PS model version.
@@ -881,49 +941,333 @@ class RolloutCoordinator(CommandExtension):
         """
         Synchronize with PS for the given instance IDs.
         """
-        # Add batching SYNC command to the command queue to interrupt the instance
-        # This will stop the instance, pull the model weights from PS, and resume generation.
-        # But this will not block the current loop.
-        # NOTE(lhy): we don't need to update the instance version here because the version
-        # is updated in the `sync_with_ps` method of the GenWorker
-        # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager
-        # will update the instance version.
-        # However, we need to update the latest stale model version here to avoid stale stats
-        # being handled after the synchronization.
-        with log_dual_events(
-            f"Synchronize rollout instances {instance_ids} with PS "
-            f"(model pull is {'non-blocking' if not wait_model_sync else 'blocking'} "
-            f"for the coordinator)",
-            psrl_logger,
-            level=logging.INFO,
-            event_type=EventType.OTHER,
-        ):
-            for instance_id in instance_ids:
-                self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
-                    instance_id, 0
+        if not self.enable_elastic_rm:
+            # Add batching SYNC command to the command queue to interrupt the instance
+            # This will stop the instance, pull the model weights from PS, and resume generation.
+            # But this will not block the current loop.
+            # NOTE(lhy): we don't need to update the instance version here because the version
+            # is updated in the `sync_with_ps` method of the GenWorker
+            # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager
+            # will update the instance version.
+            # However, we need to update the latest stale model version here to avoid stale stats
+            # being handled after the synchronization.
+            with log_dual_events(
+                f"Synchronize rollout instances {instance_ids} with PS "
+                f"(model pull is {'non-blocking' if not wait_model_sync else 'blocking'} "
+                f"for the coordinator)",
+                psrl_logger,
+                level=logging.INFO,
+                event_type=EventType.OTHER,
+            ):
+                for instance_id in instance_ids:
+                    self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
+                        instance_id, 0
+                    )
+                await self.rollout_router.pause_routing.remote()
+                psrl_logger.info("Paused routing for synchronization")
+                await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
+                psrl_logger.info("Updated currently syncing instances")
+                await self.exec_command(
+                    Command(
+                        type=CommandType.SYNC,
+                        instance_ids=instance_ids,
+                        curr_ps_model_version=self.ps_model_version,
+                        wait_model_sync=wait_model_sync,
+                    ),
+                    blocking=True,
                 )
-            await self.rollout_router.pause_routing.remote()
-            psrl_logger.info("Paused routing for synchronization")
-            await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
-            psrl_logger.info("Updated currently syncing instances")
-            await self.exec_command(
-                Command(
-                    type=CommandType.SYNC,
-                    instance_ids=instance_ids,
-                    curr_ps_model_version=self.ps_model_version,
-                    wait_model_sync=wait_model_sync,
-                ),
-                blocking=True,
+                psrl_logger.info("Executed SYNC command")
+                if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                    psrl_logger.info("Waiting for interrupted partial requests loop back")
+                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
+                    psrl_logger.info(
+                        f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
+                    )
+                await self.rollout_router.resume_routing.remote()
+                psrl_logger.info("Resumed routing after synchronization")
+            return
+
+
+        """
+        If an ElasticExecutor is registered (via set_elastic_executor), the method first
+        checks whether there is a free (asleep, non-conflicting) rollout instance available.
+
+        - **Free instance found**: a swap is performed — the free instance is woken up
+          (which automatically pulls the latest model weights inside the WAKE_UP handler),
+          and the original syncing instances are then put to sleep.  No in-place weight
+          pull is needed.
+
+        - **No free instance**: falls back to the traditional in-place sync.  During the
+          sync the affected instances are added to ``_syncing_locked_instance_ids`` so that
+          concurrent elastic SLEEP/WAKE_UP commands from ElasticExecutor are rejected.
+          After sync completes, the ElasticExecutor is notified to grant each instance an
+          immunity window (preventing an immediate re-sleep by the scaling policy).
+
+        Concurrent-call guard:
+          The coordinator's asyncio event loop yields during ``await perform_sync_swap``
+          and ``await exec_command``, which allows the sync_and_migrate loop to be
+          rescheduled.  Without a guard, it would call sync_with_ps again for the same
+          instances, producing duplicate WAKE_UP commands that trigger an AssertionError
+          in gen_worker (active_tasks != 0 when interrupt_generation=False).  We prevent
+          this by locking instance IDs at the top of this method for both swap and
+          in-place paths.
+        """
+        # Only rollout instances (index < rollout_wg_size) participate in elastic swap.
+        rollout_sync_ids = [i for i in instance_ids if i < self.rollout_wg_size]
+
+        # Drop any instances already locked by a concurrent sync_with_ps call.
+        already_locked = [i for i in rollout_sync_ids if i in self._syncing_locked_instance_ids]
+        if already_locked:
+            psrl_logger.info(
+                "sync_with_ps: skipping instances %s already under sync-lock "
+                "(concurrent call suppressed).",
+                already_locked,
             )
-            psrl_logger.info("Executed SYNC command")
-            if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
-                psrl_logger.info("Waiting for interrupted partial requests loop back")
-                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
-                psrl_logger.info(
-                    f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
+            rollout_sync_ids = [i for i in rollout_sync_ids if i not in self._syncing_locked_instance_ids]
+            if not rollout_sync_ids:
+                return
+
+        # Acquire sync-lock for ALL paths (swap and in-place) immediately.
+        for instance_id in rollout_sync_ids:
+            self._syncing_locked_instance_ids.add(instance_id)
+            psrl_logger.info("sync_with_ps: acquired sync-lock for instance %d.", instance_id)
+
+        _swap_done = False
+        try:
+            # ----------------------------------------------------------
+            # Swap path: if ElasticExecutor has a free instance, wake it
+            # (which auto-pulls the latest model), then sleep the stale one.
+            # ----------------------------------------------------------
+            if self._elastic_executor is not None and rollout_sync_ids:
+                free_ids: list[int] = await self._elastic_executor.get_free_instances.remote(
+                    self._elastic_exec_role_name,
+                    self._elastic_exec_model_name,
+                    rollout_sync_ids,  # exclude the instances being synced
                 )
-            await self.rollout_router.resume_routing.remote()
-            psrl_logger.info("Resumed routing after synchronization")
+                if len(free_ids) >= len(rollout_sync_ids):
+                    psrl_logger.info(
+                        "sync_with_ps: swap-based sync — waking free instances %s, "
+                        "sleeping syncing instances %s (PS version %d).",
+                        free_ids[: len(rollout_sync_ids)],
+                        rollout_sync_ids,
+                        self.ps_model_version,
+                    )
+                    swap_all_succeeded = True
+                    for sync_id, free_id in zip(rollout_sync_ids, free_ids[: len(rollout_sync_ids)]):
+                        swap_ok = await self._elastic_executor.perform_sync_swap.remote(
+                            self._elastic_exec_role_name,
+                            self._elastic_exec_model_name,
+                            free_id,   # wake this (it will pull latest model)
+                            sync_id,   # sleep this (no longer needed)
+                        )
+                        if not swap_ok:
+                            swap_all_succeeded = False
+                            psrl_logger.warning(
+                                "sync_with_ps: swap-based sync rejected for pair (wake=%d, sleep=%d); "
+                                "falling back to in-place sync for remaining targets.",
+                                free_id,
+                                sync_id,
+                            )
+                            break
+                    if not swap_all_succeeded:
+                        psrl_logger.info(
+                            "sync_with_ps: swap-based sync not fully applied; continue with in-place sync path."
+                        )
+                    else:
+                        psrl_logger.info(
+                            "sync_with_ps: swap-based sync completed for instances %s.",
+                            rollout_sync_ids,
+                        )
+                        _swap_done = True
+                        return  # finally block runs, releases locks; immunity set by _scale_up_instance
+
+                psrl_logger.info(
+                    "sync_with_ps: no free instances available for swap (free=%s); "
+                    "falling back to in-place sync for %s.",
+                    free_ids,
+                    rollout_sync_ids,
+                )
+
+            # ----------------------------------------------------------
+            # In-place sync path (traditional).
+            # NOTE(lhy): we don't need to update the instance version here because the
+            # version is updated in the `sync_with_ps` method of the GenWorker when
+            # calling `pull_model_async`; the ps manager will update the instance version.
+            # However, we need to update the latest stale model version here to avoid stale
+            # stats being handled after the synchronization.
+            # ----------------------------------------------------------
+            with log_dual_events(
+                f"Synchronize rollout instances {instance_ids} with PS "
+                f"(model pull is {'non-blocking' if not wait_model_sync else 'blocking'} "
+                f"for the coordinator)",
+                psrl_logger,
+                level=logging.INFO,
+                event_type=EventType.OTHER,
+            ):
+                for instance_id in instance_ids:
+                    self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
+                        instance_id, 0
+                    )
+
+                # For in-place sync fallback: sleep -> wake_up only for target instances.
+                # Skip instances already in vLLM sleep mode.
+                sleeping_flags = await asyncio.gather(
+                    *[
+                        self.gen_wg_list[i].execute_rank_zero_async("is_rollout_engine_sleeping")
+                        for i in instance_ids
+                    ]
+                )
+                in_place_sync_ids: list[int] = []
+                skipped_sleeping: list[int] = []
+                for instance_id, is_sleeping in zip(instance_ids, sleeping_flags):
+                    if is_sleeping:
+                        skipped_sleeping.append(instance_id)
+                    else:
+                        in_place_sync_ids.append(instance_id)
+
+                if skipped_sleeping:
+                    psrl_logger.info(
+                        "In-place sync fallback: skip %s sleeping instance(s) %s.",
+                        len(skipped_sleeping),
+                        skipped_sleeping,
+                    )
+
+                if in_place_sync_ids:
+                    # Pause routing to target instances before exposing the post-sync
+                    # version, avoiding a race where router sees the new version but
+                    # gen worker has not pulled model yet.
+                    await self.rollout_router.pause_instances.remote(in_place_sync_ids)
+                    psrl_logger.info(
+                        "Pre-paused instances for in-place sync fallback: %s",
+                        in_place_sync_ids,
+                    )
+                    await self.rollout_router.update_currently_syncing_instances.remote(
+                        in_place_sync_ids, self.ps_model_version
+                    )
+                    psrl_logger.info("Updated currently syncing instances to %s", in_place_sync_ids)
+
+                    inplace_policy_gate_entered = False
+                    wake_up_completed = False
+                    inplace_gate_instance_ids: list[int] = []
+                    try:
+                        # Keep parity with swap path: block new scaling-policy decisions
+                        # while in-place sync SLEEP/WAKE_UP is running.
+                        if self._elastic_executor is not None:
+                            await self._elastic_executor.enter_inplace_sync_policy_gate.remote(
+                                self._elastic_exec_role_name,
+                                self._elastic_exec_model_name,
+                                in_place_sync_ids,
+                            )
+                            inplace_policy_gate_entered = True
+                            inplace_gate_instance_ids = list(in_place_sync_ids)
+
+                        # Double-check: an instance may enter vLLM sleep while we wait on the
+                        # policy gate (or otherwise race); skip SLEEP/WAKE for it like the
+                        # initial sleeping check above.
+                        sleeping_flags_2 = await asyncio.gather(
+                            *[
+                                self.gen_wg_list[i].execute_rank_zero_async("is_rollout_engine_sleeping")
+                                for i in in_place_sync_ids
+                            ]
+                        )
+                        skipped_asleep_double: list[int] = []
+                        still_awake: list[int] = []
+                        for instance_id, is_sleeping in zip(in_place_sync_ids, sleeping_flags_2):
+                            if is_sleeping:
+                                skipped_asleep_double.append(instance_id)
+                            else:
+                                still_awake.append(instance_id)
+
+                        if skipped_asleep_double:
+                            psrl_logger.info(
+                                "In-place sync fallback: double-check skip %s instance(s) now sleeping %s.",
+                                len(skipped_asleep_double),
+                                skipped_asleep_double,
+                            )
+                            await self.rollout_router.resume_instances.remote(skipped_asleep_double)
+                            for iid in skipped_asleep_double:
+                                await self.rollout_router.update_currently_syncing_instances.remote(
+                                    [iid],
+                                    self.instance_to_model_version.get(iid, 0),
+                                )
+
+                        in_place_sync_ids = still_awake
+
+                        if in_place_sync_ids:
+                            await self.exec_command(
+                                Command(
+                                    type=CommandType.SLEEP,
+                                    instance_ids=in_place_sync_ids,
+                                ),
+                                blocking=True,
+                            )
+                            psrl_logger.info(
+                                "Executed SLEEP command for in-place sync fallback: %s",
+                                in_place_sync_ids,
+                            )
+
+                            await self.exec_command(
+                                Command(
+                                    type=CommandType.WAKE_UP,
+                                    instance_ids=in_place_sync_ids,
+                                ),
+                                blocking=True,
+                            )
+                            wake_up_completed = True
+                            psrl_logger.info(
+                                "Executed WAKE_UP command for in-place sync fallback: %s",
+                                in_place_sync_ids,
+                            )
+                        else:
+                            psrl_logger.info(
+                                "In-place sync fallback: no runnable instances after double-check "
+                                "(all targets asleep)."
+                            )
+                    finally:
+                        # If in-place sync exits early, recover router availability.
+                        if not wake_up_completed:
+                            await self.rollout_router.resume_instances.remote(in_place_sync_ids)
+                            psrl_logger.warning(
+                                "In-place sync fallback exited early; resumed instances: %s",
+                                in_place_sync_ids,
+                            )
+                        if inplace_policy_gate_entered:
+                            await self._elastic_executor.leave_inplace_sync_policy_gate.remote(
+                                self._elastic_exec_role_name,
+                                self._elastic_exec_model_name,
+                                inplace_gate_instance_ids,
+                            )
+
+                    if (
+                        wait_interrupted_partial_requests_loop_back
+                        and self.config.psrl.partial_rollout.enable
+                        and in_place_sync_ids
+                    ):
+                        psrl_logger.info("Waiting for interrupted partial requests loop back")
+                        await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(
+                            in_place_sync_ids
+                        )
+                        psrl_logger.info(
+                            "All interrupted requests on the synchronized instances %s have been looped back",
+                            in_place_sync_ids,
+                        )
+                else:
+                    psrl_logger.info("In-place sync fallback: no runnable instances to sleep/wake_up.")
+
+        finally:
+            # Release sync-lock for all paths (swap and in-place).
+            for instance_id in rollout_sync_ids:
+                self._syncing_locked_instance_ids.discard(instance_id)
+                psrl_logger.info("sync_with_ps: released sync-lock for instance %d.", instance_id)
+            # Grant immunity only for in-place sync; swap path grants immunity via
+            # _set_instance_immunity inside _scale_up_instance for the new instance.
+            if not _swap_done and self._elastic_executor is not None:
+                for instance_id in rollout_sync_ids:
+                    self._elastic_executor.set_instance_immunity.remote(
+                        self._elastic_exec_role_name,
+                        self._elastic_exec_model_name,
+                        instance_id,
+                    )
 
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
         """

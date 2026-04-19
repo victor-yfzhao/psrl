@@ -53,7 +53,7 @@ train_actor_rollout_ref:
   hybrid_engine: True
 
   # Timeout for operations executed against the process group
-  nccl_timeout: 600
+  nccl_timeout: 3600
 
   # Rollout instance config.
   rollout:
@@ -71,7 +71,7 @@ gen_actor_rollout_ref:
   path: ${oc.select:train_actor_rollout_ref.model.path}
 
   # Timeout for operations executed against the process group
-  nccl_timeout: 600
+  nccl_timeout: 3600
 
   # Rollout instance config.
   rollout:

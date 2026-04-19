@@ -7,21 +7,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.logger import DualOutputHandler, FileOnlyHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-
-def _role_name_to_str(role_name: Any) -> str:
-    if hasattr(role_name, "name"):
-        return str(role_name.name)
-    return str(role_name)
-
-
 @dataclass
 class InstanceSignal:
-    role_name: Any
+    role_name: PSRL_Role
     model_name: str
     instance_id: int
     is_awaken: bool
@@ -31,19 +25,22 @@ class InstanceSignal:
     generation_throughput: float
     total_token_num: int
     snapshot_timestamp: str | None = None
-    # Set of (node_id, gpu_id) pairs occupied by this instance.
-    # Populated by ElasticExecutor; None means mapping unavailable.
-    gpu_keys: frozenset | None = None
+    # Global placement-group bundle indices [start, end) occupied by this instance (half-open).
+    # Populated by ElasticExecutor from SubRayResourcePool bundle_range; None if unknown.
+    bundle_keys: frozenset[int] | None = None
 
 
 @dataclass
 class ScalingAction:
     action_type: str  # "scale_up" or "scale_down"
-    role_name: Any
+    role_name: PSRL_Role
     model_name: str
     num_instances: int = 1
     preferred_instance_ids: list[int] | None = None
     reason: str = ""
+    # When scale_up must evict another role first: preferred SLEEP targets (same dict shape
+    # as executor pre_sleep). Only force_wake colocated path sets this today.
+    pre_sleep_other_preferred: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -51,7 +48,7 @@ class ScalingDecision:
     actions: list[ScalingAction]
     reason: str
     estimated_lambda: float
-    role_to_total_mu: dict[str, float]
+    role_to_total_mu: dict[PSRL_Role, float]
 
 
 class ThroughputProfileLoader:
@@ -127,8 +124,8 @@ class ThroughputProfileLoader:
         return max(float(fallback_mu), 0.0)
 
     @staticmethod
-    def _resolve_new_schema_entry(payload: dict, signal: InstanceSignal, role_key: str) -> dict | None:
-        role_section = payload.get("roles", {}).get(role_key, {})
+    def _resolve_new_schema_entry(payload: dict, signal: InstanceSignal, role_name: PSRL_Role) -> dict | None:
+        role_section = payload.get("roles", {}).get(role_name, {})
         model_section = role_section.get(signal.model_name, {})
         if not model_section:
             return None
@@ -177,12 +174,11 @@ class ThroughputProfileLoader:
         if formula_mu is not None:
             return formula_mu
 
-        role_key = _role_name_to_str(signal.role_name)
         new_schema_path = self.profile_paths.get(signal.model_name)
         if new_schema_path:
             payload = self._load_json(new_schema_path)
             if payload:
-                entry = self._resolve_new_schema_entry(payload, signal, role_key)
+                entry = self._resolve_new_schema_entry(payload, signal, signal.role_name)
                 if entry:
                     mu = self._lookup_throughput_from_table(entry, signal)
                     if mu is not None:
@@ -262,17 +258,49 @@ class ScalingPolicy:
         return (datetime.now() - dt).total_seconds() > max_staleness_seconds
 
     @staticmethod
-    def _get_role_name(role_name: Any) -> str:
-        return _role_name_to_str(role_name)
+    def _pre_sleep_other_if_colocated(
+        wake: InstanceSignal, victim: InstanceSignal
+    ) -> list[dict[str, Any]] | None:
+        """If wake target shares GPUs with ``victim``, hint executor to pre-sleep ``victim``.
+
+        When either side lacks ``bundle_keys``, returns None so ElasticExecutor keeps KV ordering.
+        """
+        if not wake.bundle_keys or not victim.bundle_keys:
+            return None
+        if not wake.bundle_keys.intersection(victim.bundle_keys):
+            return None
+        return [
+            {
+                "role_name": victim.role_name,
+                "model_name": victim.model_name,
+                "instance_id": int(victim.instance_id),
+            }
+        ]
 
     @staticmethod
-    def _group_by_role(signals: list[InstanceSignal]) -> dict[str, list[InstanceSignal]]:
-        grouped: dict[str, list[InstanceSignal]] = {}
+    def _group_by_role(signals: list[InstanceSignal]) -> dict[PSRL_Role, list[InstanceSignal]]:
+        """
+        Group the signals by role.
+        Args:
+            signals: list[InstanceSignal]
+        Returns:
+            dict[PSRL_Role, list[InstanceSignal]]:
+                - grouped: {role_name: [signal]}
+        """
+        grouped: dict[PSRL_Role, list[InstanceSignal]] = {}
         for signal in signals:
-            grouped.setdefault(ScalingPolicy._get_role_name(signal.role_name), []).append(signal)
+            grouped.setdefault(signal.role_name, []).append(signal)
         return grouped
 
-    def _estimate_lambda(self, signals: list[InstanceSignal], role_to_total_mu: dict[str, float]) -> float:
+    def _estimate_lambda(self, signals: list[InstanceSignal], role_to_total_mu: dict[PSRL_Role, float]) -> float:
+        """
+        Estimate the lambda for the given signals and role_to_total_mu.
+        Args:
+            signals: list[InstanceSignal]
+            role_to_total_mu: dict[PSRL_Role, float]
+        Returns:
+            float: the estimated lambda
+        """
         now = time.time()
         elapsed = max(now - self._last_lambda_time, 1e-6)
         current_total_queue = sum(s.running_queue_num + s.waiting_queue_num for s in signals if s.is_awaken)
@@ -286,16 +314,25 @@ class ScalingPolicy:
 
     def _build_mu_maps(
         self, signals: list[InstanceSignal]
-    ) -> tuple[dict[tuple[str, str, int], float], dict[str, float]]:
-        instance_mu: dict[tuple[str, str, int], float] = {}
-        role_total_mu: dict[str, float] = {}
+    ) -> tuple[dict[tuple[PSRL_Role, str, int], float], dict[PSRL_Role, float]]:
+        """
+        Build the mu maps for the given signals.
+        Args:
+            signals: list[InstanceSignal]
+        Returns:
+            tuple[dict[tuple[PSRL_Role, str, int], float], dict[PSRL_Role, float]]:
+                - instance_mu: {(role, model_name, instance_id): mu}
+                - role_total_mu: {role: total_mu}
+        """
+        instance_mu: dict[tuple[PSRL_Role, str, int], float] = {}
+        role_total_mu: dict[PSRL_Role, float] = {}
         for signal in signals:
             mu = self.profile_loader.estimate_instance_mu(signal)
-            role_name = self._get_role_name(signal.role_name)
-            key = (role_name, signal.model_name, signal.instance_id)
+            role = signal.role_name
+            key = (role, signal.model_name, signal.instance_id)
             instance_mu[key] = mu
             if signal.is_awaken:
-                role_total_mu[role_name] = role_total_mu.get(role_name, 0.0) + mu
+                role_total_mu[role] = role_total_mu.get(role, 0.0) + mu
         return instance_mu, role_total_mu
 
     def _estimate_role_total_mu_with_rebalance(
@@ -354,7 +391,7 @@ class ScalingPolicy:
     def _pick_scale_down_candidate(
         self,
         role_signals: list[InstanceSignal],
-        instance_mu: dict[tuple[str, str, int], float],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
         """Spontaneous shrink: only cede when KV is already low (below ``theta_low``).
 
@@ -370,7 +407,7 @@ class ScalingPolicy:
         cede_candidates.sort(
             key=lambda s: (
                 s.kv_cache_utilization,
-                instance_mu.get((self._get_role_name(s.role_name), s.model_name, s.instance_id), 0.0),
+                instance_mu.get((s.role_name, s.model_name, s.instance_id), 0.0),
             )
         )
         return cede_candidates[0]
@@ -378,7 +415,7 @@ class ScalingPolicy:
     def _pick_scale_down_candidate_for_bottleneck_transfer(
         self,
         role_signals: list[InstanceSignal],
-        instance_mu: dict[tuple[str, str, int], float],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
         """Pick which awake instance to sleep when *both* roles are full-load (Priority 2).
 
@@ -392,7 +429,7 @@ class ScalingPolicy:
         awaken_sorted = sorted(
             awaken,
             key=lambda s: (
-                instance_mu.get((self._get_role_name(s.role_name), s.model_name, s.instance_id), 0.0),
+                instance_mu.get((s.role_name, s.model_name, s.instance_id), 0.0),
                 s.kv_cache_utilization,
             ),
         )
@@ -401,52 +438,112 @@ class ScalingPolicy:
     def _pick_scale_up_candidate(
         self,
         role_signals: list[InstanceSignal],
-        instance_mu: dict[tuple[str, str, int], float],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
         asleep = [s for s in role_signals if not s.is_awaken]
         if not asleep:
             return None
         asleep.sort(
-            key=lambda s: instance_mu.get((self._get_role_name(s.role_name), s.model_name, s.instance_id), 0.0),
+            key=lambda s: instance_mu.get((s.role_name, s.model_name, s.instance_id), 0.0),
             reverse=True,
         )
         return asleep[0]
+
+    def _pick_scale_up_candidate_by_force(
+        self,
+        role_signals: list[InstanceSignal],
+        other_role_signals: list[InstanceSignal],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
+    ) -> tuple[InstanceSignal, InstanceSignal | None] | None:
+        """Pick (wake_target, optional other_role_sleep_victim) for router force_wake.
+
+        Prefer a GPU where the other role has no awake instance (reuse free-GPU logic);
+        then ``other_role_sleep_victim`` is None and the executor keeps its KV-based pick.
+
+        Else walk other-role awake replicas in ascending ``kv_cache_utilization`` and pick
+        the highest-``mu`` asleep backlog instance that shares ``bundle_keys`` with that victim;
+        return that victim as ``other_role_sleep_victim`` so the executor pre-sleeps the
+        same instance the policy assumed.
+
+        If no GPU mapping / no colocation, fall back to global highest-``mu`` asleep
+        candidate with victim None.
+        """
+        asleep = [s for s in role_signals if not s.is_awaken]
+        if not asleep:
+            return None
+
+        free = self._pick_scale_up_candidate_on_free_gpu(
+            role_signals, other_role_signals, instance_mu
+        )
+        if free is not None:
+            return (free, None)
+
+        other_awaken = [s for s in other_role_signals if s.is_awaken]
+        if len(other_awaken) <= self.min_awake_per_role:
+            wake = self._pick_scale_up_candidate(role_signals, instance_mu)
+            return (wake, None) if wake is not None else None
+
+        victims_sorted = sorted(
+            other_awaken,
+            key=lambda s: (s.kv_cache_utilization, s.instance_id),
+        )
+
+        def _mu(s: InstanceSignal) -> float:
+            return instance_mu.get(
+                (s.role_name, s.model_name, s.instance_id), 0.0
+            )
+
+        for victim in victims_sorted:
+            if not victim.bundle_keys:
+                continue
+            sharing = [
+                s
+                for s in asleep
+                if s.bundle_keys and s.bundle_keys.intersection(victim.bundle_keys)
+            ]
+            if not sharing:
+                continue
+            sharing.sort(key=_mu, reverse=True)
+            return (sharing[0], victim)
+
+        wake_fb = self._pick_scale_up_candidate(role_signals, instance_mu)
+        return (wake_fb, None) if wake_fb is not None else None
 
     def _pick_scale_up_candidate_on_free_gpu(
         self,
         full_role_signals: list[InstanceSignal],
         other_role_signals: list[InstanceSignal],
-        instance_mu: dict[tuple[str, str, int], float],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
         """Among asleep instances of the full-load role, return the best one whose
         GPUs are completely free of any awake instance from the other role.
 
-        "Free" means: the candidate's gpu_keys have no intersection with the gpu_keys
-        of any currently awake other-role instance.  Candidates with unknown GPU
-        mapping (gpu_keys is None or empty) are skipped — we can't guarantee they are
+        "Free" means: the candidate's bundle_keys have no intersection with the bundle_keys
+        of any currently awake other-role instance.  Candidates with unknown bundle
+        mapping (bundle_keys is None or empty) are skipped — we can't guarantee they are
         free, so we won't take the risk of double-occupancy.
 
         Returns the highest-mu free candidate, or None if no such instance exists.
         """
-        other_awake_gpu_keys: set = set()
+        other_awake_bundle_keys: set[int] = set()
         for s in other_role_signals:
-            if s.is_awaken and s.gpu_keys:
-                other_awake_gpu_keys.update(s.gpu_keys)
+            if s.is_awaken and s.bundle_keys:
+                other_awake_bundle_keys.update(s.bundle_keys)
 
         free_candidates: list[InstanceSignal] = []
         for s in full_role_signals:
             if s.is_awaken:
                 continue
-            if not s.gpu_keys:
+            if not s.bundle_keys:
                 continue
-            if not s.gpu_keys.intersection(other_awake_gpu_keys):
+            if not s.bundle_keys.intersection(other_awake_bundle_keys):
                 free_candidates.append(s)
 
         if not free_candidates:
             return None
         free_candidates.sort(
             key=lambda s: instance_mu.get(
-                (self._get_role_name(s.role_name), s.model_name, s.instance_id), 0.0
+                (s.role_name, s.model_name, s.instance_id), 0.0
             ),
             reverse=True,
         )
@@ -536,13 +633,13 @@ class ScalingPolicy:
 
     def _make_stepwise_decision(
         self,
-        grouped: dict[str, list[InstanceSignal]],
-        instance_mu: dict[tuple[str, str, int], float],
-        role_total_mu: dict[str, float],
+        grouped: dict[PSRL_Role, list[InstanceSignal]],
+        instance_mu: dict[tuple[PSRL_Role, str, int], float],
+        role_total_mu: dict[PSRL_Role, float],
         trainer_waiting_hint: dict[str, Any] | None = None,
     ) -> tuple[list[ScalingAction], str]:
-        rollout_role = "Rollout"
-        rm_role = "RewardModel"
+        rollout_role = PSRL_Role.Rollout
+        rm_role = PSRL_Role.RewardModel
         rollout_signals = grouped.get(rollout_role, [])
         rm_signals = grouped.get(rm_role, [])
         if not rollout_signals or not rm_signals:
@@ -660,7 +757,7 @@ class ScalingPolicy:
             )
             return actions, "trainer_idle_waiting_reward"
 
-        # ── Priority 1 (new) ──────────────────────────────────────────────────────
+        # ── Priority 1  ──────────────────────────────────────────────────────────
         # Applies when EXACTLY one side is full.
         # Step A: try to wake an instance of the full side on a GPU that is
         #         completely idle for the other side (no scale_down needed).
@@ -704,6 +801,7 @@ class ScalingPolicy:
                 return actions, "rm_full_free_gpu_scale_up"
             # Step B: fall back — cede a low-load Rollout instance
             if rm_up is not None and rollout_down is not None:
+                pre_sleep = self._pre_sleep_other_if_colocated(rm_up, rollout_down)
                 actions.append(
                     ScalingAction(
                         action_type="scale_up",
@@ -711,6 +809,7 @@ class ScalingPolicy:
                         model_name=rm_up.model_name,
                         preferred_instance_ids=[rm_up.instance_id],
                         reason="rm_full_rollout_cede_transfer",
+                        pre_sleep_other_preferred=pre_sleep,
                     )
                 )
                 self._policy_log(
@@ -722,6 +821,7 @@ class ScalingPolicy:
                     outcome="action",
                     policy_branch="p1_transfer_rollout_to_rm",
                     reason="transfer_rollout_to_rm",
+                    pre_sleep_other=pre_sleep,
                 )
                 return actions, "transfer_rollout_to_rm"
 
@@ -751,6 +851,7 @@ class ScalingPolicy:
                 return actions, "rollout_full_free_gpu_scale_up"
             # Step B: fall back — cede a low-load RM instance
             if rollout_up is not None and rm_down is not None:
+                pre_sleep = self._pre_sleep_other_if_colocated(rollout_up, rm_down)
                 actions.append(
                     ScalingAction(
                         action_type="scale_up",
@@ -758,6 +859,7 @@ class ScalingPolicy:
                         model_name=rollout_up.model_name,
                         preferred_instance_ids=[rollout_up.instance_id],
                         reason="rollout_full_rm_cede_transfer",
+                        pre_sleep_other_preferred=pre_sleep,
                     )
                 )
                 self._policy_log(
@@ -769,6 +871,7 @@ class ScalingPolicy:
                     outcome="action",
                     policy_branch="p1_transfer_rm_to_rollout",
                     reason="transfer_rm_to_rollout",
+                    pre_sleep_other=pre_sleep,
                 )
                 return actions, "transfer_rm_to_rollout"
 
@@ -805,6 +908,7 @@ class ScalingPolicy:
             )
             if rollout_mu >= 0 and rm_mu >= 0:
                 bottleneck_after = min(rollout_mu, rm_mu)
+                pre_sleep = self._pre_sleep_other_if_colocated(rm_up, rollout_down_xfer)
                 transfer_candidates.append(
                     (
                         bottleneck_after - bottleneck_before,
@@ -814,6 +918,7 @@ class ScalingPolicy:
                             model_name=rm_up.model_name,
                             preferred_instance_ids=[rm_up.instance_id],
                             reason="optimize_bottleneck_rollout_to_rm",
+                            pre_sleep_other_preferred=pre_sleep,
                         ),
                         "optimize_rollout_to_rm",
                     )
@@ -839,6 +944,7 @@ class ScalingPolicy:
             )
             if rollout_mu >= 0 and rm_mu >= 0:
                 bottleneck_after = min(rollout_mu, rm_mu)
+                pre_sleep = self._pre_sleep_other_if_colocated(rollout_up, rm_down_xfer)
                 transfer_candidates.append(
                     (
                         bottleneck_after - bottleneck_before,
@@ -848,6 +954,7 @@ class ScalingPolicy:
                             model_name=rollout_up.model_name,
                             preferred_instance_ids=[rollout_up.instance_id],
                             reason="optimize_bottleneck_rm_to_rollout",
+                            pre_sleep_other_preferred=pre_sleep,
                         ),
                         "optimize_rm_to_rollout",
                     )
@@ -969,15 +1076,42 @@ class ScalingPolicy:
         self,
         signals: list[InstanceSignal],
         execution_in_progress: bool = False,
-        router_backlog_by_role: dict[str, int] | None = None,
+        router_backlog_by_role: dict[PSRL_Role, int] | None = None,
         trainer_waiting_hint: dict[str, Any] | None = None,
+        pending_scale_up_by_role: dict[PSRL_Role, int] | None = None,
     ) -> ScalingDecision:
+        """
+        Decide the scaling actions for the given signals.
+
+        Args:
+            signals: Per-instance snapshots (queues, utilization, awake/asleep, model
+                metadata, etc.), usually assembled by ElasticMonitor from coordinators.
+            execution_in_progress: True while ElasticExecutor is still executing a prior
+                decision (SLEEP/WAKE_UP/ABORT).
+            router_backlog_by_role: Pending request counts at the router, keyed by
+                ``PSRL_Role``. Drives force-wake when a role has router backlog but no
+                awaken instance (and no in-flight wake). Treated as empty when None.
+            trainer_waiting_hint: Trainer-side view for Priority -1. Expected keys include
+                ``trainer_busy`` (bool), ``waiting_on`` (e.g. ``"rollout"``,
+                ``"reward"``, ``"none"``), and ``breakdown`` with ``pending_total``
+                to bias scale-up toward the bottleneck when the trainer is idle but work
+                remains. Treated as empty when None.
+            pending_scale_up_by_role: In-flight scale-up counts per role from ElasticExecutor
+                (queued handlers not yet finished). Suppresses duplicate force-wake while a
+                wakeup RPC is already pending.
+
+        Returns:
+            ScalingDecision with actions (if any), reason string, ``estimated_lambda``,
+            and ``role_to_total_mu`` for logging and telemetry.
+        """
         if not self.enable:
             self._policy_log("decision", outcome="skipped", reason="policy_disabled")
             return ScalingDecision(actions=[], reason="policy_disabled", estimated_lambda=0.0, role_to_total_mu={})
         if not signals:
             self._policy_log("decision", outcome="skipped", reason="empty_signals")
             return ScalingDecision(actions=[], reason="empty_signals", estimated_lambda=0.0, role_to_total_mu={})
+        
+        # HIGHEST RULE: Must guarantee that any decision's execution is an ATOMIC operation.
         if execution_in_progress:
             self._policy_log("decision", outcome="skipped", reason="decision_execution_in_progress")
             return ScalingDecision(
@@ -987,33 +1121,30 @@ class ScalingPolicy:
                 role_to_total_mu={},
             )
 
-        now_ms = time.time() * 1000
-        if now_ms - self.last_action_time_ms < self.cooldown_ms:
-            remain = self.cooldown_ms - (now_ms - self.last_action_time_ms)
-            self._policy_log(
-                "decision",
-                cooldown_remaining_ms=remain,
-                outcome="skipped",
-                reason="cooldown",
-            )
-            return ScalingDecision(actions=[], reason="cooldown", estimated_lambda=0.0, role_to_total_mu={})
-
         grouped = self._group_by_role(signals)
         instance_mu, role_total_mu = self._build_mu_maps(signals)
         estimated_lambda = self._estimate_lambda(signals, role_total_mu)
 
         # Hard guarantee: if one role has zero awaken instances but router backlog exists,
-        # force wake one instance for that role. Must run *before* the all-signals-stale guard:
-        # asleep engines often have no fresh snapshot timestamps, which would otherwise skip this.
+        # force wake one instance for that role
+        now_ms = time.time() * 1000
         backlog_map = router_backlog_by_role or {}
+        pending_up = pending_scale_up_by_role or {}
         for role_name, role_signals in grouped.items():
             awaken_cnt = sum(1 for s in role_signals if s.is_awaken)
             backlog_cnt = int(backlog_map.get(role_name, 0))
             if awaken_cnt > 0 or backlog_cnt <= 0:
                 continue
-            force_up = self._pick_scale_up_candidate(role_signals, instance_mu)
-            if force_up is None:
-                r = f"force_wake_needed_but_no_asleep_candidate_{role_name}_backlog_{backlog_cnt}"
+            if int(pending_up.get(role_name, 0)) > 0:
+                continue
+            other_role = PSRL_Role.RewardModel if role_name == PSRL_Role.Rollout else PSRL_Role.Rollout
+            other_signals = grouped.get(other_role, [])
+            force_pair = self._pick_scale_up_candidate_by_force(
+                role_signals, other_signals, instance_mu
+            )
+            role_tag = role_name.name
+            if force_pair is None:
+                r = f"force_wake_needed_but_no_candidate_{role_tag}_backlog_{backlog_cnt}"
                 self._policy_log(
                     "decision",
                     backlog_cnt=backlog_cnt,
@@ -1027,8 +1158,18 @@ class ScalingPolicy:
                     estimated_lambda=estimated_lambda,
                     role_to_total_mu=role_total_mu,
                 )
+            force_up, sleep_victim = force_pair
+            pre_sleep: list[dict[str, Any]] | None = None
+            if sleep_victim is not None:
+                pre_sleep = [
+                    {
+                        "role_name": sleep_victim.role_name,
+                        "model_name": sleep_victim.model_name,
+                        "instance_id": int(sleep_victim.instance_id),
+                    }
+                ]
             self.last_action_time_ms = now_ms
-            fw_reason = f"force_wake_{role_name}_backlog_{backlog_cnt}"
+            fw_reason = f"force_wake_{role_tag}_backlog_{backlog_cnt}"
             self._policy_log(
                 "decision",
                 action="scale_up",
@@ -1039,6 +1180,7 @@ class ScalingPolicy:
                 policy_branch="force_wake_backlog",
                 reason=fw_reason,
                 role_name=role_name,
+                pre_sleep_other=pre_sleep,
             )
             return ScalingDecision(
                 actions=[
@@ -1047,7 +1189,8 @@ class ScalingPolicy:
                         role_name=force_up.role_name,
                         model_name=force_up.model_name,
                         preferred_instance_ids=[force_up.instance_id],
-                        reason=f"force_wake_from_router_backlog_{role_name}_{backlog_cnt}",
+                        reason=f"force_wake_from_router_backlog_{role_tag}_{backlog_cnt}",
+                        pre_sleep_other_preferred=pre_sleep,
                     )
                 ],
                 reason=fw_reason,
@@ -1055,7 +1198,18 @@ class ScalingPolicy:
                 role_to_total_mu=role_total_mu,
             )
 
+        if now_ms - self.last_action_time_ms < self.cooldown_ms:
+            remain = self.cooldown_ms - (now_ms - self.last_action_time_ms)
+            self._policy_log(
+                "decision",
+                cooldown_remaining_ms=remain,
+                outcome="skipped",
+                reason="cooldown",
+            )
+            return ScalingDecision(actions=[], reason="cooldown", estimated_lambda=0.0, role_to_total_mu={})
+
         # Safety guard: skip aggressive scale decisions when snapshots are stale.
+        # all signals are unreliable, so we skip the decision.
         stale_count = 0
         for signal in signals:
             snapshot = {"timestamp": signal.snapshot_timestamp}
@@ -1069,6 +1223,7 @@ class ScalingPolicy:
                 stale_count=stale_count,
             )
             return ScalingDecision(actions=[], reason="all_signals_stale", estimated_lambda=0.0, role_to_total_mu={})
+        
         actions, reason = self._make_stepwise_decision(
             grouped,
             instance_mu,

@@ -527,7 +527,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         output: DataProto = data
 
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
-            assert not self.config.reward_model.launch_reward_fn_async, (
+            assert not self.config.reward_models_config.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."
             )
             self.trajectory.reward = np.sum([self.compute_step_reward(step) for step in self.trajectory.steps])
@@ -537,7 +537,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             output = self._post_process_and_merge_reward(reward_result, data)
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
             reward_result = await self.reward_manager.compute_score.remote(data)
-            if not self.config.reward_model.launch_reward_fn_async:
+            if not self.config.reward_models_config.launch_reward_fn_async:
                 output = self._post_process_and_merge_reward(reward_result, data)
         else:
             raise ValueError(
@@ -571,14 +571,34 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
         rewards = []
         reward_extra_infos = []
+        reward_metrics = []
+        rm_generated_token_nums = []
         for request_id in request_ids:
             assert request_id in reward_result, f"Missing reward result for request ID: {request_id}"
             result = reward_result[request_id]
             rewards.append(result["reward_score"])
             extra_info = result.get("reward_extra_info", {})
             reward_extra_infos.append(extra_info)
+            reward_metrics.append(result.get("reward_metrics", {}))
+            rm_generated_token_num = 0
+            if isinstance(extra_info, dict):
+                stack = [extra_info]
+                while stack:
+                    current_info = stack.pop()
+                    for key, value in current_info.items():
+                        if key == "rm_output_len" and isinstance(value, (int, float, np.integer, np.floating)):
+                            rm_generated_token_num += int(value)
+                        elif isinstance(value, dict):
+                            stack.append(value)
+                        elif isinstance(value, list):
+                            for item in value:
+                                if isinstance(item, dict):
+                                    stack.append(item)
+            rm_generated_token_nums.append(rm_generated_token_num)
         outputs.non_tensor_batch["reward_scores"] = np.array(rewards)
         outputs.non_tensor_batch["reward_extra_infos"] = np.array(reward_extra_infos, dtype=object)
+        outputs.non_tensor_batch["reward_metrics"] = np.array(reward_metrics, dtype=object)
+        outputs.non_tensor_batch["rm_generated_token_num"] = np.array(rm_generated_token_nums, dtype=np.int64)
         return outputs
 
     @classmethod

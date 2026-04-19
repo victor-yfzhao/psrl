@@ -117,7 +117,9 @@ class PSRL_GenWorker(Worker):
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
-            env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
+            # TODO(zyf): fix this problem
+            local_ids = [x % 8 for x in bundle_indices]
+            env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, local_ids))
             env_vars["WORLD_SIZE"] = str(len(bundle_indices))
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
@@ -358,6 +360,7 @@ class PSRL_GenWorker(Worker):
         psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
         interrupted_request_num = await self.interrupt_generation()
         psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
+        
         await self.rollout.inference_engine.sleep(level=2)
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.

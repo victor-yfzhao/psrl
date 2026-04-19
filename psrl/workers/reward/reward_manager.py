@@ -422,7 +422,14 @@ class RewardManager(CommandExtension):
             Dict[int, dict]: Mapping from request IDs to normalized reward scores and extra info.
         """
         for request_id, reward in request_id_to_reward.items():
-            reward["reward_extra_info"]["data_source"] = self.request_id_to_data_source.pop(request_id)
+            reward_extra_info = reward.get("reward_extra_info", {})
+            if not isinstance(reward_extra_info, dict):
+                reward_extra_info = {}
+            reward["reward_extra_info"] = reward_extra_info
+            reward_extra_info["data_source"] = self.request_id_to_data_source.pop(request_id)
+            # Keep an always-available unnormalized scalar for trainer-side metrics,
+            # regardless of whether reward normalization is enabled.
+            reward_extra_info["original_reward_score"] = reward["reward_score"]
         if self.reward_normalization != "batch" and self.reward_normalization != "group":
             return request_id_to_reward
         
@@ -431,7 +438,6 @@ class RewardManager(CommandExtension):
         original_rewards = {}
         for request_id, reward in request_id_to_reward.items():
             reward_value = reward["reward_score"]
-            reward["reward_extra_info"]["original_reward_score"] = reward_value
             original_rewards[request_id] = reward
             
             group_id = self.request_id_to_group[request_id]
@@ -574,16 +580,28 @@ class RewardManager(CommandExtension):
                         # result = await self.reward_loop.run_single(reward_input)
                         # result = await reward_loop.run_single(reward_input)
 
-                        # TODO(zyf): need to support batchify reward computation for sync mode
-                        reward_score = 0.0
-                        reward_extra_info_dict = {}
-                        for reward_loop, reward_coef, reward_loop_key in zip(reward_loops, reward_coefs, reward_loops_keys):
-                            result = await reward_loop.run_single(reward_input)
-                            reward_score += result * reward_coef
-                            reward_extra_info_dict[reward_loop_key] = result["reward_extra_info"]
+                        singles = await asyncio.gather(
+                            *[
+                                asyncio.create_task(reward_loop.run_single(reward_input))
+                                for reward_loop in reward_loops
+                            ]
+                        )
+                        reward_score = sum(
+                            single["reward_score"] * reward_coef
+                            for single, reward_coef in zip(singles, reward_coefs)
+                        )
+                        reward_extra_info_dict = {
+                            reward_loop_key: single["reward_extra_info"]
+                            for reward_loop_key, single in zip(reward_loops_keys, singles)
+                        }
+                        reward_metrics_dict = {
+                            reward_loop_key: single.get("reward_metrics", {})
+                            for reward_loop_key, single in zip(reward_loops_keys, singles)
+                        }
                         result = {
                             "reward_score": reward_score,
-                            "reward_extra_info": reward_extra_info_dict
+                            "reward_extra_info": reward_extra_info_dict,
+                            "reward_metrics": reward_metrics_dict,
                         }
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(

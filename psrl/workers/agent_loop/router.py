@@ -30,7 +30,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote(concurrency_groups={"control": 1})
+@ray.remote(concurrency_groups={"control": 10, "monitor": 1})
 class RolloutRouter:
     def __init__(
         self,
@@ -602,7 +602,7 @@ class RolloutRouter:
         """Check if the router is currently routing requests."""
         return self._is_routing
 
-    @ray.method(concurrency_group="control")
+    @ray.method(concurrency_group="monitor")
     def get_pending_request_count(self) -> int:
         """Return current number of requests waiting in router queue."""
         t0 = time.monotonic()

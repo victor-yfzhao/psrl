@@ -152,6 +152,9 @@ class PSRL_RayPPOTrainer:
         # Elastic rm
         self.elastic_rm_mode = config.psrl.deployment.elastic_rm.enable
         self.elastic_executor = None
+        # Filled in init_workers when elastic_rm_mode: SubRayResourcePool bundle ranges [start, end) per instance.
+        self._elastic_bundle_range_by_rollout_instance: list[tuple[int, int]] | None = None
+        self._elastic_bundle_range_by_reward_model: dict[str, list[tuple[int, int]]] | None = None
 
         # Rollout gateway handle
         self.rollout_gateway = None
@@ -662,39 +665,36 @@ class PSRL_RayPPOTrainer:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
 
     @staticmethod
-    def _collect_instance_gpu_mapping(worker_group) -> tuple[list[int], str | None]:
-        gpu_ids_nested = worker_group.execute_all_sync("get_runtime_gpu_ids")
-        node_ids = worker_group.execute_all_sync("get_node_id")
-        gpu_ids = sorted({int(gpu_id) for ids in gpu_ids_nested for gpu_id in ids})
-        node_id = node_ids[0] if node_ids else None
-        return gpu_ids, node_id
-
-    @staticmethod
-    def _build_gpu_keys(node_id: str | None, gpu_ids: list[int]) -> set[tuple[str | None, int]]:
-        return {(node_id, int(gpu_id)) for gpu_id in gpu_ids}
-
-    @staticmethod
     def _select_non_conflicting_awake_ids(
-        instance_to_gpu_keys: dict[int, set[tuple[str | None, int]]],
+        instance_to_bundle_indices: dict[int, set[int]],
         target_awake_num: int,
-        occupied_gpu_keys: set[tuple[str | None, int]],
+        occupied_bundle_indices: set[int],
         min_awake_num: int = 1,
-    ) -> tuple[list[int], set[tuple[str | None, int]]]:
+    ) -> tuple[list[int], set[int]]:
+        """Pick instance ids whose placement bundles do not overlap ``occupied_bundle_indices`` (elastic RM PG)."""
+        n_target = int(target_awake_num)
+        if n_target <= 0:
+            if min_awake_num > 0:
+                raise RuntimeError(
+                    "Cannot select non-conflicting awake instances: target_awake_num<=0 but "
+                    f"min_awake_num={min_awake_num} is positive."
+                )
+            return [], occupied_bundle_indices
         selected_ids: list[int] = []
-        for instance_id in sorted(instance_to_gpu_keys.keys()):
-            gpu_keys = instance_to_gpu_keys[instance_id]
-            if not gpu_keys.isdisjoint(occupied_gpu_keys):
+        for instance_id in sorted(instance_to_bundle_indices.keys()):
+            bundle_indices = instance_to_bundle_indices[instance_id]
+            if not bundle_indices.isdisjoint(occupied_bundle_indices):
                 continue
             selected_ids.append(instance_id)
-            occupied_gpu_keys.update(gpu_keys)
-            if len(selected_ids) >= target_awake_num:
+            occupied_bundle_indices.update(bundle_indices)
+            if len(selected_ids) >= n_target:
                 break
         if len(selected_ids) < min_awake_num:
             raise RuntimeError(
                 "Cannot select non-conflicting awake instances "
-                f"(target={target_awake_num}, selected={len(selected_ids)}, min_required={min_awake_num})."
+                f"(target={n_target}, selected={len(selected_ids)}, min_required={min_awake_num})."
             )
-        return selected_ids, occupied_gpu_keys
+        return selected_ids, occupied_bundle_indices
 
     def _init_elastic_rm_runtime(self):
         if not self.elastic_rm_mode:
@@ -736,28 +736,32 @@ class PSRL_RayPPOTrainer:
                 "num_instances": rollout_instance_num,
             }
         ]
-        gpu_mappings = []
-        rollout_instance_to_gpu_keys: dict[int, set[tuple[str | None, int]]] = {}
-        for instance_id, rollout_wg in enumerate(self.rollout_wg_list):
-            gpu_ids, node_id = self._collect_instance_gpu_mapping(rollout_wg)
-            rollout_instance_to_gpu_keys[instance_id] = self._build_gpu_keys(node_id, gpu_ids)
-            gpu_mappings.append(
+        if self._elastic_bundle_range_by_rollout_instance is None or len(self._elastic_bundle_range_by_rollout_instance) != rollout_instance_num:
+            raise RuntimeError(
+                "Elastic_RM: bundle ranges for rollout instances are missing or mismatched; "
+                "expected init_workers to populate _elastic_bundle_range_by_rollout_instance."
+            )
+        bundle_mappings = []
+        rollout_instance_to_bundle_indices: dict[int, set[int]] = {}
+        for instance_id in range(rollout_instance_num):
+            br = self._elastic_bundle_range_by_rollout_instance[instance_id]
+            rollout_instance_to_bundle_indices[instance_id] = set(range(br[0], br[1]))
+            bundle_mappings.append(
                 {
                     "role_name": PSRL_Role.Rollout,
                     "model_name": rollout_model_name,
                     "instance_id": instance_id,
-                    "gpu_ids": gpu_ids,
-                    "node_id": node_id,
+                    "bundle_range": (br[0], br[1]),
                 }
             )
 
         psrl_logger.info(
-            "Elastic_RM: collected rollout GPU mappings (%d entries).",
-            len(gpu_mappings),
+            "Elastic_RM: collected rollout bundle mappings (%d entries).",
+            len(bundle_mappings),
         )
 
         reward_coordinators: dict[str, ray.actor.ActorHandle] = {}
-        reward_model_to_instance_gpu_keys: dict[str, dict[int, set[tuple[str | None, int]]]] = {}
+        reward_model_to_instance_bundle_indices: dict[str, dict[int, set[int]]] = {}
         for reward_model_name, manager in self.reward_model_manager_mapping.items():
             rm_instance_num = len(manager.reward_model_wg_list)
             rm_all_ids = list(range(rm_instance_num))
@@ -776,7 +780,7 @@ class PSRL_RayPPOTrainer:
             psrl_logger.info("Elastic_RM: reward model %s replicas slept.", reward_model_name)
 
             reward_coordinators[reward_model_name] = manager.reward_model_coordinator
-            reward_model_to_instance_gpu_keys[reward_model_name] = {}
+            reward_model_to_instance_bundle_indices[reward_model_name] = {}
             registrations.append(
                 {
                     "role_name": PSRL_Role.RewardModel,
@@ -784,37 +788,63 @@ class PSRL_RayPPOTrainer:
                     "num_instances": rm_instance_num,
                 }
             )
-            for instance_id, reward_wg in enumerate(manager.reward_model_wg_list):
-                gpu_ids, node_id = self._collect_instance_gpu_mapping(reward_wg)
-                reward_model_to_instance_gpu_keys[reward_model_name][instance_id] = self._build_gpu_keys(node_id, gpu_ids)
-                gpu_mappings.append(
+            rm_ranges = self._elastic_bundle_range_by_reward_model.get(reward_model_name)
+            if rm_ranges is None or len(rm_ranges) != rm_instance_num:
+                raise RuntimeError(
+                    f"Elastic_RM: bundle ranges for reward model {reward_model_name} are missing or "
+                    f"mismatched (expected {rm_instance_num} entries)."
+                )
+            for instance_id in range(rm_instance_num):
+                br = rm_ranges[instance_id]
+                reward_model_to_instance_bundle_indices[reward_model_name][instance_id] = set(range(br[0], br[1]))
+                bundle_mappings.append(
                     {
                         "role_name": PSRL_Role.RewardModel,
                         "model_name": reward_model_name,
                         "instance_id": instance_id,
-                        "gpu_ids": gpu_ids,
-                        "node_id": node_id,
+                        "bundle_range": (br[0], br[1]),
                     }
                 )
 
         psrl_logger.info(
-            "Elastic_RM: total GPU mapping entries (rollout + reward)=%d, registration_roles=%d.",
-            len(gpu_mappings),
+            "Elastic_RM: total instance bundle mapping entries (rollout + reward)=%d, registration_roles=%d.",
+            len(bundle_mappings),
             len(registrations),
         )
+        if self._elastic_bundle_range_by_rollout_instance is not None:
+            psrl_logger.info(
+                "Elastic_RM: per-instance placement bundles (shared elastic PG; global linear bundle indices, range [start, end)):"
+            )
+            for i, (b_start, b_end) in enumerate(self._elastic_bundle_range_by_rollout_instance):
+                psrl_logger.info(
+                    "Elastic_RM:   [Rollout] instance_id=%d bundle_range=[%d, %d)",
+                    i,
+                    b_start,
+                    b_end,
+                )
+            if self._elastic_bundle_range_by_reward_model:
+                for rm_name, ranges in self._elastic_bundle_range_by_reward_model.items():
+                    for i, (b_start, b_end) in enumerate(ranges):
+                        psrl_logger.info(
+                            "Elastic_RM:   [RewardModel] model=%s instance_id=%d bundle_range=[%d, %d)",
+                            rm_name,
+                            i,
+                            b_start,
+                            b_end,
+                        )
 
-        occupied_gpu_keys: set[tuple[str | None, int]] = set()
+        occupied_bundle_indices: set[int] = set()
         awaken_instances: list[dict] = []
         min_awake_per_role = max(0, int(self.config.psrl.deployment.elastic_rm.min_awake_per_role))
 
-        # Wake reward-model replicas first so each RM keeps at least one awake instance.
+        # Wake reward-model replicas first (up to min_awake_per_role per RM model; may be 0).
         for reward_model_name, manager in self.reward_model_manager_mapping.items():
             rm_instance_num = len(manager.reward_model_wg_list)
             rm_awake_num = max(min_awake_per_role, 0)
-            rm_awake_ids, occupied_gpu_keys = self._select_non_conflicting_awake_ids(
-                instance_to_gpu_keys=reward_model_to_instance_gpu_keys[reward_model_name],
+            rm_awake_ids, occupied_bundle_indices = self._select_non_conflicting_awake_ids(
+                instance_to_bundle_indices=reward_model_to_instance_bundle_indices[reward_model_name],
                 target_awake_num=rm_awake_num,
-                occupied_gpu_keys=occupied_gpu_keys,
+                occupied_bundle_indices=occupied_bundle_indices,
                 min_awake_num=min_awake_per_role if rm_instance_num > 0 else 0,
             )
             psrl_logger.info(
@@ -842,10 +872,10 @@ class PSRL_RayPPOTrainer:
             )
 
         rollout_awake_num = max(min_awake_per_role, rollout_instance_num)
-        awake_ids, occupied_gpu_keys = self._select_non_conflicting_awake_ids(
-            instance_to_gpu_keys=rollout_instance_to_gpu_keys,
+        awake_ids, occupied_bundle_indices = self._select_non_conflicting_awake_ids(
+            instance_to_bundle_indices=rollout_instance_to_bundle_indices,
             target_awake_num=rollout_awake_num,
-            occupied_gpu_keys=occupied_gpu_keys,
+            occupied_bundle_indices=occupied_bundle_indices,
             min_awake_num=min_awake_per_role if rollout_instance_num > 0 else 0,
         )
         psrl_logger.info(
@@ -893,13 +923,23 @@ class PSRL_RayPPOTrainer:
         ray.get(
             self.elastic_executor.initialize_runtime.remote(
                 registrations=registrations,
-                gpu_mappings=gpu_mappings,
+                bundle_mappings=bundle_mappings,
                 awaken_instances=awaken_instances,
             )
         )
         psrl_logger.info("Elastic_RM: ElasticExecutor.initialize_runtime done.")
         ray.get(self.elastic_executor.start_busy_loop.remote())
         psrl_logger.info("Elastic_RM: ElasticExecutor busy loop started; Elastic_RM runtime ready.")
+
+        # Wire ElasticExecutor into RolloutCoordinator so sync_with_ps can use swap-based sync.
+        ray.get(
+            self.rollout_coordinator.set_elastic_executor.remote(
+                self.elastic_executor,
+                PSRL_Role.Rollout,
+                rollout_model_name,
+            )
+        )
+        psrl_logger.info("Elastic_RM: ElasticExecutor wired into RolloutCoordinator for swap-based sync.")
 
     def init_reward_manager(self, validation: bool = False):
         """Initialize the reward manager for computing rewards during training."""
@@ -1312,7 +1352,7 @@ class PSRL_RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         elastic_shared_pool = None
-        elastic_subpool_group_idx = 0
+        elastic_subpool_group_idx_by_group: dict[str, int] = {}
 
         if self.elastic_rm_mode:
             elastic_shared_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, 0)
@@ -1325,12 +1365,17 @@ class PSRL_RayPPOTrainer:
                 list(elastic_shared_pool.store),
                 elastic_shared_pool.max_colocate_count,
             )
+            self._elastic_bundle_range_by_rollout_instance = []
+            self._elastic_bundle_range_by_reward_model = {}
 
         def _register_resource_pool(resource_pool):
             self.resource_pool_to_cls.setdefault(resource_pool, {})
 
-        def _build_elastic_sub_resource_pool(subgroup_world_size: int, tag: str) -> SubRayResourcePool:
-            nonlocal elastic_subpool_group_idx
+        def _build_elastic_sub_resource_pool(
+            subgroup_world_size: int,
+            tag: str,
+            group_key: str,
+        ) -> SubRayResourcePool:
             assert elastic_shared_pool is not None, "elastic_shared_pool must be initialized in elastic_rm_mode"
             if subgroup_world_size <= 0:
                 raise ValueError(f"subgroup_world_size must be > 0, but got {subgroup_world_size} ({tag})")
@@ -1341,15 +1386,15 @@ class PSRL_RayPPOTrainer:
                 )
 
             # SubRayResourcePool requires a contiguous bundle range [start, start + subgroup_world_size).
-            # We rotate start index to reduce collisions while allowing controlled oversubscription.
+            # Rotate by subgroup_world_size so different DP groups are spread across different
+            # bundle ranges first, then wrap around when oversubscribed.
+            group_idx = elastic_subpool_group_idx_by_group.get(group_key, 0)
             max_start = elastic_shared_pool.world_size - subgroup_world_size
             if max_start == 0:
                 start_bundle_index = 0
             else:
-                start_bundle_index = (
-                    elastic_subpool_group_idx * subgroup_world_size
-                ) % (max_start + 1)
-            elastic_subpool_group_idx += 1
+                start_bundle_index = (group_idx * subgroup_world_size) % (max_start + 1)
+            elastic_subpool_group_idx_by_group[group_key] = group_idx + 1
 
             sub_rp = SubRayResourcePool(
                 process_on_nodes=elastic_shared_pool.store,
@@ -1366,9 +1411,11 @@ class PSRL_RayPPOTrainer:
             end_bundle = start_bundle_index + subgroup_world_size
             pg_ids = [getattr(pg, "id", None) for pg in (elastic_shared_pool.pgs or [])]
             psrl_logger.info(
-                "Elastic SubRayResourcePool[%s]: type=%s name_prefix=%s subgroup_world_size=%d "
+                "Elastic SubRayResourcePool[%s]: group_key=%s group_idx=%d type=%s name_prefix=%s subgroup_world_size=%d "
                 "start_bundle_index=%d bundle_range=[%d, %d) shared_world_size=%d shared_store=%s pg_count=%s pg_ids=%s",
                 tag,
+                group_key,
+                group_idx,
                 type(sub_rp).__name__,
                 sub_rp.name_prefix,
                 subgroup_world_size,
@@ -1447,7 +1494,11 @@ class PSRL_RayPPOTrainer:
                 rollout_resource_pool = _build_elastic_sub_resource_pool(
                     subgroup_world_size=rollout_world_size,
                     tag=f"rollout_{i}",
+                    group_key="rollout",
                 )
+                sb = rollout_resource_pool.start_bundle_index
+                sw = rollout_resource_pool.subgroup_world_size
+                self._elastic_bundle_range_by_rollout_instance.append((sb, sb + sw))
             else:
                 rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
             _register_resource_pool(rollout_resource_pool)
@@ -1519,7 +1570,11 @@ class PSRL_RayPPOTrainer:
                     reward_model_resource_pool = _build_elastic_sub_resource_pool(
                         subgroup_world_size=reward_model_world_size,
                         tag=f"reward_model_{reward_model_name}_{i}",
+                        group_key="reward_model",
                     )
+                    sb = reward_model_resource_pool.start_bundle_index
+                    sw = reward_model_resource_pool.subgroup_world_size
+                    self._elastic_bundle_range_by_reward_model.setdefault(reward_model_name, []).append((sb, sb + sw))
                 else:
                     reward_model_resource_pool = self.resource_pool_manager.resource_pool_dict[f"reward_pool_{reward_model_name}_{i}"]
                 _register_resource_pool(reward_model_resource_pool)
@@ -2622,6 +2677,29 @@ class PSRL_RayPPOTrainer:
 
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                if not self.config.reward_models_config.launch_reward_fn_async:
+                    rm_generated_token_nums = batch.non_tensor_batch.get("rm_generated_token_num")
+                    if isinstance(rm_generated_token_nums, np.ndarray):
+                        rm_generated_token_nums = rm_generated_token_nums.tolist()
+                    global_token_num = batch.meta_info.get("global_token_num")
+                    if (
+                        isinstance(global_token_num, list)
+                        and isinstance(rm_generated_token_nums, list)
+                        and len(global_token_num) == len(rm_generated_token_nums)
+                    ):
+                        batch.meta_info["global_token_num"] = [
+                            int(token_num) + int(rm_token_num)
+                            for token_num, rm_token_num in zip(global_token_num, rm_generated_token_nums)
+                        ]
+                    elif rm_generated_token_nums is not None:
+                        psrl_logger.warning(
+                            "Skip merging reward model token count to global_token_num in sync mode due to shape mismatch: "
+                            "global_token_num=%s rm_generated_token_nums=%s",
+                            type(global_token_num),
+                            len(rm_generated_token_nums)
+                            if isinstance(rm_generated_token_nums, (list, tuple, np.ndarray))
+                            else type(rm_generated_token_nums),
+                        )
                 batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
 
                 # Operating Mode Selection:

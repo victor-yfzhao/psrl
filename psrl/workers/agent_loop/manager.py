@@ -448,6 +448,7 @@ class PSRL_AgentLoopManager:
         if not is_validate and not self.config.reward_models_config.launch_reward_fn_async:
             ## psrl_logger.info("Reward processing begin")
             scores = inputs.non_tensor_batch.pop("reward_scores", None).tolist()
+            reward_metrics = inputs.non_tensor_batch.pop("reward_metrics", None)
             prompt_length = prompt_ids.size(1)
             response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
@@ -463,7 +464,7 @@ class PSRL_AgentLoopManager:
             reward_extra_infos_dict = defaultdict(list)
             for reward_extra_info in reward_extra_infos:
                 for key, value in reward_extra_info.items():
-                    if key == "score" or key == "acc" or key == "data_source":
+                    if key in ("score", "acc", "data_source", "original_reward_score"):
                         if not isinstance(value, list):
                             value = [value]
                         reward_extra_infos_dict[key].extend(value)
@@ -471,6 +472,8 @@ class PSRL_AgentLoopManager:
 
             reward_extra_keys = list(reward_extra_infos_dict.keys())
             non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+            if reward_metrics is not None:
+                meta_info["reward_metrics"] = np.array(reward_metrics, dtype=object)
             meta_info["reward_extra_keys"] = reward_extra_keys
 
         ## psrl_logger.info("Return data proto")
@@ -836,7 +839,7 @@ class PSRL_AgentLoopManager:
                 if buffer_id is None:
                     continue
 
-                psrl_logger.debug(
+                psrl_logger.info(
                     f"Successfully occupied prompt {prompt_entry_info} into "
                     f"buffer {buffer_id} with occupy_num {occupy_num}."
                 )

@@ -103,6 +103,12 @@ class PSRL_RewardModelWorker(Worker):
             resources["num_gpus"] = 0
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
+            if bundle_indices is not None:
+                # TODO(zyf): fix this problem
+                local_ids = [x % 8 for x in bundle_indices]
+                env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, local_ids))
+                env_vars["WORLD_SIZE"] = str(len(bundle_indices))
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
         if config.rollout.disable_attn:
@@ -153,6 +159,7 @@ class PSRL_RewardModelWorker(Worker):
         # Async event management
         self._is_init_model = asyncio.Event()
         self._async_interrupt_event = asyncio.Event()
+        self._async_resume_event = asyncio.Event()
         
         self.request_num_queue = queue.Queue()
         self.request_id_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
@@ -204,6 +211,11 @@ class PSRL_RewardModelWorker(Worker):
     # @ray.method(concurrency_group="control")
     async def sleep(self):
         self._ensure_model_ready()
+
+        psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
+        interrupted_request_num = await self.interrupt_generation()
+        psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
+
         await self.rollout.inference_engine.sleep(level=1)
         psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} sleeping.")
 
@@ -212,6 +224,9 @@ class PSRL_RewardModelWorker(Worker):
         self._ensure_model_ready()
         await self.rollout.inference_engine.wake_up()
         psrl_logger.info(f"Reward model {self.reward_model_name} instance {self.instance_id} waking up.")
+
+        self.resume_generation()
+        psrl_logger.info(f"Resumed generation on instance {self.get_instance_id()}")
 
     def _build_rollout(self, trust_remote_code: bool = False) -> PSRL_vLLMRollout:
         """
@@ -457,17 +472,34 @@ class PSRL_RewardModelWorker(Worker):
         return len(request_tasks)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    # @ray.method(concurrency_group="control")
     async def interrupt_requests(self, request_ids):
         """Interrupt specific reward-model requests."""
         return await self._async_interrupt_requests(request_ids)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    # @ray.method(concurrency_group="control")
     async def interrupt_all_requests(self):
         """Interrupt all reward-model requests."""
         return await self._async_interrupt_requests()
-    
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def interrupt_generation(self):
+        """Interrupt reward-model generation: block new work, drain engine queue, join active tasks."""
+        self._async_interrupt_event.set()
+        self._async_resume_event.clear()
+
+        interrupted_request_num = await self.interrupt_all_requests()
+
+        await asyncio.gather(*self.active_tasks, return_exceptions=True)
+        self.active_tasks.clear()
+
+        return interrupted_request_num
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def resume_generation(self):
+        """Allow reward-model generation to proceed after interrupt_generation."""
+        self._async_resume_event.set()
+        self._async_interrupt_event.clear()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     # @ray.method(concurrency_group="control")
     def init_model(self):
@@ -482,11 +514,12 @@ class PSRL_RewardModelWorker(Worker):
         """
         self._ensure_model_ready()
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
-        
+
         if self._async_interrupt_event and self._async_interrupt_event.is_set():
-            psrl_logger.debug("Once generation is interrupted, we will not generate again")
-            return None
-        
+            psrl_logger.debug("Reward-model generation interrupted, waiting for resume...")
+            await self._async_resume_event.wait()
+            psrl_logger.debug("Reward-model generation resumed")
+
         request_id = int(request.non_tensor_batch["uid"][0])
         
         task = self._generate_loop.create_task(self._generate_async_task(request))

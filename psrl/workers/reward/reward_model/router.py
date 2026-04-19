@@ -15,7 +15,7 @@ from psrl.utils.logger import DualOutputHandler
 psrl_logger = logging.getLogger("reward_model_router")
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-@ray.remote(concurrency_groups={"control": 1})
+@ray.remote(concurrency_groups={"control": 5})
 class PSRL_RewardModelRouter:
     """
     Simple round-robin router for reward model replicas.

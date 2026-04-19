@@ -88,11 +88,21 @@ class PSRL_vLLMRollout:
 
         enable_return_routed_experts = config.get("enable_rollout_routing_replay", False)
 
-        # For model parallel, we only run the inference engine on the first rank.
-        # The inner parallel workers are handled by vLLM + Ray.
+        # For model parallel, we only run the inference engine on the first
+        # worker-group rank. This must align with upper-layer scheduling that
+        # uses execute_rank_zero_async()/workers[0] as the representative.
+        # Keep LOCAL_RANK as fallback for safety in non-standard env setup.
         if model_parallel_size > 1:
             import os
-            if os.environ.get("LOCAL_RANK") != "0":
+            print(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK')}")
+            print(f"RANK: {os.environ.get('RANK')}")
+            print(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
+            print(f"RAY_LOCAL_RANK: {os.environ.get('RAY_LOCAL_RANK')}")
+            print(f"RAY_WORLD_SIZE: {os.environ.get('RAY_WORLD_SIZE')}")
+            # owner_rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+            # if owner_rank != "0":
+
+            if os.environ.get("RANK") != "0":
                 self.inference_engine = None
                 return
 

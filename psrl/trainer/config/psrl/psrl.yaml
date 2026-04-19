@@ -69,6 +69,11 @@ deployment:
     # Whether to enable policy-based scaling decisions in ElasticExecutor monitor loop
     enable_policy: True
 
+    # Policy implementation variant:
+    # - normal: use ScalingPolicy (default)
+    # - dummy: use DummyScalingPolicy (free-GPU only, no preemption when busy)
+    scaling_policy_variant: normal
+
     # Monitor interval for elastic policy loop
     monitor_interval_ms: 1000
 
@@ -78,12 +83,25 @@ deployment:
 
     # Max seconds for each SLEEP/WAKE_UP/ABORT exec_command from ElasticExecutor to a coordinator.
     # Omit or 0 = wait indefinitely. When set, avoids pending stuck forever if a worker/router hangs.
-    coordinator_command_timeout_s: 300
+    # NOTE: must be generous enough to cover model load time (typically 20-30s) plus any queuing
+    # delay in the coordinator command handler.  60s was too aggressive and caused spurious timeouts.
+    coordinator_command_timeout_s: 180
+
+    # Optional Ray timeout (seconds) for compensate WAKE_UP after SLEEP/WAKE_UP times out or raises.
+    # Omit or null: use max(2 * coordinator_command_timeout_s, 180), or unlimited if primary is unlimited.
+    # coordinator_compensate_command_timeout_s: 600
 
     # Consecutive monitor ticks while policy is blocked by an unfinished scale decision; at this
     # count, clear local in-flight decision state so new scaling decisions can run. 0 = never abandon.
     # Rough wall time ≈ ticks * (monitor_interval_ms / 1000), e.g. 180 ticks @ 1000ms ≈ 3 minutes.
-    decision_execution_abandon_stall_ticks: 180
+    decision_execution_abandon_stall_ticks: 360
+
+    # Wake-up immunity window (ms): after an instance wakes up (or completes an in-place
+    # model sync), it is protected from being scaled down for this duration.
+    # Prevents the rapid sleep-wake oscillation that occurs when the scaling policy sees
+    # zero throughput on a freshly-woken or mid-sync instance and immediately scales it
+    # back down.  Set to 0 to disable.
+    wakeup_immunity_ms: 10000
 
     # KV cache utilization threshold below which an instance can cede resources
     theta_low: 0.1
@@ -398,7 +416,7 @@ buffer_post_process:
 colocate_validate_and_train: True
 
 # Whether to dispatch requests to both rollout and validate instances (when validate workers exist)
-fuse_rollout_with_validate: True
+fuse_rollout_with_validate: False
 
 # Whether to use torch_memory_saver (TMS) for GPU management
 tms:
