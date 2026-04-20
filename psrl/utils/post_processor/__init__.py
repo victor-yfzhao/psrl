@@ -6,6 +6,9 @@ from .base import (
     load_group_post_processor,
 )
 from .buffer_post_process import (
+    build_gigpo_step_auxiliary as BUFFER_build_gigpo_step_auxiliary,
+)
+from .buffer_post_process import (
     DynamicSamplingFilterProcessor as BUFFER_DynamicSamplingFilterProcessor,
 )
 from .buffer_post_process import (
@@ -31,5 +34,6 @@ __all__ = [
     "GROUP_NoFilterProcessor",
     "BUFFER_DynamicSamplingFilterProcessor",
     "BUFFER_GigpoStepMetadataProcessor",
+    "BUFFER_build_gigpo_step_auxiliary",
     "BUFFER_NoFilterProcessor",
 ]
