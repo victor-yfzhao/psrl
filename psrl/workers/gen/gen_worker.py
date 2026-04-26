@@ -70,6 +70,7 @@ class PSRL_GenWorker(Worker):
         num_gpus: int | float,
         dp_idx: int,
         bundle_indices: list[int],
+        role: str
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
         """
         Provides complete worker configuration (resource assignment, init args and environment variables)
@@ -128,23 +129,24 @@ class PSRL_GenWorker(Worker):
         # Please track https://github.com/pytorch/pytorch/issues/147851 for more infos.
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
 
-        # use tms for memory management of model weights and kv cache
-        if psrl_config.tms.range == "all" or psrl_config.tms.enable_nixl:
-            import torch_memory_saver  # noqa: F401
+        if role in ["rollout", "validate"]:
+            # use tms for memory management of model weights and kv cache
+            if psrl_config.tms.range == "all" or psrl_config.tms.enable_nixl:
+                import torch_memory_saver  # noqa: F401
 
-            dynlib_path = os.path.join(
-                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                "torch_memory_saver_hook_mode_preload.abi3.so",
-            )
-            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
-            env_vars["LD_PRELOAD"] = dynlib_path
-            env_vars["TMS_INIT_ENABLE"] = "0"
-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
+                dynlib_path = os.path.join(
+                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+                    "torch_memory_saver_hook_mode_preload.abi3.so",
+                )
+                assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+                env_vars["LD_PRELOAD"] = dynlib_path
+                env_vars["TMS_INIT_ENABLE"] = "0"
+                env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
 
-        if psrl_config.tms.enable_cuda_graph:
-            env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
-        elif psrl_config.tms.range == "all":
-            env_vars["PSRL_VLLM_PATCHES"] = "TMS"
+            if psrl_config.tms.enable_cuda_graph:
+                env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
+            elif psrl_config.tms.range == "all":
+                env_vars["PSRL_VLLM_PATCHES"] = "TMS"
 
         if config.rollout.disable_attn:
             warnings.warn(
@@ -161,18 +163,18 @@ class PSRL_GenWorker(Worker):
         role: str,
         psrl_config: DictConfig,
         gen_interface: GenInterface,
-        nixl_interface: NIXLInterface,
+        nixl_interface: NIXLInterface | None = None,
         **kwargs,
     ) -> None:
         """
-        Initialize the PSRL FSDP GenWorker.
+        Initialize the PSRL GenWorker.
 
         Args:
             config (DictConfig): The configuration for the worker.
-            role (str): The role of the worker (e.g., "gen").
+            role (str): The role of the worker (e.g., "rollout").
             psrl_config (DictConfig): The PSRL configuration.
             gen_interface (GenInterface): The interface for generation.
-            nixl_interface (NIXLInterface): The interface for NIXL storage.
+            nixl_interface (NIXLInterface | None): The interface for NIXL storage.
             **kwargs: Additional keyword arguments, including 'seed'.
         """
         super().__init__()
@@ -182,6 +184,8 @@ class PSRL_GenWorker(Worker):
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
+        self.reward_model_name = kwargs.get("reward_model_name", None)
+        self.instance_id = kwargs.get("instance_id", self.gen_interface.rollout_instance_id)
         self.instance_dist_group = None
 
         if self.psrl_config.redundant_rollout.enable:
@@ -244,7 +248,10 @@ class PSRL_GenWorker(Worker):
         # Build logger
         # Only the representative rank will build the logger
         if self.is_instance_representative_rank:
-            self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
+            if self.role == "reward":
+                self.log_prefix = f"RewardModelWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
+            else:
+                self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
             psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
@@ -360,15 +367,21 @@ class PSRL_GenWorker(Worker):
         psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
         interrupted_request_num = await self.interrupt_generation()
         psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
-        
-        await self.rollout.inference_engine.sleep(level=2)
-        if self.psrl_config.tms.range in ["rollout", "all"]:
+
+        sleep_level = 1 if self.role == "reward" else 2
+        await self.rollout.inference_engine.sleep(level=sleep_level)
+        if self.role != "reward" and self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.
             aggressive_empty_cache(force_sync=True)
 
     async def wake_up(self):
         """Wake up model weights."""
+        if self.role == "reward":
+            await self.rollout.inference_engine.wake_up()
+            self.resume_generation()
+            psrl_logger.info(f"Generation resumed on instance {self.get_instance_id()}")
+            return
         wake_up_tags = ["weights", "kv_cache"]
         if self.psrl_config.tms.enable_cuda_graph:
             wake_up_tags.append("graph")
@@ -565,6 +578,8 @@ class PSRL_GenWorker(Worker):
             instance_id=self.get_instance_id(),
             nixl_interface=self.nixl_interface,
             is_validate=self.role == "validate",
+            is_reward_model=self.role == "reward",
+            reward_model_name=self.reward_model_name,
             init_mode=init_mode,
         )
 
@@ -656,6 +671,32 @@ class PSRL_GenWorker(Worker):
         """Called by trainer to enable worker self-registration to the gateway."""
 
         self._gateway_base_url = base_url.rstrip("/") if base_url else None
+
+    def _extract_sampling_params_dict(self, request: DataProto) -> dict[str, Any]:
+        """Extract per-request sampling params for reward-model generation."""
+        if "sampling_params" in request.non_tensor_batch:
+            sp = request.non_tensor_batch["sampling_params"]
+            if isinstance(sp, np.ndarray):
+                if sp.size == 1:
+                    sp = sp.item()
+                else:
+                    sp = sp[0]
+            if isinstance(sp, dict):
+                return sp
+
+        if "sampling_params" in request.meta_info and isinstance(request.meta_info["sampling_params"], dict):
+            return request.meta_info["sampling_params"]
+
+        rollout_sp = getattr(self.rollout, "sampling_params", None)
+        if rollout_sp is None:
+            return {}
+        if isinstance(rollout_sp, dict):
+            return rollout_sp
+        if hasattr(rollout_sp, "to_dict"):
+            return rollout_sp.to_dict()
+        if hasattr(rollout_sp, "model_dump"):
+            return rollout_sp.model_dump()
+        return dict(vars(rollout_sp))
 
     def get_active_task_num(self) -> int:
         """
@@ -903,7 +944,10 @@ class PSRL_GenWorker(Worker):
         return task_done_callback
 
     async def _generate_async_task(
-        self, request: DataProto, sampling_params: dict[str, Any], needed_model_version: int
+        self,
+        request: DataProto,
+        sampling_params: dict[str, Any] | None = None,
+        needed_model_version: int | None = None,
     ):
         """
         An async task to generate sequences for a single request.
@@ -919,6 +963,36 @@ class PSRL_GenWorker(Worker):
             tuple: A tuple containing the generated sequences and the update status.
         """
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
+        if self.role == "reward":
+            rollout_instance_id = self.get_instance_id()
+            meta_info = {
+                "eos_token_id": (
+                    self.generation_config.eos_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.eos_token_id
+                ),
+                "pad_token_id": (
+                    self.generation_config.pad_token_id
+                    if self.generation_config is not None
+                    else self.tokenizer.pad_token_id
+                ),
+            }
+            request.meta_info.update(meta_info)
+            request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id] * len(request.batch))
+
+            with log_dual_events("Reward model generate", psrl_logger, event_type=EventType.GEN):
+                reward_sampling_params = sampling_params or self._extract_sampling_params_dict(request)
+                result = await self.rollout.generate_sequences_async(request, reward_sampling_params)
+
+            if result.non_tensor_batch["interrupted"][0]:
+                psrl_logger.info(
+                    "Request %s is interrupted (instance sleep), returning partial output for continuation",
+                    request.non_tensor_batch["uid"][0],
+                )
+            return result
+
+        assert needed_model_version is not None, "needed_model_version is required for rollout/validate workers"
+        assert sampling_params is not None, "sampling_params is required for rollout/validate workers"
         assert self.curr_rollout_instance_model_version >= needed_model_version, (
             f"Rollout model version should not be less than needed version, "
             f"but got {self.curr_rollout_instance_model_version} for needed {needed_model_version}"
@@ -1011,7 +1085,12 @@ class PSRL_GenWorker(Worker):
         return None, None
 
     @rollout_trace_op
-    async def generate_async(self, request: DataProto, sampling_params: dict[str, Any], consolidate: bool = True):
+    async def generate_async(
+        self,
+        request: DataProto,
+        sampling_params: dict[str, Any] | None = None,
+        consolidate: bool = True,
+    ):
         """
         Generate sequences asynchronously.
         This method handles a single async generation request, managing model versioning
@@ -1022,12 +1101,29 @@ class PSRL_GenWorker(Worker):
             sampling_params (dict): The sampling parameters for generation.
             consolidate (bool): Whether to consolidate the results after generation.
         """
+        assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
+        if self.role == "reward":
+            if self._async_interrupt_event and self._async_interrupt_event.is_set():
+                psrl_logger.debug("Generation interrupted, waiting for resume...")
+                await self._async_resume_event.wait()
+                psrl_logger.debug("Generation resumed")
+
+            request_id = int(request.non_tensor_batch["uid"][0])
+            task = self._generate_loop.create_task(
+                self._generate_async_task(request, sampling_params=sampling_params)
+            )
+            task.add_done_callback(self._create_task_done_callback(request_id, require_version=-1))
+            self.request_id_to_active_tasks[request_id].add(task)
+            self.active_tasks.add(task)
+            self.log_active_tasks(task_added=True)
+            result = await task
+            return result
+
         assert consolidate, (
             "Consolidate must be True for async generation for now. "
             "Because the postprocess is need to be done inside the vllm rollout "
             "to mark the requests that are interrupted by the scheduler."
         )
-        assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
         psrl_logger.debug(
             f"Generating request {request.non_tensor_batch['uid'][0]} "

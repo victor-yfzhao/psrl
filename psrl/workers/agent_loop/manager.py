@@ -1376,7 +1376,7 @@ class PSRL_AgentLoopManager:
                 data_list.append(data)
         return DataProto.concat(data_list)
 
-    def remove_buffer_from_data_pool(self, entry_infos: list[EntryInfo]):
+    def remove_buffer_from_data_pool(self, entry_infos: list[EntryInfo], is_validate: bool = False):
         """Remove data buffers from the internal data pool based on entry information.
 
         This method is used to delete specific data buffers that have been stored

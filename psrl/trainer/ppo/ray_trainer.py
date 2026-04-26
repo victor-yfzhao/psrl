@@ -1586,6 +1586,7 @@ class PSRL_RayPPOTrainer:
                 reward_model_cls = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[PSRL_Role.RewardModel],
                     config=reward_model_cfg,
+                    role="reward",
                     psrl_config=self.config.psrl,
                     instance_id=i,
                     gen_interface=reward_model_gen_if,

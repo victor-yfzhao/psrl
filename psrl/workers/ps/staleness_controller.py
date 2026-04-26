@@ -941,6 +941,19 @@ class StalenessInventory:
                                 first_reserved_entry_id = eid
                                 exchange_buffer_id = bid
                                 break
+                            # if (
+                            #     entry_model_version < buffer_id
+                            #     and entry.entry_info.prompt_id not in prompt_ids
+                            # ):
+                            #     first_reserved_entry_id = eid
+                            # elif (
+                            #     entry_model_version >= buffer_id - self.staleness
+                            #     and entry_model_version <= buffer_id
+                            #     and entry.entry_info.prompt_id not in prompt_ids
+                            # ):
+                            #     first_reserved_entry_id = eid
+                            #     exchange_buffer_id = bid
+                            #     break
                     # Indicate that we have found the first reserved entry to exchange
                     if first_reserved_entry_id is not None and exchange_buffer_id is not None:
                         break

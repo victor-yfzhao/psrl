@@ -366,13 +366,13 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
-        from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
+        from psrl.workers.gen.gen_worker import PSRL_GenWorker
         # self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_RewardModelWorker)
         # # concurrency_groups must be set on the actor class (not .options() in verl); use
         # # ray.remote(**opts)(Cls) — cannot pass Cls and kwargs in one ray.remote call.
         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(
             max_concurrency=10000,
-        )(PSRL_RewardModelWorker)
+        )(PSRL_GenWorker)
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""

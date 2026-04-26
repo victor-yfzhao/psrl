@@ -11,6 +11,7 @@ from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
+    deprecated,
     log_dual_events,
 )
 from psrl.utils.server.command import Command, CommandExtension, CommandType
