@@ -10,7 +10,6 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import RayResourcePool
 
 from psrl.workers.config import HFModelConfig
-from psrl.workers.reward.reward_model.worker import PSRL_RewardModelWorker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

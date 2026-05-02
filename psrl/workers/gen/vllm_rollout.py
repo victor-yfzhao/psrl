@@ -53,6 +53,7 @@ class PSRL_vLLMRollout:
         config: RolloutConfig,
         model_config: HFModelConfig,
         is_reward_model: bool = False,
+        is_teacher_model: bool = False,
         **kwargs,
     ):
         """
@@ -70,6 +71,7 @@ class PSRL_vLLMRollout:
         self.config = config
         self.stat_collector = None
         self.is_reward_model = is_reward_model
+        self.is_teacher_model = is_teacher_model
         if self.is_reward_model:
             self.reward_model_name = kwargs.get("reward_model_name")
         else:
@@ -574,6 +576,7 @@ class PSRL_vLLMRollout:
         interrupted_by_scheduler_list = []
         pooling_output_list = []
         all_log_prob_list = []
+        all_teacher_id_list = []
         routed_experts_list = []
 
         metrics_list = []
@@ -618,9 +621,15 @@ class PSRL_vLLMRollout:
                 interrupted_by_scheduler_list.append(False)
 
             log_prob_list = []
+            teacher_id_list = []
+            sampling_params = {}
+            if "sampling_params" in non_tensor_batch:
+                sampling_params = non_tensor_batch["sampling_params"][i]
+            teacher_topk = int(sampling_params.get("prompt_logprobs", 0) or 0)
             # if inference logprobs is required, we need to collect the log probabilities
             if (
                 not self.is_pooling_model
+                and not self.is_teacher_model
                 and self.psrl_config.log_prob.enable_rollout_engine_log_prob
                 and hasattr(vllm_output.outputs[0], "logprobs")
                 and vllm_output.outputs[0].logprobs is not None
@@ -643,7 +652,43 @@ class PSRL_vLLMRollout:
                     # Response log probs from decode log probs
                     for i, logprob in enumerate(vllm_output.outputs[0].logprobs):
                         log_prob_list.append(logprob[response_ids[i]].logprob)
+            elif (
+                not self.is_pooling_model
+                and self.is_teacher_model
+                and hasattr(vllm_output, "prompt_logprobs")
+                and vllm_output.prompt_logprobs is not None
+            ):
+                response_unpadded_len = int(non_tensor_batch.get("response_unpadded_len", [0])[i])
+                prompt_token_ids = vllm_output.prompt_token_ids
+                if response_unpadded_len > 0:
+                    prompt_logprobs = vllm_output.prompt_logprobs[-response_unpadded_len:]
+                    prompt_token_ids = prompt_token_ids[-response_unpadded_len:]
+                else:
+                    prompt_logprobs = []
+                    prompt_token_ids = []
+                for token_id, logprob_dict in zip(prompt_token_ids, prompt_logprobs, strict=False):
+                    if logprob_dict is None:
+                        log_prob_list.append([float("nan")] * teacher_topk if teacher_topk > 0 else float("nan"))
+                        teacher_id_list.append([])
+                        continue
+
+                    topk_entries = sorted(
+                        logprob_dict.items(),
+                        key=lambda item: getattr(item[1], "rank", None)
+                        if getattr(item[1], "rank", None) is not None
+                        else -float(item[1].logprob),
+                    )
+                    if teacher_topk > 0:
+                        topk_entries = topk_entries[:teacher_topk]
+                        log_prob_list.append([float(entry.logprob) for _, entry in topk_entries])
+                        teacher_id_list.append([int(token_id) for token_id, _ in topk_entries])
+                    elif token_id in logprob_dict:
+                        log_prob_list.append(float(logprob_dict[token_id].logprob))
+                    else:
+                        # Some vLLM versions may stringify token ids in prompt_logprobs.
+                        log_prob_list.append(float(logprob_dict[str(token_id)].logprob))
             all_log_prob_list.append(log_prob_list)
+            all_teacher_id_list.append(teacher_id_list)
 
             routed_experts = None
             if self.config.enable_rollout_routing_replay:
@@ -673,14 +718,31 @@ class PSRL_vLLMRollout:
         # meta_info["metrics"] = metrics_list
 
         # Update rollout_log_probs
-        if not self.is_pooling_model and self.psrl_config.log_prob.enable_rollout_engine_log_prob:
-            if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
-                curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
-            else:
-                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
-            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+        if not self.is_pooling_model:
+            if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
+                if "rollout_log_probs" in non_tensor_batch:
+                    curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+                    curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
+                else:
+                    curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+                curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+                non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+            elif self.is_teacher_model:
+                if "teacher_log_probs" in non_tensor_batch:
+                    curr_teacher_log_probs = non_tensor_batch.pop("teacher_log_probs")
+                    curr_teacher_log_probs = np.fromiter(curr_teacher_log_probs.tolist(), dtype=object)
+                else:
+                    curr_teacher_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+                curr_teacher_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+                non_tensor_batch["teacher_log_probs"] = curr_teacher_log_probs
+                if any(len(ids) > 0 for ids in all_teacher_id_list):
+                    if "teacher_ids" in non_tensor_batch:
+                        curr_teacher_ids = non_tensor_batch.pop("teacher_ids")
+                        curr_teacher_ids = np.fromiter(curr_teacher_ids.tolist(), dtype=object)
+                    else:
+                        curr_teacher_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+                    curr_teacher_ids += np.fromiter(all_teacher_id_list, dtype=object)
+                    non_tensor_batch["teacher_ids"] = curr_teacher_ids
 
         # process routed experts
         if self.config.enable_rollout_routing_replay:
@@ -778,13 +840,14 @@ class PSRL_vLLMRollout:
             ):
                 # Each task should own its own SamplingParams because max_tokens differs per prompt.
                 task_sampling_params = SamplingParams(**sampling_params)
+                max_tokens = None if self.is_teacher_model else self.config.response_length - curr_response_len
                 tasks.append(
                     self.generate_sequence_task(
                         prompt_idx,
                         vllm_input,
                         sampling_params=task_sampling_params,
                         uid=str(sample_id),
-                        max_tokens=self.config.response_length - curr_response_len,
+                        max_tokens=max_tokens,
                     )
                 )
 
@@ -810,13 +873,14 @@ class PSRL_vLLMRollout:
             zip(vllm_inputs, sample_ids, curr_response_unpadded_len)
         ):
             task_sampling_params = SamplingParams(**sampling_params)
+            max_tokens = None if self.is_teacher_model else self.config.response_length - curr_response_len
             tasks.append(
                 self.generate_sequence_task(
                     prompt_idx,
                     vllm_input,
                     sampling_params=task_sampling_params,
                     uid=str(sample_id),
-                    max_tokens=self.config.response_length - curr_response_len,
+                    max_tokens=max_tokens,
                 )
             )
 

@@ -9,11 +9,11 @@ This module provides:
 
 from .manager import PSRL_RewardModelManager
 from .router import PSRL_RewardModelRouter, launch_router_process
-from .worker import PSRL_RewardModelWorker
+# from .worker import PSRL_RewardModelWorker
 from .replica import PSRL_RewardModelReplica
 
 __all__ = [
-    "PSRL_RewardModelWorker",
+    # "PSRL_RewardModelWorker",
     "PSRL_RewardModelReplica",
     "PSRL_RewardModelManager",
     "PSRL_RewardModelRouter",

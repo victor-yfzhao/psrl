@@ -168,6 +168,14 @@ def load_reward_loop_manager(
             reward_function=gen_reward_function_cls(),
             **reward_kwargs,
         )
+
+    if reward_loop_manager_name == "opd":
+        return reward_loop_manager_cls(
+            reward_model_config,
+            input_tokenizer,
+            reward_model_manager=reward_model_manager,
+            **reward_kwargs,
+        )
         
     return reward_loop_manager_cls(
         reward_model_config,

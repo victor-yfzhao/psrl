@@ -326,6 +326,7 @@ class vLLMWorkerExtension:
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
+        self.nixl_log_shard_info(label=f"AFTER_GEN_PULL_{self.pull_times}")
         self.nixl_storage_client.clear_intermediate_cached_data()
         time_end = time.time()
         psrl_logger.info(

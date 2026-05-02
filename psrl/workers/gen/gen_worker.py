@@ -185,6 +185,7 @@ class PSRL_GenWorker(Worker):
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
         self.reward_model_name = kwargs.get("reward_model_name", None)
+        self.is_teacher_model = kwargs.get("is_teacher_model", False)
         self.instance_id = kwargs.get("instance_id", self.gen_interface.rollout_instance_id)
         self.instance_dist_group = None
 
@@ -579,6 +580,7 @@ class PSRL_GenWorker(Worker):
             nixl_interface=self.nixl_interface,
             is_validate=self.role == "validate",
             is_reward_model=self.role == "reward",
+            is_teacher_model=self.is_teacher_model,
             reward_model_name=self.reward_model_name,
             init_mode=init_mode,
         )

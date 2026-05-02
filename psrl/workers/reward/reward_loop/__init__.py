@@ -9,12 +9,14 @@ from .dapo import DAPORewardLoopManager
 from .naive import NaiveRewardLoopManager
 from .prime import PrimeRewardLoopManager
 from .gen import GenRewardLoopManager
+from .opd import OPDRewardLoopManager
 # isort: on
 
 __all__ = [
     "DAPORewardLoopManager",
     "NaiveRewardLoopManager",
     "PrimeRewardLoopManager",
+    "OPDRewardLoopManager",
     "register",
     "GenRewardLoopManager",
     "get_reward_loop_manager_cls",

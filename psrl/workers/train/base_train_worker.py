@@ -301,8 +301,7 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            # ---- DEBUG: log train info BEFORE push ----
-            # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
+            self._debug_log_train_info(label=f"BEFORE_TRAIN_PUSH_R{self.worker_rank}")
             self.nixl_push_model()
             # TODO(lhy): wait for the push to complete before the next iteration optimizer update
             # This will enable the NIXL push to be overlapped with the next iteration training

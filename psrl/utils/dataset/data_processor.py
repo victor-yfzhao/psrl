@@ -687,14 +687,15 @@ class DataProcessor:
                     self.stop_data_process = True
 
             except StopIteration:
-                curr_epoch = self.global_steps // len(self.train_dataloader)
+                steps_per_epoch = min(self.train_dataloader_lens)
+                curr_epoch = self.global_steps // max(steps_per_epoch, 1)
                 psrl_logger.debug(f"StopIteration encountered, current epoch: {curr_epoch}/{total_epochs}")
                 if curr_epoch >= total_epochs:
                     psrl_logger.info("All training epochs completed, stopping data processing.")
                     self.stop_data_process = True
                 else:
-                    psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
-                    self.train_dataloader_iter = iter(self.train_dataloader)
+                    psrl_logger.debug("Reinitializing train_dataloader_iters for next epoch")
+                    self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
             except Exception as e:
                 psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
 

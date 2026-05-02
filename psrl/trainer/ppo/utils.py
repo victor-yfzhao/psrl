@@ -248,14 +248,18 @@ def PSRL_compute_advantage(
                 config.pf_ppo.weight_pow,
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        assert "parent_id" in data.non_tensor_batch, "parent_id is required for GRPO"
+        if "parent_id" in data.non_tensor_batch:
+            index = data.non_tensor_batch["parent_id"]
+        else:
+            assert "uid" in data.non_tensor_batch, "Either parent_id or uid is required for GRPO"
+            index = data.non_tensor_batch["uid"]
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["parent_id"],
+            index=index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages

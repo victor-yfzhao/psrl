@@ -109,8 +109,10 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_config: DictConfig,
         train_interface: TrainInterface,
         nixl_interface: NIXLInterface,
+        distillation_config: DictConfig | None = None,
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
+        self.distillation_config = distillation_config
         PSRL_BaseTrainWorker.__init__(
             self,
             self.rank,
@@ -280,6 +282,9 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """Deregister the model weights for NIXL and free up GPU memory."""
         self.sleep_fsdp_model()
         if mode == "meta":
+            return
+        if self.nixl_storage_client.local_client_info is None:
+            psrl_logger.warning("Skip NIXL deregistration because local tensors are not registered.")
             return
         self.nixl_storage_client.deregister_local_tensors()
 

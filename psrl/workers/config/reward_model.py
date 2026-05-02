@@ -150,6 +150,7 @@ class SingleRewardModelConfig(BaseConfig):
     sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
     pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
     sandbox_fusion: SandboxFusionConfig = field(default_factory=SandboxFusionConfig)
+    reward_loop_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass

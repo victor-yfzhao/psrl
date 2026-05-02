@@ -152,7 +152,9 @@ class RewardManager(CommandExtension):
             reward_loop_manager_type = reward_model_config.reward_loop_type
             reward_fns = reward_model_config.reward_fn
             reward_model_name = reward_model_config.get("reward_model_name", None)
-            reward_loop_kwargs = reward_model_config.get("reward_loop_kwargs", {})
+            reward_loop_kwargs = dict(reward_model_config.get("reward_loop_kwargs", {}) or {})
+            if reward_loop_manager_type == "opd" and "teacher_key" not in reward_loop_kwargs:
+                reward_loop_kwargs["teacher_key"] = reward_model_name or reward_model_config.model.path.split("/")[-1]
 
             for reward_fn in reward_fns:
                 if isinstance(reward_fn, dict):
@@ -160,8 +162,9 @@ class RewardManager(CommandExtension):
                 else:
                     reward_fn_name = reward_fn
                
-                if (reward_loop_manager_type == "gen" and 
-                    (reward_model_name is None or reward_model_name not in self.reward_model_manager_mapping)
+                if (
+                    reward_loop_manager_type in ("gen", "opd")
+                    and (reward_model_name is None or reward_model_name not in self.reward_model_manager_mapping)
                 ):
                     raise ValueError(f"Reward model manager for {reward_model_name} not found")
 
@@ -533,7 +536,8 @@ class RewardManager(CommandExtension):
                     group_id = reward_input[0].non_tensor_batch["data_source"]
                     self.request_id_to_group[request_id] = group_id
                 elif self.reward_normalization == "group":
-                    group_id = reward_input[0].non_tensor_batch["parent_id"]
+                    item_non_tensor = reward_input[0].non_tensor_batch
+                    group_id = item_non_tensor.get("parent_id", item_non_tensor["uid"])
                     self.request_id_to_group[request_id] = group_id
 
                 self.request_id_to_data_source[request_id] = reward_input[0].non_tensor_batch["data_source"]
@@ -587,7 +591,7 @@ class RewardManager(CommandExtension):
                             ]
                         )
                         reward_score = sum(
-                            single["reward_score"] * reward_coef
+                            single.get("reward_score", 0.0) * reward_coef
                             for single, reward_coef in zip(singles, reward_coefs)
                         )
                         reward_extra_info_dict = {
@@ -598,11 +602,25 @@ class RewardManager(CommandExtension):
                             reward_loop_key: single.get("reward_metrics", {})
                             for reward_loop_key, single in zip(reward_loops_keys, singles)
                         }
+                        teacher_logprobs_dict = {
+                            reward_loop_key: single["teacher_logprobs"]
+                            for reward_loop_key, single in zip(reward_loops_keys, singles)
+                            if "teacher_logprobs" in single
+                        }
+                        teacher_ids_dict = {
+                            reward_loop_key: single["teacher_ids"]
+                            for reward_loop_key, single in zip(reward_loops_keys, singles)
+                            if "teacher_ids" in single
+                        }
                         result = {
                             "reward_score": reward_score,
                             "reward_extra_info": reward_extra_info_dict,
                             "reward_metrics": reward_metrics_dict,
                         }
+                        if teacher_logprobs_dict:
+                            result["teacher_logprobs"] = teacher_logprobs_dict
+                        if teacher_ids_dict:
+                            result["teacher_ids"] = teacher_ids_dict
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(
                             int(request_id),
@@ -635,42 +653,57 @@ class RewardManager(CommandExtension):
         await self.set_reward_for_requests({request_id: result})
 
     async def _async_reward_task(
-        self, 
-        reward_input: DataProto, 
-        reward_loops_keys: list[str], 
-        reward_loops: list[RewardLoopManagerBase], 
-        reward_coefs: list[float]
+        self,
+        reward_input: DataProto,
+        reward_loops_keys: list[str],
+        reward_loops: list[RewardLoopManagerBase],
+        reward_coefs: list[float],
     ):
         """Async task to compute reward and store the result for later retrieval."""
         request_id = reward_input.non_tensor_batch["uid"][0]
-        
+
         futures = [
-            asyncio.create_task(reward_loop.run_single(reward_input)) 
+            asyncio.create_task(reward_loop.run_single(reward_input))
             for reward_loop in reward_loops
         ]
 
         results = await asyncio.gather(*futures)
 
         reward_score = sum(
-            result["reward_score"] * reward_coef 
+            result.get("reward_score", 0.0) * reward_coef
             for result, reward_coef in zip(results, reward_coefs)
         )
 
         reward_extra_info_dict = {
-            reward_loop_key: result["reward_extra_info"] 
+            reward_loop_key: result["reward_extra_info"]
             for reward_loop_key, result in zip(reward_loops_keys, results)
         }
 
         reward_metrics_dict = {
-            reward_loop_key: result.get("reward_metrics", {}) 
+            reward_loop_key: result.get("reward_metrics", {})
             for reward_loop_key, result in zip(reward_loops_keys, results)
         }
-        
+
+        teacher_logprobs_dict = {
+            reward_loop_key: result["teacher_logprobs"]
+            for reward_loop_key, result in zip(reward_loops_keys, results)
+            if "teacher_logprobs" in result
+        }
+        teacher_ids_dict = {
+            reward_loop_key: result["teacher_ids"]
+            for reward_loop_key, result in zip(reward_loops_keys, results)
+            if "teacher_ids" in result
+        }
+
         result = {
             "reward_score": reward_score,
             "reward_extra_info": reward_extra_info_dict,
-            "reward_metrics": reward_metrics_dict
+            "reward_metrics": reward_metrics_dict,
         }
+        if teacher_logprobs_dict:
+            result["teacher_logprobs"] = teacher_logprobs_dict
+        if teacher_ids_dict:
+            result["teacher_ids"] = teacher_ids_dict
         await self.set_reward_for_requests({request_id: result})
 
     async def wait_for_reward_of_requests(self, request_ids: list[int],  validation: bool = False):

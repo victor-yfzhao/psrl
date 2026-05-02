@@ -308,7 +308,7 @@ class TaskRunner:
         total_reward_pool_id_list = [] if not deployment_config.elastic_rm.enable else ["shared_rollout_pool"]
         reward_models_config = config.reward_models_config
         for reward_model in reward_models_config.reward_models:
-            if reward_model.reward_loop_type != "gen":
+            if reward_model.reward_loop_type not in ("gen", "opd"):
                 continue
             if deployment_config.elastic_rm.enable:
                 reward_model.num_replicas = (

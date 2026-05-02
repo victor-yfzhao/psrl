@@ -165,27 +165,21 @@ class ThroughputProfileLoader:
                     return float(row["mu"])
         return None
 
-    def estimate_instance_mu(self, signal: InstanceSignal) -> float:
+    def estimate_instance_mu_with_source(self, signal: InstanceSignal) -> tuple[float, str]:
         formula_mu = self.estimate_mu_by_running_queue(
             model_name=signal.model_name,
             running_queue_num=float(signal.running_queue_num),
             fallback_mu=None,
         )
         if formula_mu is not None:
-            return formula_mu
+            return formula_mu, "formula"
 
-        new_schema_path = self.profile_paths.get(signal.model_name)
-        if new_schema_path:
-            payload = self._load_json(new_schema_path)
-            if payload:
-                entry = self._resolve_new_schema_entry(payload, signal, signal.role_name)
-                if entry:
-                    mu = self._lookup_throughput_from_table(entry, signal)
-                    if mu is not None:
-                        return max(0.0, float(mu))
+        # Final fallback: trust runtime throughput if no formula is found.
+        return max(0.0, float(signal.generation_throughput)), "fallback_runtime"
 
-        # Final fallback: trust runtime throughput if no formula/profile is found.
-        return max(0.0, float(signal.generation_throughput))
+    def estimate_instance_mu(self, signal: InstanceSignal) -> float:
+        mu, _ = self.estimate_instance_mu_with_source(signal)
+        return mu
 
 
 class ScalingPolicy:
@@ -314,7 +308,11 @@ class ScalingPolicy:
 
     def _build_mu_maps(
         self, signals: list[InstanceSignal]
-    ) -> tuple[dict[tuple[PSRL_Role, str, int], float], dict[PSRL_Role, float]]:
+    ) -> tuple[
+        dict[tuple[PSRL_Role, str, int], float],
+        dict[PSRL_Role, float],
+        dict[tuple[PSRL_Role, str, int], str],
+    ]:
         """
         Build the mu maps for the given signals.
         Args:
@@ -325,15 +323,17 @@ class ScalingPolicy:
                 - role_total_mu: {role: total_mu}
         """
         instance_mu: dict[tuple[PSRL_Role, str, int], float] = {}
+        instance_mu_source: dict[tuple[PSRL_Role, str, int], str] = {}
         role_total_mu: dict[PSRL_Role, float] = {}
         for signal in signals:
-            mu = self.profile_loader.estimate_instance_mu(signal)
+            mu, mu_source = self.profile_loader.estimate_instance_mu_with_source(signal)
             role = signal.role_name
             key = (role, signal.model_name, signal.instance_id)
             instance_mu[key] = mu
+            instance_mu_source[key] = mu_source
             if signal.is_awaken:
                 role_total_mu[role] = role_total_mu.get(role, 0.0) + mu
-        return instance_mu, role_total_mu
+        return instance_mu, role_total_mu, instance_mu_source
 
     def _estimate_role_total_mu_with_rebalance(
         self,
@@ -352,11 +352,20 @@ class ScalingPolicy:
             total_queue = sum(float(s.running_queue_num + s.waiting_queue_num) for s in awaken_signals)
             new_active = awaken_signals + [scale_up_signal]
             avg_running = total_queue / max(len(new_active), 1)
+            avg_awake_throughput = sum(float(s.generation_throughput) for s in awaken_signals) / max(
+                len(awaken_signals), 1
+            )
             return sum(
                 self.profile_loader.estimate_mu_by_running_queue(
                     model_name=s.model_name,
                     running_queue_num=avg_running,
-                    fallback_mu=s.generation_throughput,
+                    # For newly added asleep instance, use current role-average throughput
+                    # as fallback instead of stale 0.0 snapshot throughput.
+                    fallback_mu=(
+                        avg_awake_throughput
+                        if (not s.is_awaken and s.instance_id == scale_up_signal.instance_id)
+                        else s.generation_throughput
+                    ),
                 )
                 or 0.0
                 for s in new_active
@@ -1122,8 +1131,23 @@ class ScalingPolicy:
             )
 
         grouped = self._group_by_role(signals)
-        instance_mu, role_total_mu = self._build_mu_maps(signals)
+        instance_mu, role_total_mu, instance_mu_source = self._build_mu_maps(signals)
         estimated_lambda = self._estimate_lambda(signals, role_total_mu)
+        source_counts: dict[str, int] = {}
+        source_details: list[str] = []
+        for signal in signals:
+            key = (signal.role_name, signal.model_name, signal.instance_id)
+            source = instance_mu_source.get(key, "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+            source_details.append(
+                f"{signal.role_name.name}/{signal.model_name}/{signal.instance_id}:{source}"
+            )
+        self._policy_log(
+            "mu_source",
+            details="|".join(source_details),
+            formula_count=source_counts.get("formula", 0),
+            fallback_runtime_count=source_counts.get("fallback_runtime", 0),
+        )
 
         # Hard guarantee: if one role has zero awaken instances but router backlog exists,
         # force wake one instance for that role

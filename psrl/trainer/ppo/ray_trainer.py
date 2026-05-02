@@ -215,6 +215,71 @@ class PSRL_RayPPOTrainer:
         # otherwise, it will cause error when running Megatron backend
         self._init_data_processor()
 
+    @staticmethod
+    def _select_opd_teacher_value(reward_result: dict, field: str):
+        teacher_values = reward_result.get(field, {})
+        if not isinstance(teacher_values, dict) or not teacher_values:
+            return None
+        for key, value in teacher_values.items():
+            if str(key).startswith("opd/"):
+                return value
+        return next(iter(teacher_values.values()))
+
+    @classmethod
+    def _merge_teacher_tensor_from_rewards(
+        cls,
+        request_id_to_reward: dict,
+        request_ids: list[int],
+        response_mask: torch.Tensor,
+        field: str,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, dict[str, float]]:
+        teacher_values = []
+        missing_count = 0
+        mismatch_count = 0
+        topk_width = 0
+        for request_id in request_ids:
+            value = cls._select_opd_teacher_value(request_id_to_reward[request_id], field)
+            if value is None:
+                teacher_values.append(None)
+                missing_count += 1
+                continue
+            tensor = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.tensor(value)
+            if tensor.ndim == 2:
+                topk_width = max(topk_width, int(tensor.shape[-1]))
+            teacher_values.append(tensor)
+
+        if missing_count == len(request_ids):
+            return None, {}
+
+        batch_size, response_width = response_mask.shape
+        output_shape = (batch_size, response_width, topk_width) if topk_width > 0 else (batch_size, response_width)
+        merged = torch.zeros(output_shape, dtype=dtype)
+        for idx, tensor in enumerate(teacher_values):
+            if tensor is None:
+                continue
+            valid_len = int(response_mask[idx].sum().item())
+            if tensor.shape[0] != valid_len:
+                mismatch_count += 1
+            copy_len = min(int(tensor.shape[0]), valid_len, response_width)
+            if copy_len <= 0:
+                continue
+            if topk_width > 0:
+                if tensor.ndim == 1:
+                    tensor = tensor.unsqueeze(-1)
+                copy_width = min(int(tensor.shape[-1]), topk_width)
+                merged[idx, :copy_len, :copy_width] = tensor[:copy_len, :copy_width].to(dtype)
+            else:
+                merged[idx, :copy_len] = tensor[:copy_len].to(dtype)
+
+        metrics = {
+            f"distillation/{field}_missing": float(missing_count),
+            f"distillation/{field}_mismatch": float(mismatch_count),
+        }
+        if topk_width > 0:
+            metrics[f"distillation/{field}_topk"] = float(topk_width)
+        return merged, metrics
+
     def _initialize_queue_buffers(self):
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
@@ -238,7 +303,7 @@ class PSRL_RayPPOTrainer:
         self.status_queues = [RayQueue() for _ in range(self.n_rollout_instances + self.n_validate_instances)]
 
         for reward_model in self.config.reward_models_config.reward_models:
-            if reward_model.reward_loop_type != "gen":
+            if reward_model.reward_loop_type not in ("gen", "opd"):
                 continue
             reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
             reward_model_replica_num = reward_model.get("num_replicas", 1)
@@ -1532,6 +1597,7 @@ class PSRL_RayPPOTrainer:
             psrl_config=self.config.psrl,
             train_interface=train_interface,
             nixl_interface=nixl_interface,
+            distillation_config=self.config.get("distillation", None),
         )
         self.resource_pool_to_cls[actor_resource_pool]["actor"] = actor_cls
 
@@ -1556,7 +1622,7 @@ class PSRL_RayPPOTrainer:
 
         # create reward model instances
         for reward_model in self.config.reward_models_config.reward_models:
-            if reward_model.reward_loop_type != "gen":
+            if reward_model.reward_loop_type not in ("gen", "opd"):
                 continue
             reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
             reward_model_cfg = reward_model
@@ -1591,6 +1657,7 @@ class PSRL_RayPPOTrainer:
                     instance_id=i,
                     gen_interface=reward_model_gen_if,
                     reward_model_name=reward_model_name,
+                    is_teacher_model=reward_model.reward_loop_type == "opd",
                 )
                 # max_concurrency only: Ray disallows concurrency_groups in .options() for this version;
                 # concurrency_groups is set on ray.remote(PSRL_RewardModelWorker, ...) in main_ppo.py.
@@ -1776,7 +1843,7 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Creating reward model managers")
         reward_models_config = self.config.reward_models_config
         for reward_model in reward_models_config.reward_models:
-            if reward_model.reward_loop_type != "gen":
+            if reward_model.reward_loop_type not in ("gen", "opd"):
                 continue
             reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
             reward_model_wg_list = [all_wg[f"reward_model_{reward_model_name}_{i}"] for i in range(reward_model.num_replicas)]
@@ -2053,6 +2120,9 @@ class PSRL_RayPPOTrainer:
         """
         if not self.config.psrl.colocate_validate_and_train or self.is_rollout_mode_in_actor:
             return
+        if self.n_validate_instances == 0:
+            psrl_logger.info("Skip switching to rollout mode because no validation instances are configured.")
+            return
 
         _switch_start = time.time()
         psrl_logger.info("Switching to rollout mode...")
@@ -2078,15 +2148,17 @@ class PSRL_RayPPOTrainer:
         # sync with server
         updated_client_names = []  # to collect all updated client names for broadcasting
         futures = []
+        expected_update_infos = 0
         for i in range(self.n_validate_instances):
             tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
+            expected_update_infos += tp_size
             for rank in range(tp_size):
                 updated_client_names.append(
                     WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
                 )
             futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME))
         # wait for ps manager to collect all infos
-        futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
+        futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(expected_update_infos))
         ray.get(futures)
         psrl_logger.info(f"Step 3 done in {time.time() - _t:.2f}s.")
 
@@ -2891,6 +2963,33 @@ class PSRL_RayPPOTrainer:
                                 reward_extra_infos_dict["reward_extra_info"].append(reward_extra_infos)
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                             batch.meta_info["reward_metrics"] = np.array(reward_metrics_dict_list, dtype=object)
+                            teacher_logprobs, teacher_logprob_metrics = self._merge_teacher_tensor_from_rewards(
+                                request_id_to_reward=request_id_to_reward,
+                                request_ids=request_ids,
+                                response_mask=batch.batch["response_mask"],
+                                field="teacher_logprobs",
+                                dtype=torch.float32,
+                            )
+                            if teacher_logprobs is not None:
+                                batch.batch["teacher_logprobs"] = teacher_logprobs
+                                valid_teacher_logprobs = teacher_logprobs[
+                                    batch.batch["response_mask"].bool()
+                                ]
+                                if valid_teacher_logprobs.numel() > 0:
+                                    teacher_logprob_metrics["distillation/teacher_logprobs_mean"] = (
+                                        valid_teacher_logprobs.float().mean().item()
+                                    )
+                            metrics.update(teacher_logprob_metrics)
+                            teacher_ids, teacher_id_metrics = self._merge_teacher_tensor_from_rewards(
+                                request_id_to_reward=request_id_to_reward,
+                                request_ids=request_ids,
+                                response_mask=batch.batch["response_mask"],
+                                field="teacher_ids",
+                                dtype=torch.long,
+                            )
+                            if teacher_ids is not None:
+                                batch.batch["teacher_ids"] = teacher_ids
+                            metrics.update(teacher_id_metrics)
                             global_token_num = batch.meta_info.get("global_token_num")
                             if (
                                 isinstance(global_token_num, list)
@@ -2912,9 +3011,7 @@ class PSRL_RayPPOTrainer:
 
                 batch.batch["token_level_scores"] = reward_tensor
 
-                # print(f"batch_metrics: {batch[0].meta_info['rollout_metrics']=}, {batch[0].meta_info['reward_metrics']=}")
-                print(f"dump meta_info: {batch.meta_info=}")
-                record_rollout_rm_metrics(batch, output_path="/jizhicfs/pkuhetu/yfzhao/psrl/logs/test_metrics.jsonl")
+                # record_rollout_rm_metrics(batch, output_path="/jizhicfs/pkuhetu/yfzhao/psrl/logs/test_metrics.jsonl")
                 with marked_timer("adv", timing_raw, color="brown"):
                     with log_dual_events("Compute advantage", psrl_logger, event_type=EventType.OTHER):
                         # compute rewards. apply_kl_penalty if available
