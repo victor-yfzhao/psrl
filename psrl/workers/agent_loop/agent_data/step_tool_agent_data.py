@@ -236,6 +236,11 @@ class StepToolAgentData(ToolAgentData):
         """
         # Snapshot the start before the parent update mutates response_ids.
         response_start = len(self.trajectory.prompt_ids) + len(self.trajectory.response_ids)
+        rollout_logprobs = output.non_tensor_batch.get("rollout_log_probs", [None])[0]
+        if rollout_logprobs:
+            missing_prefix = len(self.trajectory.response_ids) - len(self.trajectory.response_logprobs)
+            if missing_prefix > 0:
+                self.trajectory.response_logprobs += [0.0] * missing_prefix
         action, done = await super().update_from_model_token_ids(output, **kwargs)
         step = self.get_current_step()
         if isinstance(step, StepToolStep):

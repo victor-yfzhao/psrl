@@ -258,6 +258,17 @@ def PSRL_compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == "gigpo":
+        from psrl.trainer.ppo.adv_estimators.gigpo import compute_gigpo_advantage
+
+        advantages, returns = compute_gigpo_advantage(
+            data,
+            gamma=gamma,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            step_advantage_weight=config.get("gigpo_step_advantage_weight", 1.0) if config is not None else 1.0,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

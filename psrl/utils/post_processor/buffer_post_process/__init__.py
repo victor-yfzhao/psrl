@@ -1,10 +1,8 @@
 from .filter import DynamicSamplingFilterProcessor, NoFilterProcessor
-from .gigpo_aux import build_gigpo_step_auxiliary
-from .gigpo import GigpoStepMetadataProcessor
+from .gigpo import GigpoStepRowProcessor
 
 __all__ = [
     "DynamicSamplingFilterProcessor",
-    "GigpoStepMetadataProcessor",
-    "build_gigpo_step_auxiliary",
+    "GigpoStepRowProcessor",
     "NoFilterProcessor",
 ]

@@ -210,6 +210,30 @@ class StepToolAgentDataTest(unittest.TestCase):
         self.assertGreaterEqual(step_starts[1], step_ends[0])
         self.assertGreaterEqual(response_starts[1], response_ends[0])
 
+    def test_response_logprobs_align_with_full_response_ids(self):
+        request = _make_request()
+        self.agent_data.init_trajectory(request)
+
+        asyncio.run(self.agent_data.update_from_env([{"role": "user", "content": "obs0"}], 0.0, False, {"anchor_obs": "a0"}))
+        asyncio.run(self.agent_data.update_from_model_token_ids(_make_model_output([11], [-0.1])))
+        asyncio.run(self.agent_data.update_from_env([{"role": "tool", "content": "obs1"}], 0.5, False, {"anchor_obs": "a1"}))
+        asyncio.run(self.agent_data.update_from_model_token_ids(_make_model_output([12], [-0.2])))
+
+        output = asyncio.run(self.agent_data.finalize_output(request))
+        response_ids = output.non_tensor_batch["raw_response_ids"][0]
+        rollout_log_probs = output.non_tensor_batch["rollout_log_probs"][0]
+        prompt_length = len(self.agent_data.trajectory.prompt_ids)
+        first_response_start = self.agent_data.trajectory.steps[0].response_start - prompt_length
+        first_response_end = self.agent_data.trajectory.steps[0].response_end - prompt_length
+        second_response_start = self.agent_data.trajectory.steps[1].response_start - prompt_length
+
+        self.assertEqual(len(rollout_log_probs), len(response_ids))
+        self.assertEqual(rollout_log_probs[0], 0.0)
+        self.assertEqual(rollout_log_probs[first_response_start], -0.1)
+        env_token_start = first_response_end
+        self.assertEqual(rollout_log_probs[env_token_start], 0.0)
+        self.assertEqual(rollout_log_probs[second_response_start], -0.2)
+
     def test_allows_empty_response_span(self):
         request = _make_request()
         self.agent_data.init_trajectory(request)
