@@ -8,14 +8,21 @@ import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from safetensors import safe_open
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 from verl.utils.fs import copy_to_local
 
-from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import convert_hf_inplace
-from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.hf_converter import (
+    convert_hf_inplace,
+    maybe_convert_to_smaller_parts
+)
+from psrl.utils.converter.model_mappings import (
+    slice_attn_conv1d,
+    slice_qwen3_5_in_proj_qkv,
+)
+from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
     NIXLInterface,
@@ -249,9 +256,7 @@ class PSStorageWorker:
         if self._cached_non_persistent_buffers is not None:
             return self._cached_non_persistent_buffers
 
-        assert self.train_meta_hf_model is not None, (
-            "train_meta_hf_model is not initialized; call init_model() first."
-        )
+        assert self.train_meta_hf_model is not None, "train_meta_hf_model is not initialized; call init_model() first."
         # Identify non-persistent buffer names: in named_buffers() but not state_dict().
         persistent_names = set(self.train_meta_hf_model.state_dict().keys())
         result: dict[str, torch.Tensor] = {}
@@ -289,8 +294,8 @@ class PSStorageWorker:
             local_path,
             trust_remote_code=self.model_config.get("trust_remote_code", False),
         )
-        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-            model_class = AutoModelForVision2Seq
+        if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
+            model_class = AutoModelForImageTextToText
         else:
             model_class = AutoModelForCausalLM
 
@@ -314,13 +319,16 @@ class PSStorageWorker:
 
         # Build the tied-weights alias map while the meta model is alive.
         # train and gen share the same architecture, so one model suffices.
-        self._tied_weights_alias_map = self._build_tied_weights_alias_map(
-            self.train_meta_hf_model, local_path
-        )
+        self._tied_weights_alias_map = self._build_tied_weights_alias_map(self.train_meta_hf_model, local_path)
         if self._tied_weights_alias_map:
-            psrl_logger.info(
-                f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}"
-            )
+            psrl_logger.info(f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}")
+
+        # Save model info
+        self.model_info = create_parameter_mapping(
+            "HuggingFace", 
+            self.train_meta_hf_model.config
+        ).get_model_info()
+
         psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
 
     @staticmethod
@@ -345,13 +353,15 @@ class PSStorageWorker:
         if alias in ckpt_keys:
             return {}
 
+        if canonical not in ckpt_keys:
+            # NOTE(zym) For Qwen3_5ForConditionalGeneration
+            canonical = "model.language_model.embed_tokens.weight"
+
         assert canonical in ckpt_keys, (
             f"_build_tied_weights_alias_map: tie_word_embeddings=True but "
             f"'{canonical}' not found in checkpoint under '{local_path}'."
         )
-        psrl_logger.info(
-            f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical)"
-        )
+        psrl_logger.info(f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical)")
         return {canonical: [alias]}
 
     @staticmethod
@@ -374,9 +384,7 @@ class PSStorageWorker:
             with safe_open(single_sf, framework="pt", device="cpu") as f:
                 return set(f.keys())
 
-        raise FileNotFoundError(
-            f"No safetensors checkpoint found under '{local_path}' for key scanning."
-        )
+        raise FileNotFoundError(f"No safetensors checkpoint found under '{local_path}' for key scanning.")
 
     # ------------------------------------------------------------------
     # Post-protocol weight loading
@@ -402,9 +410,7 @@ class PSStorageWorker:
 
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         shard_files = self._discover_safetensors_shards(local_path)
-        psrl_logger.info(
-            f"[preload_checkpoint_to_cpu] Reading {len(shard_files)} shard file(s) under {local_path}."
-        )
+        psrl_logger.info(f"[preload_checkpoint_to_cpu] Reading {len(shard_files)} shard file(s) under {local_path}.")
 
         cache: dict[str, torch.Tensor] = {}
 
@@ -412,7 +418,10 @@ class PSStorageWorker:
             psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
             with safe_open(shard_file, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    cache[key] = f.get_tensor(key)
+                    full_tensor = f.get_tensor(key)
+                    param_dict = maybe_convert_to_smaller_parts(self.model_info, key, full_tensor)
+                    for param_name, param in param_dict.items():
+                        cache[param_name] = param
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0
@@ -425,8 +434,7 @@ class PSStorageWorker:
 
         self._checkpoint_cpu_cache = cache
         psrl_logger.info(
-            f"[preload_checkpoint_to_cpu] Cached {len(cache)} key(s) "
-            f"({alias_count} tied-weight alias expansion(s))."
+            f"[preload_checkpoint_to_cpu] Cached {len(cache)} key(s) ({alias_count} tied-weight alias expansion(s))."
         )
 
     def write_checkpoint_to_registered_tensors(self) -> None:
@@ -553,7 +561,7 @@ class PSStorageWorker:
             if k not in self._transfer_key_cache:
                 self._transfer_key_cache[k] = []
             self._transfer_key_cache[k].append((k, shard_idx))
-            
+
     def transfer_train_to_gen_merged(self, key_and_shards_list: list[tuple[str, list[tuple[int, ...]]]]):
         if self.storage_plan.train_gen_model_share():
             return

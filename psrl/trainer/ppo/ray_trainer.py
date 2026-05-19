@@ -36,7 +36,6 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.utils.torch_dtypes import PrecisionType
 
 from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
@@ -49,6 +48,8 @@ from psrl.trainer.ppo.utils import (
     need_reward_model,
     record_rollout_rm_metrics,
 )
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.dataset import DataProcessor, DatasetType
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
 from psrl.utils.common.tms_env import build_ray_train_worker_tms_env
@@ -58,8 +59,6 @@ from psrl.utils.logger import (
     log_data_protocol,
     log_dual_events,
 )
-from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.nixl import (
     GLOBAL_PORT_SCANNER,
     NIXLInterface,
@@ -182,15 +181,19 @@ class PSRL_RayPPOTrainer:
         self.n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
-        
+
         if self.config.psrl.redundant_rollout.enable:
-            self.max_concurrency = self.config.psrl.redundant_rollout.redundant_rollout_n * \
-                self.config.psrl.redundant_rollout.redundant_global_batch_size * \
-                (self.config.psrl.staleness + 1)
+            self.max_concurrency = (
+                self.config.psrl.redundant_rollout.redundant_rollout_n
+                * self.config.psrl.redundant_rollout.redundant_global_batch_size
+                * (self.config.psrl.staleness + 1)
+            )
         else:
-            self.max_concurrency = self.config.psrl.rollout_n * \
-                self.config.psrl.staleness_buffer_entries * \
-                (self.config.psrl.staleness + 1)
+            self.max_concurrency = (
+                self.config.psrl.rollout_n
+                * self.config.psrl.staleness_buffer_entries
+                * (self.config.psrl.staleness + 1)
+            )
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -570,11 +573,7 @@ class PSRL_RayPPOTrainer:
 
         # Initialize the data processor
         self.data_processor = DataProcessor.remote(
-            self.config,
-            self.tokenizer,
-            self.processor,
-            self.ps_manager_handle,
-            collate_fn=self.collate_fn
+            self.config, self.tokenizer, self.processor, self.ps_manager_handle, collate_fn=self.collate_fn
         )
 
         # Get total training steps from the data processor where dataloaders are built
@@ -614,14 +613,18 @@ class PSRL_RayPPOTrainer:
             return
 
         # Initialize the agent loop manager
-        self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).options(max_concurrency=self.max_concurrency).remote(
-            self.config,
-            self.data_queue_size,
-            self.agent_loop_workers,
-            self.ps_manager_handle,
-            self.gateway_base_url,
-            group_post_process_fn=self.group_post_process_fn,
-            buffer_post_process_fn=self.buffer_post_process_fn,
+        self.agent_loop_manager = (
+            ray.remote(PSRL_AgentLoopManager)
+            .options(max_concurrency=self.max_concurrency)
+            .remote(
+                self.config,
+                self.data_queue_size,
+                self.agent_loop_workers,
+                self.ps_manager_handle,
+                self.gateway_base_url,
+                group_post_process_fn=self.group_post_process_fn,
+                buffer_post_process_fn=self.buffer_post_process_fn,
+            )
         )
 
     def start_agent_loop_manager(self):
@@ -1870,12 +1873,13 @@ class PSRL_RayPPOTrainer:
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.n_rollout_instances)]
         self.validate_wg_list = [all_wg[f"validate_{i}"] for i in range(self.n_validate_instances)]
         self.init_rollout_router()
-        max_concurrency_per_worker = self.max_concurrency // self.config.gen_actor_rollout_ref.rollout.agent.num_workers
+        max_concurrency_per_worker = (
+            self.max_concurrency // self.config.gen_actor_rollout_ref.rollout.agent.num_workers
+        )
         for i in range(self.config.gen_actor_rollout_ref.rollout.agent.num_workers):
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
-                    name=f"agent_loop_worker_{i}",
-                    max_concurrency=max_concurrency_per_worker
+                    name=f"agent_loop_worker_{i}", max_concurrency=max_concurrency_per_worker
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -1918,7 +1922,10 @@ class PSRL_RayPPOTrainer:
                     for node_id in rollout_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
-                        {WorkerKey("rollout", i, idx): node_id for idx, node_id in enumerate(rollout_instance_node_ids)}
+                        {
+                            WorkerKey("rollout", i, idx): node_id
+                            for idx, node_id in enumerate(rollout_instance_node_ids)
+                        }
                     )
 
                 # Get all actor instances' distinct node ids
@@ -1935,7 +1942,10 @@ class PSRL_RayPPOTrainer:
                     for node_id in validate_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
-                        {WorkerKey("validate", i, idx): node_id for idx, node_id in enumerate(validate_instance_node_ids)}
+                        {
+                            WorkerKey("validate", i, idx): node_id
+                            for idx, node_id in enumerate(validate_instance_node_ids)
+                        }
                     )
 
                 ps_spec_list = []
@@ -1984,7 +1994,10 @@ class PSRL_RayPPOTrainer:
         self.init_rollout_coordinator()
         # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
-        model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
+        if self.config.psrl.ps_mode == "cpu_ref":
+            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "full"))
+        else:
+            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -2030,7 +2043,7 @@ class PSRL_RayPPOTrainer:
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
-        
+
         else:
             # init validate wg -> offload -> init actor wg
             # ray.get(model_init_futures)
@@ -2163,7 +2176,9 @@ class PSRL_RayPPOTrainer:
                 updated_client_names.append(
                     WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
                 )
-            futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME))
+            futures.append(
+                self.validate_wg_list[i].execute_rank_zero_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME)
+            )
         # wait for ps manager to collect all infos
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(expected_update_infos))
         ray.get(futures)
@@ -2324,9 +2339,7 @@ class PSRL_RayPPOTrainer:
         for i in range(self.n_validate_instances):
             tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
             for rank in range(tp_size):
-                dst_agent_names.append(
-                    WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
-                )
+                dst_agent_names.append(WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances))
         # 4. actor workers
         for i in range(self.actor_wg.world_size):
             dst_agent_names.append(train_client_name(i))

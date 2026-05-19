@@ -3,7 +3,6 @@ import importlib
 import inspect
 import logging
 import os
-import queue
 import time
 import warnings
 from collections import defaultdict, deque
@@ -33,7 +32,6 @@ from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
-    deprecated,
     get_worker_info,
     log_begin_event,
     log_dual_events,
@@ -62,7 +60,6 @@ class GenInterface:
 
 
 class PSRL_GenWorker(Worker):
-    
     @staticmethod
     def configure_worker(
         config,

@@ -16,7 +16,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
 from verl import DataProto
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt

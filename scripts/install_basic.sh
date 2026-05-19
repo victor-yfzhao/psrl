@@ -20,7 +20,7 @@ python -m uv pip install "torch==2.9.1" "torchvision==0.24.1" "torchaudio==2.9.1
 python -m uv pip install "triton==3.5.1" "tensordict==0.10.0" torchdata
 
 echo "2. Install basic packages"
-python -m uv pip install "transformers[hf_xet]>=4.55.4" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
+python -m uv pip install "transformers[hf_xet]==5.5.0" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
     "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko sortedcontainers \
     ray[default]==2.49.1 codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
     pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl==0.26.2
@@ -30,7 +30,7 @@ python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[stand
 
 echo "4. Install FlashAttention and FlashInfer"
 # Install flash-attn-2.8.1
-FLASH_ATTN_CUDA_ARCHS=128 \
+FLASH_ATTN_CUDA_ARCHS=90 \
 FLASH_ATTENTION_FORCE_BUILD="TRUE" \
 FLASH_ATTENTION_FORCE_CXX11_ABI="FALSE" \
 FLASH_ATTENTION_SKIP_CUDA_BUILD="FALSE" \
@@ -38,6 +38,8 @@ python -m uv pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.1"
 
 # Install flashinfer-python
 python -m uv pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.5.3"
+
+python -m uv pip install flash-linear-attention==0.4.2
 
 echo "5. Install apex"
 mkdir -p apex_src
@@ -51,19 +53,7 @@ rm -rf apex_src
 echo "6. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    # NOTE(linsh): Current patch will modify cpp files,
-    # so we need to apply the patch before building vllm
-    # we can update it until v0.14.0 is released
-    git clone -b v0.12.0 https://github.com/vllm-project/vllm.git
-    VLLM_PATH=$THIRD_PARTY_PATH/vllm
-    cd $VLLM_PATH
-    cp $PSRL_PATH/patch/vllm/v0.12.0.patch .
-    git apply v0.12.0.patch
-    rm v0.12.0.patch
-    # Apply R3 patch (remove it after merged into vllm main branch)
-    cp $PSRL_PATH/patch/vllm/R3.patch .
-    git apply R3.patch
-    rm R3.patch
+    git clone -b v0.18.1 https://github.com/vllm-project/vllm.git
     popd
 fi
 pushd $VLLM_PATH
@@ -71,6 +61,9 @@ python use_existing_torch.py
 python -m uv pip install -r requirements/build.txt
 python -m uv pip install --no-build-isolation -e .
 popd
+
+# Reinstall transformers because vllm v0.18.1 uses transformers==4.57.3
+python -m uv pip install "transformers[hf_xet]==5.5.0"
 
 if [ -z "$VERL_PATH" ]; then
     pushd $THIRD_PARTY_PATH
@@ -84,9 +77,10 @@ pushd $VERL_PATH
 python -m uv pip install -e .
 popd
 
-# pushd $PSRL_PATH/patch/vllm
-# bash apply_patch.sh
-# popd
+echo "7. Apply patch for vllm"
+pushd $PSRL_PATH/patch/vllm
+bash apply_patch.sh
+popd
 
 echo "8. Apply patch for verl"
 pushd $PSRL_PATH/patch/verl
