@@ -1,5 +1,6 @@
 # Modified from verl/experimental/reward/router/naive_router.py
 import asyncio
+import heapq
 import logging
 import os
 import time
@@ -30,6 +31,7 @@ class PSRL_RewardModelRouter:
         self,
         worker_handles: list[ray.actor.ActorHandle],
         config: DictConfig,
+        reward_model_config: DictConfig | None = None,
         retry_delay: float = 2.0,
         verbose: bool = False,
     ) -> None:
@@ -45,22 +47,44 @@ class PSRL_RewardModelRouter:
         self.config = config
         self.verbose = verbose
         self.worker_handles = worker_handles
+        self.reward_model_config = reward_model_config
         self.request_counts = {i: 0 for i in range(len(worker_handles))}
         self.paused_worker_indices: set[int] = set()
         self.retry_delay = retry_delay
         self.request_futures: dict[str, asyncio.Future] = {}
-        self.requests_to_route: asyncio.Queue[tuple[str, DataProto]] = asyncio.Queue()
+        # Min-heap items (see _enqueue_request): (missing_flag, buffer_id, fifo_seq, request_key, request).
+        # missing_flag: 0 if buffer_id present (routed first), 1 if absent (demoted).
+        # buffer_id: normalized id for ordering (smaller first); 0 when missing_flag==1.
+        # fifo_seq: monotonic tie-break for FIFO among equal priority.
+        self.requests_to_route: list[tuple[int, int, int, str, DataProto]] = []
         self.routing_lock = asyncio.Lock()
         self.routing_status_update_event = asyncio.Event()
         self._is_routing = False
         self._interrupt_routing = False
         self.scheduler_task: asyncio.Task | None = None
         self._request_key_counter = 0
+        self._waiting_seq_counter = 0
+
+        raw_cap = None
+        if self.reward_model_config is not None:
+            raw_cap = self.reward_model_config.get("max_concurrent_requests_per_instance", None)
+        self.max_concurrent_requests_per_instance: int | None = None
+        if raw_cap is not None:
+            try:
+                cap = int(raw_cap)
+                if cap > 0:
+                    self.max_concurrent_requests_per_instance = cap
+            except (TypeError, ValueError):
+                self.max_concurrent_requests_per_instance = None
 
         # Build logger
         self.log_prefix = "RewardModelRouter"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
-        psrl_logger.info(f"RewardModelRouter initialized with {len(worker_handles)} workers")
+        psrl_logger.info(
+            "RewardModelRouter initialized with %d workers (max_concurrent_requests_per_instance=%s)",
+            len(worker_handles),
+            self.max_concurrent_requests_per_instance,
+        )
 
     async def _get_worker_active_task_num(self, worker_idx: int) -> int | None:
         """
@@ -100,8 +124,7 @@ class PSRL_RewardModelRouter:
         request_key = self._build_request_key(request)
         result_future = asyncio.get_running_loop().create_future()
         self.request_futures[request_key] = result_future
-        self.requests_to_route.put_nowait((request_key, request))
-        self.routing_status_update_event.set()
+        self._enqueue_request(request_key, request)
         try:
             return await result_future
         finally:
@@ -116,83 +139,92 @@ class PSRL_RewardModelRouter:
                 await self.routing_status_update_event.wait()
                 continue
 
-            try:
-                request_key, request = self.requests_to_route.get_nowait()
-            except asyncio.QueueEmpty:
+            worker_idx = self._select_worker()
+            if worker_idx is None:
                 self._is_routing = False
                 self.routing_status_update_event.clear()
                 await self.routing_status_update_event.wait()
                 continue
 
+            next_request = self._dequeue_request()
+            if next_request is None:
+                self._release_worker(worker_idx)
+                self._is_routing = False
+                self.routing_status_update_event.clear()
+                await self.routing_status_update_event.wait()
+                continue
+
+            request_key, request = next_request
             self._is_routing = True
-            task = asyncio.create_task(self._route_single_request(request_key, request))
+            task = asyncio.create_task(self._route_single_request(request_key, request, worker_idx))
             task.add_done_callback(lambda t: t.result())
             await asyncio.sleep(0)
 
-    async def _route_single_request(self, request_key: str, request: DataProto):
-        """Route one request to an available worker; requeue when needed."""
+    async def _route_single_request(self, request_key: str, request: DataProto, worker_idx: int):
+        """Route one request to a selected worker; requeue when needed."""
         # The caller might have already cancelled/aborted this request.
         if request_key not in self.request_futures:
+            self._release_worker(worker_idx)
             return
 
         request_uids = self._format_request_uids(request)
-        while True:
-            if self._interrupt_routing:
-                self.requests_to_route.put_nowait((request_key, request))
-                self.routing_status_update_event.set()
-                psrl_logger.info(f"[router] Routing is interrupted, Request {request_uids}, requeueing original request.")
-                return
-
-            worker_idx = self._select_worker()
-            if worker_idx is None:
-                psrl_logger.warning("[router] No available reward worker, retrying in %.2fs", self.retry_delay)
-                await asyncio.sleep(self.retry_delay)
-                continue
-
-            worker_handle = self.worker_handles[worker_idx]
-            inflight = await self._get_worker_active_task_num(worker_idx)
-            if inflight is None:
-                inflight = self.request_counts[worker_idx]
+        if self._interrupt_routing:
+            self._release_worker(worker_idx)
+            self._enqueue_request(request_key, request)
             psrl_logger.info(
-                "[router] Routing reward request %s to worker %d (inflight=%d)",
+                "[router] Routing is interrupted, Request %s, requeueing original request.",
                 request_uids,
-                worker_idx,
-                inflight,
             )
-            try:
-                result = await worker_handle.generate_async.remote(request)
-            finally:
-                self._release_worker(worker_idx)
-
-            if result is None:
-                psrl_logger.info("Request %s interrupted or unavailable, requeueing original request.", request_uids)
-                self.requests_to_route.put_nowait((request_key, request))
-                self.routing_status_update_event.set()
-                await asyncio.sleep(self.retry_delay)
-                return
-
-            interrupted = False
-            try:
-                interrupted = bool(result.non_tensor_batch.get("interrupted", [False])[0])
-            except Exception:
-                interrupted = False
-            if interrupted:
-                # Requeue the partial output to continue generation from existing tokens.
-                psrl_logger.info("Request %s interrupted, requeueing partial output for continuation.", request_uids)
-                self.requests_to_route.put_nowait((request_key, result))
-                self.routing_status_update_event.set()
-                await asyncio.sleep(self.retry_delay)
-                return
-
-            psrl_logger.info("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
-            self._set_result(request_key, result)
             return
+
+        worker_handle = self.worker_handles[worker_idx]
+        inflight = await self._get_worker_active_task_num(worker_idx)
+        if inflight is None:
+            inflight = self.request_counts[worker_idx]
+        psrl_logger.info(
+            "[router] Routing reward request %s to worker %d (inflight=%d)",
+            request_uids,
+            worker_idx,
+            inflight,
+        )
+        try:
+            result = await worker_handle.generate_async.remote(request)
+        finally:
+            self._release_worker(worker_idx)
+
+        if result is None:
+            psrl_logger.info("Request %s interrupted or unavailable, requeueing original request.", request_uids)
+            self._enqueue_request(request_key, request)
+            await asyncio.sleep(self.retry_delay)
+            return
+
+        interrupted = False
+        try:
+            interrupted = bool(result.non_tensor_batch.get("interrupted", [False])[0])
+        except Exception:
+            interrupted = False
+        if interrupted:
+            # Requeue the partial output to continue generation from existing tokens.
+            psrl_logger.info("Request %s interrupted, requeueing partial output for continuation.", request_uids)
+            self._enqueue_request(request_key, result)
+            await asyncio.sleep(self.retry_delay)
+            return
+
+        psrl_logger.info("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
+        self._set_result(request_key, result)
+        return
 
     def _select_worker(self) -> int | None:
         """
         Select the least-loaded worker (simple by request count).
         """
         available_indices = [idx for idx in self.request_counts if idx not in self.paused_worker_indices]
+        if self.max_concurrent_requests_per_instance is not None:
+            available_indices = [
+                idx
+                for idx in available_indices
+                if self.request_counts[idx] < self.max_concurrent_requests_per_instance
+            ]
         if not available_indices:
             return None
         worker_idx = min(available_indices, key=lambda idx: self.request_counts[idx])
@@ -204,6 +236,7 @@ class PSRL_RewardModelRouter:
         Mark worker as free after request completes.
         """
         self.request_counts[worker_idx] = max(0, self.request_counts[worker_idx] - 1)
+        self.routing_status_update_event.set()
 
     def _set_result(self, request_key: str, result: DataProto | None):
         """Resolve the waiting future of a routed request."""
@@ -226,6 +259,29 @@ class PSRL_RewardModelRouter:
         self._request_key_counter += 1
         return request_key
 
+    def _enqueue_request(self, request_key: str, request: DataProto) -> None:
+        buffer_id = self._extract_buffer_id(request)
+        # Smaller buffer_id should be routed first. Requests without buffer_id are
+        # demoted behind known buffer_id requests while preserving FIFO order.
+        missing_flag = 1 if buffer_id is None else 0
+        normalized_buffer_id = buffer_id if buffer_id is not None else 0
+        item = (
+            missing_flag,
+            normalized_buffer_id,
+            self._waiting_seq_counter,
+            request_key,
+            request,
+        )
+        self._waiting_seq_counter += 1
+        heapq.heappush(self.requests_to_route, item)
+        self.routing_status_update_event.set()
+
+    def _dequeue_request(self) -> tuple[str, DataProto] | None:
+        if not self.requests_to_route:
+            return None
+        _, _, _, request_key, request = heapq.heappop(self.requests_to_route)
+        return request_key, request
+
     @ray.method(concurrency_group="control")
     def pause_instances(self, instance_ids: list[int]):
         for instance_id in instance_ids:
@@ -244,16 +300,14 @@ class PSRL_RewardModelRouter:
 
     @ray.method(concurrency_group="control")
     def get_pending_request_count(self) -> int:
-        """Return outstanding reward requests not yet completed (elastic_rm backlog signal).
+        """Return waiting-queue depth for reward routing (elastic_rm backlog signal).
 
-        `requests_to_route` only counts items not yet dequeued by `_routing_loop`. When all
-        workers are paused (e.g. elastic sleep), `_route_single_request` dequeue then spins
-        in the retry loop — the queue can be empty while many callers still wait on
-        `request_futures`. Count futures so coordinators see real pressure and can force WAKE_UP.
+        Uses ``requests_to_route`` size: requests not yet dequeued by ``_routing_loop``.
+        Excludes requests already in ``_route_single_request`` or running on a worker.
         """
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RewardModelRouter_enter")
-        n = int(len(self.request_futures))
+        n = int(len(self.requests_to_route))
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RewardModelRouter_exit pending=%d body_s=%.6f",
@@ -288,10 +342,41 @@ class PSRL_RewardModelRouter:
             return ",".join(str(u) for u in uid_value)
         return str(uid_value)
 
+    @staticmethod
+    def _extract_buffer_id(request: DataProto) -> int | None:
+        non_tensor_batch = getattr(request, "non_tensor_batch", {}) or {}
+        candidate_keys = ("buffer_id", "waiting_buffer_id", "train_buffer_id")
+
+        def _normalize_int(v: Any) -> int | None:
+            if hasattr(v, "tolist"):
+                v = v.tolist()
+            if isinstance(v, (list, tuple)):
+                if not v:
+                    return None
+                v = v[0]
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        for key in candidate_keys:
+            value = non_tensor_batch.get(key, None)
+            normalized = _normalize_int(value)
+            if normalized is not None:
+                return normalized
+
+        extra_info = non_tensor_batch.get("extra_info", None)
+        if isinstance(extra_info, dict):
+            normalized = _normalize_int(extra_info.get("buffer_id", None))
+            if normalized is not None:
+                return normalized
+        return None
+
 
 def launch_router_process(
     worker_handles: list[ray.actor.ActorHandle],
     config: DictConfig,
+    reward_model_config: DictConfig | None = None,
     max_attempts: int = 3,
     retry_delay: float = 2.0,
     verbose: bool = False,
@@ -320,6 +405,7 @@ def launch_router_process(
     router_handle = reward_model_router_cls.options(max_concurrency=max_concurrency).remote(
         worker_handles=worker_handles,
         config=config,
+        reward_model_config=reward_model_config,
         retry_delay=retry_delay,
         verbose=verbose,
     )

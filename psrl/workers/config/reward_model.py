@@ -94,6 +94,9 @@ class RewardModelConfig(BaseConfig):
     nnodes: int = 0
     reward_manager: str = "naive"
     launch_reward_fn_async: bool = False
+    # Optional cap for concurrently occupied requests per RM instance.
+    # None means unlimited (backward-compatible behavior).
+    max_concurrent_requests_per_instance: int | None = None
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
@@ -151,6 +154,9 @@ class SingleRewardModelConfig(BaseConfig):
     pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
     sandbox_fusion: SandboxFusionConfig = field(default_factory=SandboxFusionConfig)
     reward_loop_kwargs: dict = field(default_factory=dict)
+    # Optional cap for concurrently occupied requests per RM instance.
+    # None means unlimited (backward-compatible behavior).
+    max_concurrent_requests_per_instance: int | None = None
 
 
 @dataclass

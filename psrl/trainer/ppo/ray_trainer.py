@@ -1451,14 +1451,21 @@ class PSRL_RayPPOTrainer:
                 )
 
             # SubRayResourcePool requires a contiguous bundle range [start, start + subgroup_world_size).
-            # Rotate by subgroup_world_size so different DP groups are spread across different
-            # bundle ranges first, then wrap around when oversubscribed.
+            # Align starts by subgroup size so a larger-parallelism instance maps to a group of
+            # smaller power-of-two instances, e.g. [0, 4) corresponds to [0, 2) and [2, 4).
             group_idx = elastic_subpool_group_idx_by_group.get(group_key, 0)
-            max_start = elastic_shared_pool.world_size - subgroup_world_size
-            if max_start == 0:
-                start_bundle_index = 0
-            else:
-                start_bundle_index = (group_idx * subgroup_world_size) % (max_start + 1)
+            if elastic_shared_pool.world_size % subgroup_world_size != 0:
+                raise ValueError(
+                    f"subgroup_world_size={subgroup_world_size} must divide shared pool world_size="
+                    f"{elastic_shared_pool.world_size} for elastic_rm power-of-two placement ({tag})."
+                )
+            if subgroup_world_size & (subgroup_world_size - 1) != 0:
+                raise ValueError(
+                    f"subgroup_world_size={subgroup_world_size} must be a power of two for elastic_rm "
+                    f"different-parallelism placement ({tag})."
+                )
+            slots_per_cycle = elastic_shared_pool.world_size // subgroup_world_size
+            start_bundle_index = (group_idx % slots_per_cycle) * subgroup_world_size
             elastic_subpool_group_idx_by_group[group_key] = group_idx + 1
 
             sub_rp = SubRayResourcePool(

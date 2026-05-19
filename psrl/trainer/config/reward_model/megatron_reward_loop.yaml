@@ -15,6 +15,7 @@ num_replicas: 2
 nnodes: 1
 rollout_ngpus_per_instance_per_node: 1
 rollout_nnodes_per_instance: 1
+max_concurrent_requests_per_instance: null
 
 model:
   path: ~/models/FsfairX-LLaMA3-RM-v0.1

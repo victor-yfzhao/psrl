@@ -27,6 +27,9 @@ reward_models:
     reward_fn: 
       - default
     reward_model_name: Qwen2.5-3B-Instruct
+    # Optional cap for concurrently occupied requests per RM instance.
+    # null means unlimited (backward-compatible behavior).
+    max_concurrent_requests_per_instance: null
     # reward_model_name: DeepSeek-R1-Distill-Qwen-32B
     # reward_model_name: Qwen3-30B-A3B-Instruct
   

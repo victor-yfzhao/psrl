@@ -585,8 +585,10 @@ class PSRL_GenWorker(Worker):
             init_mode=init_mode,
         )
 
-        # Don't keep the dummy data in memory
-        await rollout.inference_engine.reset_mm_cache()
+        # Non-owner model-parallel ranks do not host the vLLM engine.
+        if rollout.inference_engine is not None:
+            # Don't keep the dummy data in memory.
+            await rollout.inference_engine.reset_mm_cache()
 
         return rollout
 

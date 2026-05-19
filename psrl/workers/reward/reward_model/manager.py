@@ -122,6 +122,7 @@ class PSRL_RewardModelManager:
         self.router_process = launch_router_process(
             worker_handles=worker_handles,
             config=self.config,
+            reward_model_config=self.reward_model_config,
             max_concurrency=self.max_concurrency,
         )
         ray.get(self.reward_model_coordinator.set_reward_model_router.remote(self.router_process))

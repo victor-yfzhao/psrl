@@ -3,45 +3,73 @@ set -xeuo pipefail
 
 PSRL_WORKSPACE=/jizhicfs/pkuhetu/yfzhao/psrl
 
-staleness=${1:-2}
+staleness=${1:-1}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
-min_awake_per_role=${4:-0}
+min_awake_per_role=${4:-4}
+launch_reward_fn_async=${5:-True}
 project_name='psrl_elastic_rm'
-experiment_name=elastic_min_${min_awake_per_role}_share_8_rm_qwen_8b_rollout_qwen_7b_staleness_${staleness}
+experiment_name=async_elastic_min_${min_awake_per_role}_qwen_30b_a3b_ds_distill_staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/env_311.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
-MODEL_NAME='Qwen2.5-7B'
+# MODEL_NAME='Qwen3-30B-A3B-Instruct'
+MODEL_NAME='DeepSeek-R1-Distill-Qwen-32B'
+# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/${MODEL_NAME}
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/${MODEL_NAME}
+# python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-NNODES=2
+# Data config (Hydra / OmegaConf), aligned with psrl/trainer/config/data/multi_datasets.yaml
+GSM8K_TRAIN="${PSRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
+GSM8K_TEST="${PSRL_WORKSPACE}/data/gsm8k_verl/test.parquet"
+DAPO_TRAIN="${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"
+DAPO_VAL="${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"
+
+# One reward-dict in OmegaConf inline form: { reward_fn_key, reward_loop_type, ... }
+_DS_NAIVE='reward_fn_key:data_source,reward_loop_type:naive,reward_fn:default,reward_model_name:null,reward_coef:1.0'
+_DS_DAPO='reward_fn_key:data_source,reward_loop_type:dapo,reward_fn:default,reward_model_name:null,reward_coef:1.0'
+_DS_GEN='reward_fn_key:data_source,reward_loop_type:gen,reward_fn:default,reward_model_name:Qwen3-30B-A3B-Instruct,reward_coef:1.0'
+
+# train_datas: two rows, see diagram above
+_ROW_TRAIN_GSM8K="{file:${GSM8K_TRAIN},data_source_name:openai/gsm8k,prompt_key:prompt,reward_model_dicts:[{${_DS_NAIVE}},{${_DS_GEN}}]}"
+_ROW_TRAIN_DAPO="{file:${DAPO_TRAIN},data_source_name:dapo/dapo-math-17k,prompt_key:prompt,reward_model_dicts:[{${_DS_DAPO}},{${_DS_GEN}}]}"
+TRAIN_DATAS="[${_ROW_TRAIN_GSM8K},${_ROW_TRAIN_DAPO}]"
+
+# val_datas: one reward column each
+_ROW_VAL_GSM8K="{file:${GSM8K_TEST},prompt_key:prompt,reward_model_dicts:[{${_DS_NAIVE}}]}"
+_ROW_VAL_DAPO="{file:${DAPO_VAL},prompt_key:prompt,reward_model_dicts:[{${_DS_DAPO}}]}"
+VAL_DATAS="[${_ROW_VAL_GSM8K},${_ROW_VAL_DAPO}]"
+
+TRAIN_DATASETS_RATIOS='[0.5,0.5]'
+
+NNODES=6
 NGPUS_PER_NODE=8
 
 # shared resource pool settings
-SHARED_NNODES=1
+SHARED_NNODES=2
 SHARED_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 # rollout settings
-GEN_TP=1
+GEN_TP=2
 GEN_PP=1
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
 # training settings
-TRAIN_NNODES=1
+TRAIN_NNODES=4
 TRAIN_NGPUS_PER_NODE=8
 
 # validation settings
-VAL_TP=4 # TP in the training side for validation
+VAL_TP=8 # TP in the training side for validation
 VAL_PP=1 # PP in the training side for validation
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
 # training settings
-sp_size=2
-fsdp_size=4
+sp_size=1
+fsdp_size=32
 use_dynamic_bsz=True
 
 # dapo-reward
@@ -53,15 +81,15 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 1))
-max_response_length=$((1024 * 10))
-packing_length=$(((max_prompt_length + max_response_length) * 2))
+max_response_length=$((1024 * 8))
+packing_length=$((1024 * 10))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 8))
+overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=128
 n_resp_per_prompt=8
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=16
 
 # Algorithm
 temperature=1.0
@@ -76,6 +104,7 @@ rollout_is_threshold=2.0
 
 # Elastic RM settings
 enable_elastic_rm=True
+load_threshold_metric=kv_cache
 theta_low=0.1
 theta_max=0.8
 cooldown_ms=10000
@@ -87,10 +116,10 @@ full_load_mode=any
 
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
-offload=False
+offload=True
 
 REWARD_MODELS=(
-    reward_models_config.launch_reward_fn_async=False
+    reward_models_config.launch_reward_fn_async=${launch_reward_fn_async}
     reward_models_config.reward_normalization=batch
     reward_models_config.reward_models.0.reward_loop_type=naive
     reward_models_config.reward_models.0.reward_fn='["default"]'
@@ -103,11 +132,12 @@ REWARD_MODELS=(
     reward_models_config.reward_models.1.reward_loop_kwargs.overlong_buffer_cfg.log=False
     reward_models_config.reward_models.2.reward_loop_type=gen
     reward_models_config.reward_models.2.reward_fn='["default"]'
-    reward_models_config.reward_models.2.reward_model_name=Qwen3-8B
+    reward_models_config.reward_models.2.reward_model_name=Qwen3-30B-A3B-Instruct
     reward_models_config.reward_models.2.enable_resource_pool=True
-    reward_models_config.reward_models.2.rollout_ngpus_per_instance_per_node=1
+    reward_models_config.reward_models.2.rollout_ngpus_per_instance_per_node=2
     reward_models_config.reward_models.2.rollout_nnodes_per_instance=1
-    reward_models_config.reward_models.2.model.path=/jizhicfs/pkuhetu/models/Qwen3-8B
+    reward_models_config.reward_models.2.max_concurrent_requests_per_instance=128
+    reward_models_config.reward_models.2.model.path=models/Qwen3-30B-A3B-Instruct
     reward_models_config.reward_models.2.model.trust_remote_code=False
     reward_models_config.reward_models.2.rollout._target_=psrl.workers.config.RolloutConfig
     reward_models_config.reward_models.2.rollout.name=vllm
@@ -118,18 +148,18 @@ REWARD_MODELS=(
     reward_models_config.reward_models.2.rollout.enforce_eager=true
     reward_models_config.reward_models.2.rollout.free_cache_engine=true
     reward_models_config.reward_models.2.rollout.data_parallel_size=1
-    reward_models_config.reward_models.2.rollout.expert_parallel_size=1
+    reward_models_config.reward_models.2.rollout.expert_parallel_size=2
     reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=2
     reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=1
-    reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 11 + 1024 * 10))
-    reward_models_config.reward_models.2.rollout.max_num_seqs=10240
+    reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 19))
+    reward_models_config.reward_models.2.rollout.max_num_seqs=1024
     reward_models_config.reward_models.2.rollout.enable_chunked_prefill=false
     reward_models_config.reward_models.2.rollout.enable_prefix_caching=false
     reward_models_config.reward_models.2.rollout.disable_log_stats=false
     reward_models_config.reward_models.2.rollout.skip_tokenizer_init=false
-    reward_models_config.reward_models.2.rollout.prompt_length=$((1024 * 11))
-    reward_models_config.reward_models.2.rollout.response_length=$((1024 * 10))
-    reward_models_config.reward_models.2.rollout.max_model_len=$((1024 * 11 + 1024 * 10))
+    reward_models_config.reward_models.2.rollout.prompt_length=$((1024 * 10))
+    reward_models_config.reward_models.2.rollout.response_length=$((1024 * 8))
+    reward_models_config.reward_models.2.rollout.max_model_len=$((1024 * 19))
     reward_models_config.reward_models.2.rollout.runner=generate
     reward_models_config.reward_models.2.rollout.task=generate
     reward_models_config.reward_models.2.sampling_config.temperature=1.0
@@ -149,7 +179,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.logging_path=${PSRL_PATH}/logs/${project_name}/${experiment_name} \
     \
     psrl.deployment.elastic_rm.enable=${enable_elastic_rm} \
+    psrl.deployment.elastic_rm.shared_nnodes=${SHARED_NNODES} \
+    psrl.deployment.elastic_rm.shared_ngpus_per_node=${SHARED_NGPUS_PER_NODE} \
     psrl.deployment.elastic_rm.min_awake_per_role=${min_awake_per_role} \
+    psrl.deployment.elastic_rm.load_threshold_metric=${load_threshold_metric} \
     psrl.deployment.elastic_rm.theta_low=${theta_low} \
     psrl.deployment.elastic_rm.theta_max=${theta_max} \
     psrl.deployment.elastic_rm.cooldown_ms=${cooldown_ms} \
@@ -170,6 +203,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.deployment.total_nnodes=${NNODES} \
     \
     psrl.nixl.server_port=23456 \
+    +psrl.validate_on_psrl=False \
+    psrl.tms.range=all \
+    psrl.tms.enable_nixl=True \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
@@ -177,8 +213,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     \
     psrl.partial_rollout.enable=True \
     \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
+    \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -215,6 +253,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
+    train_actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    train_actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${sp_size} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -225,6 +265,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.train_datas="${TRAIN_DATAS}" \
+    data.val_datas="${VAL_DATAS}" \
+    data.train_datasets_ratios="${TRAIN_DATASETS_RATIOS}" \
     \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
@@ -235,10 +278,20 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.proactive_filter_strategy.threshold=4 \
     \
     trainer.logger='["console", "wandb"]' \
+    +trainer.wandb_proxy=http://star-proxy.oa.com:3128 \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.val_before_train=False \
-    trainer.test_freq=200 \
-    trainer.save_freq=200 \
+    trainer.test_freq=-1 \
+    trainer.save_freq=-1 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${PSRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
+    trainer.total_training_steps=50 2>&1 | tee ${PSRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
+
+# Optional reward_model overrides (not passed to main_ppo by default):
+#   reward_model.reward_manager=dapo \
+#   reward_model.enable_resource_pool=False \
+#   +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+#   +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+#   +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+#   +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+#   +reward_model.reward_kwargs.max_resp_len=${max_response_length} \

@@ -95,6 +95,10 @@ max_length: null
 # Whether to dynamically adjust batch size at runtime
 use_dynamic_bsz: ${critic.use_dynamic_bsz}
 
+# Optional cap for concurrently occupied requests per RM instance.
+# null means unlimited (backward-compatible behavior).
+max_concurrent_requests_per_instance: null
+
 # Maximum number of tokens per GPU in one forward pass
 forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 

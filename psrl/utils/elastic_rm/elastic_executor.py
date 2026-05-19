@@ -544,6 +544,7 @@ class ElasticExecutor:
                                 "preferred_instance_ids": action.preferred_instance_ids,
                                 "reason": action.reason,
                                 "pre_sleep_other_preferred": action.pre_sleep_other_preferred,
+                                "pre_wake_other_preferred": action.pre_wake_other_preferred,
                             }
                             for action in decision.actions
                         ],
@@ -558,6 +559,7 @@ class ElasticExecutor:
                             "reason": action.reason,
                             "decision_id": decision_id,
                             "pre_sleep_other_preferred": action.pre_sleep_other_preferred or [],
+                            "pre_wake_other_preferred": action.pre_wake_other_preferred or [],
                         }
                         if action.action_type == "scale_up":
                             self.scale_up_task_queue.put_nowait(task)
@@ -590,6 +592,24 @@ class ElasticExecutor:
                     decision_id,
                     role_need_to_scale_up,
                 )
+                instances_to_pre_wake = self._resolve_preferred_instances_to_scaled_up(
+                    role_need_to_scale_up.get("pre_wake_other_preferred") or []
+                )
+                if instances_to_pre_wake:
+                    psrl_logger.info(
+                        "elastic_rm scale_up_handler decision_id=%s pre_wake_migration count=%s detail=%s",
+                        decision_id,
+                        len(instances_to_pre_wake),
+                        instances_to_pre_wake,
+                    )
+                    await asyncio.gather(
+                        *[self._scale_up_instance(instance) for instance in instances_to_pre_wake]
+                    )
+                    psrl_logger.info(
+                        "elastic_rm scale_up_handler decision_id=%s pre_wake_migration done",
+                        decision_id,
+                    )
+
                 instances_to_scaled_down = self._find_instances_to_scaled_down_for_other_roles(role_need_to_scale_up)
                 if instances_to_scaled_down:
                     psrl_logger.info(
@@ -615,7 +635,7 @@ class ElasticExecutor:
                     decision_id,
                     instances_to_scaled_up,
                 )
-                await asyncio.gather(*[self._scale_up_instance(instance) for instance in instances_to_scaled_up])
+                await self._scale_up_instances(instances_to_scaled_up)
                 psrl_logger.info(
                     "elastic_rm scale_up_handler decision_id=%s wake_targets done; post_scale_up_abort",
                     decision_id,
@@ -742,6 +762,15 @@ class ElasticExecutor:
             dict(sorted(awake_by_role.items())),
             dict(sorted(awake_by_role_model.items())),
         )
+        router_backlog_log: dict[str, int] = {}
+        for role_key, backlog in self.router_backlog_by_role.items():
+            role_name = getattr(role_key, "name", str(role_key))
+            router_backlog_log[role_name] = int(backlog)
+        router_backlog_log = dict(sorted(router_backlog_log.items()))
+        monitor_logger.info("------------------------------------------------------------")
+        psrl_logger.info("Router backlog summary: by_role=%s", router_backlog_log)
+        monitor_logger.info("Router backlog summary: by_role=%s", router_backlog_log)
+        monitor_logger.info("------------------------------------------------------------")
 
     async def _await_elastic_coordinator_command(
         self,
@@ -904,6 +933,60 @@ class ElasticExecutor:
                 instance_model_name,
                 instance_id,
             )
+
+    async def _scale_up_instances(self, instances_to_scaled_up: list[dict]) -> None:
+        """Batch WAKE_UP for same role/model instances; fallback to per-instance on failure."""
+        if not instances_to_scaled_up:
+            return
+        if len(instances_to_scaled_up) == 1:
+            await self._scale_up_instance(instances_to_scaled_up[0])
+            return
+
+        role_set = {item["role_name"] for item in instances_to_scaled_up}
+        model_set = {item["model_name"] for item in instances_to_scaled_up}
+        if len(role_set) != 1 or len(model_set) != 1:
+            await asyncio.gather(*[self._scale_up_instance(item) for item in instances_to_scaled_up])
+            return
+
+        instance_role = next(iter(role_set))
+        instance_model_name = next(iter(model_set))
+        instance_ids = [int(item["instance_id"]) for item in instances_to_scaled_up]
+        coordinator = self.coordinators[instance_role][instance_model_name]
+        primary_stage = (
+            f"WAKE_UP role={getattr(instance_role, 'name', instance_role)} "
+            f"model={instance_model_name} instances={instance_ids}"
+        )
+
+        result = None
+        try:
+            result = await self._await_elastic_coordinator_command(
+                coordinator,
+                Command(type=CommandType.WAKE_UP, instance_ids=instance_ids),
+                stage=primary_stage,
+            )
+        except Exception:
+            psrl_logger.exception(
+                "elastic_rm batch WAKE_UP RPC raised role=%s model=%s instance_ids=%s; fallback to per-instance.",
+                getattr(instance_role, "name", instance_role),
+                instance_model_name,
+                instance_ids,
+            )
+
+        if result is True:
+            for instance_id in instance_ids:
+                self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.AWAKEN
+                self._set_instance_immunity(instance_role, instance_model_name, instance_id)
+            return
+
+        psrl_logger.warning(
+            "elastic_rm batch WAKE_UP did not fully succeed (result=%r) role=%s model=%s instance_ids=%s; "
+            "fallback to per-instance.",
+            result,
+            getattr(instance_role, "name", instance_role),
+            instance_model_name,
+            instance_ids,
+        )
+        await asyncio.gather(*[self._scale_up_instance(item) for item in instances_to_scaled_up])
 
     def _waiting_uids_for_abort_by_ratio(self, normalized_waiting_uids: list[int]) -> list[int]:
         """Take the first k waiting uids (FIFO vs queue order); k = floor(n * ratio)."""
@@ -1182,6 +1265,34 @@ class ElasticExecutor:
             for instance_id in filtered_ids[:num_instances]
         ]
 
+    def _resolve_preferred_instances_to_scaled_up(self, preferred_entries: list[dict]):
+        if not preferred_entries:
+            return None
+        resolved: list[dict] = []
+        seen: set[tuple[PSRL_Role, str, int]] = set()
+        for entry in preferred_entries:
+            if not isinstance(entry, dict):
+                continue
+            role_name = entry.get("role_name")
+            model_name = entry.get("model_name")
+            if role_name is None or model_name is None:
+                continue
+            try:
+                instance_id = int(entry["instance_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = self._instance_key(role_name, model_name, instance_id)
+            if key in seen:
+                continue
+            role_status = self.instances_status_flags.get(role_name, {}).get(model_name, {})
+            if role_status.get(instance_id) != InstanceStatus.ASLEEP:
+                continue
+            if self._has_other_role_awaken_on_shared_bundle(role_name, model_name, instance_id):
+                continue
+            resolved.append({"role_name": role_name, "model_name": model_name, "instance_id": instance_id})
+            seen.add(key)
+        return resolved if resolved else None
+
     def _find_instances_to_scaled_down_for_other_roles(self, role_need_to_scale_up: dict):
         target_role = role_need_to_scale_up["role_name"]
         num_instances = int(role_need_to_scale_up.get("num_instances", 1))
@@ -1220,8 +1331,6 @@ class ElasticExecutor:
         seen: set[tuple[PSRL_Role, str, int]] = set()
 
         def _try_pick_preferred(entry: dict) -> None:
-            if len(picked) >= num_instances:
-                return
             r = entry.get("role_name")
             m = entry.get("model_name")
             if r is None or m is None:
@@ -1249,12 +1358,10 @@ class ElasticExecutor:
             removable_budget[key] -= 1
 
         for entry in preferred_entries:
-            if len(picked) >= num_instances:
-                break
             if isinstance(entry, dict):
                 _try_pick_preferred(entry)
 
-        if len(picked) >= num_instances:
+        if preferred_entries:
             return picked
 
         rest = [

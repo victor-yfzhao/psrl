@@ -103,10 +103,18 @@ deployment:
     # back down.  Set to 0 to disable.
     wakeup_immunity_ms: 10000
 
-    # KV cache utilization threshold below which an instance can cede resources
+    # Metric used by theta_low/theta_max thresholds for elastic scaling decisions.
+    # Available options:
+    # - kv_cache: scheduler_stats.kv_cache_usage
+    # - running_request_num: scheduler_stats.num_running_reqs
+    # - waiting_request_num: scheduler_stats.num_waiting_reqs
+    # - total_request_num: num_running_reqs + num_waiting_reqs
+    load_threshold_metric: kv_cache
+
+    # Low-load threshold under `load_threshold_metric` below which an instance can cede resources
     theta_low: 0.1
 
-    # KV cache utilization threshold above which an instance is considered full-load
+    # Full-load threshold under `load_threshold_metric` above which an instance is considered full-load
     theta_max: 0.8
 
     # Cooldown window after each scaling action to avoid oscillation
