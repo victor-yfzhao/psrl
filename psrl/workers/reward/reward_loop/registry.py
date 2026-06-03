@@ -5,7 +5,7 @@ from functools import partial
 from typing import Any
 
 from omegaconf import DictConfig
-from verl.trainer.ppo.reward import get_custom_reward_fn
+from psrl.trainer.ppo.reward import get_custom_reward_fn
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase

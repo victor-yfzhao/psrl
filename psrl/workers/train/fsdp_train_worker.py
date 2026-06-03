@@ -482,40 +482,53 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
     def compute_log_prob(self, data: DataProto):
-        # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
-        with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
-            assert self._is_actor
-            if self._is_offload_param:
-                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        # Support all hardwares
+        from contextlib import nullcontext
 
-            is_lora = data.meta_info.pop("is_lora", False)
-            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-            data = data.to(get_device_id())
-            # perform recompute log_prob
-            with self.ulysses_sharding_manager:
-                data = self.ulysses_sharding_manager.preprocess_data(data)
-                with adapter_ctx:
-                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-                output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
-                output = self.ulysses_sharding_manager.postprocess_data(output)
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        # we should always recompute old_log_probs when it is HybridEngine
+        config_source = self.config.ref if is_lora else self.config.rollout
+        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        # perform recompute log_prob
+        calculate_entropy = not is_lora
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+            if not is_lora:
+                tensors = {"recomputed_log_probs": outputs["log_probs"]}
+            else:
+                tensors = {"ref_log_prob": outputs["log_probs"]}
+            if calculate_entropy:
+                tensors["entropys"] = outputs["entropys"]
+            if "sum_pi_squared" in outputs:
+                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            output = DataProto.from_dict(
+                tensors=tensors,
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
 
-            output = output.to("cpu")
+        output = output.to("cpu")
 
-            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-            # unshard the root FSDP module
-            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-                self.actor.actor_module._handle.reshard(True)
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
 
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
-            return output
+        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)

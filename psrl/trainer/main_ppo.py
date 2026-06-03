@@ -9,8 +9,8 @@ import ray
 import torch
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from verl.trainer.ppo.reward import load_reward_manager
 
+from psrl.trainer.ppo.reward import load_reward_manager
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.post_processor import (
@@ -395,11 +395,13 @@ class TaskRunner:
         reward_fn = load_reward_manager(
             config,
             tokenizer,
+            num_examine=0,
             **config.reward_model.get("reward_kwargs", {}),
         )
         val_reward_fn = load_reward_manager(
             config,
             tokenizer,
+            num_examine=1,
             **config.reward_model.get("reward_kwargs", {}),
         )
 

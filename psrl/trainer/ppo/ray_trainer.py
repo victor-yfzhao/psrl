@@ -2091,7 +2091,7 @@ class PSRL_RayPPOTrainer:
                         with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
                             self.switch_to_trainer_mode()
                     else:
-                        from verl.trainer.ppo.reward import compute_reward
+                        from psrl.trainer.ppo.reward import compute_reward
 
                         batch = ray.get(self.agent_loop_manager.get_data.remote())
                         if batch is None:
