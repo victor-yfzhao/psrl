@@ -264,7 +264,7 @@ index df927583..1ce90c5e 100644
 -
 -__all__ = ["CheckpointHandler", "OrchestrationMode"]
 diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
-index 6e643bb9..3f9651e7 100644
+index 6e643bb9..8aa97b15 100644
 --- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
 @@ -129,6 +129,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
@@ -315,7 +315,7 @@ index 6e643bb9..3f9651e7 100644
  
          if should_load_dist_model:
              assert "model" in state_dict or any(
-@@ -545,20 +562,36 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -545,18 +562,36 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                      log_with_rank(
                          f"Generated state dict for saving: {state_dict['model'].keys()}", rank=self.rank, logger=logger
                      )
@@ -344,8 +344,6 @@ index 6e643bb9..3f9651e7 100644
 +                )
 +                async_save_request = None
                  torch.distributed.barrier()
--        else:
--            assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
 +            else:
 +                log_with_rank(
 +                    f"Using DCP save to {dist_checkpoint_path}",
@@ -362,9 +360,9 @@ index 6e643bb9..3f9651e7 100644
 +                if not self.checkpoint_config.async_save:
 +                    assert async_save_request is None, "Async save request should be None when not using async save."
 +                    torch.distributed.barrier()
+         else:
+             assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
              # Generate optimizer and exra state dicts
-             sharded_sd_metadata = self._build_sharded_state_dict_metadata()
-             state_dict = self.generate_state_dict(
 diff --git a/verl/utils/import_utils.py b/verl/utils/import_utils.py
 index ab427315..8aebd3dd 100644
 --- a/verl/utils/import_utils.py
