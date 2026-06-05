@@ -18,7 +18,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 class NIXLMetaServer:
-    def __init__(self, server_name: str, nixl_config: DictConfig):
+    def __init__(self, server_name: str, nixl_config: DictConfig, broadcast_init_enabled: bool = False):
         self.server_name = server_name
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
@@ -36,6 +36,12 @@ class NIXLMetaServer:
         self._is_all_client_shardings_recved = False
         self._is_all_client_infos_recved = False
         self._is_all_temp_mappings_recved = False
+
+        # NOTE(claude): When broadcast_init is enabled, PS workers act as both senders and
+        # receivers during initialization and need each other's GPU descriptors to perform
+        # direct NIXL writes. This flag causes _get_relevant_client_names_for_agent to include
+        # all PS clients in the Phase 2b info broadcast for PS agents.
+        self._broadcast_init_enabled = broadcast_init_enabled
 
     def _add_client(self, agent_name: str, client_name: str):
         if agent_name not in self.connected_clients:
@@ -236,6 +242,17 @@ class NIXLMetaServer:
         for client_name, client_info in self.client_infos.items():
             if client_info.type in needed_types:
                 relevant.add(client_name)
+
+        # When broadcast_init is enabled, each PS worker writes directly to every other PS
+        # worker's train buffer via NIXL. Include all PS clients so every PS agent receives
+        # the GPU descriptors it needs for the broadcast. This piggybacks on the existing
+        # Phase 2b info exchange — no extra coordination round is required.
+        if self._broadcast_init_enabled:
+            ps_types = {NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL}
+            if my_types & ps_types:
+                for client_name, client_info in self.client_infos.items():
+                    if client_info.type in ps_types:
+                        relevant.add(client_name)
 
         return relevant
 

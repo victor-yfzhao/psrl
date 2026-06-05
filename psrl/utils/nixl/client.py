@@ -1157,7 +1157,7 @@ class NIXLStorageClient:
             # Contiguous xfer can be merged and executed together later
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if running_key is not None and running_shard_idx is not None:
@@ -1207,6 +1207,10 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
+        # Return [] so the caller knows there is nothing to wait on immediately.
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def client_write(
@@ -1217,9 +1221,10 @@ class NIXLStorageClient:
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
+        use_comm_plan: bool = True,
     ) -> list[tuple[int, ...]]:
         """Write to another client, supports shard alignment and communication plan."""
-        plan = comm_plan or self._comm_plan
+        plan = (comm_plan or self._comm_plan) if use_comm_plan else None
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
@@ -1327,7 +1332,7 @@ class NIXLStorageClient:
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if (key, shard_idx) in self._write_contiguous_event_cache:
@@ -1361,6 +1366,8 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client WRITE transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def clear_intermediate_cached_data(self):
@@ -1960,10 +1967,11 @@ class NIXLMultiStorageClients:
         key: str,
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
+        use_comm_plan: bool = True,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
-        client.client_write(target_agent, target_client, key, tag, comm_plan)
+        client.client_write(target_agent, target_client, key, tag, comm_plan, use_comm_plan=use_comm_plan)
 
     def wait(
         self,
