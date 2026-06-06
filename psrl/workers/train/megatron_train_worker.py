@@ -18,7 +18,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.patch_utils import apply_tms_patch
+from psrl.utils.common.patch_utils import apply_megatron_distrib_optimizer_patch, apply_tms_patch
 from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.converter import create_parameter_mapping
@@ -101,6 +101,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             "gate_proj_layer_name": "linear_fc1.",
         }
         self.weight_converter = None
+        
+        # HACK(claude): Fix Megatron Core bug where dp_reshardable checkpoint loading
+        # crashes with use_precision_aware_optimizer due to non-tensor 'padding' key
+        apply_megatron_distrib_optimizer_patch()
 
         if self.psrl_config.tms.range in ["train", "all"]:
             lazy_import_to_globals("torch_memory_saver", "torch_memory_saver")

@@ -102,6 +102,7 @@ class PSRL_AgentLoopManager:
         self.stop_collect_task = False
 
         self.curr_ps_version_tag = 0
+        self.initial_ps_version = 0  # Set during resume to offset version calculations
 
         # Data
         self.data_pool: dict[int, DataProto] = {}  # Maps request_id to stored/occupied DataProto
@@ -585,8 +586,20 @@ class PSRL_AgentLoopManager:
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
-        expected_ps_version = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        expected_ps_version = self.initial_ps_version + max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
         return expected_ps_version
+
+    def set_initial_ps_version(self, version: int):
+        """
+        Set the initial PS version for resume. This offsets the expected version
+        calculation and initializes curr_ps_version_tag.
+
+        Args:
+            version (int): The initial PS model version (= checkpoint global_step).
+        """
+        self.initial_ps_version = version
+        self.curr_ps_version_tag = version
+        psrl_logger.info(f"Set initial PS version to {version} (resume)")
 
     async def _inner_dispatch_data(self, data: DataProto, is_validate: bool = False):
         """Dispatch data to agent loop workers in a round-robin manner.
