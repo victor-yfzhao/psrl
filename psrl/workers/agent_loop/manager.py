@@ -272,7 +272,18 @@ class PSRL_AgentLoopManager:
 
         # prompts
         self.tokenizer.padding_side = "left"
-        if "raw_prompt_ids" not in inputs.non_tensor_batch:
+        # NOTE(claude): For multimodal inputs, raw_prompt_ids uses text-only tokenization
+        # (1 <|image_pad|> token), but multi_modal_inputs was computed by the processor for
+        # N vision tokens. Rebuilding prompt_ids from raw_prompt_ids would produce input_ids
+        # with only 1 image pad token, causing a shape mismatch when mbridge assigns
+        # combined_embeddings[vision_mask] = vision_embeds (1 position vs N embeddings).
+        # Use the pre-computed processor-expanded input_ids from the dataset directly.
+        is_multi_modal = "multi_modal_inputs" in inputs.non_tensor_batch
+        if is_multi_modal:
+            prompt_ids = inputs.batch["input_ids"]  # [bsz, prompt_length], already left-padded
+            prompt_attention_mask = (prompt_ids != self.tokenizer.pad_token_id).long()
+            raw_prompt_ids = None
+        elif "raw_prompt_ids" not in inputs.non_tensor_batch:
             batch_size = len(inputs)
             raw_prompt_ids = np.array(
                 [
@@ -282,21 +293,31 @@ class PSRL_AgentLoopManager:
                 dtype=object,
             )
             ## psrl_logger.info("Remove left padding from input ids to get raw_prompt_ids")
+            prompt_output = self.tokenizer.pad(
+                [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
+                padding="max_length",
+                max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            prompt_ids, prompt_attention_mask = (
+                prompt_output["input_ids"],
+                prompt_output["attention_mask"],
+            )
         else:
             raw_prompt_ids = inputs.non_tensor_batch["raw_prompt_ids"]
-
-        ## psrl_logger.info("Left pad prompt ids begin")
-        prompt_output = self.tokenizer.pad(
-            [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
-            padding="max_length",
-            max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        prompt_ids, prompt_attention_mask = (
-            prompt_output["input_ids"],
-            prompt_output["attention_mask"],
-        )
+            ## psrl_logger.info("Left pad prompt ids begin")
+            prompt_output = self.tokenizer.pad(
+                [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
+                padding="max_length",
+                max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            prompt_ids, prompt_attention_mask = (
+                prompt_output["input_ids"],
+                prompt_output["attention_mask"],
+            )
 
         # responses
         raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
@@ -340,37 +361,51 @@ class PSRL_AgentLoopManager:
         ## psrl_logger.info("Concat prompt attention mask and response attention mask begin")
         attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         ## psrl_logger.info("Concat prompt ids and response ids begin")
+        # NOTE(claude): mbridge builds vision_mask by scanning the full input_ids (prompt+response)
+        # for image_token_id occurrences. If the model generates an image pad token during rollout,
+        # vision_mask will count more positions than vision_embeds has rows, causing a shape mismatch.
+        # Sanitize response_ids to replace any stray image pad tokens before concatenation.
+        if is_multi_modal:
+            image_token_id = getattr(self.tokenizer, "image_token_id", None)
+            assert image_token_id is not None, (
+                "Cannot determine image_token_id from processor or tokenizer for multimodal sanitization."
+            )
+            response_ids = response_ids.clone()
+            response_ids[response_ids == image_token_id] = self.tokenizer.pad_token_id
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
         # Handle multi-modal inputs and position_ids calculation
-        # Only support Qwen2VLImageProcessor for multi-modal processing currently
-        # TODO(verl): support other multi-modal inputs
         multi_modal_inputs = None
-        # if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-        if False:
-            from verl.models.transformers.qwen2_vl import get_rope_index
+        if is_multi_modal and self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+            # NOTE(claude): mirror rl_dataset.py logic — select get_rope_index based on processor type.
+            # Do not re-run self.processor; image_grid_thw is already in non_tensor_batch["multi_modal_inputs"].
+            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                from verl.models.transformers.qwen3_vl import get_rope_index
+            else:
+                from verl.models.transformers.qwen2_vl import get_rope_index
 
-            images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
-            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-            multi_modal_inputs.pop("input_ids", None)
-            multi_modal_inputs.pop("attention_mask", None)
-
-            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-            # because np.array() only keeps the keys for BatchFeature.
-            multi_modal_inputs = dict(multi_modal_inputs)
-
-            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-            video_grid_thw = multi_modal_inputs.get("video_grid_thw")
-            second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
-
-            position_ids = get_rope_index(
-                self.processor,
-                input_ids=input_ids.squeeze(0),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                attention_mask=attention_mask.squeeze(0),
-            ).unsqueeze(0)  # (1, 3, seq_len)
+            mm_inputs_batch = inputs.non_tensor_batch["multi_modal_inputs"]
+            position_ids_list = []
+            for i in range(input_ids.shape[0]):
+                mm_inputs_i = mm_inputs_batch[i] if mm_inputs_batch is not None else {}
+                image_grid_thw = mm_inputs_i.get("image_grid_thw") if isinstance(mm_inputs_i, dict) else None
+                video_grid_thw = mm_inputs_i.get("video_grid_thw") if isinstance(mm_inputs_i, dict) else None
+                if image_grid_thw is not None and not isinstance(image_grid_thw, torch.Tensor):
+                    image_grid_thw = torch.tensor(image_grid_thw, device=input_ids.device)
+                elif image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.to(input_ids.device)
+                if video_grid_thw is not None and not isinstance(video_grid_thw, torch.Tensor):
+                    video_grid_thw = torch.tensor(video_grid_thw, device=input_ids.device)
+                elif video_grid_thw is not None:
+                    video_grid_thw = video_grid_thw.to(input_ids.device)
+                pos_ids_i = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids[i],
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask[i],
+                )  # (3, seq_len)
+                position_ids_list.append(pos_ids_i)
+            position_ids = torch.stack(position_ids_list, dim=0)  # (bsz, 3, seq_len)
         else:
             ## psrl_logger.info("Compute position ids with attention mask begin")
             position_ids = compute_position_id_with_mask(attention_mask)
@@ -419,10 +454,8 @@ class PSRL_AgentLoopManager:
                 actual_length = experts_array.shape[0]
                 experts_tensor = torch.from_numpy(experts_array)
 
-                raw_prompt_id = raw_prompt_ids[i]
-
-                # Calculate start position: left padding means original prompt starts at the end
-                start_pos = prompt_ids.shape[1] - len(raw_prompt_id)
+                # Calculate start position: number of left padding tokens.
+                start_pos = int((prompt_ids[i] == self.tokenizer.pad_token_id).sum())
                 end_pos = min(start_pos + actual_length, total_length)
 
                 # Add boundary checks for robustness

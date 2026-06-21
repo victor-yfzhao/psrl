@@ -219,6 +219,7 @@ class PSRL_vLLMRollout:
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
             enable_return_routed_experts=enable_return_routed_experts,
+            mm_processor_cache_gb=0,
             **compilation_config,
             **lora_kwargs,
             **engine_kwargs,
