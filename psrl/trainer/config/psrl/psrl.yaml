@@ -216,6 +216,15 @@ routing_strategy:
   # The actual max number of concurrent sequences per instance
   max_concurrent_seqs_per_instance: 1024
 
+  # Per-instance in-flight request budget for validation, used to size the router/agent Ray actor's
+  # max_concurrency. NOTE: this is different from max_concurrent_seqs_per_instance above, which is the
+  # route-strategy layer's per-instance cap that rejects routing once an engine is saturated. This one
+  # instead controls how many validation requests can be in-flight (dispatched and awaiting completion)
+  # per instance at the actor level. Validation does not need staleness control, so its in-flight count
+  # is not bounded by the training staleness formula; raising this lets validation saturate the engines
+  # instead of inheriting the (often small) training in-flight limit.
+  val_max_inflight_requests_per_instance: 1024
+
 # Model synchronization and rollout migration strategy config
 sync_and_mig_strategy:
 
@@ -345,6 +354,17 @@ colocate_validate_and_train: True
 
 # Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
 fuse_rollout_with_validate: True
+
+# How to free up rollout instances for validation so val requests are not slowed down by
+# competing training rollout requests. Options:
+#   "none": do nothing; training rollouts keep competing with validation.
+#   "soft": stop routing NEW training rollout requests during validation; in-flight rollouts
+#           drain naturally. Low overhead, but early validation may still compete with in-flight rollouts.
+#   "hard": "soft" plus aborting in-flight training rollouts already dispatched to the engines so
+#           validation gets exclusive engine capacity immediately. Interrupted rollouts are looped
+#           back as partial rollouts and rescheduled after validation. Requires partial_rollout.enable=True.
+val_rollout_pause_mode: hard
+
 
 # Whether to use torch_memory_saver (TMS) for GPU management
 tms:

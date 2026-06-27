@@ -97,6 +97,9 @@ class RolloutRouter:
             )
         self._is_routing = False
         self._pause_routing = False
+        # NOTE(claude): _pause_rollout_routing selectively defers non-validate (rollout) requests
+        # while still routing validate requests. Used to give validation exclusive engine capacity.
+        self._pause_rollout_routing = False
         self.scheduler_task = None  # Will be created in async context
         # Track the inflight request ids for each instance (i.e., request that is being generated
         # and is not yet completed or queued in the priority queue): {instance_id: [request_id, ...]}
@@ -597,6 +600,24 @@ class RolloutRouter:
         self._pause_routing = False
         psrl_logger.info("Resuming routing")
 
+    @ray.method(concurrency_group="control")
+    async def pause_rollout_routing(self):
+        """Defer routing of rollout requests while keeping validate requests routable.
+
+        Unlike pause_routing, which halts the routing loop entirely, this only causes
+        the routing loops to skip non-validate requests. In-flight rollout requests already
+        dispatched to engines are not interrupted; they drain naturally. This gives validation
+        exclusive scheduling of new requests so it is not slowed down by competing rollouts.
+        """
+        self._pause_rollout_routing = True
+        psrl_logger.info("Pausing rollout request routing (validate requests still routed).")
+
+    @ray.method(concurrency_group="control")
+    async def resume_rollout_routing(self):
+        """Resume routing of rollout requests after validation completes."""
+        self._pause_rollout_routing = False
+        psrl_logger.info("Resuming rollout request routing.")
+
     async def _single_priority_queue_routing_loop(self):
         """Continuous routing loop for a single priority queue.
 
@@ -605,6 +626,9 @@ class RolloutRouter:
         psrl_logger.info("Started single priority queue routing loop")
         while True:
             self._is_routing = False
+            # NOTE(claude): rollout requests deferred this cycle due to _pause_rollout_routing.
+            # They are put back into the queue after the inner loop so validation can proceed.
+            deferred_rollout_requests = []
             async with (
                 AsyncBusyPollingRayLock(self.ps_manager_handle),
             ):
@@ -614,13 +638,14 @@ class RolloutRouter:
                     assert request is not None, "Request should not be None in priority queue"
                     request_id = request.non_tensor_batch["uid"][0]
                     assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+                    # Defer rollout requests while validation has exclusive routing.
+                    if self._pause_rollout_routing and not request.meta_info.get("validate", False):
+                        deferred_rollout_requests.append(request)
+                        continue
                     if await self.ps_manager_handle.check_aborted_requests.remote(request_id, remove=True):
                         self._set_result(request_id, None)
                         continue
-                    # time_begin = time.time()
                     new_instance_id = await self._choose_new_rollout_instance(request)
-                    # time_end = time.time()
-                    # psrl_logger.info(f"Choosing rollout instance for request {request_id} to {new_instance_id} in {time_end - time_begin} seconds") # noqa: E501
                     if new_instance_id is None:
                         # new_instance_id is None indicates that we cannot find a suitable rollout instance
                         # for the request due to the current engine status (e.g.,
@@ -637,6 +662,9 @@ class RolloutRouter:
                     task = asyncio.create_task(task_coro)
                     # To avoid silent error in async tasks
                     task.add_done_callback(lambda f: f.result())
+                # Put deferred rollout requests back so they are reconsidered next cycle.
+                for request in deferred_rollout_requests:
+                    self.requests_to_route.put(request)
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
             await asyncio.sleep(sleep_time)
@@ -663,11 +691,17 @@ class RolloutRouter:
                         break
                         # Method 2: Try to process the other queues
                         # remain_requests.clear()
+                    # Rollout requests deferred this cycle due to _pause_rollout_routing; put back per queue.
+                    deferred_rollout_requests = []
                     while not request_queue.empty() and not self._pause_routing:
                         request = request_queue.pop()
                         assert request is not None, "Request should not be None in priority queue"
                         request_id = request.non_tensor_batch["uid"][0]
                         assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+                        # Defer rollout requests while validation has exclusive routing.
+                        if self._pause_rollout_routing and not request.meta_info.get("validate", False):
+                            deferred_rollout_requests.append(request)
+                            continue
                         if await self.ps_manager_handle.check_aborted_requests.remote(request_id, remove=True):
                             self._set_result(request_id, None)
                             continue
@@ -691,6 +725,8 @@ class RolloutRouter:
                         task.add_done_callback(lambda f: f.result())
                         route_num += 1
                     for request in remain_requests:
+                        request_queue.put(request)
+                    for request in deferred_rollout_requests:
                         request_queue.put(request)
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000

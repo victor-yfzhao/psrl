@@ -181,6 +181,17 @@ class PSRL_RayPPOTrainer:
                 * (self.config.psrl.staleness + 1)
             )
 
+        # NOTE(claude): The training formula above bounds in-flight rollout requests for staleness
+        # control. Validation requests skip staleness reservation (version_tag != -1), so they are
+        # only limited by the router/agent actor's max_concurrency. To let validation saturate the
+        # engines instead of inheriting the (often small) training in-flight cap, raise the actor
+        # concurrency to also cover the validation target. Training staleness is still enforced
+        # independently by the staleness inventory, so a larger ceiling does not affect it.
+        val_required_concurrency = self.config.psrl.routing_strategy.val_max_inflight_requests_per_instance * (
+            self.n_rollout_instances + self.n_validate_instances
+        )
+        self.max_concurrency = max(self.max_concurrency, val_required_concurrency)
+
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if config.algorithm.use_kl_in_reward:
@@ -890,96 +901,125 @@ class PSRL_RayPPOTrainer:
         ray.get(futures)
 
         val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
-        for test_batch in test_batch_list:
-            batch_size = len(test_batch.batch)
-
-            sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
-            test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
-
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO(verl): Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
-
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "interaction_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-            if "agent_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("agent_name")
-            non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        # Free up rollout instances for validation according to the configured pause mode so that
+        # validation is not slowed down by competing training rollout requests.
+        #   "none": do nothing.
+        #   "soft": stop routing new training rollout requests; in-flight rollouts drain naturally.
+        #   "hard": "soft" plus abort in-flight rollouts (looped back as partial rollouts) for
+        #           immediate exclusive engine capacity. Requires partial_rollout.enable=True.
+        val_rollout_pause_mode = self.config.psrl.get("val_rollout_pause_mode", "none")
+        assert val_rollout_pause_mode in ("none", "soft", "hard"), (
+            f"val_rollout_pause_mode must be one of 'none', 'soft', 'hard', got: {val_rollout_pause_mode!r}."
+        )
+        if val_rollout_pause_mode in ("soft", "hard"):
+            ray.get(self.rollout_router.pause_rollout_routing.remote())
+        if val_rollout_pause_mode == "hard":
+            assert self.config.psrl.partial_rollout.enable, (
+                "val_rollout_pause_mode='hard' requires partial_rollout.enable=True so aborted "
+                "in-flight rollouts are looped back as partial rollouts instead of being discarded."
             )
+            # Only applicable to the non-colocate async rollout path where a rollout coordinator
+            # drives streaming rollouts.
+            if self.rollout_coordinator is not None:
+                rollout_instance_ids = list(range(self.n_rollout_instances))
+                ray.get(self.rollout_coordinator.abort_rollout_instances.remote(rollout_instance_ids))
+        try:
+            for test_batch in test_batch_list:
+                batch_size = len(test_batch.batch)
 
-            if val_rollout_n > 1:
-                uid_list = []
-                for i in range(batch_size):
-                    for j in range(val_rollout_n):
-                        child_id = sample_ids[i] * val_rollout_n + j
-                        uid_list.append(child_id)
-                test_gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
+                sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
+                test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
+                # repeat test batch
+                test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
 
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.train_actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            psrl_logger.debug(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+                # Store original inputs
+                input_ids = test_batch.batch["input_ids"]
+                # TODO(verl): Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                sample_inputs.extend(input_texts)
+                sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
 
-            val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
-            with log_dual_events(f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                test_output_gen_batch = ray.get(
-                    self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
+                ground_truths = [
+                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+                ]
+                sample_gts.extend(ground_truths)
+
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                if "multi_modal_data" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "tools_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "interaction_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+                if "agent_name" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("agent_name")
+                non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
+                test_gen_batch = test_batch.pop(
+                    batch_keys=batch_keys_to_pop,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                if val_rollout_n > 1:
+                    uid_list = []
+                    for i in range(batch_size):
+                        for j in range(val_rollout_n):
+                            child_id = sample_ids[i] * val_rollout_n + j
+                            uid_list.append(child_id)
+                    test_gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.train_actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
+                psrl_logger.debug(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
+                with log_dual_events(
+                    f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT
+                ):
+                    test_output_gen_batch = ray.get(
+                        self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
+                    )
 
-            reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                sample_outputs.extend(output_texts)
 
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+                test_batch = test_batch.union(test_output_gen_batch)
+                test_batch.meta_info["validate"] = True
 
-            data_source_lst.append(
-                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
-            )
+                # evaluate using reward_function
+                if self.val_reward_fn is None:
+                    raise ValueError("val_reward_fn must be provided for validation.")
+                result = self.val_reward_fn(test_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_scores.extend(scores)
+
+                reward_extra_infos_dict["reward"].extend(scores)
+                if "reward_extra_info" in result:
+                    for key, lst in result["reward_extra_info"].items():
+                        reward_extra_infos_dict[key].extend(lst)
+
+                # collect num_turns of each prompt
+                if "__num_turns__" in test_batch.non_tensor_batch:
+                    sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+                data_source_lst.append(
+                    test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+                )
+        finally:
+            # Resume training rollout request routing once validation generation is done.
+            if val_rollout_pause_mode in ("soft", "hard"):
+                ray.get(self.rollout_router.resume_rollout_routing.remote())
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 

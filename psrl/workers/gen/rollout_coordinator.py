@@ -779,6 +779,49 @@ class RolloutCoordinator(CommandExtension):
             await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after synchronization")
 
+    async def abort_rollout_instances(
+        self,
+        instance_ids: list[int],
+        wait_interrupted_partial_requests_loop_back: bool = True,
+    ):
+        """Abort in-flight rollout requests on the given instances without pulling the model.
+
+        Unlike sync_with_ps, this only interrupts running generations so that the engines free up
+        capacity (e.g. for exclusive validation), without a subsequent model pull or resume command.
+        Interrupted requests are looped back into the router queue as partial rollouts and will be
+        rescheduled once rollout routing is resumed. The caller is responsible for deferring rollout
+        routing (e.g. via router.pause_rollout_routing) before calling this, so the aborted requests
+        are not immediately re-dispatched.
+
+        Args:
+            instance_ids (list[int]): Rollout instance IDs whose in-flight requests should be aborted.
+            wait_interrupted_partial_requests_loop_back (bool): If True, wait until all interrupted
+                requests have been looped back into the router queue before returning.
+        """
+        assert self.config.psrl.partial_rollout.enable, (
+            "abort_rollout_instances requires partial_rollout.enable=True so interrupted requests "
+            "are looped back as partial rollouts instead of being discarded."
+        )
+        with log_dual_events(
+            f"Aborting in-flight rollout requests on instances {instance_ids}",
+            psrl_logger,
+            level=logging.INFO,
+            event_type=EventType.OTHER,
+        ):
+            await self.exec_command(
+                Command(
+                    type=CommandType.ABORT,
+                    instance_ids=instance_ids,
+                ),
+                blocking=True,
+            )
+            psrl_logger.info(f"Executed ABORT command for instances {instance_ids}")
+            if wait_interrupted_partial_requests_loop_back:
+                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
+                psrl_logger.info(
+                    f"All interrupted requests on aborted instances {instance_ids} have been looped back."
+                )
+
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
         """
         Check whether the instance has no active tasks.
