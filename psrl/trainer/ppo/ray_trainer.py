@@ -2490,6 +2490,7 @@ class PSRL_RayPPOTrainer:
                             batch = batch.union(values)
 
                 # compute reward model score
+                reward_extra_infos_dict = defaultdict(list)
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
                     with marked_timer("reward", timing_raw, color="yellow"):
                         with log_dual_events(
@@ -2538,7 +2539,6 @@ class PSRL_RayPPOTrainer:
                             reward_tensor = rm_scores  # [bsz, response_length]
 
                             # add reward_extra_info to non_tensor_batch
-                            reward_extra_infos_dict = defaultdict(list)
                             for reward_extra_infos in reward_extra_infos_dict_list:
                                 for key, value in reward_extra_infos.items():
                                     if not isinstance(value, list):
@@ -2630,51 +2630,21 @@ class PSRL_RayPPOTrainer:
                     # )
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
-
-                # Log rollout generations if enabled
-                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                if rollout_data_dir:
-                    with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                        with log_dual_events(
-                            "Dump rollout generations",
-                            psrl_logger,
-                            event_type=EventType.OTHER,
-                        ):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            sample_gts = [
-                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-                                for item in batch
-                            ]
-                            if "request_id" in batch.non_tensor_batch:
-                                reward_extra_infos_dict.setdefault(
-                                    "request_id",
-                                    batch.non_tensor_batch["request_id"].tolist(),
-                                )
-
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                gts=sample_gts,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
-
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        with log_dual_events("Validate", psrl_logger, event_type=EventType.VAL):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
+                
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
+                
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
@@ -2682,19 +2652,18 @@ class PSRL_RayPPOTrainer:
                         with log_dual_events("Save checkpoint", psrl_logger, event_type=EventType.OTHER):
                             self._save_checkpoint()
 
-            with marked_timer("stop_profile", timing_raw):
-                next_step_profile = (
-                    self.global_steps + 1 in self.config.global_profiler.steps
-                    if self.config.global_profiler.steps is not None
-                    else False
-                )
-                self._stop_profiling(
-                    curr_step_profile and not next_step_profile
-                    if self.config.global_profiler.profile_continuous_steps
-                    else curr_step_profile
-                )
-                prev_step_profile = curr_step_profile
-                curr_step_profile = next_step_profile
+            # validate
+            if (
+                self.val_reward_fn is not None
+                and self.config.trainer.test_freq > 0
+                and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+            ):
+                with marked_timer("testing", timing_raw, color="green"):
+                    with log_dual_events("Validate", psrl_logger, event_type=EventType.VAL):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                metrics.update(val_metrics)
 
             steps_duration = timing_raw["step"]
             self.max_steps_duration = max(self.max_steps_duration, steps_duration)
@@ -2717,6 +2686,37 @@ class PSRL_RayPPOTrainer:
 
             progress_bar.update(1)
             self.global_steps += 1
+            
+            # Log rollout generations if enabled
+            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+            if rollout_data_dir:
+                with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                    with log_dual_events(
+                        "Dump rollout generations",
+                        psrl_logger,
+                        event_type=EventType.OTHER,
+                    ):
+                        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                        sample_gts = [
+                            item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                            for item in batch
+                        ]
+                        if "request_id" in batch.non_tensor_batch:
+                            reward_extra_infos_dict.setdefault(
+                                "request_id",
+                                batch.non_tensor_batch["request_id"].tolist(),
+                            )
+
+                        self._dump_generations(
+                            inputs=inputs,
+                            outputs=outputs,
+                            gts=sample_gts,
+                            scores=scores,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                            dump_path=rollout_data_dir,
+                        )
 
             if (
                 hasattr(self.config.train_actor_rollout_ref.actor, "profiler")
