@@ -40,14 +40,20 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import NIXLInterface
 from psrl.utils.ray import shared_pull_model_context_async
+from psrl.utils.rollout.request_id import (
+    normalize_request_ids_for_vllm_abort,
+    parse_psrl_uid_from_request_id,
+)
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.config import HFModelConfig, RolloutConfig
-from psrl.workers.gen import PSRL_vLLMRollout
+from psrl.workers.gen import PSRL_TransformersRollout, PSRL_vLLMRollout
 from psrl.workers.gen.engine_http_server import EngineHttpServer
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+vllm_rollout_logger = logging.getLogger(PSRL_vLLMRollout.__module__)
+vllm_rollout_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 @dataclass
@@ -126,7 +132,7 @@ class PSRL_GenWorker(Worker):
         # Please track https://github.com/pytorch/pytorch/issues/147851 for more infos.
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
 
-        if role in ["rollout", "validate"]:
+        if role in ["rollout", "validate", "reward"]:
             # use tms for memory management of model weights and kv cache
             if psrl_config.tms.range == "all" or psrl_config.tms.enable_nixl:
                 import torch_memory_saver  # noqa: F401
@@ -140,7 +146,7 @@ class PSRL_GenWorker(Worker):
                 env_vars["TMS_INIT_ENABLE"] = "0"
                 env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
 
-            if psrl_config.tms.enable_cuda_graph:
+            if role != "reward" and psrl_config.tms.enable_cuda_graph:
                 env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
             elif psrl_config.tms.range == "all":
                 env_vars["PSRL_VLLM_PATCHES"] = "TMS"
@@ -182,6 +188,7 @@ class PSRL_GenWorker(Worker):
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
         self.reward_model_name = kwargs.get("reward_model_name", None)
+        self.rm_config = kwargs.get("rm_config", None)
         self.is_teacher_model = kwargs.get("is_teacher_model", False)
         self.instance_id = kwargs.get("instance_id", self.gen_interface.rollout_instance_id)
         self.instance_dist_group = None
@@ -250,7 +257,14 @@ class PSRL_GenWorker(Worker):
                 self.log_prefix = f"RewardModelWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
             else:
                 self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
-            psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+            worker_log_handler = DualOutputHandler(self.psrl_config.logging_path, self.log_prefix)
+            psrl_logger.addHandler(worker_log_handler)
+            if self.role == "reward" and not any(
+                isinstance(handler, DualOutputHandler)
+                and getattr(handler, "log_prefix", None) == self.log_prefix
+                for handler in vllm_rollout_logger.handlers
+            ):
+                vllm_rollout_logger.addHandler(worker_log_handler)
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
         # [Optional] expose this rollout engine via HTTP (OpenAI-compatible) and
@@ -268,6 +282,31 @@ class PSRL_GenWorker(Worker):
             method_name,
             args=args,
         )
+
+    async def _preload_reward_weights_to_cpu_cache(self) -> None:
+        """Preload reward model checkpoint weights into vLLM worker CPU memory."""
+        assert self.rollout, "Rollout must be initialized before preloading reward weights."
+        assert self.rollout.inference_engine is not None, "Reward vLLM engine must be initialized."
+        await self.rollout.inference_engine.collective_rpc(
+            "preload_weights_to_cpu_cache",
+            args=(self.config.model.path, self.config.rollout.load_format),
+        )
+        psrl_logger.info("Reward model weights preloaded to CPU cache on instance %s.", self.get_instance_id())
+
+    async def _load_reward_weights_from_cpu_cache(self) -> None:
+        """Load reward model weights from the vLLM worker CPU cache to GPU."""
+        assert self.rollout, "Rollout must be initialized before loading reward weights."
+        assert self.rollout.inference_engine is not None, "Reward vLLM engine must be initialized."
+        loaded_params = await self.rollout.inference_engine.collective_rpc(
+            "load_weights_from_cpu_cache",
+            args=(),
+        )
+        if loaded_params is None:
+            raise RuntimeError("Reward model failed to load weights from CPU cache.")
+
+    def _is_transformers_rollout_backend(self) -> bool:
+        rollout_name = str(self.config.rollout.name).lower()
+        return rollout_name in ("transformers", "hf")
 
     def _build_distributed(self):
         """Build the distributed process group for the rollout instance."""
@@ -362,21 +401,29 @@ class PSRL_GenWorker(Worker):
 
     async def sleep(self):
         """Put model weights to sleep state (free up GPU memory)."""
+        if self._is_transformers_rollout_backend():
+            psrl_logger.info("Transformers rollout sleep is a no-op on instance %s.", self.get_instance_id())
+            return
         psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
         interrupted_request_num = await self.interrupt_generation()
         psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
 
-        sleep_level = 1 if self.role == "reward" else 2
-        await self.rollout.inference_engine.sleep(level=sleep_level)
-        if self.role != "reward" and self.psrl_config.tms.range in ["rollout", "all"]:
+        await self.rollout.inference_engine.sleep(level=2)
+        if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.
             aggressive_empty_cache(force_sync=True)
 
     async def wake_up(self):
         """Wake up model weights."""
+        if self._is_transformers_rollout_backend():
+            self.resume_generation()
+            psrl_logger.info("Transformers rollout wake_up is a no-op on instance %s.", self.get_instance_id())
+            return
         if self.role == "reward":
-            await self.rollout.inference_engine.wake_up()
+            await self.rollout.inference_engine.wake_up(tags=["weights"])
+            await self._load_reward_weights_from_cpu_cache()
+            await self.rollout.inference_engine.wake_up(tags=["kv_cache"])
             self.resume_generation()
             psrl_logger.info(f"Generation resumed on instance {self.get_instance_id()}")
             return
@@ -390,6 +437,8 @@ class PSRL_GenWorker(Worker):
         """True if vLLM engine is sleeping (weights released); coordinator should not SYNC these instances."""
         await self._is_init_model.wait()
         assert self.rollout is not None
+        if self._is_transformers_rollout_backend():
+            return False
         return await self.rollout.inference_engine.is_sleeping()
 
     async def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
@@ -518,8 +567,11 @@ class PSRL_GenWorker(Worker):
 
         NOTE: This method only supports building for one rollout instance at a time.
         """
-        rollout_name = self.config.rollout.name
-        assert rollout_name == "vllm", "Only support vLLM rollout for now"
+        rollout_name = str(self.config.rollout.name).lower()
+        supported_rollout_names = ("vllm", "transformers", "hf")
+        assert rollout_name in supported_rollout_names, (
+            f"Unsupported rollout backend {rollout_name!r}, expected one of {supported_rollout_names}."
+        )
         assert init_mode in ["full", "empty"], "init_mode must be either 'full' or 'empty'"
 
         try:
@@ -567,7 +619,7 @@ class PSRL_GenWorker(Worker):
         get_torch_device().manual_seed(self.seed)
 
         psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
-        rollout = PSRL_vLLMRollout(
+        rollout_kwargs = dict(
             psrl_config=self.psrl_config,
             config=rollout_config,
             model_config=model_config,
@@ -579,8 +631,24 @@ class PSRL_GenWorker(Worker):
             is_reward_model=self.role == "reward",
             is_teacher_model=self.is_teacher_model,
             reward_model_name=self.reward_model_name,
+            rm_config=self.rm_config,
             init_mode=init_mode,
         )
+        if rollout_name == "vllm":
+            rollout = PSRL_vLLMRollout(**rollout_kwargs)
+        else:
+            if self.role != "reward" or not self.is_teacher_model:
+                raise NotImplementedError("Transformers rollout only supports OPD teacher reward workers.")
+            if pp != 1:
+                raise NotImplementedError("Transformers rollout does not support pipeline parallelism.")
+            ep = int(self.config.rollout.get("expert_parallel_size", 1))
+            if ep > 1 and ep != tp:
+                raise NotImplementedError(
+                    "Transformers rollout uses a 1D EP mesh and requires "
+                    f"expert_parallel_size == tensor_model_parallel_size, got {ep=} {tp=}."
+                )
+            self._build_distributed()
+            rollout = PSRL_TransformersRollout(**rollout_kwargs)
 
         # Non-owner model-parallel ranks do not host the vLLM engine.
         if rollout.inference_engine is not None:
@@ -603,11 +671,19 @@ class PSRL_GenWorker(Worker):
             self.rollout = await self._build_rollout(
                 init_mode, trust_remote_code=self.config.model.get("trust_remote_code", False)
             )
+            if self.role == "reward" and self.rollout.inference_engine is not None:
+                await self._preload_reward_weights_to_cpu_cache()
+                if not self.psrl_config.deployment.elastic_rm.enable:
+                    await self._load_reward_weights_from_cpu_cache()
         self._is_init_model.set()
 
         # Representative rank can start HTTP server after model built.
         # For other ranks, the server is not needed.
-        if self.psrl_config.server_rollout.enable and self.is_instance_representative_rank:
+        if (
+            self.psrl_config.server_rollout.enable
+            and self.is_instance_representative_rank
+            and not self._is_transformers_rollout_backend()
+        ):
             await self._maybe_start_engine_http_server()
 
     async def init_and_register_model(self, init_mode: str = "full"):
@@ -674,7 +750,13 @@ class PSRL_GenWorker(Worker):
         self._gateway_base_url = base_url.rstrip("/") if base_url else None
 
     def _extract_sampling_params_dict(self, request: DataProto) -> dict[str, Any]:
-        """Extract per-request sampling params for reward-model generation."""
+        """Extract sampling params for reward-model generation.
+
+        Priority order:
+        1. per-request ``sampling_params`` override
+        2. reward model ``sampling_config``
+        3. rollout default ``SamplingParams``
+        """
         if "sampling_params" in request.non_tensor_batch:
             sp = request.non_tensor_batch["sampling_params"]
             if isinstance(sp, np.ndarray):
@@ -688,11 +770,27 @@ class PSRL_GenWorker(Worker):
         if "sampling_params" in request.meta_info and isinstance(request.meta_info["sampling_params"], dict):
             return request.meta_info["sampling_params"]
 
+        params = self._rollout_sampling_params_dict()
+        if self.role == "reward" and self.rm_config is not None:
+            sampling_config = self.rm_config.get("sampling_config", None)
+            if sampling_config is not None:
+                sampling_config = OmegaConf.to_container(sampling_config, resolve=True)
+                if isinstance(sampling_config, dict):
+                    for key, value in sampling_config.items():
+                        # vLLM rollout repeats samples outside SamplingParams; keep n=1.
+                        if key == "n" or value is None:
+                            continue
+                        if key in params:
+                            params[key] = value
+        return params
+
+    def _rollout_sampling_params_dict(self) -> dict[str, Any]:
+        """Return the rollout default SamplingParams as a mutable dict."""
         rollout_sp = getattr(self.rollout, "sampling_params", None)
         if rollout_sp is None:
             return {}
         if isinstance(rollout_sp, dict):
-            return rollout_sp
+            return dict(rollout_sp)
         if hasattr(rollout_sp, "to_dict"):
             return rollout_sp.to_dict()
         if hasattr(rollout_sp, "model_dump"):
@@ -827,16 +925,34 @@ class PSRL_GenWorker(Worker):
             psrl_logger.debug(f"Interrupted all {interrupt_request_num} requests")
             return interrupt_request_num
 
+        engine_request_ids = normalize_request_ids_for_vllm_abort(request_ids)
         request_tasks = set()
-        for request_id in request_ids:
-            if request_id in self.request_id_to_active_tasks:
-                request_tasks.update(self.request_id_to_active_tasks[request_id])
+        missing_request_ids = []
+        for request_id in engine_request_ids:
+            lookup_key = parse_psrl_uid_from_request_id(request_id)
+            if lookup_key in self.request_id_to_active_tasks:
+                request_tasks.update(self.request_id_to_active_tasks[lookup_key])
             else:
-                psrl_logger.warning(f"Request ID {request_id} not found in active tasks.")
-        psrl_logger.debug(f"Found {len(request_tasks)} active tasks for request IDs: {request_ids}")
-        if request_tasks:
-            await self.rollout.interrupt_requests_async(request_ids)
-            psrl_logger.debug(f"Interrupted requests with IDs: {request_ids}")
+                # Waiting-queue ids from scheduler stats are vLLM-internal strings;
+                # active tasks are keyed by PSRL integer uid. Unmatched ids may still
+                # exist only in the engine queue (not yet tracked locally).
+                missing_request_ids.append(request_id)
+        psrl_logger.debug(
+            "Found %d active tasks for engine request IDs (sample=%s)",
+            len(request_tasks),
+            engine_request_ids[:10],
+        )
+        if missing_request_ids:
+            psrl_logger.debug(
+                "Interrupt engine ids not found in active tasks (count=%d, lookup_keys=%s); ids=%s",
+                len(missing_request_ids),
+                [parse_psrl_uid_from_request_id(rid) for rid in missing_request_ids[:10]],
+                missing_request_ids[:10],
+            )
+
+        # Abort using vLLM internal request id strings (not PSRL uid integers).
+        await self.rollout.interrupt_requests_async(engine_request_ids)
+        psrl_logger.debug(f"Interrupted requests with IDs: {request_ids}")
         interrupt_request_num = len(request_tasks)
         return interrupt_request_num
 
@@ -965,6 +1081,7 @@ class PSRL_GenWorker(Worker):
         """
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
         if self.role == "reward":
+            request_id = request.non_tensor_batch.get("uid", ["unknown"])[0]
             rollout_instance_id = self.get_instance_id()
             meta_info = {
                 "eos_token_id": (

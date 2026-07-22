@@ -985,7 +985,7 @@ class StalenessInventory:
                         buffer_id,
                         entry_id,
                     )
-                    psrl_logger.info(
+                    psrl_logger.debug(
                         f"[Reserved Entry Move (1/2)]: entry {first_reserved_entry_info} moved "
                         f"from (buffer {exchange_buffer_id}, entry {first_reserved_entry_id}) "
                         f"to (buffer {buffer_id}, entry {entry_id})"
@@ -1005,7 +1005,7 @@ class StalenessInventory:
                             exchange_buffer_id,
                             first_reserved_entry_id,
                         )
-                        psrl_logger.info(
+                        psrl_logger.debug(
                             f"[Reserved Entry Move (2/2)]: entry {moved_entry_info} moved "
                             f"from (buffer {exchange_buffer_id}, entry {last_reserved_entry_id}) "
                             f"to (buffer {exchange_buffer_id}, entry {first_reserved_entry_id})"

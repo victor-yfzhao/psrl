@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import numpy as np
 import torch
@@ -102,6 +103,10 @@ class OPDRewardLoopManager(RewardLoopManagerBase):
             "teacher_response_len": len(response_token_ids),
             "teacher_logprob_len": teacher_logprobs.shape[0],
         }
+        if "teacher_prefill_elapsed_s" in teacher_output_dict:
+            reward_extra_info["teacher_prefill_elapsed_s"] = teacher_output_dict["teacher_prefill_elapsed_s"]
+        if "teacher_vllm_prefill_s" in teacher_output_dict:
+            reward_extra_info["teacher_vllm_prefill_s"] = teacher_output_dict["teacher_vllm_prefill_s"]
 
         result = {
             "teacher_logprobs": teacher_logprobs,
@@ -210,22 +215,49 @@ class OPDRewardLoopManager(RewardLoopManagerBase):
         Returns:
             dict: Teacher log probabilities and vLLM metrics.
         """
+        teacher_input_len = self._get_teacher_input_len(teacher_data_proto)
+        psrl_logger.info(
+            "[opd] Teacher prefill request uid=%s input_len=%d response_len=%d.",
+            request_uid,
+            teacher_input_len,
+            response_len,
+        )
+
+        request_start_time = time.monotonic()
         if self.router_process is not None:
             psrl_logger.info("Routing OPD teacher request uid=%s through router.", request_uid)
             teacher_outputs = await self.router_process.generate_async.remote(teacher_data_proto)
         else:
             replica_idx, replica_handle = self._get_next_replica_handle()
             psrl_logger.info("Sending OPD teacher request uid=%s to replica_%d.", request_uid, replica_idx)
-            teacher_outputs = await replica_handle.generate_async.remote(teacher_data_proto)
+            if hasattr(replica_handle.generate_async, "remote"):
+                teacher_outputs = await replica_handle.generate_async.remote(teacher_data_proto)
+            else:
+                teacher_outputs = await replica_handle.generate_async(teacher_data_proto)
+        teacher_prefill_elapsed_s = time.monotonic() - request_start_time
 
-        result = {"teacher_logprobs": torch.empty(0, dtype=torch.float32), "reward_metrics": {}}
+        result = {
+            "teacher_logprobs": torch.empty(0, dtype=torch.float32),
+            "reward_metrics": {},
+            "teacher_prefill_elapsed_s": teacher_prefill_elapsed_s,
+        }
         if teacher_outputs is None or len(teacher_outputs) == 0:
             psrl_logger.warning("Teacher model returned empty output for uid=%s.", request_uid)
+            psrl_logger.info(
+                "[opd] Teacher prefill finished uid=%s input_len=%d response_len=%d elapsed_s=%.6f.",
+                request_uid,
+                teacher_input_len,
+                response_len,
+                teacher_prefill_elapsed_s,
+            )
             return result
 
         reward_metrics = teacher_outputs.meta_info.pop("vllm_metrics", None)
         if reward_metrics is not None:
             result["reward_metrics"] = reward_metrics[0]
+        teacher_vllm_prefill_s = self._get_metric_value(result["reward_metrics"], "prefill_time")
+        if teacher_vllm_prefill_s is not None:
+            result["teacher_vllm_prefill_s"] = teacher_vllm_prefill_s
 
         teacher_logprobs = self._extract_teacher_logprobs(teacher_outputs)
         if response_len > 0 and len(teacher_logprobs) > response_len:
@@ -238,6 +270,7 @@ class OPDRewardLoopManager(RewardLoopManagerBase):
                 len(teacher_logprobs),
             )
         result["teacher_logprobs"] = teacher_logprobs
+        self._log_teacher_logprob_preview(request_uid, "teacher_logprobs", teacher_logprobs)
         teacher_ids = self._extract_teacher_ids(teacher_outputs)
         if teacher_ids is not None:
             if response_len > 0 and len(teacher_ids) > response_len:
@@ -250,6 +283,18 @@ class OPDRewardLoopManager(RewardLoopManagerBase):
                     len(teacher_ids),
                 )
             result["teacher_ids"] = teacher_ids
+            self._log_teacher_logprob_preview(request_uid, "teacher_ids", teacher_ids)
+        vllm_prefill_msg = "none" if teacher_vllm_prefill_s is None else f"{teacher_vllm_prefill_s:.6f}"
+        psrl_logger.info(
+            "[opd] Teacher prefill finished uid=%s input_len=%d response_len=%d logprob_shape=%s "
+            "elapsed_s=%.6f vllm_prefill_s=%s.",
+            request_uid,
+            teacher_input_len,
+            response_len,
+            tuple(teacher_logprobs.shape),
+            teacher_prefill_elapsed_s,
+            vllm_prefill_msg,
+        )
         return result
 
     def _extract_teacher_logprobs(self, teacher_outputs: DataProto) -> torch.Tensor:
@@ -274,6 +319,44 @@ class OPDRewardLoopManager(RewardLoopManagerBase):
         if len(teacher_ids) == 0:
             return None
         return torch.tensor(teacher_ids[0], dtype=torch.long)
+
+    @staticmethod
+    def _get_teacher_input_len(teacher_data_proto: DataProto) -> int:
+        input_ids = teacher_data_proto.batch.get("input_ids", None)
+        if input_ids is None:
+            return 0
+        return int(input_ids.shape[-1])
+
+    @staticmethod
+    def _get_metric_value(metrics, name: str) -> float | None:
+        if metrics is None:
+            return None
+        if isinstance(metrics, dict):
+            value = metrics.get(name, None)
+        else:
+            value = getattr(metrics, name, None)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_tensor_preview(tensor: torch.Tensor, max_elements: int = 8) -> list:
+        if tensor.numel() == 0:
+            return []
+        return tensor.detach().cpu().reshape(-1)[:max_elements].tolist()
+
+    def _log_teacher_logprob_preview(self, request_uid: str | None, name: str, tensor: torch.Tensor) -> None:
+        psrl_logger.debug(
+            "[opd] %s preview uid=%s shape=%s dtype=%s first_values=%s.",
+            name,
+            request_uid,
+            tuple(tensor.shape),
+            tensor.dtype,
+            self._format_tensor_preview(tensor),
+        )
 
     def _get_teacher_topk(self) -> int:
         distillation_config = self.config.get("distillation", None)

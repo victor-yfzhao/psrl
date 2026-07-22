@@ -77,6 +77,9 @@ rollout:
 
   enable_prefix_caching: True
 
+  # Disable KV cache for one-shot teacher logprob scoring.
+  disable_kv_cache: True
+
   # Keep stats disabled to reduce logging overhead
   disable_log_stats: True
 

@@ -98,6 +98,7 @@ class RolloutCoordinator(CommandExtension):
         # Background event handler
         self.running_loop = None
         self.command_handler_task = None
+        self._active_command_id: int | None = None
         self.sync_task = None
         self.process_status_queue_tasks = []
         self.broadcast_status_to_router_task = None
@@ -136,6 +137,8 @@ class RolloutCoordinator(CommandExtension):
         # While locked, the command handler rejects elastic SLEEP/WAKE_UP commands for
         # these instances so that the ElasticExecutor does not interfere mid-sync.
         self._syncing_locked_instance_ids: set[int] = set()
+        self._syncing_lock_owner_by_instance: dict[int, int] = {}
+        self._next_sync_operation_id = 1
 
         # Build logger
         self.log_prefix = "RolloutCoordinator"
@@ -356,7 +359,7 @@ class RolloutCoordinator(CommandExtension):
         # Start the background tasks
         self.running_loop = asyncio.get_running_loop()
         self.command_handler_task = self.running_loop.create_task(self._command_handler_loop())
-        self.command_handler_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        self.command_handler_task.add_done_callback(self._on_command_handler_done)
 
         # Start the status collection tasks
         if self.config.psrl.status_collection.enable:
@@ -441,12 +444,39 @@ class RolloutCoordinator(CommandExtension):
                 # Unpack command attributes
                 command_type = command.type
                 command_id = command.get_kwargs()["id"]
+                self._active_command_id = command_id
+                self._start_command(command_id)
                 command_args = command.get_args()
                 psrl_logger.info(
                     f"Receive command: type = {command_type}, kwargs = {command.get_kwargs()}, args = {command_args}"
                 )
 
                 result = None
+                if command_type in (CommandType.SLEEP, CommandType.WAKE_UP):
+                    raw_instance_ids = command_args.get("instance_ids", [])
+                    if not isinstance(raw_instance_ids, list):
+                        raw_instance_ids = [raw_instance_ids]
+                    lock_check_ids = (
+                        list(range(self.rollout_wg_size)) if -1 in raw_instance_ids else raw_instance_ids
+                    )
+                    sync_operation_id = command_args.get("sync_operation_id")
+                    conflicting_ids = [
+                        int(instance_id)
+                        for instance_id in lock_check_ids
+                        if instance_id in self._syncing_locked_instance_ids
+                        and self._syncing_lock_owner_by_instance.get(int(instance_id)) != sync_operation_id
+                    ]
+                    if conflicting_ids:
+                        psrl_logger.info(
+                            "Reject %s command for sync-locked instances %s (owner=%s).",
+                            command_type.name,
+                            conflicting_ids,
+                            sync_operation_id,
+                        )
+                        self._complete_command(command_id, False)
+                        self._active_command_id = None
+                        await asyncio.sleep(0)
+                        continue
                 # Process the command based on its type
                 if command_type == CommandType.ABORT:
                     instance_to_uids = command_args.get("instance_to_uids", None)
@@ -575,40 +605,52 @@ class RolloutCoordinator(CommandExtension):
                         raise ValueError("SLEEP command must contain 'instance_ids' in args.")
                     if not isinstance(instance_ids, list):
                         instance_ids = [instance_ids]
-
-                    # Pause routing to sleeping instances first to avoid new requests racing in.
-                    if self.rollout_router is not None:
-                        await self.rollout_router.pause_instances.remote(instance_ids)
-                    
-                    abort_futures = []
-                    sleep_futures = []
-
-                    # First, abort the instance
-                    if instance_ids is not None:
-                        for instance_id in instance_ids:
-                            abort_futures.append(
+                    if -1 in instance_ids:
+                        instance_ids = list(range(self.rollout_wg_size))
+                    try:
+                        if self.rollout_router is not None:
+                            await self.rollout_router.pause_instances.remote(instance_ids)
+                        sleeping_flags = await asyncio.gather(
+                            *[
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                    "is_rollout_engine_sleeping"
+                                )
+                                for instance_id in instance_ids
+                            ]
+                        )
+                        awake_instance_ids = [
+                            instance_id
+                            for instance_id, is_sleeping in zip(instance_ids, sleeping_flags)
+                            if not is_sleeping
+                        ]
+                        interrupted_request_nums = await asyncio.gather(
+                            *[
                                 self.rollout_wg_list[instance_id].execute_rank_zero_async(
                                     "interrupt_generation"
                                 )
-                            )
-
-                    if not abort_futures:
-                        interrupted_request_num = 0
-                    else:
-                        interrupted_request_nums = await asyncio.gather(*abort_futures)
+                                for instance_id in awake_instance_ids
+                            ]
+                        )
                         interrupted_request_num = np.sum(interrupted_request_nums)
-                    
-                    psrl_logger.info(f"Received SLEEP command for instances {instance_ids}, "
-                                    f"interrupted {interrupted_request_num} requests")
-
-                    # second, sleep the instance
-                    for instance_id in instance_ids:
-                        sleep_futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_sleep"))
-                    await asyncio.gather(*sleep_futures)
-
-                    psrl_logger.info(f"SLEEP command for instances {instance_ids} completed")
-
-                    self._complete_command(command_id, True)
+                        psrl_logger.info(
+                            "Received SLEEP command for instances %s, interrupted %s requests",
+                            instance_ids,
+                            interrupted_request_num,
+                        )
+                        await asyncio.gather(
+                            *[
+                                self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_sleep")
+                                for instance_id in awake_instance_ids
+                            ]
+                        )
+                    except Exception:
+                        psrl_logger.exception("SLEEP command failed for instances %s", instance_ids)
+                        if self.rollout_router is not None:
+                            await self.rollout_router.resume_instances.remote(instance_ids)
+                        self._complete_command(command_id, False)
+                    else:
+                        psrl_logger.info("SLEEP command for instances %s completed", instance_ids)
+                        self._complete_command(command_id, True)
                 
                 elif command_type == CommandType.WAKE_UP:
                     instance_ids = command_args.get("instance_ids", None)
@@ -617,52 +659,104 @@ class RolloutCoordinator(CommandExtension):
                     if not isinstance(instance_ids, list):
                         instance_ids = [instance_ids]
 
-                    wake_up_futures = []
-                    for instance_id in instance_ids:
-                        wake_up_futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up"))
-                    await asyncio.gather(*wake_up_futures)
-                    psrl_logger.info(f"WAKE_UP command for instances {instance_ids} completed")
+                    if -1 in instance_ids:
+                        instance_ids = list(range(self.rollout_wg_size))
 
-                    await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
-                    psrl_logger.info(f"Updated currently syncing instances to {instance_ids} with PS model version {self.ps_model_version}")
+                    # Snapshot once. A queued command may span a PS version update;
+                    # all worker and router updates in this command must agree.
+                    target_ps_version = int(command_args.get("target_ps_model_version", self.ps_model_version))
+                    resume_instances = bool(command_args.get("resume_instances", True))
 
-                    sync_futures = []
-                    for instance_id in instance_ids:
-                        # Check active_tasks: normally zero after a clean wake-up, but a
-                        # duplicate WAKE_UP (e.g. from a concurrent sync_with_ps race) may
-                        # arrive when the instance already has running tasks.  In that case
-                        # interrupt first to avoid the AssertionError in gen_worker.sync_with_ps.
-                        active_tasks = await self.gen_wg_list[instance_id].execute_rank_zero_async(
-                            "get_active_task_num"
+                    try:
+                        sleeping_flags = await asyncio.gather(
+                            *[
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                    "is_rollout_engine_sleeping"
+                                )
+                                for instance_id in instance_ids
+                            ]
                         )
-                        needs_interrupt = active_tasks > 0
-                        if needs_interrupt:
-                            psrl_logger.warning(
-                                "WAKE_UP for instance %d: found %d active task(s) — "
-                                "will interrupt before sync (possible duplicate WAKE_UP).",
-                                instance_id,
-                                active_tasks,
-                            )
-                        sync_futures.append(
-                            self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                "sync_with_ps",
-                                ps_version=self.ps_model_version,
-                                interrupt_generation=needs_interrupt,
-                                sync_after_wake_up=True,
-                            )
+                        await asyncio.gather(
+                            *[
+                                self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up")
+                                for instance_id, is_sleeping in zip(instance_ids, sleeping_flags)
+                                if is_sleeping
+                            ]
                         )
-                    await asyncio.gather(*sync_futures)
-                    psrl_logger.info(f"Synced with PS for instances {instance_ids} with PS model version {self.ps_model_version}")
+                        psrl_logger.info("WAKE_UP command for instances %s completed", instance_ids)
 
-                    if self.rollout_router is not None:
-                        await self.rollout_router.resume_instances.remote(instance_ids)
-                    self._complete_command(command_id, True)
+                        await self.rollout_router.update_currently_syncing_instances.remote(
+                            instance_ids, target_ps_version
+                        )
+                        psrl_logger.info(
+                            "Updated currently syncing instances to %s with PS model version %d",
+                            instance_ids,
+                            target_ps_version,
+                        )
+
+                        sync_futures = []
+                        for instance_id in instance_ids:
+                            active_tasks = await self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                "get_active_task_num"
+                            )
+                            needs_interrupt = active_tasks > 0
+                            if needs_interrupt:
+                                psrl_logger.warning(
+                                    "WAKE_UP for instance %d found %d active tasks; interrupting before sync",
+                                    instance_id,
+                                    active_tasks,
+                                )
+                            sync_futures.append(
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
+                                    "sync_with_ps",
+                                    ps_version=target_ps_version,
+                                    interrupt_generation=needs_interrupt,
+                                    sync_after_wake_up=True,
+                                )
+                            )
+                        await asyncio.gather(*sync_futures)
+                        if self.rollout_router is not None and resume_instances:
+                            await self.rollout_router.resume_instances.remote(instance_ids)
+                    except Exception:
+                        psrl_logger.exception(
+                            "WAKE_UP command failed for instances %s at PS version %d",
+                            instance_ids,
+                            target_ps_version,
+                        )
+                        self._complete_command(command_id, False)
+                    else:
+                        psrl_logger.info(
+                            "Synced with PS for instances %s with PS model version %d",
+                            instance_ids,
+                            target_ps_version,
+                        )
+                        self._complete_command(command_id, True)
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 
+                self._active_command_id = None
             await asyncio.sleep(0)
 
         psrl_logger.info("Background command handler of rollout coordinator has finished.")
+
+    def _on_command_handler_done(self, task: asyncio.Task) -> None:
+        """Fail the active command and restart the queue loop after an unexpected exception."""
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None:
+            return
+        psrl_logger.error(
+            "Rollout command handler crashed; active_command_id=%s. Restarting queue loop.",
+            self._active_command_id,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+        if self._active_command_id is not None:
+            self._complete_command(self._active_command_id, False)
+            self._active_command_id = None
+        if not self.stop_command_handler and self.running_loop is not None:
+            self.command_handler_task = self.running_loop.create_task(self._command_handler_loop())
+            self.command_handler_task.add_done_callback(self._on_command_handler_done)
 
     async def _process_status_queue(self, instance_id: int):
         psrl_logger.info(f"Starting to process status queue for instance {instance_id}")
@@ -718,6 +812,40 @@ class RolloutCoordinator(CommandExtension):
             time.monotonic() - t_enter,
         )
         return pending
+
+    async def get_router_backlog_summary(self, top_t: int | None = None) -> dict[str, int]:
+        """Return selected rollout router waiting queue load for elastic scaling."""
+        t_enter = time.monotonic()
+        model_tag = str(self.config.gen_actor_rollout_ref.model.path).rstrip("/").split("/")[-1]
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutCoordinator_summary_enter model=%s elapsed_since_entry_s=0.000",
+            model_tag,
+        )
+        if self.rollout_router is None:
+            return {"pending": 0, "count": 0, "total_tokens": 0}
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutCoordinator_summary_before_router_rpc model=%s since_enter_s=%.3f",
+            model_tag,
+            time.monotonic() - t_enter,
+        )
+        t_rpc = time.monotonic()
+        summary = await self.rollout_router.get_pending_request_summary.remote(top_t)
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            (
+                "stage=RolloutCoordinator_summary_after_router_rpc model=%s pending=%d count=%d "
+                "total_tokens=%d router_rpc_s=%.3f since_enter_s=%.3f"
+            ),
+            model_tag,
+            int(summary.get("pending", 0)),
+            int(summary.get("count", 0)),
+            int(summary.get("total_tokens", 0)),
+            time.monotonic() - t_rpc,
+            time.monotonic() - t_enter,
+        )
+        return summary
 
     async def _broadcast_status_to_router(self):
         """
@@ -941,8 +1069,7 @@ class RolloutCoordinator(CommandExtension):
             # being handled after the synchronization.
             with log_dual_events(
                 f"Synchronize rollout instances {instance_ids} with PS "
-                f"(model pull is {'non-blocking' if not wait_model_sync else 'blocking'} "
-                f"for the coordinator)",
+                "(model pull and request loopback are blocking for the coordinator)",
                 psrl_logger,
                 level=logging.INFO,
                 event_type=EventType.OTHER,
@@ -951,28 +1078,33 @@ class RolloutCoordinator(CommandExtension):
                     self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                         instance_id, 0
                     )
+                target_ps_version = int(self.ps_model_version)
+                transition_id = await self.rollout_router.begin_instance_transition.remote(instance_ids)
                 await self.rollout_router.pause_routing.remote()
-                psrl_logger.info("Paused routing for synchronization")
-                await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
-                psrl_logger.info("Updated currently syncing instances")
-                await self.exec_command(
-                    Command(
-                        type=CommandType.SYNC,
-                        instance_ids=instance_ids,
-                        curr_ps_model_version=self.ps_model_version,
-                        wait_model_sync=wait_model_sync,
-                    ),
-                    blocking=True,
-                )
-                psrl_logger.info("Executed SYNC command")
-                if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
-                    psrl_logger.info("Waiting for interrupted partial requests loop back")
-                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
-                    psrl_logger.info(
-                        f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
+                psrl_logger.info("Paused routing for synchronization transition %d", transition_id)
+                try:
+                    await self.rollout_router.update_currently_syncing_instances.remote(
+                        instance_ids,
+                        target_ps_version,
                     )
-                await self.rollout_router.resume_routing.remote()
-                psrl_logger.info("Resumed routing after synchronization")
+                    result = await self.exec_command(
+                        Command(
+                            type=CommandType.SYNC,
+                            instance_ids=instance_ids,
+                            curr_ps_model_version=target_ps_version,
+                            # Routing must not resume before the pull finishes.
+                            wait_model_sync=True,
+                        ),
+                        blocking=True,
+                    )
+                    if result is None or result is False:
+                        raise RuntimeError(f"SYNC command failed for instances {instance_ids}")
+                    if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                        await self.rollout_router.wait_instance_transition.remote(transition_id)
+                finally:
+                    await self.rollout_router.finish_instance_transition.remote(transition_id, resume=True)
+                    await self.rollout_router.resume_routing.remote()
+                    psrl_logger.info("Resumed routing after synchronization transition %d", transition_id)
             return
 
 
@@ -1016,12 +1148,26 @@ class RolloutCoordinator(CommandExtension):
                 return
 
         # Acquire sync-lock for ALL paths (swap and in-place) immediately.
+        sync_operation_id = self._next_sync_operation_id
+        self._next_sync_operation_id += 1
         for instance_id in rollout_sync_ids:
             self._syncing_locked_instance_ids.add(instance_id)
-            psrl_logger.info("sync_with_ps: acquired sync-lock for instance %d.", instance_id)
+            self._syncing_lock_owner_by_instance[instance_id] = sync_operation_id
+            psrl_logger.info(
+                "sync_with_ps: acquired sync-lock for instance %d (operation=%d).",
+                instance_id,
+                sync_operation_id,
+            )
 
         _swap_done = False
+        sync_policy_gate_token = None
         try:
+            if self._elastic_executor is not None:
+                sync_policy_gate_token = await self._elastic_executor.enter_inplace_sync_policy_gate.remote(
+                    self._elastic_exec_role_name,
+                    self._elastic_exec_model_name,
+                    rollout_sync_ids,
+                )
             # ----------------------------------------------------------
             # Swap path: if ElasticExecutor has a free instance, wake it
             # (which auto-pulls the latest model), then sleep the stale one.
@@ -1040,23 +1186,16 @@ class RolloutCoordinator(CommandExtension):
                         rollout_sync_ids,
                         self.ps_model_version,
                     )
-                    swap_all_succeeded = True
-                    for sync_id, free_id in zip(rollout_sync_ids, free_ids[: len(rollout_sync_ids)]):
-                        swap_ok = await self._elastic_executor.perform_sync_swap.remote(
-                            self._elastic_exec_role_name,
-                            self._elastic_exec_model_name,
-                            free_id,   # wake this (it will pull latest model)
-                            sync_id,   # sleep this (no longer needed)
-                        )
-                        if not swap_ok:
-                            swap_all_succeeded = False
-                            psrl_logger.warning(
-                                "sync_with_ps: swap-based sync rejected for pair (wake=%d, sleep=%d); "
-                                "falling back to in-place sync for remaining targets.",
-                                free_id,
-                                sync_id,
-                            )
-                            break
+                    swap_pairs = list(
+                        zip(free_ids[: len(rollout_sync_ids)], rollout_sync_ids)
+                    )
+                    swap_all_succeeded = await self._elastic_executor.perform_sync_swaps.remote(
+                        self._elastic_exec_role_name,
+                        self._elastic_exec_model_name,
+                        swap_pairs,
+                        sync_operation_id,
+                        sync_policy_gate_token,
+                    )
                     if not swap_all_succeeded:
                         psrl_logger.info(
                             "sync_with_ps: swap-based sync not fully applied; continue with in-place sync path."
@@ -1121,34 +1260,9 @@ class RolloutCoordinator(CommandExtension):
                     )
 
                 if in_place_sync_ids:
-                    # Pause routing to target instances before exposing the post-sync
-                    # version, avoiding a race where router sees the new version but
-                    # gen worker has not pulled model yet.
-                    await self.rollout_router.pause_instances.remote(in_place_sync_ids)
-                    psrl_logger.info(
-                        "Pre-paused instances for in-place sync fallback: %s",
-                        in_place_sync_ids,
-                    )
-                    await self.rollout_router.update_currently_syncing_instances.remote(
-                        in_place_sync_ids, self.ps_model_version
-                    )
-                    psrl_logger.info("Updated currently syncing instances to %s", in_place_sync_ids)
-
-                    inplace_policy_gate_entered = False
                     wake_up_completed = False
-                    inplace_gate_instance_ids: list[int] = []
+                    transition_id: int | None = None
                     try:
-                        # Keep parity with swap path: block new scaling-policy decisions
-                        # while in-place sync SLEEP/WAKE_UP is running.
-                        if self._elastic_executor is not None:
-                            await self._elastic_executor.enter_inplace_sync_policy_gate.remote(
-                                self._elastic_exec_role_name,
-                                self._elastic_exec_model_name,
-                                in_place_sync_ids,
-                            )
-                            inplace_policy_gate_entered = True
-                            inplace_gate_instance_ids = list(in_place_sync_ids)
-
                         # Double-check: an instance may enter vLLM sleep while we wait on the
                         # policy gate (or otherwise race); skip SLEEP/WAKE for it like the
                         # initial sleeping check above.
@@ -1172,7 +1286,6 @@ class RolloutCoordinator(CommandExtension):
                                 len(skipped_asleep_double),
                                 skipped_asleep_double,
                             )
-                            await self.rollout_router.resume_instances.remote(skipped_asleep_double)
                             for iid in skipped_asleep_double:
                                 await self.rollout_router.update_currently_syncing_instances.remote(
                                     [iid],
@@ -1182,63 +1295,74 @@ class RolloutCoordinator(CommandExtension):
                         in_place_sync_ids = still_awake
 
                         if in_place_sync_ids:
-                            await self.exec_command(
+                            transition_id = await self.rollout_router.begin_instance_transition.remote(
+                                in_place_sync_ids
+                            )
+                            sleep_result = await self.exec_command(
                                 Command(
                                     type=CommandType.SLEEP,
                                     instance_ids=in_place_sync_ids,
+                                    sync_operation_id=sync_operation_id,
                                 ),
                                 blocking=True,
                             )
+                            if sleep_result is not True:
+                                raise RuntimeError(
+                                    f"In-place sync SLEEP failed for {in_place_sync_ids}: {sleep_result!r}"
+                                )
                             psrl_logger.info(
                                 "Executed SLEEP command for in-place sync fallback: %s",
                                 in_place_sync_ids,
                             )
 
-                            await self.exec_command(
+                            target_ps_version = int(self.ps_model_version)
+                            wake_result = await self.exec_command(
                                 Command(
                                     type=CommandType.WAKE_UP,
                                     instance_ids=in_place_sync_ids,
+                                    target_ps_model_version=target_ps_version,
+                                    resume_instances=False,
+                                    sync_operation_id=sync_operation_id,
                                 ),
                                 blocking=True,
                             )
+                            if wake_result is not True:
+                                raise RuntimeError(
+                                    f"In-place sync WAKE_UP failed for {in_place_sync_ids}: {wake_result!r}"
+                                )
                             wake_up_completed = True
                             psrl_logger.info(
                                 "Executed WAKE_UP command for in-place sync fallback: %s",
                                 in_place_sync_ids,
                             )
+
+                            if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                                psrl_logger.info(
+                                    "Waiting for interrupted requests in transition %d to loop back",
+                                    transition_id,
+                                )
+                                await self.rollout_router.wait_instance_transition.remote(transition_id)
+                                psrl_logger.info(
+                                    "Interrupted requests in transition %d have looped back",
+                                    transition_id,
+                                )
                         else:
                             psrl_logger.info(
                                 "In-place sync fallback: no runnable instances after double-check "
                                 "(all targets asleep)."
                             )
                     finally:
-                        # If in-place sync exits early, recover router availability.
-                        if not wake_up_completed:
-                            await self.rollout_router.resume_instances.remote(in_place_sync_ids)
-                            psrl_logger.warning(
-                                "In-place sync fallback exited early; resumed instances: %s",
-                                in_place_sync_ids,
+                        if transition_id is not None:
+                            await self.rollout_router.finish_instance_transition.remote(
+                                transition_id,
+                                resume=True,
+                                resume_instance_ids=in_place_sync_ids,
                             )
-                        if inplace_policy_gate_entered:
-                            await self._elastic_executor.leave_inplace_sync_policy_gate.remote(
-                                self._elastic_exec_role_name,
-                                self._elastic_exec_model_name,
-                                inplace_gate_instance_ids,
-                            )
-
-                    if (
-                        wait_interrupted_partial_requests_loop_back
-                        and self.config.psrl.partial_rollout.enable
-                        and in_place_sync_ids
-                    ):
-                        psrl_logger.info("Waiting for interrupted partial requests loop back")
-                        await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(
-                            in_place_sync_ids
-                        )
-                        psrl_logger.info(
-                            "All interrupted requests on the synchronized instances %s have been looped back",
-                            in_place_sync_ids,
-                        )
+                            if not wake_up_completed:
+                                psrl_logger.warning(
+                                    "In-place sync fallback exited early; released routing transition for: %s",
+                                    in_place_sync_ids,
+                                )
                 else:
                     psrl_logger.info("In-place sync fallback: no runnable instances to sleep/wake_up.")
 
@@ -1246,15 +1370,29 @@ class RolloutCoordinator(CommandExtension):
             # Release sync-lock for all paths (swap and in-place).
             for instance_id in rollout_sync_ids:
                 self._syncing_locked_instance_ids.discard(instance_id)
+                self._syncing_lock_owner_by_instance.pop(instance_id, None)
                 psrl_logger.info("sync_with_ps: released sync-lock for instance %d.", instance_id)
-            # Grant immunity only for in-place sync; swap path grants immunity via
-            # _set_instance_immunity inside _scale_up_instance for the new instance.
-            if not _swap_done and self._elastic_executor is not None:
-                for instance_id in rollout_sync_ids:
-                    self._elastic_executor.set_instance_immunity.remote(
+            try:
+                # Grant immunity only for in-place sync; swap path grants immunity via
+                # _set_instance_immunity inside _scale_up_instance for the new instance.
+                if not _swap_done and self._elastic_executor is not None:
+                    await asyncio.gather(
+                        *[
+                            self._elastic_executor.set_instance_immunity.remote(
+                                self._elastic_exec_role_name,
+                                self._elastic_exec_model_name,
+                                instance_id,
+                            )
+                            for instance_id in rollout_sync_ids
+                        ]
+                    )
+            finally:
+                if sync_policy_gate_token is not None:
+                    await self._elastic_executor.leave_inplace_sync_policy_gate.remote(
                         self._elastic_exec_role_name,
                         self._elastic_exec_model_name,
-                        instance_id,
+                        rollout_sync_ids,
+                        sync_policy_gate_token,
                     )
 
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
@@ -1299,20 +1437,20 @@ class RolloutCoordinator(CommandExtension):
                 level=logging.INFO,
                 event_type=EventType.OTHER,
             ):
+                transition_id = await self.rollout_router.begin_instance_transition.remote(migrate_instance_ids)
                 await self.rollout_router.pause_routing.remote()
-                psrl_logger.info("Interrupted routing for migration")
-                await self.exec_command(
-                    Command(
-                        type=CommandType.ABORT,
-                        instance_ids=migrate_instance_ids,
-                    ),
-                    blocking=True,
-                )
-                if wait_interrupted_partial_requests_loop_back:
-                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
-                    psrl_logger.info(
-                        f"All interrupted requests on the migrated "
-                        f"instances {migrate_instance_ids} have been looped back"
+                psrl_logger.info("Interrupted routing for migration transition %d", transition_id)
+                try:
+                    await self.exec_command(
+                        Command(
+                            type=CommandType.ABORT,
+                            instance_ids=migrate_instance_ids,
+                        ),
+                        blocking=True,
                     )
-                await self.rollout_router.resume_routing.remote()
-                psrl_logger.info("Resumed routing after migration")
+                    if wait_interrupted_partial_requests_loop_back:
+                        await self.rollout_router.wait_instance_transition.remote(transition_id)
+                finally:
+                    await self.rollout_router.finish_instance_transition.remote(transition_id, resume=True)
+                    await self.rollout_router.resume_routing.remote()
+                    psrl_logger.info("Resumed routing after migration transition %d", transition_id)

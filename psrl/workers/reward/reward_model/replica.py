@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 
 import ray
 from abc import ABC, abstractmethod
@@ -78,6 +79,7 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
         self.reward_model_name = reward_model_name
         self.status_queue = status_queue
         self._worker_handle = self.worker_group.workers[0] if self.worker_group.workers else None
+        self._rollout_name = str(self.rollout_config.name).lower()
 
     @property
     def worker_handle(self):
@@ -91,7 +93,17 @@ class PSRL_RewardModelReplica(PSRL_RewardModelReplicaBase):
     async def generate_async(self, request, consolidate: bool = True):
         if self._worker_handle is None:
             raise RuntimeError("Replica not initialized.")
+        if self._rollout_name in ("transformers", "hf"):
+            results = await asyncio.gather(*self.worker_group.execute_all_async("generate_async", request))
+            return self._select_rank_zero_result(results)
         return await self._worker_handle.generate_async.remote(request, consolidate=consolidate)
+
+    @staticmethod
+    def _select_rank_zero_result(results):
+        for result in results:
+            if result is not None:
+                return result
+        return None
 
 
 class PSRL_RewardModelHttpServerReplica(PSRL_RewardModelReplicaBase):

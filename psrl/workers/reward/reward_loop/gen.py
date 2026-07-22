@@ -1,6 +1,8 @@
 import inspect
 import logging
 import os
+import threading
+from typing import Callable, TypeVar
 
 import numpy as np
 import torch
@@ -17,6 +19,25 @@ from psrl.workers.reward.gen_reward_function import DefaultGenRewardFunction, Ge
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+T = TypeVar("T")
+
+
+def _extract_problem(extra_info: dict, raw_prompt, fallback: str) -> str:
+    if isinstance(extra_info, dict):
+        for key in ("question", "prompt", "problem"):
+            value = extra_info.get(key)
+            if isinstance(value, str) and value:
+                return value
+    if hasattr(raw_prompt, "item"):
+        raw_prompt = raw_prompt.item()
+    if isinstance(raw_prompt, list) and raw_prompt:
+        first_message = raw_prompt[0]
+        if isinstance(first_message, dict):
+            content = first_message.get("content")
+            if isinstance(content, str) and content:
+                return content
+    return fallback
+
 
 @register("gen")
 class GenRewardLoopManager(RewardLoopManagerBase):
@@ -28,6 +49,8 @@ class GenRewardLoopManager(RewardLoopManagerBase):
     2. Sending prompts to RewardModelManager (via router or direct replica access)
     3. Parsing RM outputs and computing reward scores
     """
+    _tokenizer_locks: dict[int, threading.RLock] = {}
+    _tokenizer_locks_guard = threading.Lock()
 
     def __init__(
         self,
@@ -60,9 +83,31 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         self.router_process = self.reward_model_manager.get_router_process()
         self.replica_handles = self.reward_model_manager.get_replica_handles()
         self._replica_rr_index = 0
+        self._reward_model_tokenizer_lock = self._get_tokenizer_lock(self.reward_model_tokenizer)
         self.reward_kwargs = reward_kwargs
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, "gen_reward_loop"))
         psrl_logger.info("Initialized GenRewardLoopManager.")
+
+    @classmethod
+    def _get_tokenizer_lock(cls, tokenizer) -> threading.RLock:
+        tokenizer_id = id(tokenizer)
+        with cls._tokenizer_locks_guard:
+            lock = cls._tokenizer_locks.get(tokenizer_id)
+            if lock is None:
+                lock = threading.RLock()
+                cls._tokenizer_locks[tokenizer_id] = lock
+            return lock
+
+    @staticmethod
+    def _call_with_lock(lock: threading.RLock, fn: Callable[[], T]) -> T:
+        with lock:
+            return fn()
+
+    async def _run_reward_model_tokenizer_call(self, fn: Callable[[], T]) -> T:
+        return await self.loop.run_in_executor(
+            None,
+            lambda: self._call_with_lock(self._reward_model_tokenizer_lock, fn),
+        )
 
     async def run_single(self, data: DataProto) -> dict:
         """
@@ -106,15 +151,19 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         else:
             ground_truth = ""
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        psrl_logger.info("Reward loop received uid=%s source=%s", request_uid, data_source)
+        psrl_logger.debug("Reward loop received uid=%s source=%s", request_uid, data_source)
 
         # Construct RM prompt (e.g., "Question: ... Answer: ..." or custom template)
-        rm_prompt = self.reward_function.prompt_constructor(prompt_str=prompt_str, response_str=response_str)
+        problem_str = _extract_problem(
+            extra_info,
+            raw_prompt=data_item.non_tensor_batch.get("raw_prompt"),
+            fallback=prompt_str,
+        )
+        rm_prompt = self.reward_function.prompt_constructor(prompt_str=problem_str, response_str=response_str)
         using_sys_prompt = self.reward_function.using_sys_prompt
 
         # Tokenize RM prompt
-        rm_inputs = await self.loop.run_in_executor(
-            None,
+        rm_inputs = await self._run_reward_model_tokenizer_call(
             lambda: self.reward_model_tokenizer.apply_chat_template(
                 rm_prompt,
                 tokenize=True,
@@ -200,13 +249,13 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         reward_extra_info["agent_response"] = response_str
 
         # Attach RM input/output token lengths to reward_extra_info
+        rm_output_len = rm_output_dict.get("rm_output_len", None)
         if rm_input_len is not None:
             reward_extra_info["rm_input_len"] = rm_input_len
-        rm_output_len = rm_output_dict.get("rm_output_len", None)
         if rm_output_len is not None:
             reward_extra_info["rm_output_len"] = rm_output_len
 
-        psrl_logger.info(
+        psrl_logger.debug(
             "Reward computed uid=%s score=%.4f extra=%s",
             request_uid,
             score,
@@ -303,11 +352,9 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         """
         rm_outputs = None
         if self.router_process is not None:
-            psrl_logger.info("Routing reward uid=%s through router", request_uid)
             rm_outputs = await self.router_process.generate_async.remote(rm_data_proto)
         else:
             replica_idx, replica_handle = self._get_next_replica_handle()
-            psrl_logger.info("Sending reward uid=%s to replica_%d", request_uid, replica_idx)
             rm_outputs = await replica_handle.generate_async.remote(rm_data_proto)
 
         result = {"rm_output_str": "", "rm_output_value": None, "reward_metrics": {}}
@@ -346,15 +393,11 @@ class GenRewardLoopManager(RewardLoopManagerBase):
             raw_response_ids = rm_outputs.non_tensor_batch["raw_response_ids"]
             if len(raw_response_ids) > 0 and len(raw_response_ids[0]) > 0:
                 generated_ids = raw_response_ids[0]
-                generated_str = await self.loop.run_in_executor(
-                    None,
+                generated_str = await self._run_reward_model_tokenizer_call(
                     lambda: self.reward_model_tokenizer.decode(generated_ids, skip_special_tokens=True),
                 )
                 result["rm_output_str"] = generated_str
                 result["rm_output_len"] = len(generated_ids)
-                psrl_logger.info(
-                    "Reward model response ready uid=%s tokens=%d", request_uid, len(generated_ids)
-                )
         else:
             psrl_logger.warning("No raw_response_ids in RM output non_tensor_batch")
 

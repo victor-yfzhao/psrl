@@ -3,8 +3,8 @@ set -e
 set -o pipefail
 trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
-VLLM_PATH=${VLLM_PATH:-}
-VERL_PATH=${VERL_PATH:-}
+VLLM_PATH=${VLLM_PATH:-third_party/vllm}
+VERL_PATH=${VERL_PATH:-third_party/verl}
 MAX_JOBS=${MAX_JOBS:-32}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,14 +77,14 @@ pushd $VERL_PATH
 python -m uv pip install -e .
 popd
 
-echo "7. Apply patch for vllm"
-pushd $PSRL_PATH/patch/vllm
-bash apply_patch.sh
-popd
+# echo "7. Apply patch for vllm"
+# pushd $PSRL_PATH/patch/vllm
+# bash apply_patch.sh
+# popd
 
-echo "8. Apply patch for verl"
-pushd $PSRL_PATH/patch/verl
-bash apply_patch.sh
-popd
+# echo "8. Apply patch for verl"
+# pushd $PSRL_PATH/patch/verl
+# bash apply_patch.sh
+# popd
 
 echo "Successfully installed all basic packages"

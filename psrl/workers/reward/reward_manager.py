@@ -64,6 +64,8 @@ class RewardManager(CommandExtension):
         self.tokenizer = tokenizer
         self.processor = processor
         self.reward_model_manager_mapping = reward_model_manager_mapping
+        # SleepWakeOrchestrator handle (colocated modes 2/3); None otherwise.
+        self.sleep_wake_orchestrator = None
         # self.reward_model_router = reward_model_router
         # if self.config.psrl.redundant_rollout.enable:
         #     self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
@@ -186,6 +188,10 @@ class RewardManager(CommandExtension):
     def remove_requests(self, sample_ids: list[int]):
         for sample_id in sample_ids:
             self.request_buffer.pop(sample_id, None)
+
+    def set_sleep_wake_orchestrator(self, orchestrator):
+        """Inject the SleepWakeOrchestrator (colocated modes 2/3)."""
+        self.sleep_wake_orchestrator = orchestrator
 
     def start_busy_loop(self):
         """Start the reward manager and begin processing requests.
@@ -419,14 +425,8 @@ class RewardManager(CommandExtension):
             await asyncio.sleep(0)
         psrl_logger.info("Command event handler of reward manager has finished.")
 
-    def normalize_reward(self, request_id_to_reward: dict[int, dict]) -> dict[int, dict]:
-        """Normalize the reward for the given request_id_to_reward.
-        
-        Args:
-            request_id_to_reward (dict[int, dict]): Mapping from request IDs to reward scores and extra info.
-        Returns:
-            Dict[int, dict]: Mapping from request IDs to normalized reward scores and extra info.
-        """
+    def _attach_reward_metadata(self, request_id_to_reward: dict[int, dict]) -> dict[int, dict]:
+        """Attach stable metadata used by the trainer-side reward pipeline."""
         for request_id, reward in request_id_to_reward.items():
             reward_extra_info = reward.get("reward_extra_info", {})
             if not isinstance(reward_extra_info, dict):
@@ -436,6 +436,17 @@ class RewardManager(CommandExtension):
             # Keep an always-available unnormalized scalar for trainer-side metrics,
             # regardless of whether reward normalization is enabled.
             reward_extra_info["original_reward_score"] = reward["reward_score"]
+        return request_id_to_reward
+
+    def normalize_reward(self, request_id_to_reward: dict[int, dict]) -> dict[int, dict]:
+        """Normalize the reward for the given request_id_to_reward.
+
+        Args:
+            request_id_to_reward (dict[int, dict]): Mapping from request IDs to reward scores and extra info.
+        Returns:
+            Dict[int, dict]: Mapping from request IDs to normalized reward scores and extra info.
+        """
+        request_id_to_reward = self._attach_reward_metadata(request_id_to_reward)
         if self.reward_normalization != "batch" and self.reward_normalization != "group":
             return request_id_to_reward
         
@@ -635,7 +646,9 @@ class RewardManager(CommandExtension):
                             results[request_id] = result
 
             if not self.config.reward_models_config.launch_reward_fn_async:
-                results = self.normalize_reward(results)
+                results = self._attach_reward_metadata(results)
+                for request_id in results:
+                    self.request_id_to_group.pop(request_id, None)
 
         return results
 
@@ -752,6 +765,30 @@ class RewardManager(CommandExtension):
                     fut.set_result(reward)
             else:
                 self.request_id_to_reward[request_id] = reward
+
+    async def wait_for_reward_ready(self, request_ids: list[int]) -> None:
+        """Wait until rewards for ``request_ids`` are computed, WITHOUT consuming them.
+
+        Unlike ``wait_for_reward_of_requests`` this does not pop anything from
+        ``request_id_to_reward`` / ``request_id_to_future``; it only blocks until
+        every requested reward has been produced (or registers a future for ones
+        not yet dispatched so the producing task can resolve it). A subsequent
+        ``wait_for_reward_of_requests`` call can then pop and post-process the
+        results. Used by colocated deployment modes to ensure the rm finishes
+        scoring before the trainer sleeps it for the TRAIN phase.
+        """
+        futures_to_wait = {}
+        for request_id in request_ids:
+            if request_id in self.request_id_to_reward:
+                continue  # already computed
+            if request_id in self.request_id_to_future:
+                futures_to_wait[request_id] = self.request_id_to_future[request_id]
+            else:
+                fut = asyncio.get_event_loop().create_future()
+                self.request_id_to_future[request_id] = fut
+                futures_to_wait[request_id] = fut
+        if futures_to_wait:
+            await asyncio.gather(*futures_to_wait.values())
     
     async def compute_score_for_validation(self, reward_inputs: DataProto) -> dict[int, dict]:
         """
@@ -826,4 +863,3 @@ class RewardManager(CommandExtension):
         if self.config.reward_models_config.launch_reward_fn_async:
             return await self.wait_for_reward_of_requests(_request_ids, validation=True)
         return results
-

@@ -86,18 +86,24 @@ class SimpleRolloutTester:
 
         # Configure vLLM engine args
         rollout_config = self.config.rollout
+
+        max_num_batched_tokens = rollout_config.max_num_batched_tokens
+        max_model_len = rollout_config.get(
+                "max_model_len",
+                self.config.data.max_prompt_length + self.config.data.max_response_length,
+            )
+        if max_num_batched_tokens < max_model_len:
+            max_num_batched_tokens = max_model_len
+        
         engine_kwargs = {
             "model": local_path,
             "tensor_parallel_size": rollout_config.tensor_parallel_size,
             "pipeline_parallel_size": rollout_config.pipeline_parallel_size,
             "dtype": rollout_config.dtype,
             "gpu_memory_utilization": rollout_config.gpu_memory_utilization,
-            "max_model_len": rollout_config.get(
-                "max_model_len",
-                self.config.data.max_prompt_length + self.config.data.max_response_length,
-            ),
+            "max_model_len": max_model_len,
             "max_num_seqs": rollout_config.max_num_seqs,
-            "max_num_batched_tokens": rollout_config.max_num_batched_tokens,
+            "max_num_batched_tokens": max_num_batched_tokens,
             "enable_chunked_prefill": rollout_config.enable_chunked_prefill,
             "enable_prefix_caching": rollout_config.enable_prefix_caching,
             "trust_remote_code": self.config.model.get("trust_remote_code", False),

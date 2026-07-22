@@ -3,13 +3,13 @@ set -xeuo pipefail
 
 PSRL_WORKSPACE=/jizhicfs/pkuhetu/yfzhao/psrl
 
-staleness=${1:-1}
+staleness=${1:-2}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
-min_awake_per_role=${4:-4}
-launch_reward_fn_async=${5:-True}
+min_awake_per_role=${4:-0}
+launch_reward_fn_async=${5:-False}
 project_name='psrl_elastic_rm'
-experiment_name=async_elastic_min_${min_awake_per_role}_qwen_30b_a3b_ds_distill_staleness_${staleness}
+experiment_name=debug_partial_rollout_harmonic_max_sacle_8_qwen_30b_a3b_ds_distill_staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/env_311.sh
 
@@ -48,7 +48,7 @@ TRAIN_DATASETS_RATIOS='[0.5,0.5]'
 NNODES=6
 NGPUS_PER_NODE=8
 
-# shared resource pool settings
+# shared_rollout_pool: rollout + RM elastic replicas on the inference side
 SHARED_NNODES=2
 SHARED_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
@@ -57,11 +57,11 @@ GEN_TP=2
 GEN_PP=1
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-# training settings
+# train_pool: actor training + trainer-pool rollout/RM replicas (sleep/wake with trainer)
 TRAIN_NNODES=4
 TRAIN_NGPUS_PER_NODE=8
 
-# validation settings
+# validation settings (separate validate pools; does not use trainer-pool elastic path)
 VAL_TP=8 # TP in the training side for validation
 VAL_PP=1 # PP in the training side for validation
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
@@ -104,15 +104,8 @@ rollout_is_threshold=2.0
 
 # Elastic RM settings
 enable_elastic_rm=True
-load_threshold_metric=kv_cache
-theta_low=0.1
-theta_max=0.8
-cooldown_ms=10000
-max_waiting_queue_for_scale_down=64
-post_scale_up_abort_waiting_ratio=0.8
-throughput_model_dir=psrl/config/throughput_model
-throughput_model_output_len=1024
-full_load_mode=any
+enable_trainer_pool=True
+scaling_policy_variant=itl_harmonic
 
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
@@ -179,18 +172,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.logging_path=${PSRL_PATH}/logs/${project_name}/${experiment_name} \
     \
     psrl.deployment.elastic_rm.enable=${enable_elastic_rm} \
+    psrl.deployment.elastic_rm.enable_trainer_pool=${enable_trainer_pool} \
     psrl.deployment.elastic_rm.shared_nnodes=${SHARED_NNODES} \
     psrl.deployment.elastic_rm.shared_ngpus_per_node=${SHARED_NGPUS_PER_NODE} \
     psrl.deployment.elastic_rm.min_awake_per_role=${min_awake_per_role} \
-    psrl.deployment.elastic_rm.load_threshold_metric=${load_threshold_metric} \
-    psrl.deployment.elastic_rm.theta_low=${theta_low} \
-    psrl.deployment.elastic_rm.theta_max=${theta_max} \
-    psrl.deployment.elastic_rm.cooldown_ms=${cooldown_ms} \
-    psrl.deployment.elastic_rm.max_waiting_queue_for_scale_down=${max_waiting_queue_for_scale_down} \
-    psrl.deployment.elastic_rm.post_scale_up_abort_waiting_ratio=${post_scale_up_abort_waiting_ratio} \
-    psrl.deployment.elastic_rm.throughput_model_dir=${throughput_model_dir} \
-    psrl.deployment.elastic_rm.throughput_model_output_len=${throughput_model_output_len} \
-    psrl.deployment.elastic_rm.full_load_mode=${full_load_mode} \
+    psrl.deployment.elastic_rm.scaling_policy_variant=${scaling_policy_variant} \
     \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -202,10 +188,20 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     \
+    psrl.routing_strategy.method="throughput_optimal" \
+    psrl.routing_strategy.candidate_sort_indicator=reserve_capability \
+    psrl.routing_strategy.enable_multi_priority_queue=True \
+    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/deepseek_r1_distill_qwen_32b.json \
+    psrl.routing_strategy.delta_throughput_threshold=0.2 \
+    psrl.routing_strategy.request_budget=1024 \
+    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
+    \
+    psrl.colocate_validate_and_train=False \
+    psrl.fuse_rollout_with_validate=True \
+    \
     psrl.nixl.server_port=23456 \
-    +psrl.validate_on_psrl=False \
-    psrl.tms.range=all \
-    psrl.tms.enable_nixl=True \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
@@ -213,10 +209,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     \
     psrl.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
-    \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -239,7 +233,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -295,3 +289,5 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
 #   +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
 #   +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
 #   +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+
+

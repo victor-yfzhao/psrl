@@ -639,6 +639,8 @@ class DataProcessor:
                         non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                         meta_info_keys=meta_info_keys_to_pop,
                     )
+                    if "raw_prompt" in gen_batch.non_tensor_batch:
+                        batch_dict.non_tensor_batch["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"]
 
                 # Store the other batch fields in the request buffer of the reward manager
                 # They will be merged with the reward data.

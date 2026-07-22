@@ -5,6 +5,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 
 import ray
@@ -12,6 +13,8 @@ import ray
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.elastic_rm.dummy_scaling_policy import DummyScalingPolicy
+from psrl.utils.elastic_rm.itl_harmonic_scaling_policy import ITLHarmonicScalingPolicy
+from psrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy
 from psrl.utils.elastic_rm.scaling_policy import InstanceSignal, ScalingPolicy
 from psrl.utils.logger import DualOutputHandler, FileOnlyHandler
 from psrl.utils.server.command import Command, CommandType
@@ -29,6 +32,31 @@ _ELASTIC_COORD_CMD_TIMEOUT_UNSET = object()
 class InstanceStatus(Enum):
     ASLEEP = enum.auto()
     AWAKEN = enum.auto()
+    TRAINING = enum.auto()
+    RECOVERING = enum.auto()
+
+
+@dataclass(frozen=True)
+class _PostScaleUpRequestCandidate:
+    """A request candidate considered during post-scale-up rebalancing."""
+
+    instance_id: int
+    request_id: str
+    seq_len: int
+    is_waiting: bool
+
+
+@dataclass(frozen=True)
+class _PostScaleUpDonorPlan:
+    """A pre-sorted donor instance plan for post-scale-up rebalancing."""
+
+    instance_id: int
+    request_count: float
+    token_sum: float
+    score: float
+    over_request_ratio: float
+    over_length_ratio: float
+    candidates: list[_PostScaleUpRequestCandidate]
 
 
 @ray.remote
@@ -40,18 +68,25 @@ class ElasticExecutor:
         coordinators: dict[PSRL_Role, dict[str, ray.actor.ActorHandle]],
         agent_loop_manager: ray.actor.ActorHandle | None = None,
         elastic_rm_config: dict | None = None,
+        train_pool_available: bool = False,
     ):
         self.coordinators = coordinators
         self.roles = roles
         self.elastic_rm_config = elastic_rm_config or {}
         self.config = config
         self.agent_loop_manager = agent_loop_manager
+        # Whether train_pool GPUs are available for elastic rollout/RM replicas.
+        # True when the trainer actor is NIXL-slept (train_pool lent out); False
+        # while a training step owns train_pool. Flipped by enter/leave_training_pool
+        # and seeded at construction with the trainer's initial sleep state. Drives
+        # the ``trainer_busy`` flag reported to the scaling policy.
+        self._train_pool_available = bool(train_pool_available)
 
         self.instances_status_flags: dict[PSRL_Role, dict[str, dict[int, InstanceStatus]]] = {}
         self.instances_engine_stats: dict[PSRL_Role, dict[str, dict[int, dict | None]]] = {}
-        # Per-instance bundle_range (start, end) in shared elastic PG; used for cross-role conflict checks.
+        # Per-instance pool-local bundle_range (start, end); used for cross-role conflict checks.
         self.instance_bundle_mappings: dict[PSRL_Role, dict[str, dict[int, dict[str, object]]]] = {}
-        self.bundle_to_instances: dict[int, set[tuple[PSRL_Role, str, int]]] = {}
+        self.bundle_to_instances: dict[tuple[str, int], set[tuple[PSRL_Role, str, int]]] = {}
 
         for role_name, model_name in self.roles:
             self.instances_status_flags.setdefault(role_name, {}).setdefault(model_name, {})
@@ -65,12 +100,20 @@ class ElasticExecutor:
         self.monitor_task = None
         self.scale_up_task = None
         self.scale_down_task = None
+        self.interrupt_vllm_waiting_task = None
 
         self.stop_monitor = False
         self.stop_scale_up = False
         self.stop_scale_down = False
+        self.stop_interrupt_vllm_waiting = False
         policy_variant = str(self.elastic_rm_config.get("scaling_policy_variant", "normal")).lower()
-        policy_cls = DummyScalingPolicy if policy_variant == "dummy" else ScalingPolicy
+        policy_cls_by_variant = {
+            "normal": ScalingPolicy,
+            "dummy": DummyScalingPolicy,
+            "itl": ITLScalingPolicy,
+            "itl_harmonic": ITLHarmonicScalingPolicy,
+        }
+        policy_cls = policy_cls_by_variant.get(policy_variant, ScalingPolicy)
         self.scaling_policy = policy_cls(config=self.config, policy_config=self.elastic_rm_config)
 
         # When set, elastic scaling policy may accept new decisions. Cleared while a decision
@@ -80,8 +123,14 @@ class ElasticExecutor:
         # the same event but leaves pending empty).
         self._policy_scaling_idle = asyncio.Event()
         self._policy_scaling_idle.set()
+        self._policy_scaling_holder: str | None = None
+        self._policy_scaling_holder_since_s: float | None = None
+        self._policy_scaling_owner_token: int | None = None
+        self._next_policy_scaling_owner_token = 1
+        self._policy_scaling_waiters: list[asyncio.Future] = []
         self._next_decision_id = 1
         self._decision_pending_action_counts: dict[int, int] = {}
+        self._decision_gate_tokens: dict[int, int] = {}
         # Consecutive monitor ticks where policy is blocked by an unfinished scale decision.
         self._execution_in_progress_stall_ticks: int = 0
         # When stall ticks reach this threshold, clear in-flight decision state so policy can proceed.
@@ -98,16 +147,37 @@ class ElasticExecutor:
             self.elastic_rm_config.get("enable_monitor_instance_log", True)
         )
         self.router_backlog_by_role: dict[PSRL_Role, int] = {}
+        self.router_backlog_summary_by_role: dict[PSRL_Role, dict[str, int]] = {}
         self.trainer_waiting_hint: dict[str, object] = {
-            "trainer_busy": True,
+            "trainer_busy": not self._train_pool_available,
             "waiting_buffer_id": None,
             "waiting_on": "none",
             "breakdown": {},
         }
 
-        # Fraction [0,1] of waiting uids to ABORT per instance after scale-up (FIFO / queue head).
-        _r = float(self.elastic_rm_config.get("post_scale_up_abort_waiting_ratio", 1.0))
-        self._post_scale_up_abort_waiting_ratio = max(0.0, min(1.0, _r))
+        self._post_scale_up_rebalance_request_weight = max(
+            0.0,
+            float(self.elastic_rm_config.get("post_scale_up_rebalance_request_weight", 1.0)),
+        )
+        self._post_scale_up_rebalance_length_weight = max(
+            0.0,
+            float(self.elastic_rm_config.get("post_scale_up_rebalance_length_weight", 1.0)),
+        )
+        if (
+            self._post_scale_up_rebalance_request_weight <= 0.0
+            and self._post_scale_up_rebalance_length_weight <= 0.0
+        ):
+            self._post_scale_up_rebalance_request_weight = 1.0
+        _waiting_scope = getattr(self.scaling_policy, "vllm_current_queue_scope", "running_waiting")
+        self._interrupt_vllm_waiting_enabled = bool(
+            self.elastic_rm_config.get("interrupt_vllm_waiting_when_running_only", False)
+        ) and _waiting_scope == "running"
+        self._interrupt_vllm_waiting_interval_s = max(
+            0.01,
+            float(self.elastic_rm_config.get("interrupt_vllm_waiting_interval_s", 2.0)),
+        )
+        _rt_waiting_ratio = float(self.elastic_rm_config.get("interrupt_vllm_waiting_ratio", 1.0))
+        self._interrupt_vllm_waiting_ratio = max(0.0, min(1.0, _rt_waiting_ratio))
 
         # Wake-up immunity: after an instance wakes up (or completes an in-place sync), it is
         # protected from being scaled down for this many milliseconds.  Set to 0 to disable.
@@ -124,26 +194,11 @@ class ElasticExecutor:
         else:
             self._coordinator_command_timeout_s = float(_cmd_to)
 
-        # Optional longer timeout for compensate WAKE_UP after uncertain SLEEP/WAKE_UP (None = derive from primary).
-        _comp_to = self.elastic_rm_config.get("coordinator_compensate_command_timeout_s", None)
-        if _comp_to is not None and float(_comp_to) > 0:
-            self._coordinator_compensate_command_timeout_s = float(_comp_to)
-        else:
-            self._coordinator_compensate_command_timeout_s = None
-
         # Logger
         self.log_prefix = "ElasticExecutor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         monitor_logger.propagate = False
         monitor_logger.addHandler(FileOnlyHandler(self.config.psrl.logging_path, "ElasticMonitor"))
-
-    def _effective_compensate_timeout_s(self) -> float | None:
-        """Ray RPC timeout for best-effort WAKE_UP after SLEEP/WAKE_UP timeout or exception."""
-        if self._coordinator_compensate_command_timeout_s is not None:
-            return self._coordinator_compensate_command_timeout_s
-        if self._coordinator_command_timeout_s is not None:
-            return max(float(self._coordinator_command_timeout_s) * 2.0, 180.0)
-        return None
 
     def register_instances(self, role_name: PSRL_Role, model_name: str, num_instances: int):
         self.instances_status_flags.setdefault(role_name, {}).setdefault(model_name, {})
@@ -154,7 +209,7 @@ class ElasticExecutor:
             self.instances_engine_stats[role_name][model_name][instance_id] = None
             self.instance_bundle_mappings[role_name][model_name].setdefault(
                 instance_id,
-                {"bundle_range": None},
+                {"bundle_range": None, "pool_id": "shared_rollout_pool"},
             )
 
     def register_instance_bundle_mapping(
@@ -163,11 +218,13 @@ class ElasticExecutor:
         model_name: str,
         instance_id: int,
         bundle_range: tuple[int, int] | None,
+        pool_id: str | None = None,
     ):
         self.instance_bundle_mappings.setdefault(role_name, {}).setdefault(model_name, {})
         self._remove_instance_from_bundle_reverse_index(role_name, model_name, instance_id)
         self.instance_bundle_mappings[role_name][model_name][instance_id] = {
             "bundle_range": (int(bundle_range[0]), int(bundle_range[1])) if bundle_range is not None else None,
+            "pool_id": str(pool_id or "shared_rollout_pool"),
         }
         self._add_instance_to_bundle_reverse_index(role_name, model_name, instance_id)
 
@@ -211,6 +268,7 @@ class ElasticExecutor:
                 model_name=item["model_name"],
                 instance_id=int(item["instance_id"]),
                 bundle_range=bundle_range,
+                pool_id=item.get("pool_id"),
             )
         self.initialize_instance_states(awaken_instances=awaken_instances)
 
@@ -269,11 +327,84 @@ class ElasticExecutor:
             free_ids.append(iid)
         return free_ids
 
-    def _release_policy_scaling_idle_if_clear(self) -> None:
+    def _policy_scaling_holder_elapsed_s(self) -> float | None:
+        if self._policy_scaling_holder_since_s is None:
+            return None
+        return time.monotonic() - self._policy_scaling_holder_since_s
+
+    def _policy_scaling_wait_context(self) -> dict:
+        elapsed_s = self._policy_scaling_holder_elapsed_s()
+        return {
+            "holder": self._policy_scaling_holder,
+            "holder_elapsed_s": None if elapsed_s is None else round(elapsed_s, 3),
+            "pending_decision_action_counts": dict(self._decision_pending_action_counts),
+        }
+
+    async def _wait_for_policy_scaling_idle(self, waiter: str) -> None:
+        while self._policy_scaling_owner_token is not None:
+            psrl_logger.info(
+                "elastic_rm policy_scaling_idle wait begin: waiter=%s waiting_for=%s",
+                waiter,
+                self._policy_scaling_wait_context(),
+            )
+            t0 = time.monotonic()
+            future = asyncio.get_running_loop().create_future()
+            self._policy_scaling_waiters.append(future)
+            await future
+            psrl_logger.info(
+                "elastic_rm policy_scaling_idle wait end: waiter=%s waited_s=%.3f",
+                waiter,
+                time.monotonic() - t0,
+            )
+        return
+
+    def _acquire_policy_scaling_idle(self, holder: str) -> int:
+        if self._policy_scaling_owner_token is not None:
+            raise RuntimeError(
+                "policy scaling gate is already owned by "
+                f"{self._policy_scaling_holder} token={self._policy_scaling_owner_token}"
+            )
+        token = self._next_policy_scaling_owner_token
+        self._next_policy_scaling_owner_token += 1
+        self._policy_scaling_owner_token = token
+        self._policy_scaling_idle.clear()
+        self._policy_scaling_holder = holder
+        self._policy_scaling_holder_since_s = time.monotonic()
+        return token
+
+    async def _wait_and_acquire_policy_scaling_idle(self, holder: str) -> int:
+        await self._wait_for_policy_scaling_idle(holder)
+        return self._acquire_policy_scaling_idle(holder)
+
+    def _release_policy_scaling_idle_if_clear(self, owner_token: int) -> None:
         """Set idle event when no in-flight decision actions remain."""
         if self._decision_pending_action_counts:
             return
+        if owner_token != self._policy_scaling_owner_token:
+            psrl_logger.error(
+                "Refuse to release policy scaling gate with stale token=%s; current_token=%s holder=%s",
+                owner_token,
+                self._policy_scaling_owner_token,
+                self._policy_scaling_holder,
+            )
+            return
+        holder = self._policy_scaling_holder
+        elapsed_s = self._policy_scaling_holder_elapsed_s()
+        if holder is not None:
+            psrl_logger.info(
+                "elastic_rm policy_scaling_idle release: holder=%s held_s=%.3f",
+                holder,
+                0.0 if elapsed_s is None else elapsed_s,
+            )
+        self._policy_scaling_holder = None
+        self._policy_scaling_holder_since_s = None
+        self._policy_scaling_owner_token = None
         self._policy_scaling_idle.set()
+        while self._policy_scaling_waiters:
+            waiter = self._policy_scaling_waiters.pop(0)
+            if not waiter.done():
+                waiter.set_result(None)
+                break
 
     def _check_sync_swap_legality(
         self,
@@ -324,25 +455,30 @@ class ElasticExecutor:
         role_name: PSRL_Role,
         model_name: str,
         instance_ids: list[int],
-    ) -> None:
+    ) -> int:
         """Serialize policy decisions while coordinator executes in-place sync."""
-        await self._policy_scaling_idle.wait()
-        self._policy_scaling_idle.clear()
+        owner_token = await self._wait_and_acquire_policy_scaling_idle(
+            "enter_inplace_sync_policy_gate "
+            f"role={getattr(role_name, 'name', role_name)} model={model_name} "
+            f"instances={[int(i) for i in instance_ids]}"
+        )
         psrl_logger.info(
             "elastic_rm enter_inplace_sync_policy_gate: role=%s model=%s instances=%s",
             getattr(role_name, "name", role_name),
             model_name,
             [int(i) for i in instance_ids],
         )
+        return owner_token
 
     def leave_inplace_sync_policy_gate(
         self,
         role_name: PSRL_Role,
         model_name: str,
         instance_ids: list[int],
+        owner_token: int,
     ) -> None:
         """Release policy gate after coordinator finishes in-place sync."""
-        self._release_policy_scaling_idle_if_clear()
+        self._release_policy_scaling_idle_if_clear(int(owner_token))
         psrl_logger.info(
             "elastic_rm leave_inplace_sync_policy_gate: role=%s model=%s instances=%s",
             getattr(role_name, "name", role_name),
@@ -356,45 +492,88 @@ class ElasticExecutor:
         model_name: str,
         wake_instance_id: int,
         sleep_instance_id: int,
+        sync_operation_id: int,
+        policy_gate_token: int | None = None,
     ) -> bool:
-        """Swap-based sync: wake a free instance (which auto-pulls the latest model
-        inside the WAKE_UP command handler) then sleep the instance that needed sync.
-        Returns True on success."""
-        await self._policy_scaling_idle.wait()
-        self._policy_scaling_idle.clear()
-        try:
-            legal, reason = self._check_sync_swap_legality(
-                role_name=role_name,
-                model_name=model_name,
-                wake_instance_id=wake_instance_id,
-                sleep_instance_id=sleep_instance_id,
+        return await self.perform_sync_swaps(
+            role_name,
+            model_name,
+            [(int(wake_instance_id), int(sleep_instance_id))],
+            sync_operation_id,
+            policy_gate_token,
+        )
+
+    async def perform_sync_swaps(
+        self,
+        role_name: PSRL_Role,
+        model_name: str,
+        swap_pairs: list[tuple[int, int]],
+        sync_operation_id: int,
+        policy_gate_token: int | None = None,
+    ) -> bool:
+        """Execute a whole sync-swap batch under one policy transition lease."""
+        owns_policy_gate = policy_gate_token is None
+        if owns_policy_gate:
+            owner_token = await self._wait_and_acquire_policy_scaling_idle(
+                "perform_sync_swaps "
+                f"role={getattr(role_name, 'name', role_name)} model={model_name} "
+                f"pairs={[(int(wake), int(sleep)) for wake, sleep in swap_pairs]}"
             )
-            if not legal:
-                psrl_logger.warning(
-                    "elastic_rm perform_sync_swap rejected: role=%s model=%s wake=%d sleep=%d reason=%s",
-                    getattr(role_name, "name", role_name),
-                    model_name,
-                    int(wake_instance_id),
-                    int(sleep_instance_id),
-                    reason,
+        else:
+            owner_token = int(policy_gate_token)
+            if owner_token != self._policy_scaling_owner_token:
+                psrl_logger.error(
+                    "Refuse sync swap with stale policy gate token=%s current_token=%s",
+                    owner_token,
+                    self._policy_scaling_owner_token,
                 )
                 return False
-            psrl_logger.info(
-                "elastic_rm perform_sync_swap: role=%s model=%s wake=%d sleep=%d",
-                getattr(role_name, "name", role_name),
-                model_name,
-                wake_instance_id,
-                sleep_instance_id,
-            )
-            await self._scale_up_instance(
-                {"role_name": role_name, "model_name": model_name, "instance_id": wake_instance_id}
-            )
-            await self._scale_down_instance(
-                {"role_name": role_name, "model_name": model_name, "instance_id": sleep_instance_id}
-            )
+        try:
+            for wake_instance_id, sleep_instance_id in swap_pairs:
+                legal, reason = self._check_sync_swap_legality(
+                    role_name=role_name,
+                    model_name=model_name,
+                    wake_instance_id=wake_instance_id,
+                    sleep_instance_id=sleep_instance_id,
+                )
+                if not legal:
+                    psrl_logger.warning(
+                        "elastic_rm sync swap rejected: role=%s model=%s wake=%d sleep=%d reason=%s",
+                        getattr(role_name, "name", role_name),
+                        model_name,
+                        int(wake_instance_id),
+                        int(sleep_instance_id),
+                        reason,
+                    )
+                    return False
+                wake_ok = await self._scale_up_instance(
+                    {
+                        "role_name": role_name,
+                        "model_name": model_name,
+                        "instance_id": wake_instance_id,
+                        "sync_operation_id": sync_operation_id,
+                    }
+                )
+                if not wake_ok:
+                    return False
+                sleep_ok = await self._scale_down_instance(
+                    {
+                        "role_name": role_name,
+                        "model_name": model_name,
+                        "instance_id": sleep_instance_id,
+                        "sync_operation_id": sync_operation_id,
+                    }
+                )
+                if not sleep_ok:
+                    psrl_logger.warning(
+                        "sync swap kept both instances available because sleeping old instance %d failed",
+                        sleep_instance_id,
+                    )
+                    return False
             return True
         finally:
-            self._release_policy_scaling_idle_if_clear()
+            if owns_policy_gate:
+                self._release_policy_scaling_idle_if_clear(owner_token)
 
     def snapshot(self) -> dict:
         return {
@@ -403,9 +582,62 @@ class ElasticExecutor:
             "bundle_to_instances": self.bundle_to_instances,
         }
 
+    def get_awake_instance_counts(self) -> dict[str, int]:
+        """Return the live count of AWAKEN instances per role.
+
+        Keyed by role name string (e.g. ``Rollout`` / ``RewardModel``) so the result
+        is plain-JSON for cross-process transport to the trainer driver, which pushes
+        it to wandb. TRAINING and ASLEEP instances are not counted as awake, matching
+        the awake summary in ``_maybe_log_instance_signals``.
+        """
+        counts: dict[str, int] = {}
+        for role_name, role_data in self.instances_status_flags.items():
+            role_key = getattr(role_name, "name", str(role_name))
+            awake = sum(
+                1
+                for instance_status in role_data.values()
+                for status in instance_status.values()
+                if status == InstanceStatus.AWAKEN
+            )
+            counts[role_key] = counts.get(role_key, 0) + awake
+        return counts
+
     @staticmethod
     def _instance_key(role_name: PSRL_Role, model_name: str, instance_id: int) -> tuple[PSRL_Role, str, int]:
         return (role_name, model_name, int(instance_id))
+
+    def _normalize_instance_entries(self, instances: list[dict] | None) -> list[dict]:
+        normalized: list[dict] = []
+        seen: set[tuple[PSRL_Role, str, int]] = set()
+        for item in instances or []:
+            if not isinstance(item, dict):
+                continue
+            role_name = item.get("role_name")
+            model_name = item.get("model_name")
+            if role_name is None or model_name is None:
+                continue
+            try:
+                instance_id = int(item["instance_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = self._instance_key(role_name, model_name, instance_id)
+            if key in seen:
+                continue
+            if instance_id not in self.instances_status_flags.get(role_name, {}).get(model_name, {}):
+                psrl_logger.warning(
+                    "Skip unknown elastic instance entry: role=%s model=%s instance=%s.",
+                    role_name,
+                    model_name,
+                    instance_id,
+                )
+                continue
+            normalized.append({"role_name": role_name, "model_name": model_name, "instance_id": instance_id})
+            seen.add(key)
+        return normalized
+
+    def _get_instance_pool_id(self, role_name: PSRL_Role, model_name: str, instance_id: int) -> str:
+        mapping = self.instance_bundle_mappings.get(role_name, {}).get(model_name, {}).get(instance_id, {})
+        return str(mapping.get("pool_id") or "shared_rollout_pool")
 
     def _get_instance_bundle_indices(self, role_name: PSRL_Role, model_name: str, instance_id: int) -> list[int]:
         mapping = self.instance_bundle_mappings.get(role_name, {}).get(model_name, {}).get(instance_id, {})
@@ -419,26 +651,29 @@ class ElasticExecutor:
 
     def _remove_instance_from_bundle_reverse_index(self, role_name: PSRL_Role, model_name: str, instance_id: int):
         target_key = self._instance_key(role_name, model_name, instance_id)
+        pool_id = self._get_instance_pool_id(role_name, model_name, instance_id)
         for bundle_idx in self._get_instance_bundle_indices(role_name, model_name, instance_id):
-            instance_set = self.bundle_to_instances.get(bundle_idx)
+            instance_set = self.bundle_to_instances.get((pool_id, bundle_idx))
             if not instance_set:
                 continue
             instance_set.discard(target_key)
             if not instance_set:
-                self.bundle_to_instances.pop(bundle_idx, None)
+                self.bundle_to_instances.pop((pool_id, bundle_idx), None)
 
     def _add_instance_to_bundle_reverse_index(self, role_name: PSRL_Role, model_name: str, instance_id: int):
         target_key = self._instance_key(role_name, model_name, instance_id)
+        pool_id = self._get_instance_pool_id(role_name, model_name, instance_id)
         for bundle_idx in self._get_instance_bundle_indices(role_name, model_name, instance_id):
-            self.bundle_to_instances.setdefault(bundle_idx, set()).add(target_key)
+            self.bundle_to_instances.setdefault((pool_id, bundle_idx), set()).add(target_key)
 
     def _has_other_role_awaken_on_shared_bundle(self, role_name: PSRL_Role, model_name: str, instance_id: int) -> bool:
+        pool_id = self._get_instance_pool_id(role_name, model_name, instance_id)
         for bundle_idx in self._get_instance_bundle_indices(role_name, model_name, instance_id):
-            for other_role, other_model, other_instance_id in self.bundle_to_instances.get(bundle_idx, set()):
+            for other_role, other_model, other_instance_id in self.bundle_to_instances.get((pool_id, bundle_idx), set()):
                 if other_role == role_name:
                     continue
                 other_status = self.instances_status_flags.get(other_role, {}).get(other_model, {}).get(other_instance_id)
-                if other_status == InstanceStatus.AWAKEN:
+                if other_status in (InstanceStatus.AWAKEN, InstanceStatus.TRAINING):
                     return True
         return False
 
@@ -446,27 +681,58 @@ class ElasticExecutor:
         if self.monitor_task is not None and not self.monitor_task.done():
             return
 
+        def _log_background_task_done(task_name: str):
+            def _callback(task: asyncio.Task) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    psrl_logger.warning("elastic_rm background task cancelled: %s", task_name)
+                except Exception:
+                    psrl_logger.exception("elastic_rm background task failed: %s", task_name)
+                else:
+                    psrl_logger.warning("elastic_rm background task exited unexpectedly: %s", task_name)
+
+            return _callback
+
         self.running_loop = asyncio.get_running_loop()
         self.stop_monitor = False
         self.stop_scale_up = False
         self.stop_scale_down = False
+        self.stop_interrupt_vllm_waiting = False
 
         self.monitor_task = self.running_loop.create_task(self._monitor_loop())
-        self.monitor_task.add_done_callback(lambda f: f.result())
+        self.monitor_task.add_done_callback(_log_background_task_done("monitor_loop"))
 
         self.scale_up_task = self.running_loop.create_task(self._scale_up_handler_loop())
-        self.scale_up_task.add_done_callback(lambda f: f.result())
+        self.scale_up_task.add_done_callback(_log_background_task_done("scale_up_handler_loop"))
 
         self.scale_down_task = self.running_loop.create_task(self._scale_down_handler_loop())
-        self.scale_down_task.add_done_callback(lambda f: f.result())
+        self.scale_down_task.add_done_callback(_log_background_task_done("scale_down_handler_loop"))
+
+        # NOTE: elastic-side periodic waiting-queue interruption is disabled on purpose.
+        # We rely solely on the vLLM scheduler patch (RolloutScheduler._preempt_request ->
+        # need_to_abort_reqs -> inference_engine.abort) to handle waiting/preempted requests.
+        # if self._interrupt_vllm_waiting_enabled:
+        #     self.interrupt_vllm_waiting_task = self.running_loop.create_task(
+        #         self._interrupt_vllm_waiting_loop()
+        #     )
+        #     self.interrupt_vllm_waiting_task.add_done_callback(
+        #         _log_background_task_done("interrupt_vllm_waiting_loop")
+        #     )
 
     async def stop(self):
-        if self.monitor_task is None and self.scale_up_task is None and self.scale_down_task is None:
+        if (
+            self.monitor_task is None
+            and self.scale_up_task is None
+            and self.scale_down_task is None
+            and self.interrupt_vllm_waiting_task is None
+        ):
             return
 
         self.stop_monitor = True
         self.stop_scale_up = True
         self.stop_scale_down = True
+        self.stop_interrupt_vllm_waiting = True
 
         tasks_to_wait = []
         if self.monitor_task is not None:
@@ -475,6 +741,8 @@ class ElasticExecutor:
             tasks_to_wait.append(self.scale_up_task)
         if self.scale_down_task is not None:
             tasks_to_wait.append(self.scale_down_task)
+        if self.interrupt_vllm_waiting_task is not None:
+            tasks_to_wait.append(self.interrupt_vllm_waiting_task)
         if tasks_to_wait:
             await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
@@ -487,10 +755,15 @@ class ElasticExecutor:
                 await self._sync_trainer_waiting_hint()
                 signals = self._build_instance_signals()
                 self._maybe_log_instance_signals(signals)
+                router_backlog_for_policy = (
+                    self.router_backlog_summary_by_role
+                    if isinstance(self.scaling_policy, ITLScalingPolicy)
+                    else self.router_backlog_by_role
+                )
                 decision = self.scaling_policy.decide(
                     signals,
                     execution_in_progress=not self._policy_scaling_idle.is_set(),
-                    router_backlog_by_role=self.router_backlog_by_role,
+                    router_backlog_by_role=router_backlog_for_policy,
                     trainer_waiting_hint=self.trainer_waiting_hint,
                 )
                 if not decision.actions and decision.reason == "decision_execution_in_progress":
@@ -501,7 +774,7 @@ class ElasticExecutor:
                     else:
                         self._execution_in_progress_stall_ticks = 0
                     if self._decision_abandon_stall_ticks > 0 and (
-                        self._execution_in_progress_stall_ticks >= self._decision_abandon_stall_ticks
+                        self._execution_in_progress_stall_ticks == self._decision_abandon_stall_ticks
                     ):
                         self._abandon_in_flight_decision(
                             reason="decision_execution_stall_ticks_exceeded",
@@ -513,13 +786,13 @@ class ElasticExecutor:
                     ):
                         psrl_logger.warning(
                             "elastic_rm: policy blocked by in-flight scaling for %d monitor ticks; "
-                            "pending=%s. Likely causes: (1) coordinator.exec_command stuck inside "
+                            "context=%s. Likely causes: (1) coordinator.exec_command stuck inside "
                             "SLEEP/WAKE_UP/ABORT (gen/RM workers or router not returning); "
                             "(2) another client's command ahead in the same coordinator queue never finishes "
                             "(head-of-line blocking). Check ElasticExecutor.log for the last "
                             "coordinator_cmd START line without matching END.",
                             self._execution_in_progress_stall_ticks,
-                            dict(self._decision_pending_action_counts),
+                            self._policy_scaling_wait_context(),
                         )
                 else:
                     self._execution_in_progress_stall_ticks = 0
@@ -527,7 +800,10 @@ class ElasticExecutor:
                 if decision.actions:
                     decision_id = self._next_decision_id
                     self._next_decision_id += 1
-                    self._policy_scaling_idle.clear()
+                    decision_gate_token = self._acquire_policy_scaling_idle(
+                        f"policy_decision decision_id={decision_id} reason={decision.reason}"
+                    )
+                    self._decision_gate_tokens[decision_id] = decision_gate_token
                     self._decision_pending_action_counts[decision_id] = len(decision.actions)
                     psrl_logger.info(
                         "Policy decision accepted: decision_id=%d, reason=%s, lambda=%.6f, role_to_total_mu=%s, actions=%s",
@@ -610,6 +886,8 @@ class ElasticExecutor:
                         decision_id,
                     )
 
+                sleep_elapsed_s = 0.0
+                wake_elapsed_s = 0.0
                 instances_to_scaled_down = self._find_instances_to_scaled_down_for_other_roles(role_need_to_scale_up)
                 if instances_to_scaled_down:
                     psrl_logger.info(
@@ -618,9 +896,9 @@ class ElasticExecutor:
                         len(instances_to_scaled_down),
                         instances_to_scaled_down,
                     )
-                    await asyncio.gather(
-                        *[self._scale_down_instance(instance) for instance in instances_to_scaled_down]
-                    )
+                    t0 = time.monotonic()
+                    await self._scale_down_instances(instances_to_scaled_down)
+                    sleep_elapsed_s = time.monotonic() - t0
                     psrl_logger.info(
                         "elastic_rm scale_up_handler decision_id=%s pre_sleep_other done",
                         decision_id,
@@ -635,7 +913,10 @@ class ElasticExecutor:
                     decision_id,
                     instances_to_scaled_up,
                 )
+                t0 = time.monotonic()
                 await self._scale_up_instances(instances_to_scaled_up)
+                wake_elapsed_s = time.monotonic() - t0
+                self._record_policy_migration_observation(sleep_elapsed_s, wake_elapsed_s)
                 psrl_logger.info(
                     "elastic_rm scale_up_handler decision_id=%s wake_targets done; post_scale_up_abort",
                     decision_id,
@@ -643,6 +924,7 @@ class ElasticExecutor:
                 await self._interrupt_waiting_after_scale_up(
                     role_name=role_need_to_scale_up["role_name"],
                     model_name=role_need_to_scale_up["model_name"],
+                    wake_instance_ids={int(item["instance_id"]) for item in instances_to_scaled_up},
                 )
                 psrl_logger.info("elastic_rm scale_up_handler decision_id=%s post_scale_up_abort done", decision_id)
             finally:
@@ -671,32 +953,25 @@ class ElasticExecutor:
                     decision_id,
                     instances_to_scaled_down,
                 )
-                await asyncio.gather(*[self._scale_down_instance(instance) for instance in instances_to_scaled_down])
+                await self._scale_down_instances(instances_to_scaled_down)
                 psrl_logger.info("elastic_rm scale_down_handler decision_id=%s sleep_targets done", decision_id)
             finally:
                 self._mark_decision_action_finished(decision_id)
 
     def _abandon_in_flight_decision(self, *, reason: str, stall_ticks: int) -> None:
-        """Clear local decision bookkeeping so scaling policy is no longer blocked.
-
-        Scale handler tasks may still complete later; their _mark_decision_action_finished
-        calls become no-ops if the decision was already cleared here. Cluster state may
-        diverge from ElasticExecutor flags until the next sync — same as coordinator timeouts.
-        """
+        """Report a stalled decision without releasing its live transition lease."""
         if self._policy_scaling_idle.is_set() and not self._decision_pending_action_counts:
             return
         pending = dict(self._decision_pending_action_counts)
         psrl_logger.error(
-            "elastic_rm: abandoning in-flight scaling decision (%s): stall_ticks=%d >= threshold=%d, "
-            "pending_action_counts=%s. Policy will accept new decisions; handlers may still finish RPCs.",
+            "elastic_rm: in-flight scaling decision exceeded stall threshold (%s): "
+            "stall_ticks=%d threshold=%d pending_action_counts=%s. Keeping the transition lease "
+            "until the original handlers finish to avoid overlapping state changes.",
             reason,
             stall_ticks,
             self._decision_abandon_stall_ticks,
             pending,
         )
-        self._decision_pending_action_counts.clear()
-        self._execution_in_progress_stall_ticks = 0
-        self._release_policy_scaling_idle_if_clear()
 
     def _mark_decision_action_finished(self, decision_id: int | None):
         if decision_id is None:
@@ -710,7 +985,17 @@ class ElasticExecutor:
         self._decision_pending_action_counts.pop(decision_id, None)
         if not self._decision_pending_action_counts:
             psrl_logger.info("elastic_rm decision_id=%d execution completed.", decision_id)
-            self._release_policy_scaling_idle_if_clear()
+            owner_token = self._decision_gate_tokens.pop(decision_id)
+            self._release_policy_scaling_idle_if_clear(owner_token)
+
+    def _record_policy_migration_observation(self, sleep_elapsed_s: float, wake_elapsed_s: float) -> None:
+        recorder = getattr(self.scaling_policy, "record_migration_observation", None)
+        if recorder is None:
+            return
+        try:
+            recorder(sleep_elapsed_s, wake_elapsed_s)
+        except Exception:
+            psrl_logger.exception("elastic_rm failed to record policy migration observation.")
 
     def _maybe_log_instance_signals(self, signals: list[InstanceSignal]):
         if not self._enable_monitor_instance_log:
@@ -730,7 +1015,8 @@ class ElasticExecutor:
                     "role": role_name,
                     "model": s.model_name,
                     "instance": int(s.instance_id),
-                    "status": "AWAKEN" if bool(s.is_awaken) else "ASLEEP",
+                    "status": "TRAINING" if bool(s.is_training) else ("AWAKEN" if bool(s.is_awaken) else "ASLEEP"),
+                    "pool_id": s.pool_id,
                     "running": int(s.running_queue_num),
                     "waiting": int(s.waiting_queue_num),
                     "kv_cache": float(s.kv_cache_utilization),
@@ -806,6 +1092,16 @@ class ElasticExecutor:
                 time.monotonic() - t0,
             )
             raise
+        if isinstance(result, dict) and result.get("command_id") is not None:
+            command_id = int(result["command_id"])
+            psrl_logger.warning(
+                "elastic_rm coordinator_cmd timed out but remains active: stage=%s command_id=%d status=%s; "
+                "waiting for the original command instead of issuing a duplicate",
+                stage,
+                command_id,
+                result.get("status"),
+            )
+            result = await coordinator.synchronize_command.remote(command_id, timeout=None)
         elapsed = time.monotonic() - t0
         psrl_logger.info(
             "elastic_rm coordinator_cmd END stage=%s type=%s elapsed_s=%.3f result=%r",
@@ -823,64 +1119,19 @@ class ElasticExecutor:
             )
         return result
 
-    async def _best_effort_wake_up_after_uncertain_elastic_op(
-        self,
-        coordinator: ray.actor.ActorHandle,
-        instance_role: PSRL_Role,
-        instance_model_name: str,
-        instance_id: int,
-        *,
-        reason: str,
-    ) -> bool:
-        """Undo partial SLEEP (router paused, etc.) or finish a stuck WAKE_UP via a second WAKE_UP RPC."""
-        rid = int(instance_id)
-        rname = getattr(instance_role, "name", str(instance_role))
-        stage = f"compensate_WAKE_UP reason={reason} role={rname} model={instance_model_name} instance={rid}"
-        t_comp = self._effective_compensate_timeout_s()
-        psrl_logger.warning(
-            "elastic_rm: best-effort compensate WAKE_UP (%s) instance=%d role=%s model=%s compensate_timeout_s=%r",
-            reason,
-            rid,
-            rname,
-            instance_model_name,
-            t_comp,
-        )
-        try:
-            comp = await self._await_elastic_coordinator_command(
-                coordinator,
-                Command(type=CommandType.WAKE_UP, instance_ids=[rid]),
-                stage=stage,
-                timeout_s=t_comp,
-            )
-        except Exception:
-            psrl_logger.exception(
-                "elastic_rm: compensate WAKE_UP raised role=%s model=%s instance=%s",
-                rname,
-                instance_model_name,
-                rid,
-            )
-            return False
-        if comp is True:
-            psrl_logger.info(
-                "elastic_rm: compensate WAKE_UP succeeded role=%s model=%s instance=%s",
-                rname,
-                instance_model_name,
-                rid,
-            )
-            return True
-        psrl_logger.error(
-            "elastic_rm: compensate WAKE_UP did not succeed (got %r) role=%s model=%s instance=%s",
-            comp,
-            rname,
-            instance_model_name,
-            rid,
-        )
-        return False
-
-    async def _scale_up_instance(self, instance_to_scaled_up: dict):
+    async def _scale_up_instance(self, instance_to_scaled_up: dict) -> bool:
         instance_role = instance_to_scaled_up["role_name"]
         instance_model_name = instance_to_scaled_up["model_name"]
         instance_id = int(instance_to_scaled_up["instance_id"])
+        status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {}).get(instance_id)
+        if status == InstanceStatus.TRAINING:
+            psrl_logger.info(
+                "Skip scale up for role=%s model=%s instance=%d: instance is reserved by trainer pool.",
+                instance_role,
+                instance_model_name,
+                instance_id,
+            )
+            return False
 
         coordinator = self.coordinators[instance_role][instance_model_name]
         primary_stage = (
@@ -893,49 +1144,37 @@ class ElasticExecutor:
                 Command(
                     type=CommandType.WAKE_UP,
                     instance_ids=[instance_id],
+                    sync_operation_id=instance_to_scaled_up.get("sync_operation_id"),
                 ),
                 stage=primary_stage,
             )
         except Exception:
             psrl_logger.exception(
-                "elastic_rm WAKE_UP RPC raised role=%s model=%s instance=%s; attempting compensate WAKE_UP",
+                "elastic_rm WAKE_UP RPC raised role=%s model=%s instance=%s; marking RECOVERING",
                 getattr(instance_role, "name", instance_role),
                 instance_model_name,
                 instance_id,
             )
-            result = None
+            self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.RECOVERING
+            return False
         if result is True:
             self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.AWAKEN
             self._set_instance_immunity(instance_role, instance_model_name, instance_id)
-            return
+            return True
         if result is False:
             psrl_logger.info(
                 "elastic_rm WAKE_UP rejected by coordinator role=%s model=%s instance=%s (e.g. sync-lock); "
-                "skipping compensate and local AWAKEN update.",
+                "leaving the local state unchanged.",
                 getattr(instance_role, "name", instance_role),
                 instance_model_name,
                 instance_id,
             )
-            return
-        recovered = await self._best_effort_wake_up_after_uncertain_elastic_op(
-            coordinator,
-            instance_role,
-            instance_model_name,
-            instance_id,
-            reason="wake_up_timeout_or_exception",
-        )
-        if recovered:
-            self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.AWAKEN
-            self._set_instance_immunity(instance_role, instance_model_name, instance_id)
-            psrl_logger.info(
-                "elastic_rm: marked AWAKEN after successful compensate WAKE_UP role=%s model=%s instance=%s",
-                getattr(instance_role, "name", instance_role),
-                instance_model_name,
-                instance_id,
-            )
+            return False
+        self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.RECOVERING
+        return False
 
     async def _scale_up_instances(self, instances_to_scaled_up: list[dict]) -> None:
-        """Batch WAKE_UP for same role/model instances; fallback to per-instance on failure."""
+        """Batch WAKE_UP for same role/model instances without duplicate retries."""
         if not instances_to_scaled_up:
             return
         if len(instances_to_scaled_up) == 1:
@@ -966,7 +1205,7 @@ class ElasticExecutor:
             )
         except Exception:
             psrl_logger.exception(
-                "elastic_rm batch WAKE_UP RPC raised role=%s model=%s instance_ids=%s; fallback to per-instance.",
+                "elastic_rm batch WAKE_UP RPC raised role=%s model=%s instance_ids=%s; not retrying blindly.",
                 getattr(instance_role, "name", instance_role),
                 instance_model_name,
                 instance_ids,
@@ -980,19 +1219,23 @@ class ElasticExecutor:
 
         psrl_logger.warning(
             "elastic_rm batch WAKE_UP did not fully succeed (result=%r) role=%s model=%s instance_ids=%s; "
-            "fallback to per-instance.",
+            "not issuing per-instance duplicates.",
             result,
             getattr(instance_role, "name", instance_role),
             instance_model_name,
             instance_ids,
         )
-        await asyncio.gather(*[self._scale_up_instance(item) for item in instances_to_scaled_up])
+        return
 
-    def _waiting_uids_for_abort_by_ratio(self, normalized_waiting_uids: list[int]) -> list[int]:
+    def _waiting_uids_for_abort_by_ratio(
+        self,
+        normalized_waiting_uids: list[str],
+        ratio: float,
+    ) -> list[str]:
         """Take the first k waiting uids (FIFO vs queue order); k = floor(n * ratio)."""
         if not normalized_waiting_uids:
             return []
-        r = self._post_scale_up_abort_waiting_ratio
+        r = max(0.0, min(1.0, float(ratio)))
         if r <= 0.0:
             return []
         if r >= 1.0:
@@ -1003,7 +1246,18 @@ class ElasticExecutor:
         )
         return normalized_waiting_uids[:k]
 
-    async def _interrupt_waiting_after_scale_up(self, role_name: PSRL_Role, model_name: str):
+    async def _interrupt_vllm_waiting_loop(self):
+        while not self.stop_interrupt_vllm_waiting:
+            try:
+                if self._interrupt_vllm_waiting_ratio > 0.0:
+                    await self._sync_engine_status_from_coordinators()
+                    for role_name, model_name in self.roles:
+                        await self._interrupt_vllm_waiting_for_role(role_name, model_name)
+            except Exception:
+                psrl_logger.exception("elastic_rm vLLM waiting interrupt loop failed; will retry after sleep.")
+            await asyncio.sleep(self._interrupt_vllm_waiting_interval_s)
+
+    async def _interrupt_vllm_waiting_for_role(self, role_name: PSRL_Role, model_name: str):
         role_status = self.instances_status_flags.get(role_name, {}).get(model_name, {})
         awaken_instance_ids = [
             int(instance_id)
@@ -1012,7 +1266,8 @@ class ElasticExecutor:
         ]
         if not awaken_instance_ids:
             return
-        instance_to_uids: dict[int, list[int]] = {}
+
+        instance_to_uids: dict[int, list[str]] = {}
         role_engine_stats = self.instances_engine_stats.get(role_name, {}).get(model_name, {})
         for instance_id in awaken_instance_ids:
             snapshot = role_engine_stats.get(instance_id, {})
@@ -1022,38 +1277,265 @@ class ElasticExecutor:
             if not isinstance(scheduler_stats, dict):
                 continue
             waiting_uids = scheduler_stats.get("req_id_in_waiting", [])
-            normalized_waiting_uids: list[int] = []
-            for uid in waiting_uids:
-                try:
-                    normalized_waiting_uids.append(int(uid))
-                except (TypeError, ValueError):
-                    psrl_logger.warning(
-                        "Skip non-integer waiting uid during post-scale-up ABORT: role=%s model=%s instance=%s uid=%r",
-                        role_name,
-                        model_name,
-                        instance_id,
-                        uid,
-                    )
-            selected = self._waiting_uids_for_abort_by_ratio(normalized_waiting_uids)
+            normalized_waiting_uids = [str(uid) for uid in waiting_uids if uid is not None]
+            selected = self._waiting_uids_for_abort_by_ratio(
+                normalized_waiting_uids,
+                self._interrupt_vllm_waiting_ratio,
+            )
             if selected:
                 instance_to_uids[int(instance_id)] = selected
+
+        if not instance_to_uids:
+            return
 
         coordinator = self.coordinators.get(role_name, {}).get(model_name)
         if coordinator is None:
             psrl_logger.warning(
-                "Skip post-scale-up ABORT: coordinator missing for role=%s model=%s.",
+                "Skip vLLM waiting ABORT: coordinator missing for role=%s model=%s.",
                 role_name,
                 model_name,
             )
             return
 
-        if not instance_to_uids:
+        interrupted_request_num = await self._await_elastic_coordinator_command(
+            coordinator,
+            Command(
+                type=CommandType.ABORT,
+                instance_to_uids=instance_to_uids,
+            ),
+            stage=(
+                f"ABORT_vllm_waiting_requeue role={getattr(role_name, 'name', role_name)} "
+                f"model={model_name} instances={sorted(instance_to_uids.keys())}"
+            ),
+        )
+        psrl_logger.info(
+            (
+                "vLLM waiting requeue abort executed: role=%s model=%s "
+                "uid_sources=%s interrupted=%s abort_waiting_ratio=%.4f"
+            ),
+            role_name,
+            model_name,
+            sorted(instance_to_uids.keys()),
+            interrupted_request_num,
+            self._interrupt_vllm_waiting_ratio,
+        )
+
+    @staticmethod
+    def _normalize_request_token_map(raw: dict | None) -> dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        normalized: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                normalized[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def _build_post_scale_up_request_candidates(
+        self,
+        *,
+        role_name: PSRL_Role,
+        model_name: str,
+        wake_instance_ids: set[int],
+    ) -> tuple[dict[int, list[_PostScaleUpRequestCandidate]], float, float]:
+        """Collect donor-side requests visible in scheduler stats for post-scale-up rebalancing.
+
+        We only look at currently awake donor instances, excluding the new wake targets.
+        The goal is to approximate the post-scale-up load distribution using request
+        counts and sequence lengths already exposed in scheduler stats.
+        """
+        # Only scheduler-visible requests are considered here. Waiting requests are
+        # cheaper to move, but running requests are still eligible if they are the
+        # only way to reduce imbalance on the donor side.
+        role_status = self.instances_status_flags.get(role_name, {}).get(model_name, {})
+        role_engine_stats = self.instances_engine_stats.get(role_name, {}).get(model_name, {})
+        candidates_by_instance: dict[int, list[_PostScaleUpRequestCandidate]] = {}
+        total_requests = 0.0
+        total_tokens = 0.0
+
+        for instance_id, status in role_status.items():
+            iid = int(instance_id)
+            if status != InstanceStatus.AWAKEN or iid in wake_instance_ids:
+                continue
+            snapshot = role_engine_stats.get(iid, {})
+            if not isinstance(snapshot, dict):
+                continue
+            scheduler_stats = snapshot.get("scheduler_stats", {})
+            if not isinstance(scheduler_stats, dict):
+                continue
+
+            prompt_map = self._normalize_request_token_map(scheduler_stats.get("req_id_to_prompt_token_num"))
+            response_map = self._normalize_request_token_map(scheduler_stats.get("req_id_to_response_token_num"))
+            waiting_uids = {str(uid) for uid in scheduler_stats.get("req_id_in_waiting", []) if uid is not None}
+            request_ids = set(prompt_map) | set(response_map) | waiting_uids
+            if not request_ids:
+                continue
+
+            instance_candidates: list[_PostScaleUpRequestCandidate] = []
+            instance_token_sum = 0.0
+            for request_id in request_ids:
+                seq_len = max(0, int(prompt_map.get(request_id, 0)) + int(response_map.get(request_id, 0)))
+                instance_candidates.append(
+                    _PostScaleUpRequestCandidate(
+                        instance_id=iid,
+                        request_id=request_id,
+                        seq_len=seq_len,
+                        is_waiting=request_id in waiting_uids,
+                    )
+                )
+                instance_token_sum += float(seq_len)
+
+            if instance_candidates:
+                candidates_by_instance[iid] = instance_candidates
+                total_requests += float(len(instance_candidates))
+                total_tokens += float(instance_token_sum)
+
+        return candidates_by_instance, total_requests, total_tokens
+
+    async def _interrupt_waiting_after_scale_up_balanced_candidates(
+        self,
+        role_name: PSRL_Role,
+        model_name: str,
+        wake_instance_ids: set[int] | None = None,
+    ):
+        # Rebalance only after the wake step is done. We approximate the new
+        # post-scale-up steady state from scheduler stats, then choose the
+        # smallest interrupt set that moves the donor side toward even
+        # request-count and sequence-length balance. New wake targets are
+        # excluded from donors.
+        wake_ids = {int(i) for i in (wake_instance_ids or set())}
+        candidates_by_instance, total_requests, total_tokens = self._build_post_scale_up_request_candidates(
+            role_name=role_name,
+            model_name=model_name,
+            wake_instance_ids=wake_ids,
+        )
+        if not candidates_by_instance or total_requests <= 0.0:
             psrl_logger.info(
-                "Skip post-scale-up ABORT: no waiting uids selected (ratio=%.4f) role=%s model=%s.",
-                self._post_scale_up_abort_waiting_ratio,
+                "Skip post-scale-up rebalancing: no donor candidates role=%s model=%s wake_ids=%s.",
+                role_name,
+                model_name,
+                sorted(wake_ids),
+            )
+            return
+
+        source_instance_count = len(candidates_by_instance)
+        target_instance_count = source_instance_count + len(wake_ids)
+        if target_instance_count <= 0:
+            return
+
+        moved_request_budget = total_requests * float(len(wake_ids)) / float(target_instance_count)
+        moved_request_count = int(math.floor(moved_request_budget + 0.5))
+        if moved_request_count <= 0:
+            psrl_logger.info(
+                "Skip post-scale-up rebalancing: moved_request_budget=%.4f < 1 role=%s model=%s.",
+                moved_request_budget,
                 role_name,
                 model_name,
             )
+            return
+
+        target_requests_per_instance = total_requests / float(target_instance_count)
+        target_tokens_per_instance = total_tokens / float(target_instance_count)
+        selected_by_instance: dict[int, list[str]] = {}
+        selected_total = 0
+        selected_tokens = 0.0
+
+        request_weight = self._post_scale_up_rebalance_request_weight
+        length_weight = self._post_scale_up_rebalance_length_weight
+        request_denominator = max(target_requests_per_instance, 1e-12)
+        length_denominator = max(target_tokens_per_instance, 1e-12)
+
+        def donor_score(request_count: float, token_sum: float) -> tuple[float, float, float]:
+            over_request_ratio = (request_count - target_requests_per_instance) / request_denominator
+            over_length_ratio = (token_sum - target_tokens_per_instance) / length_denominator
+            score = request_weight * over_request_ratio + length_weight * over_length_ratio
+            return score, over_request_ratio, over_length_ratio
+
+        donor_plans: list[_PostScaleUpDonorPlan] = []
+        for instance_id, cands in candidates_by_instance.items():
+            request_count = float(len(cands))
+            token_sum = float(sum(candidate.seq_len for candidate in cands))
+            score, over_request_ratio, over_length_ratio = donor_score(request_count, token_sum)
+            if score <= 0.0:
+                continue
+
+            def candidate_sort_key(candidate: _PostScaleUpRequestCandidate) -> tuple[float, int, int, str]:
+                marginal_score_drop = (
+                    request_weight / request_denominator
+                    + length_weight * float(candidate.seq_len) / length_denominator
+                )
+                return (
+                    -marginal_score_drop,
+                    0 if candidate.is_waiting else 1,
+                    -int(candidate.seq_len),
+                    candidate.request_id,
+                )
+
+            donor_plans.append(
+                _PostScaleUpDonorPlan(
+                    instance_id=int(instance_id),
+                    request_count=request_count,
+                    token_sum=token_sum,
+                    score=score,
+                    over_request_ratio=over_request_ratio,
+                    over_length_ratio=over_length_ratio,
+                    candidates=sorted(cands, key=candidate_sort_key),
+                )
+            )
+
+        donor_plans.sort(
+            key=lambda item: (
+                -item.score,
+                -item.over_request_ratio,
+                -item.over_length_ratio,
+                item.instance_id,
+            )
+        )
+
+        for donor_plan in donor_plans:
+            if selected_total >= moved_request_count:
+                break
+            instance_id = donor_plan.instance_id
+            remaining_count = donor_plan.request_count
+            remaining_tokens = donor_plan.token_sum
+            selected_for_instance: list[str] = []
+
+            for candidate in donor_plan.candidates:
+                if selected_total >= moved_request_count:
+                    break
+                selected_for_instance.append(candidate.request_id)
+                selected_total += 1
+                selected_tokens += float(candidate.seq_len)
+                remaining_count -= 1.0
+                remaining_tokens = max(0.0, remaining_tokens - float(candidate.seq_len))
+                score, _, _ = donor_score(remaining_count, remaining_tokens)
+                if score < 0.0:
+                    break
+
+            if selected_for_instance:
+                selected_by_instance[instance_id] = selected_for_instance
+
+        if not selected_by_instance:
+            psrl_logger.info(
+                "Skip post-scale-up rebalancing: selection produced no aborts role=%s model=%s wake_ids=%s.",
+                role_name,
+                model_name,
+                sorted(wake_ids),
+            )
+            return
+
+        coordinator = self.coordinators.get(role_name, {}).get(model_name)
+        if coordinator is None:
+            psrl_logger.warning(
+                "Skip post-scale-up rebalancing: coordinator missing for role=%s model=%s.",
+                role_name,
+                model_name,
+            )
+            return
+
+        instance_to_uids = {instance_id: uids for instance_id, uids in selected_by_instance.items() if uids}
+        if not instance_to_uids:
             return
 
         try:
@@ -1064,145 +1546,313 @@ class ElasticExecutor:
                     instance_to_uids=instance_to_uids,
                 ),
                 stage=(
-                    f"ABORT_post_scale_up role={getattr(role_name, 'name', role_name)} model={model_name} "
-                    f"instances={sorted(instance_to_uids.keys())}"
+                    f"ABORT_post_scale_up_rebalance role={getattr(role_name, 'name', role_name)} model={model_name} "
+                    f"wake_instances={sorted(wake_ids)} donor_instances={sorted(instance_to_uids.keys())}"
                 ),
             )
             if interrupted_request_num is None:
                 psrl_logger.warning(
-                    "elastic_rm post-scale-up ABORT returned None (timeout?); role=%s model=%s",
+                    "elastic_rm post-scale-up rebalance ABORT returned None (timeout?); role=%s model=%s",
                     role_name,
                     model_name,
                 )
                 return
             psrl_logger.info(
                 (
-                    "Post-scale-up rebalancing abort executed: role=%s model=%s "
-                    "awake_instances=%s uid_sources=%s interrupted=%s abort_waiting_ratio=%.4f"
+                    "Post-scale-up rebalancing executed: role=%s model=%s wake_instances=%s donor_instances=%s "
+                    "selected=%s interrupted=%s selected_tokens=%.0f "
+                    "target_requests_per_instance=%.2f target_tokens_per_instance=%.2f "
+                    "request_weight=%.4f length_weight=%.4f"
                 ),
                 role_name,
                 model_name,
-                awaken_instance_ids,
+                sorted(wake_ids),
                 sorted(instance_to_uids.keys()),
+                selected_total,
                 interrupted_request_num,
-                self._post_scale_up_abort_waiting_ratio,
+                selected_tokens,
+                target_requests_per_instance,
+                target_tokens_per_instance,
+                request_weight,
+                length_weight,
             )
         except Exception as exc:
             psrl_logger.warning(
-                "elastic_rm post-scale-up ABORT failed for role=%s model=%s instances=%s: %s",
+                "elastic_rm post-scale-up rebalancing failed for role=%s model=%s wake_instances=%s: %s",
                 role_name,
                 model_name,
-                awaken_instance_ids,
+                sorted(wake_ids),
                 exc,
             )
 
-    async def _scale_down_instance(self, instance_to_scaled_down: dict):
-        instance_role = instance_to_scaled_down["role_name"]
-        instance_model_name = instance_to_scaled_down["model_name"]
-        instance_id = int(instance_to_scaled_down["instance_id"])
+    async def _interrupt_waiting_after_scale_up(
+        self,
+        role_name: PSRL_Role,
+        model_name: str,
+        wake_instance_ids: set[int] | None = None,
+    ):
+        wake_ids = {int(i) for i in (wake_instance_ids or set())}
+        await self._interrupt_waiting_after_scale_up_balanced_candidates(
+            role_name=role_name,
+            model_name=model_name,
+            wake_instance_ids=wake_ids,
+        )
 
-        # Skip if the instance is within its wake-up immunity window.
-        if self._is_instance_in_immunity(instance_role, instance_model_name, instance_id):
-            remaining_ms = (
-                self._instance_immunity_until_ms.get(
-                    self._instance_key(instance_role, instance_model_name, instance_id), 0.0
-                )
-                - time.monotonic() * 1000
-            )
-            psrl_logger.info(
-                "Skip scale down for role=%s model=%s instance=%d: within wake-up immunity (%.0f ms remaining).",
-                instance_role,
-                instance_model_name,
-                instance_id,
-                max(0.0, remaining_ms),
-            )
-            return
+    async def _scale_down_instance(self, instance_to_scaled_down: dict) -> bool:
+        return await self._scale_down_instances([instance_to_scaled_down])
 
+    async def _scale_down_instances(self, instances_to_scaled_down: list[dict]) -> bool:
+        grouped: dict[tuple[PSRL_Role, str, int | None], list[int]] = defaultdict(list)
         min_awake_per_role = max(0, int(getattr(self.scaling_policy, "min_awake_per_role", 0)))
-        role_status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {})
-        awaken_count = sum(1 for status in role_status.values() if status == InstanceStatus.AWAKEN)
-        # Concurrency safety: even if multiple scale-down tasks race, keep at least
-        # `min_awake_per_role` alive for each role/model.
-        if awaken_count <= min_awake_per_role:
-            psrl_logger.info(
-                "Skip scale down for role=%s model=%s instance=%d: keep at least %d awaken instances.",
-                instance_role,
-                instance_model_name,
-                instance_id,
-                min_awake_per_role,
-            )
-            return
 
-        # When min_awake_per_role==0 only: do not sleep the last awake instance if the engine
-        # still has running/waiting work. When min_awake_per_role>0, allow shrinking straight
-        # down to the configured floor without this queue gate.
-        if min_awake_per_role == 0 and awaken_count == 1:
-            running_n, waiting_n = self._get_instance_running_waiting(
-                instance_role, instance_model_name, instance_id
-            )
-            if running_n > 0 or waiting_n > 0:
+        for instance_to_scaled_down in instances_to_scaled_down:
+            instance_role = instance_to_scaled_down["role_name"]
+            instance_model_name = instance_to_scaled_down["model_name"]
+            instance_id = int(instance_to_scaled_down["instance_id"])
+            sync_operation_id = instance_to_scaled_down.get("sync_operation_id")
+
+            status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {}).get(instance_id)
+            if status == InstanceStatus.TRAINING:
                 psrl_logger.info(
-                    "Skip scale down for role=%s model=%s instance=%d: sole awake instance still has "
-                    "running=%d waiting=%d (min_awake_per_role=0).",
+                    "Skip scale down for role=%s model=%s instance=%d: instance is reserved by trainer pool.",
                     instance_role,
                     instance_model_name,
                     instance_id,
-                    running_n,
-                    waiting_n,
                 )
-                return
+                continue
+            if status != InstanceStatus.AWAKEN:
+                psrl_logger.info(
+                    "Skip scale down for role=%s model=%s instance=%d: status=%s.",
+                    instance_role,
+                    instance_model_name,
+                    instance_id,
+                    getattr(status, "name", status),
+                )
+                continue
 
-        coordinator = self.coordinators[instance_role][instance_model_name]
-        sleep_stage = (
-            f"SLEEP role={getattr(instance_role, 'name', instance_role)} "
-            f"model={instance_model_name} instance={instance_id}"
+            if self._is_instance_in_immunity(instance_role, instance_model_name, instance_id):
+                remaining_ms = (
+                    self._instance_immunity_until_ms.get(
+                        self._instance_key(instance_role, instance_model_name, instance_id), 0.0
+                    )
+                    - time.monotonic() * 1000
+                )
+                psrl_logger.info(
+                    "Skip scale down for role=%s model=%s instance=%d: within wake-up immunity (%.0f ms remaining).",
+                    instance_role,
+                    instance_model_name,
+                    instance_id,
+                    max(0.0, remaining_ms),
+                )
+                continue
+
+            grouped[(instance_role, instance_model_name, sync_operation_id)].append(instance_id)
+
+        async def _sleep_group(
+            instance_role: PSRL_Role,
+            instance_model_name: str,
+            sync_operation_id: int | None,
+            candidate_ids: list[int],
+        ) -> bool:
+            role_status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {})
+            awaken_count = sum(1 for status in role_status.values() if status == InstanceStatus.AWAKEN)
+            allowed_to_sleep = max(0, awaken_count - min_awake_per_role)
+            if allowed_to_sleep <= 0:
+                psrl_logger.info(
+                    "Skip scale down for role=%s model=%s instances=%s: keep at least %d awaken instances.",
+                    instance_role,
+                    instance_model_name,
+                    candidate_ids,
+                    min_awake_per_role,
+                )
+                return False
+
+            instance_ids = candidate_ids[:allowed_to_sleep]
+            if len(instance_ids) < len(candidate_ids):
+                psrl_logger.info(
+                    "Truncate scale down for role=%s model=%s instances=%s -> %s to keep min_awake_per_role=%d.",
+                    instance_role,
+                    instance_model_name,
+                    candidate_ids,
+                    instance_ids,
+                    min_awake_per_role,
+                )
+
+            if min_awake_per_role == 0 and awaken_count == 1 and instance_ids:
+                instance_id = int(instance_ids[0])
+                running_n, waiting_n = self._get_instance_running_waiting(
+                    instance_role, instance_model_name, instance_id
+                )
+                if running_n > 0 or waiting_n > 0:
+                    psrl_logger.info(
+                        "Skip scale down for role=%s model=%s instance=%d: sole awake instance still has "
+                        "running=%d waiting=%d (min_awake_per_role=0).",
+                        instance_role,
+                        instance_model_name,
+                        instance_id,
+                        running_n,
+                        waiting_n,
+                    )
+                    return False
+
+            coordinator = self.coordinators[instance_role][instance_model_name]
+            sleep_stage = (
+                f"SLEEP role={getattr(instance_role, 'name', instance_role)} "
+                f"model={instance_model_name} instances={instance_ids}"
+            )
+            try:
+                result = await self._await_elastic_coordinator_command(
+                    coordinator,
+                    Command(
+                        type=CommandType.SLEEP,
+                        instance_ids=instance_ids,
+                        sync_operation_id=sync_operation_id,
+                    ),
+                    stage=sleep_stage,
+                )
+            except Exception:
+                psrl_logger.exception(
+                    "elastic_rm SLEEP RPC raised role=%s model=%s instances=%s; marking RECOVERING",
+                    getattr(instance_role, "name", instance_role),
+                    instance_model_name,
+                    instance_ids,
+                )
+                for instance_id in instance_ids:
+                    self.instances_status_flags[instance_role][instance_model_name][instance_id] = (
+                        InstanceStatus.RECOVERING
+                    )
+                return False
+            if result is None:
+                for instance_id in instance_ids:
+                    self.instances_status_flags[instance_role][instance_model_name][instance_id] = (
+                        InstanceStatus.RECOVERING
+                    )
+                return False
+            if result is False:
+                psrl_logger.info(
+                    "elastic_rm SLEEP rejected by coordinator for role=%s model=%s instances=%s "
+                    "(an instance may be in sync-lock); skipping status update.",
+                    instance_role,
+                    instance_model_name,
+                    instance_ids,
+                )
+                return False
+            for instance_id in instance_ids:
+                self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.ASLEEP
+                self.instances_engine_stats[instance_role][instance_model_name][instance_id] = None
+            return True
+
+        results = await asyncio.gather(
+            *[
+                _sleep_group(instance_role, instance_model_name, sync_operation_id, instance_ids)
+                for (instance_role, instance_model_name, sync_operation_id), instance_ids in grouped.items()
+            ]
         )
-        try:
+        return all(results) if results else False
+
+    async def _sleep_instances_for_training_pool(self, instances: list[dict]) -> None:
+        grouped: dict[tuple[PSRL_Role, str], list[int]] = defaultdict(list)
+        for instance in instances:
+            instance_role = instance["role_name"]
+            instance_model_name = instance["model_name"]
+            instance_id = int(instance["instance_id"])
+            status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {}).get(instance_id)
+            if status in (InstanceStatus.ASLEEP, InstanceStatus.TRAINING):
+                continue
+            if status != InstanceStatus.AWAKEN:
+                psrl_logger.warning(
+                    "Cannot reserve trainer-pool instance with unexpected status: role=%s model=%s instance=%d status=%s.",
+                    instance_role,
+                    instance_model_name,
+                    instance_id,
+                    getattr(status, "name", status),
+                )
+                raise RuntimeError(f"Failed to reserve trainer-pool instance for training: {instance!r}")
+            grouped[(instance_role, instance_model_name)].append(instance_id)
+
+        async def _sleep_group(instance_role: PSRL_Role, instance_model_name: str, instance_ids: list[int]) -> None:
+            coordinator = self.coordinators[instance_role][instance_model_name]
             result = await self._await_elastic_coordinator_command(
                 coordinator,
-                Command(
-                    type=CommandType.SLEEP,
-                    instance_ids=[instance_id],
+                Command(type=CommandType.SLEEP, instance_ids=instance_ids),
+                stage=(
+                    f"SLEEP_for_training_pool role={getattr(instance_role, 'name', instance_role)} "
+                    f"model={instance_model_name} instances={instance_ids}"
                 ),
-                stage=sleep_stage,
+                timeout_s=None,
             )
-        except Exception:
-            psrl_logger.exception(
-                "elastic_rm SLEEP RPC raised role=%s model=%s instance=%s; attempting compensate WAKE_UP",
-                getattr(instance_role, "name", instance_role),
-                instance_model_name,
-                instance_id,
-            )
-            await self._best_effort_wake_up_after_uncertain_elastic_op(
-                coordinator,
-                instance_role,
-                instance_model_name,
-                instance_id,
-                reason="sleep_exception",
-            )
-            return
-        if result is None:
-            await self._best_effort_wake_up_after_uncertain_elastic_op(
-                coordinator,
-                instance_role,
-                instance_model_name,
-                instance_id,
-                reason="sleep_timeout_or_none",
-            )
-            return
-        # A False result means the coordinator rejected the SLEEP (e.g. instance is currently
-        # doing an in-place model sync and has its sync-lock held).  Do not mark as ASLEEP.
-        if result is False:
-            psrl_logger.info(
-                "elastic_rm SLEEP rejected by coordinator for role=%s model=%s instance=%d "
-                "(instance may be in sync-lock); skipping status update.",
-                instance_role,
-                instance_model_name,
-                instance_id,
-            )
-            return
-        self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.ASLEEP
-        self.instances_engine_stats[instance_role][instance_model_name][instance_id] = None
+            if result is not True:
+                psrl_logger.warning(
+                    "Failed to sleep trainer-pool instances before training: role=%s model=%s instance_ids=%s result=%r.",
+                    instance_role,
+                    instance_model_name,
+                    instance_ids,
+                    result,
+                )
+                raise RuntimeError(
+                    "Failed to reserve trainer-pool instances for training: "
+                    f"role={instance_role!r} model={instance_model_name!r} instance_ids={instance_ids!r}"
+                )
+            for instance_id in instance_ids:
+                self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.ASLEEP
+                self.instances_engine_stats[instance_role][instance_model_name][instance_id] = None
+
+        await asyncio.gather(
+            *[
+                _sleep_group(instance_role, instance_model_name, instance_ids)
+                for (instance_role, instance_model_name), instance_ids in grouped.items()
+            ]
+        )
+
+    def _release_instances_from_training_pool(self, instances: list[dict]) -> None:
+        for instance in instances:
+            instance_role = instance["role_name"]
+            instance_model_name = instance["model_name"]
+            instance_id = int(instance["instance_id"])
+            status = self.instances_status_flags.get(instance_role, {}).get(instance_model_name, {}).get(instance_id)
+            if status != InstanceStatus.TRAINING:
+                psrl_logger.warning(
+                    "Cannot release trainer-pool instance with unexpected status: role=%s model=%s instance=%d status=%s.",
+                    instance_role,
+                    instance_model_name,
+                    instance_id,
+                    getattr(status, "name", status),
+                )
+                continue
+            self.instances_status_flags[instance_role][instance_model_name][instance_id] = InstanceStatus.ASLEEP
+            self.instances_engine_stats[instance_role][instance_model_name][instance_id] = None
+
+    async def enter_training_pool(self, instances: list[dict]) -> None:
+        normalized = self._normalize_instance_entries(instances)
+        owner_token = await self._wait_and_acquire_policy_scaling_idle(
+            f"enter_training_pool instances={normalized}"
+        )
+        entered = False
+        try:
+            await self._sleep_instances_for_training_pool(normalized)
+            for instance in normalized:
+                role_name = instance["role_name"]
+                model_name = instance["model_name"]
+                instance_id = int(instance["instance_id"])
+                self.instances_status_flags[role_name][model_name][instance_id] = InstanceStatus.TRAINING
+                self.instances_engine_stats[role_name][model_name][instance_id] = None
+            psrl_logger.info("Reserved trainer-pool elastic instances for training: %s.", normalized)
+            entered = True
+        finally:
+            # A training step now owns train_pool GPUs; they are no longer
+            # available for elastic replicas. Set before releasing the idle
+            # gate so the next policy tick observes the updated trainer_busy.
+            if entered:
+                self._train_pool_available = False
+            self._release_policy_scaling_idle_if_clear(owner_token)
+
+    async def leave_training_pool(self, instances: list[dict]) -> None:
+        normalized = self._normalize_instance_entries(instances)
+        self._release_instances_from_training_pool(normalized)
+        # Training step done; trainer actor is NIXL-slept again and train_pool
+        # GPUs are lent back to elastic rollout/RM replicas.
+        self._train_pool_available = True
+        psrl_logger.info("Released trainer-pool elastic instances from training: %s.", normalized)
 
     def _find_instances_to_scaled_up(self, role_need_to_scale_up: dict):
         role_name = role_need_to_scale_up["role_name"]
@@ -1531,14 +2181,20 @@ class ElasticExecutor:
     async def _sync_router_backlog_from_coordinators(self):
         refs = []
         task_keys: list[tuple[PSRL_Role, str]] = []
+        router_waiting_top_t = int(getattr(self.scaling_policy, "router_waiting_top_t", 0))
         for role_name, model_name in self.roles:
             coordinator = self.coordinators.get(role_name, {}).get(model_name)
             if coordinator is None:
                 continue
-            refs.append(coordinator.get_router_backlog_size.remote())
+            if router_waiting_top_t != 0:
+                summary_top_t = None if router_waiting_top_t < 0 else router_waiting_top_t
+                refs.append(coordinator.get_router_backlog_summary.remote(summary_top_t))
+            else:
+                refs.append(coordinator.get_router_backlog_size.remote())
             task_keys.append((role_name, model_name))
         if not refs:
             self.router_backlog_by_role = {}
+            self.router_backlog_summary_by_role = {}
             return
         results = await self._await_coordinator_refs_with_per_ref_timeout(
             refs,
@@ -1547,47 +2203,57 @@ class ElasticExecutor:
             trace_router_backlog=True,
         )
         prev_by_role = dict(self.router_backlog_by_role)
+        prev_summary_by_role = dict(self.router_backlog_summary_by_role)
         grouped: dict[PSRL_Role, list] = defaultdict(list)
         for (role_name, model_name), result in zip(task_keys, results):
             grouped[role_name].append(result)
 
         role_backlog: dict[PSRL_Role, int] = {}
+        role_summary: dict[PSRL_Role, dict[str, int]] = {}
         for role_key, result_list in grouped.items():
             total = 0
+            selected_count = 0
+            selected_tokens = 0
             for result in result_list:
                 if isinstance(result, Exception):
                     psrl_logger.warning(
                         "Failed to fetch router backlog for role=%s: %s", role_key, result
                     )
                     role_backlog[role_key] = prev_by_role.get(role_key, 0)
+                    role_summary[role_key] = prev_summary_by_role.get(
+                        role_key,
+                        {"pending": prev_by_role.get(role_key, 0), "count": 0, "total_tokens": 0},
+                    )
                     break
-                total += max(0, int(result))
+                if isinstance(result, dict):
+                    total += max(0, int(result.get("pending", result.get("count", 0))))
+                    selected_count += max(0, int(result.get("count", 0)))
+                    selected_tokens += max(0, int(result.get("total_tokens", 0)))
+                else:
+                    total += max(0, int(result))
             else:
                 role_backlog[role_key] = total
+                role_summary[role_key] = {
+                    "pending": total,
+                    "count": selected_count,
+                    "total_tokens": selected_tokens,
+                }
         self.router_backlog_by_role = role_backlog
+        self.router_backlog_summary_by_role = role_summary
 
     async def _sync_trainer_waiting_hint(self):
-        if self.agent_loop_manager is None:
-            self.trainer_waiting_hint = {
-                "trainer_busy": True,
-                "waiting_buffer_id": None,
-                "waiting_on": "none",
-                "breakdown": {},
-            }
-            return
-        try:
-            hint = await self.agent_loop_manager.get_trainer_waiting_hint.remote()
-            if not isinstance(hint, dict):
-                raise TypeError(f"trainer waiting hint must be dict, got {type(hint)}")
-            self.trainer_waiting_hint = hint
-        except Exception as exc:
-            psrl_logger.warning("Failed to sync trainer waiting hint from agent_loop_manager: %s", exc)
-            self.trainer_waiting_hint = {
-                "trainer_busy": True,
-                "waiting_buffer_id": None,
-                "waiting_on": "none",
-                "breakdown": {},
-            }
+        # trainer_busy is owned by the executor via _train_pool_available, which
+        # is flipped by enter/leave_training_pool (called every training step)
+        # and seeded at construction with the trainer's initial sleep state. This
+        # avoids depending on the AgentLoopManager, whose handle is None here
+        # (the executor is created before the manager) and which does not
+        # implement get_trainer_waiting_hint.
+        self.trainer_waiting_hint = {
+            "trainer_busy": not self._train_pool_available,
+            "waiting_buffer_id": None,
+            "waiting_on": "none",
+            "breakdown": {},
+        }
 
     def _get_instance_kv_cache_usage(self, role_name: PSRL_Role, model_name: str, instance_id: int) -> float:
         snapshot = self.instances_engine_stats.get(role_name, {}).get(model_name, {}).get(instance_id, {})
@@ -1626,15 +2292,19 @@ class ElasticExecutor:
                     scheduler_stats = snapshot.get("scheduler_stats", {})
                     if not isinstance(scheduler_stats, dict):
                         scheduler_stats = {}
+                    if status != InstanceStatus.AWAKEN:
+                        scheduler_stats = {}
+                        snapshot = {}
                     bundle_mapping = (
                         self.instance_bundle_mappings.get(role_name, {})
                         .get(model_name, {})
                         .get(instance_id, {})
                     )
                     br = bundle_mapping.get("bundle_range")
+                    pool_id = str(bundle_mapping.get("pool_id") or "shared_rollout_pool")
                     if br is not None and len(br) == 2:
                         b0, b1 = int(br[0]), int(br[1])
-                        bundle_keys = frozenset(range(b0, b1)) if b0 < b1 else None
+                        bundle_keys = frozenset((pool_id, idx) for idx in range(b0, b1)) if b0 < b1 else None
                     else:
                         bundle_keys = None
                     signal = InstanceSignal(
@@ -1642,6 +2312,8 @@ class ElasticExecutor:
                         model_name=model_name,
                         instance_id=int(instance_id),
                         is_awaken=status == InstanceStatus.AWAKEN,
+                        is_training=status == InstanceStatus.TRAINING,
+                        pool_id=pool_id,
                         kv_cache_utilization=float(scheduler_stats.get("kv_cache_usage", 0.0)),
                         running_queue_num=int(scheduler_stats.get("num_running_reqs", 0)),
                         waiting_queue_num=int(scheduler_stats.get("num_waiting_reqs", 0)),

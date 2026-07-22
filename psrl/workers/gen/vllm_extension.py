@@ -1,6 +1,8 @@
 import logging
 import os
 import time
+from contextlib import nullcontext
+from copy import copy, deepcopy
 
 import ray
 import torch
@@ -20,6 +22,7 @@ from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
@@ -64,6 +67,81 @@ class NIXLWorker(Worker):
 
 
 class vLLMWorkerExtension:
+    @staticmethod
+    def _maybe_tms_weights_region():
+        """Tag temporary GPU allocations as weights when the TMS vLLM patch is active."""
+        if not os.environ.get("PSRL_VLLM_PATCHES", "").startswith("TMS"):
+            return nullcontext()
+        try:
+            from torch_memory_saver import torch_memory_saver
+        except ImportError:
+            return nullcontext()
+        return torch_memory_saver.region(tag="weights")
+
+    def preload_weights_to_cpu_cache(self, weights_path: str | None = None, load_format: str | None = None) -> int:
+        """
+        Preload checkpoint weights into CPU memory for reward-model wake up.
+
+        The cache stores checkpoint-format weights, so wake up can remap GPU
+        parameter memory first and then call `model.load_weights` without
+        reading checkpoint files again.
+        """
+        try:
+            model = self.model_runner.model
+            if isinstance(model, CUDAGraphWrapper):
+                model = model.unwrap()
+
+            model_config = copy(self.model_config)
+            if weights_path is not None:
+                model_config.model = copy_to_local(weights_path)
+
+            load_config = deepcopy(self.model_runner.load_config)
+            if load_format is not None:
+                # Reward models are initialized with dummy weights on GPU, but
+                # the CPU cache must come from the real checkpoint.
+                load_config.load_format = "auto" if str(load_format).startswith("dummy") else load_format
+
+            model_loader = get_model_loader(load_config)
+            if not hasattr(model_loader, "get_all_weights"):
+                raise NotImplementedError(
+                    f"CPU weight cache does not support load format `{load_config.load_format}`."
+                )
+
+            cache: list[tuple[str, torch.Tensor]] = []
+            for name, tensor in model_loader.get_all_weights(model_config, model):
+                if isinstance(tensor, DTensor):
+                    tensor = tensor.full_tensor()
+                cache.append((name, tensor.detach().cpu().clone()))
+
+            self._psrl_cpu_weight_cache = cache
+            psrl_logger.info("Preloaded %d reward model tensors to CPU cache.", len(cache))
+            return len(cache)
+        except Exception as e:
+            raise ValueError(f"Error in vLLMWorkerExtension.preload_weights_to_cpu_cache: {e}") from e
+
+    def load_weights_from_cpu_cache(self, blocking: bool = True):
+        """
+        Load reward-model weights from the worker-local CPU cache to GPU.
+        """
+        try:
+            if not hasattr(self, "_psrl_cpu_weight_cache"):
+                raise RuntimeError("CPU weight cache is not initialized.")
+
+            current_device = torch.cuda.current_device()
+
+            def cached_weights_generator():
+                for name, tensor in self._psrl_cpu_weight_cache:
+                    yield (name, tensor.to(current_device, non_blocking=True))
+
+            torch.cuda.synchronize()
+            with self._maybe_tms_weights_region():
+                loaded_params = self.model_runner.model.load_weights(weights=cached_weights_generator())
+            if blocking:
+                torch.cuda.synchronize()
+        except Exception as e:
+            raise ValueError(f"Error in vLLMWorkerExtension.load_weights_from_cpu_cache: {e}") from e
+        return loaded_params
+
     def load_weights(self, weights, blocking: bool = True):
         """
         Load weights into the vLLM model runner.
@@ -108,7 +186,8 @@ class vLLMWorkerExtension:
 
             rebuild_weights = rebuild_weights_generator()
             torch.cuda.synchronize()
-            loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
+            with self._maybe_tms_weights_region():
+                loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
             if blocking:
                 # Ensure all operations are completed before returning
                 torch.cuda.synchronize()
@@ -324,7 +403,7 @@ class vLLMWorkerExtension:
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
-        self.nixl_log_shard_info(label=f"AFTER_GEN_PULL_{self.pull_times}")
+        # self.nixl_log_shard_info(label=f"AFTER_GEN_PULL_{self.pull_times}")
         self.nixl_storage_client.clear_intermediate_cached_data()
         time_end = time.time()
         psrl_logger.info(

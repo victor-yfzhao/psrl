@@ -71,6 +71,7 @@ reward_models:
       limit_images: null
       enable_chunked_prefill: false
       enable_prefix_caching: false
+      disable_kv_cache: false
       disable_log_stats: false
       skip_tokenizer_init: false
   
@@ -83,8 +84,8 @@ reward_models:
   
     sampling_config:
       temperature: 1.0
-      top_p: -1
-      top_k: 1
+      top_p: 1.0
+      top_k: -1
     reward_loop_kwargs:
       topk: 64
 

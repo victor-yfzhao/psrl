@@ -163,9 +163,20 @@ class PSRL_AgentLoopManager:
         self.log_prefix = "AgentLoopManager"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
+        # SleepWakeOrchestrator handle (colocated modes 2/3); None otherwise.
+        self.sleep_wake_orchestrator = None
+
     def set_val_buffer_size(self, val_buffer_size: int):
         """Set the validation buffer size."""
         self.val_buffer_size = val_buffer_size
+
+    def set_sleep_wake_orchestrator(self, orchestrator):
+        """Inject the SleepWakeOrchestrator (colocated modes 2/3).
+
+        Stored for phase gating / rollout-complete notifications. Unused when the
+        deployment mode is not colocated.
+        """
+        self.sleep_wake_orchestrator = orchestrator
 
     async def start_busy_loop(self):
         """Start the busy loop for continuous data processing from the queue."""
@@ -840,7 +851,7 @@ class PSRL_AgentLoopManager:
                 if buffer_id is None:
                     continue
 
-                psrl_logger.info(
+                psrl_logger.debug(
                     f"Successfully occupied prompt {prompt_entry_info} into "
                     f"buffer {buffer_id} with occupy_num {occupy_num}."
                 )
@@ -1241,23 +1252,28 @@ class PSRL_AgentLoopManager:
         else:
             raise ValueError(f"Invalid proactive filter strategy: {self.config.psrl.proactive_filter_strategy.method}")
 
-    async def wait_for_training_batch(self, buffer_id: int) -> DataProto:
-        """Await a training batch for a specific buffer ID."""
-        await self.ps_manager_handle.ensure_train_buffer_exists.remote(buffer_id)
-
+    async def _try_prepare_training_batch(self, buffer_id: int) -> bool:
+        """Promote an immediately completable accumulated buffer to READY."""
         if buffer_id in self.train_data_buffers:
-            # If the buffer is ready, return immediately
-            psrl_logger.info(f"TRAINING Buffer {buffer_id} is ready, returning immediately.")
-            return self.consume_buffer(buffer_id)
+            return True
 
-        # TODO(lhy): Support more consumption strategies
-        # 1. Truncate if buffer status is STUCK
-        # 2. Abort the RESERVED entry if buffer status is STUCK and move some OCCUPIED entries from other buffers
         if buffer_id in self.train_accumulated_buffers:
             async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+                # Buffer collection runs concurrently with trainer RPCs. Recheck
+                # after acquiring the PS lock before touching accumulated state.
+                if buffer_id in self.train_data_buffers:
+                    return True
+                if buffer_id not in self.train_accumulated_buffers:
+                    return False
+
                 await self.handle_waiting_buffer(buffer_id)
 
-                if self.train_accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer:
+                if buffer_id in self.train_data_buffers:
+                    return True
+                if (
+                    buffer_id in self.train_accumulated_buffers
+                    and self.train_accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer
+                ):
                     prompt_entry_infos = []
                     for model_version in sorted(list(self.train_accumulated_buffers[buffer_id].keys())):
                         prompt_entry_infos.extend(self.train_accumulated_buffers[buffer_id][model_version])
@@ -1276,9 +1292,39 @@ class PSRL_AgentLoopManager:
                         self.train_accumulated_buffer_size.pop(buffer_id)
                         psrl_logger.info(
                             f"TRAINING Buffer {buffer_id} is ready after "
-                            f"the abort and truncate strategy, return immediately."
+                            f"the abort and truncate strategy."
                         )
-                        return self.consume_buffer(buffer_id)
+                        return True
+        return False
+
+    async def prepare_training_batch_if_ready(self, buffer_id: int) -> bool:
+        """Prepare a batch without consuming it when no rollout wait is needed.
+
+        Unlike a read-only READY-state peek, this applies the same proactive
+        retry/truncate path as :meth:`wait_for_training_batch`. The trainer uses
+        the result to avoid sleeping when the batch can be completed immediately.
+        """
+        await self.ps_manager_handle.ensure_train_buffer_exists.remote(buffer_id)
+        return await self._try_prepare_training_batch(buffer_id)
+
+    async def wait_for_training_batch_ready(self, buffer_id: int, timeout_s: float) -> bool:
+        """Wait briefly for readiness without consuming the batch or registering a waiter."""
+        timeout_s = max(0.0, float(timeout_s))
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while buffer_id not in self.train_data_buffers:
+            remaining_s = deadline - asyncio.get_running_loop().time()
+            if remaining_s <= 0:
+                return False
+            await asyncio.sleep(min(0.05, remaining_s))
+        return True
+
+    async def wait_for_training_batch(self, buffer_id: int) -> DataProto:
+        """Await a training batch for a specific buffer ID."""
+        await self.ps_manager_handle.ensure_train_buffer_exists.remote(buffer_id)
+
+        if await self._try_prepare_training_batch(buffer_id):
+            psrl_logger.info(f"TRAINING Buffer {buffer_id} is ready, returning immediately.")
+            return self.consume_buffer(buffer_id)
 
         # If the buffer is still not ready after the abort and truncate strategy, wait for it to be ready
         psrl_logger.info(f"TRAINING Buffer {buffer_id} is not ready, waiting for it to be ready.")

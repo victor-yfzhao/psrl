@@ -54,7 +54,6 @@ class DefaultGenRewardFunction(GenRewardFunctionBase):
         extra_info: Optional[dict] = None,
         **kwargs,
     ) -> float:
-        print(f"Inside DefaultGenRewardFunction")
         # Default gen_rm uses string output, ignore rm_output_value
         reward_score = 0.0
         try:

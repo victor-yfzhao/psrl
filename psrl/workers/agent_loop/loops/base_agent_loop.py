@@ -7,6 +7,7 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
 
+from psrl.utils.reward_token_metrics import extract_reward_model_token_counts
 from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
 
 
@@ -83,6 +84,7 @@ class AgentLoopBase(ABC):
         rewards = []
         reward_extra_infos = []
         reward_metrics = []
+        rm_input_token_nums = []
         rm_generated_token_nums = []
         for request_id in request_ids:
             assert request_id in reward_result, f"Missing reward result for request ID: {request_id}"
@@ -91,24 +93,13 @@ class AgentLoopBase(ABC):
             extra_info = result.get("reward_extra_info", {})
             reward_extra_infos.append(extra_info)
             reward_metrics.append(result.get("reward_metrics", {}))
-            rm_generated_token_num = 0
-            if isinstance(extra_info, dict):
-                stack = [extra_info]
-                while stack:
-                    current_info = stack.pop()
-                    for key, value in current_info.items():
-                        if key == "rm_output_len" and isinstance(value, (int, float, np.integer, np.floating)):
-                            rm_generated_token_num += int(value)
-                        elif isinstance(value, dict):
-                            stack.append(value)
-                        elif isinstance(value, list):
-                            for item in value:
-                                if isinstance(item, dict):
-                                    stack.append(item)
+            rm_input_token_num, rm_generated_token_num = extract_reward_model_token_counts(extra_info)
+            rm_input_token_nums.append(rm_input_token_num)
             rm_generated_token_nums.append(rm_generated_token_num)
         outputs.non_tensor_batch["reward_scores"] = np.array(rewards)
         outputs.non_tensor_batch["reward_extra_infos"] = np.array(reward_extra_infos, dtype=object)
         outputs.non_tensor_batch["reward_metrics"] = np.array(reward_metrics, dtype=object)
+        outputs.non_tensor_batch["rm_input_token_num"] = np.array(rm_input_token_nums, dtype=np.int64)
         outputs.non_tensor_batch["rm_generated_token_num"] = np.array(rm_generated_token_nums, dtype=np.int64)
         return outputs
 

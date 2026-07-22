@@ -121,6 +121,7 @@ class PSRL_RewardModelManager:
         # Launch the router as a separate Ray actor or process
         self.router_process = launch_router_process(
             worker_handles=worker_handles,
+            worker_groups=self.reward_model_wg_list,
             config=self.config,
             reward_model_config=self.reward_model_config,
             max_concurrency=self.max_concurrency,
@@ -133,9 +134,9 @@ class PSRL_RewardModelManager:
 
     def get_replica_handles(self) -> list:
         """
-        Return all replica worker handles for direct access (no router).
+        Return all replicas for direct access (no router).
         """
-        return [replica.worker_handle for replica in self.replicas if replica.worker_handle is not None]
+        return self.replicas
     
     def get_router_process(self) -> ray.actor.ActorHandle | None:
         """

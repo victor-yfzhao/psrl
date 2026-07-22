@@ -9,6 +9,7 @@ from math import ceil
 import numpy as np
 from verl import DataProto
 
+from psrl.utils.cost_model_path import resolve_cost_model_json_path
 from psrl.workers.gen.stats_collector import EngineStats
 
 _ROUTE_STRATEGY_REGISTRY: dict[str, type["RouteStrategyBase"]] = {}
@@ -272,8 +273,9 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
 
     def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
         super().update_instance_to_engine_status(instance_to_engine_status)
-        for i, engine_stats in instance_to_engine_status.items():
-            self.instance_request_counts[i] = engine_stats.get_waiting_and_running_queue_size()
+        # instance_request_counts is router-authoritative (route/pop maintained).
+        # Do not overwrite it with the lagged engine queue size; see
+        # CostModelBasedRouteStrategy.update_instance_to_engine_status for details.
 
     def push_request(self, request: DataProto, instance_id: int):
         super().push_request(request, instance_id)
@@ -281,18 +283,22 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
 
     def pop_request(self, request: DataProto, instance_id: int):
         super().pop_request(request, instance_id)
-        self.instance_request_counts[instance_id] -= 1
+        self.instance_request_counts[instance_id] = max(0, self.instance_request_counts[instance_id] - 1)
 
     def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        # Only timestamp freshness gates engine-status resync; a queue-size
+        # mismatch is expected (engine snapshot lags router-side
+        # instance_request_counts) and must not block storing engine status.
         if super().is_staled(instance_id, engine_status):
             return True
         if engine_status.get_waiting_and_running_queue_size() != self.instance_request_counts[instance_id]:
             self.logger.debug(
-                f"Instance {instance_id} collected engine status is stale, "
-                f"waiting and running queue size {engine_status.get_waiting_and_running_queue_size()} "
-                f"is not equal to the recorded request count {self.instance_request_counts[instance_id]}"
+                f"Instance {instance_id} engine queue size "
+                f"{engine_status.get_waiting_and_running_queue_size()} "
+                f"differs from router recorded request count "
+                f"{self.instance_request_counts[instance_id]} "
+                f"(expected due to snapshot lag, not gating engine-status resync)"
             )
-            return True
         return False
 
     def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
@@ -336,8 +342,12 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
         self.last_logging_time = [time.time() for _ in range(n_instances)]
         self.logging_interval_in_ms = strategy_kwargs["logging_interval_in_ms"]
         cost_model_path = strategy_kwargs["cost_model_path"]
-        assert os.path.exists(cost_model_path), f"cost_model_path {cost_model_path} does not exist"
-        with open(cost_model_path) as f:
+        model_name = strategy_kwargs.get("model_name", "")
+        resolved_cost_model_path = resolve_cost_model_json_path(cost_model_path, model_name)
+        assert resolved_cost_model_path is not None, (
+            f"cost_model_path {cost_model_path} does not resolve to a JSON for model {model_name!r}"
+        )
+        with open(resolved_cost_model_path, encoding="utf-8") as f:
             self.cost_model = json.load(f)
         self.instance_to_tp_pp = strategy_kwargs["instance_to_tp_pp"]
         for tp_pp in self.instance_to_tp_pp.values():
@@ -442,7 +452,15 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
     def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
         super().update_instance_to_engine_status(instance_to_engine_status)
         for i, engine_stats in instance_to_engine_status.items():
-            self.instance_to_request_num[i] = engine_stats.get_waiting_and_running_queue_size()
+            # NOTE: instance_to_request_num is the router-authoritative inflight
+            # counter maintained by route(+1)/pop_request(-1). It must NOT be
+            # overwritten by the engine snapshot here: the engine snapshot lags
+            # behind the router (a freshly routed +1 has not reached the engine
+            # queue yet), so overwriting would silently revert that +1 and make
+            # the counter drift below the true inflight count. Under a bulk
+            # pop storm (e.g. model sync) this drift then drives the counter
+            # negative. running/waiting/token below are engine-side metrics and
+            # are correctly resynced from the engine snapshot.
             self.instance_to_running_request_num[i] = engine_stats.snapshot.get("scheduler_stats", {}).get(
                 "num_running_reqs", 0
             )
@@ -483,22 +501,45 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
 
     def pop_request(self, request: DataProto, instance_id: int):
         super().pop_request(request, instance_id)
-        self.instance_to_request_num[instance_id] -= 1
-        self.instance_to_running_request_num[instance_id] -= 1
-        self.instance_to_token_num[instance_id] -= self._get_request_token_num(request)
+        _old_request_num = self.instance_to_request_num[instance_id]
+        _new_request_num = max(0, _old_request_num - 1)
+        self.instance_to_request_num[instance_id] = _new_request_num
+        if _old_request_num <= 0:
+            self.logger.warning(
+                f"request {request.non_tensor_batch['uid'][0]} finished from "
+                f"instance {instance_id}, but instance_to_request_num was already "
+                f"{_old_request_num}; clamped to 0 to avoid negative drift "
+                f"(inflight count may be desynced from engine)"
+            )
+        else:
+            self.logger.debug(
+                f"request {request.non_tensor_batch['uid'][0]} finished from "
+                f"instance {instance_id}, instance_to_request_num turning from "
+                f"{_old_request_num} to {_new_request_num}"
+            )
+        self.instance_to_running_request_num[instance_id] = max(
+            0, self.instance_to_running_request_num[instance_id] - 1
+        )
+        self.instance_to_token_num[instance_id] = max(
+            0, self.instance_to_token_num[instance_id] - self._get_request_token_num(request)
+        )
 
     def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        # Only timestamp freshness gates engine-metric resync. The router-side
+        # instance_to_request_num is no longer overwritten by the engine
+        # snapshot, so a queue-size mismatch is *expected* (the engine snapshot
+        # lags the router's route(+1)) and must NOT block resyncing
+        # running/waiting/token from an otherwise-fresh snapshot.
         if super().is_staled(instance_id, engine_status):
             return True
         if engine_status.get_waiting_and_running_queue_size() != self.instance_to_request_num[instance_id]:
             self.logger.debug(
-                f"Instance {instance_id} collected engine status is stale, "
-                f"waiting and running queue size "
+                f"Instance {instance_id} engine queue size "
                 f"{engine_status.get_waiting_and_running_queue_size()} "
-                f"is not equal to the recorded request count "
-                f"{self.instance_to_request_num[instance_id]}"
+                f"differs from router recorded request count "
+                f"{self.instance_to_request_num[instance_id]} "
+                f"(expected due to snapshot lag, not gating engine-metric resync)"
             )
-            return True
         return False
 
 
@@ -617,7 +658,14 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                 and self.instance_to_request_num[best_candidate] < self.max_concurrent_seqs_per_instance
             ):
                 # if best_delta_throughput >= threshold:
+                _old_request_num = self.instance_to_request_num[best_candidate]
                 self.instance_to_request_num[best_candidate] += 1
+                self.logger.debug(
+                    f"request {request.non_tensor_batch['uid'][0]} decided to "
+                    f"route to instance {best_candidate}, "
+                    f"instance_to_request_num turning from {_old_request_num} "
+                    f"to {self.instance_to_request_num[best_candidate]}"
+                )
                 self.instance_to_running_request_num[best_candidate] += 1
                 self.instance_to_token_num[best_candidate] += self._get_request_token_num(request)
                 if "rollout_instance_id" in request.non_tensor_batch:

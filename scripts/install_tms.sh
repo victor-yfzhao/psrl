@@ -3,7 +3,7 @@ set -e
 set -o pipefail
 trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
-TMS_PATH=${TMS_PATH:-}
+TMS_PATH=${TMS_PATH:-third_party/torch_memory_saver}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSRL_PATH="$(dirname "$SCRIPT_DIR")"

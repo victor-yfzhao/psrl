@@ -1,69 +1,679 @@
-# Modified from verl/experimental/reward/router/naive_router.py
 import asyncio
 import heapq
+import json
 import logging
 import os
 import time
+from abc import ABC, abstractmethod
+from math import ceil
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import DictConfig
 from verl import DataProto
 
+from psrl.utils.cost_model_path import resolve_cost_model_json_path
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
+from psrl.utils.elastic_rm.itl_scaling_policy import (
+    ITLModelParams,
+    compute_itl,
+    resolve_itl_model_params,
+)
 from psrl.utils.logger import DualOutputHandler
+from psrl.workers.gen.stats_collector import EngineStats
 
 psrl_logger = logging.getLogger("reward_model_router")
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+
+# ---------------------------------------------------------------------------
+# Strategy registry
+# ---------------------------------------------------------------------------
+_RM_ROUTE_STRATEGY_REGISTRY: dict[str, type["RewardModelRouteStrategyBase"]] = {}
+
+
+def register_rm_route_strategy(name: str):
+    """Register a reward-model route strategy class."""
+
+    def decorator(cls: type["RewardModelRouteStrategyBase"]):
+        if name in _RM_ROUTE_STRATEGY_REGISTRY:
+            raise ValueError(f"Reward-model route strategy {name!r} is already registered.")
+        _RM_ROUTE_STRATEGY_REGISTRY[name] = cls
+        return cls
+
+    return decorator
+
+
+def get_rm_route_strategy_class(name: str) -> type["RewardModelRouteStrategyBase"]:
+    if name not in _RM_ROUTE_STRATEGY_REGISTRY:
+        raise ValueError(
+            f"Reward-model route strategy {name!r} is not registered. "
+            f"Available strategies: {list(_RM_ROUTE_STRATEGY_REGISTRY.keys())}."
+        )
+    return _RM_ROUTE_STRATEGY_REGISTRY[name]
+
+
+def list_available_rm_route_strategies() -> list[str]:
+    return list(_RM_ROUTE_STRATEGY_REGISTRY.keys())
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _request_token_num(request: DataProto) -> int:
+    """Best-effort token count for a queued single reward request (module-level)."""
+    batch = getattr(request, "batch", None)
+    if batch is None:
+        batch = {}
+    attention_mask = batch.get("attention_mask", None)
+    if attention_mask is not None:
+        if hasattr(attention_mask, "sum"):
+            return max(0, int(attention_mask.sum().item()))
+        return max(0, int(np.asarray(attention_mask).sum()))
+    input_ids = batch.get("input_ids", None)
+    if input_ids is not None:
+        shape = getattr(input_ids, "shape", None)
+        if shape is not None and len(shape) > 0:
+            return max(0, int(shape[-1]))
+        return max(0, len(input_ids))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Strategy base + implementations
+# ---------------------------------------------------------------------------
+class RewardModelRouteStrategyBase(ABC):
+    """Base class for reward-model routing strategies.
+
+    Reward-model routing mirrors rollout routing but does not group or order
+    candidates by model version. Callers pass only the currently available
+    replica candidates and optional load hints.
+    """
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict | None = None):
+        self.n_instances = int(n_instances)
+        self.strategy_kwargs = strategy_kwargs or {}
+        self.logger = self.strategy_kwargs.get("logger", logging.getLogger(__file__))
+        self.logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+        self.instance_to_engine_status = {
+            i: EngineStats(
+                instance_id=i,
+                model_version=0,
+                snapshot=EngineStats.get_default_snapshot(),
+            )
+            for i in range(self.n_instances)
+        }
+
+    @abstractmethod
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        pass
+
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]) -> None:
+        for instance_id, engine_status in instance_to_engine_status.items():
+            self.instance_to_engine_status[int(instance_id)] = engine_status
+
+    def update_instance_loads(self, instance_to_load: dict[int, int]) -> None:
+        """Update local load counters from router-side probes."""
+
+    def push_request(self, request: DataProto, instance_id: int) -> None:
+        """Record a routed request."""
+
+    def pop_request(self, request: DataProto, instance_id: int) -> None:
+        """Record a finished request."""
+
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        return 1.0
+
+
+@register_rm_route_strategy("random")
+class RandomRewardModelRouteStrategy(RewardModelRouteStrategyBase):
+    """Randomly select one available reward-model replica."""
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if not candidates:
+            return None
+        return int(np.random.choice(candidates))
+
+
+@register_rm_route_strategy("round_robin")
+class RoundRobinRewardModelRouteStrategy(RewardModelRouteStrategyBase):
+    """Route requests in round-robin order across available replicas."""
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict | None = None):
+        super().__init__(n_instances, strategy_kwargs)
+        self.curr_idx = 0
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if not candidates:
+            return None
+        idx = int(candidates[self.curr_idx % len(candidates)])
+        self.curr_idx = (self.curr_idx + 1) % len(candidates)
+        return idx
+
+
+@register_rm_route_strategy("request_num_balance")
+class RequestNumBalanceRewardModelRouteStrategy(RewardModelRouteStrategyBase):
+    """Route to the replica with the fewest active requests."""
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict | None = None):
+        super().__init__(n_instances, strategy_kwargs)
+        self.max_concurrent_seqs_per_instance = int(
+            self.strategy_kwargs.get("max_concurrent_seqs_per_instance", 2**31 - 1)
+        )
+        self.instance_request_counts = {i: 0 for i in range(self.n_instances)}
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if not candidates:
+            return None
+        active_loads = (route_kwargs or {}).get("active_loads", {})
+        for instance_id, load in active_loads.items():
+            self.instance_request_counts[int(instance_id)] = max(
+                int(load),
+                self.instance_request_counts.get(int(instance_id), 0),
+            )
+        selected = min(candidates, key=lambda idx: (self.instance_request_counts[int(idx)], int(idx)))
+        if self.instance_request_counts[int(selected)] >= self.max_concurrent_seqs_per_instance:
+            return None
+        self.instance_request_counts[int(selected)] += 1
+        return int(selected)
+
+    def update_instance_loads(self, instance_to_load: dict[int, int]) -> None:
+        for instance_id, load in instance_to_load.items():
+            self.instance_request_counts[int(instance_id)] = max(0, int(load))
+
+    def pop_request(self, request: DataProto, instance_id: int) -> None:
+        instance_id = int(instance_id)
+        self.instance_request_counts[instance_id] = max(0, self.instance_request_counts[instance_id] - 1)
+
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        if self.instance_request_counts[int(instance_id)] >= self.max_concurrent_seqs_per_instance:
+            return 0.0
+        return 1.0
+
+
+@register_rm_route_strategy("itl")
+class ITLBalanceRewardModelRouteStrategy(RewardModelRouteStrategyBase):
+    """Route to the replica with the smallest predicted ITL after admission.
+
+    Mirrors the legacy base-router ITL fast path: estimate
+    ``compute_itl(params, total_token_num=0, running_queue_num=load + 1)`` for
+    each candidate and pick the minimum, optionally filtered by an ITL cap.
+    """
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict | None = None):
+        super().__init__(n_instances, strategy_kwargs)
+        self._itl_params = self.strategy_kwargs.get("itl_model_params", None)
+        self._itl_max_itl = self.strategy_kwargs.get("itl_max_itl", None)
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        active_loads = (route_kwargs or {}).get("active_loads", {})
+        if candidates is None:
+            candidates = list(active_loads.keys())
+        if not candidates:
+            return None
+        best_key: tuple | None = None
+        best_idx: int | None = None
+        for idx in candidates:
+            idx = int(idx)
+            load = int(active_loads.get(idx, 0))
+            if self._itl_params is None:
+                next_itl = float(load + 1)
+            else:
+                next_itl = compute_itl(
+                    self._itl_params,
+                    total_token_num=0.0,
+                    running_queue_num=load + 1,
+                )
+            if self._itl_max_itl is not None and next_itl > self._itl_max_itl:
+                continue
+            key = (next_itl, load, idx)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+        if best_idx is None:
+            self.logger.warning(
+                "[router] No reward workers under ITL threshold %s; active_loads=%s.",
+                self._itl_max_itl,
+                active_loads,
+            )
+            return None
+        return best_idx
+
+
+class CostModelBasedRewardModelRouteStrategy(RewardModelRouteStrategyBase):
+    """Cost-model based reward-model route strategy."""
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict | None = None):
+        super().__init__(n_instances, strategy_kwargs)
+        required_keys = (
+            "cost_model_path",
+            "instance_to_tp_pp",
+            "max_num_waiting_reqs_after_preemption",
+            "max_concurrent_seqs_per_instance",
+            "delta_throughput_threshold",
+            "max_prompt_length",
+            "request_budget",
+            "instance_to_max_model_len",
+        )
+        missing = [key for key in required_keys if key not in self.strategy_kwargs]
+        if missing:
+            raise ValueError(f"Missing reward-model routing strategy kwargs: {missing}.")
+
+        cost_model_path = self.strategy_kwargs["cost_model_path"]
+        model_name = self.strategy_kwargs.get("model_name", "")
+        resolved_cost_model_path = resolve_cost_model_json_path(cost_model_path, model_name)
+        if resolved_cost_model_path is None:
+            raise ValueError(f"cost_model_path {cost_model_path!r} does not resolve for model {model_name!r}.")
+        with open(resolved_cost_model_path, encoding="utf-8") as f:
+            self.cost_model = json.load(f)
+
+        self.instance_to_tp_pp = self.strategy_kwargs["instance_to_tp_pp"]
+        for tp_pp in self.instance_to_tp_pp.values():
+            if tp_pp not in self.cost_model:
+                raise ValueError(f"tp_pp {tp_pp!r} is not in cost model.")
+
+        self.max_num_waiting_reqs_after_preemption = int(
+            self.strategy_kwargs["max_num_waiting_reqs_after_preemption"]
+        )
+        self.max_concurrent_seqs_per_instance = int(self.strategy_kwargs["max_concurrent_seqs_per_instance"])
+        self.delta_throughput_threshold = float(self.strategy_kwargs["delta_throughput_threshold"])
+        self.logging_interval_s = float(self.strategy_kwargs.get("logging_interval_in_ms", 1000)) / 1000.0
+        self._last_route_reject_log_ts = 0.0
+        self.max_prompt_length = int(self.strategy_kwargs["max_prompt_length"])
+        self.request_budget = int(self.strategy_kwargs["request_budget"])
+        self.instance_to_max_model_len = {
+            int(instance_id): int(max_model_len)
+            for instance_id, max_model_len in self.strategy_kwargs["instance_to_max_model_len"].items()
+        }
+        self.instance_to_request_num = {i: 0 for i in range(self.n_instances)}
+        self.instance_to_running_request_num = {i: 0 for i in range(self.n_instances)}
+        self.instance_to_waiting_request_num = {i: 0 for i in range(self.n_instances)}
+        self.instance_to_token_num = {i: 0 for i in range(self.n_instances)}
+        # Cost-model strategies need engine-status snapshots (token / waiting
+        # queue) to estimate throughput correctly. Until the coordinator pushes
+        # real snapshots via ``update_instance_to_engine_status``, fall back to
+        # load-based eager dispatch so requests are never stranded in the router
+        # queue (see ``_route_blind``).
+        self._has_engine_status = False
+
+    def _get_request_token_num(self, request: DataProto, log_len: bool = False) -> int:
+        non_tensor_batch = getattr(request, "non_tensor_batch", {}) or {}
+        raw_prompt_ids = non_tensor_batch.get("raw_prompt_ids")
+        if raw_prompt_ids is not None:
+            prompt_ids = raw_prompt_ids[0] if len(raw_prompt_ids) > 0 else []
+            response_len = non_tensor_batch.get("response_unpadded_len", [0])
+            if hasattr(response_len, "tolist"):
+                response_len = response_len.tolist()
+            if isinstance(response_len, (list, tuple, np.ndarray)):
+                response_len = response_len[0] if len(response_len) > 0 else 0
+            token_num = len(prompt_ids) + int(response_len)
+        else:
+            token_num = _request_token_num(request)
+        if log_len:
+            self.logger.info("Reward request token num is %d.", token_num)
+        return max(0, int(token_num))
+
+    def _can_run_directly(self, request: DataProto, instance_id: int) -> bool:
+        if self.instance_to_waiting_request_num[int(instance_id)] > 0:
+            return False
+        new_token_num = self.instance_to_token_num[int(instance_id)] + self._get_request_token_num(request)
+        return new_token_num <= self.instance_to_max_model_len[int(instance_id)]
+
+    def _estimate_latency(self, instance_id: int, request_num: int, token_num: int) -> float:
+        tp_pp = self.instance_to_tp_pp[int(instance_id)]
+        cost_model = self.cost_model[tp_pp]
+        return (
+            cost_model["attn_latency_b"]
+            + cost_model["attn_latency_k"] * token_num
+            + max(
+                cost_model["other_threshold"],
+                cost_model["other_latency_b"] + cost_model["other_latency_k"] * request_num,
+            )
+        )
+
+    def _estimate_curr_throughput(self, instance_id: int) -> float:
+        instance_id = int(instance_id)
+        request_num = self.instance_to_running_request_num[instance_id]
+        if request_num <= 0:
+            return 0.0
+        return request_num / self._estimate_latency(
+            instance_id,
+            request_num,
+            self.instance_to_token_num[instance_id],
+        )
+
+    def _estimate_curr_throughput_after_route_request(self, request: DataProto, instance_id: int) -> float:
+        instance_id = int(instance_id)
+        request_num = self.instance_to_running_request_num[instance_id] + 1
+        token_num = self.instance_to_token_num[instance_id] + self._get_request_token_num(request)
+        return request_num / self._estimate_latency(instance_id, request_num, token_num)
+
+    def _estimate_baseline_delta_throughput(self, request: DataProto, instance_id: int) -> float:
+        return 1.0 / self._estimate_latency(int(instance_id), 1, self._get_request_token_num(request))
+
+    def _format_candidate_state(self, candidates: list[int]) -> str:
+        parts = []
+        for idx in candidates:
+            idx = int(idx)
+            parts.append(
+                (
+                    f"{idx}:req={self.instance_to_request_num.get(idx, 0)},"
+                    f"run={self.instance_to_running_request_num.get(idx, 0)},"
+                    f"wait={self.instance_to_waiting_request_num.get(idx, 0)},"
+                    f"tok={self.instance_to_token_num.get(idx, 0)},"
+                    f"max={self.instance_to_max_model_len.get(idx, 0)}"
+                )
+            )
+        return "; ".join(parts)
+
+    def _maybe_log_route_reject(self, reason: str, **kwargs: Any) -> None:
+        now = time.monotonic()
+        if now - self._last_route_reject_log_ts < self.logging_interval_s:
+            return
+        self._last_route_reject_log_ts = now
+        details = ", ".join(f"{key}={value}" for key, value in kwargs.items())
+        self.logger.warning("[router][throughput_optimal] route reject: reason=%s, %s", reason, details)
+
+    def obtain_instance_token_num_from_engine_status(self, instance_id: int, engine_status: EngineStats) -> int:
+        return ceil(engine_status.get_kv_cache_utilization() * self.instance_to_max_model_len[int(instance_id)])
+
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]) -> None:
+        super().update_instance_to_engine_status(instance_to_engine_status)
+        if instance_to_engine_status:
+            self._has_engine_status = True
+        for instance_id, engine_stats in instance_to_engine_status.items():
+            instance_id = int(instance_id)
+            scheduler_stats = engine_stats.snapshot.get("scheduler_stats", {})
+            self.instance_to_request_num[instance_id] = engine_stats.get_waiting_and_running_queue_size()
+            self.instance_to_running_request_num[instance_id] = int(scheduler_stats.get("num_running_reqs", 0))
+            self.instance_to_waiting_request_num[instance_id] = int(scheduler_stats.get("num_waiting_reqs", 0))
+            self.instance_to_token_num[instance_id] = self.obtain_instance_token_num_from_engine_status(
+                instance_id,
+                engine_stats,
+            )
+
+    def update_instance_loads(self, instance_to_load: dict[int, int]) -> None:
+        for instance_id, load in instance_to_load.items():
+            instance_id = int(instance_id)
+            load = max(0, int(load))
+            self.instance_to_request_num[instance_id] = load
+            self.instance_to_running_request_num[instance_id] = load
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        raise RuntimeError("CostModelBasedRewardModelRouteStrategy is abstract.")
+
+    def push_request(self, request: DataProto, instance_id: int) -> None:
+        instance_id = int(instance_id)
+        self.instance_to_request_num[instance_id] += 1
+        self.instance_to_running_request_num[instance_id] += 1
+        # Only maintain a router-side token estimate when no engine-status
+        # snapshots are available. Once the coordinator pushes real snapshots
+        # (``_has_engine_status``), ``instance_to_token_num`` is the engine
+        # truth refreshed every coordinator sync; accumulating per-dispatch
+        # token estimates here would inflate it within a greedy batch and make
+        # ``_can_run_directly`` falsely refuse dispatch while the real worker
+        # still has kv-cache headroom.
+        if not self._has_engine_status:
+            self.instance_to_token_num[instance_id] += self._get_request_token_num(request)
+
+    def pop_request(self, request: DataProto, instance_id: int) -> None:
+        instance_id = int(instance_id)
+        self.instance_to_request_num[instance_id] = max(0, self.instance_to_request_num[instance_id] - 1)
+        self.instance_to_running_request_num[instance_id] = max(0, self.instance_to_running_request_num[instance_id] - 1)
+        if not self._has_engine_status:
+            self.instance_to_token_num[instance_id] = max(
+                0,
+                self.instance_to_token_num[instance_id] - self._get_request_token_num(request),
+            )
+
+
+@register_rm_route_strategy("throughput_optimal")
+class ThroughputOptimalRewardModelRouteStrategy(CostModelBasedRewardModelRouteStrategy):
+    """Route each reward request to the replica with best throughput gain."""
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if not candidates:
+            return None
+        if not self._has_engine_status:
+            return self._route_blind(request, candidates, route_kwargs)
+
+        best_candidate = None
+        best_delta_throughput = float("-inf")
+        request_token_num = self._get_request_token_num(request)
+        waiting_blocked = 0
+        token_blocked = 0
+        for candidate in candidates:
+            candidate = int(candidate)
+            if self.instance_to_waiting_request_num[candidate] > 0:
+                waiting_blocked += 1
+                continue
+            if self.instance_to_token_num[candidate] + request_token_num > self.instance_to_max_model_len[candidate]:
+                token_blocked += 1
+                continue
+            delta_throughput = (
+                self._estimate_curr_throughput_after_route_request(request, candidate)
+                - self._estimate_curr_throughput(candidate)
+            )
+            if delta_throughput > best_delta_throughput:
+                best_delta_throughput = delta_throughput
+                best_candidate = candidate
+
+        if best_candidate is None:
+            self._maybe_log_route_reject(
+                "no_direct_candidate",
+                request_token_num=request_token_num,
+                candidate_count=len(candidates),
+                waiting_blocked=waiting_blocked,
+                token_blocked=token_blocked,
+                candidates=self._format_candidate_state(candidates),
+            )
+            return None
+
+        threshold = self._estimate_baseline_delta_throughput(request, best_candidate) * self.delta_throughput_threshold
+        best_request_num = self.instance_to_request_num[best_candidate]
+        if (
+            best_delta_throughput >= threshold
+            and best_request_num < self.max_concurrent_seqs_per_instance
+        ):
+            self.push_request(request, best_candidate)
+            return best_candidate
+        reason = (
+            "marginal_throughput_below_threshold"
+            if best_delta_throughput < threshold
+            else "max_concurrent_seqs_cap"
+        )
+        self._maybe_log_route_reject(
+            reason,
+            best_candidate=best_candidate,
+            best_delta_throughput=best_delta_throughput,
+            threshold=threshold,
+            delta_throughput_threshold=self.delta_throughput_threshold,
+            request_token_num=request_token_num,
+            request_num=best_request_num,
+            running=self.instance_to_running_request_num[best_candidate],
+            waiting=self.instance_to_waiting_request_num[best_candidate],
+            token_num=self.instance_to_token_num[best_candidate],
+            new_token_num=self.instance_to_token_num[best_candidate] + request_token_num,
+            max_model_len=self.instance_to_max_model_len[best_candidate],
+            max_concurrent_seqs_per_instance=self.max_concurrent_seqs_per_instance,
+            candidate_count=len(candidates),
+            candidates=self._format_candidate_state(candidates),
+        )
+        return None
+
+    def _route_blind(
+        self,
+        request: DataProto,
+        candidates: list[int],
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        """Load-based eager dispatch used until engine-status snapshots arrive.
+
+        Without token/waiting-queue snapshots the throughput model is unreliable,
+        so we degrade to "pick the least-loaded candidate under the concurrency
+        cap" and always dispatch. This keeps the router from stranding requests
+        while the coordinator's status broadcast is not yet connected (or while
+        ``status_collection.enable`` is False).
+        """
+        active_loads = (route_kwargs or {}).get("active_loads", {})
+        best_idx: int | None = None
+        best_key: tuple | None = None
+        for idx in candidates:
+            idx = int(idx)
+            if self.instance_to_request_num[idx] >= self.max_concurrent_seqs_per_instance:
+                continue
+            load = int(active_loads.get(idx, self.instance_to_request_num[idx]))
+            key = (load, idx)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+        if best_idx is None:
+            return None
+        self.push_request(request, best_idx)
+        return best_idx
+
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        instance_id = int(instance_id)
+        if not self._can_run_directly(request, instance_id):
+            return 0.0
+        delta_throughput = (
+            self._estimate_curr_throughput_after_route_request(request, instance_id)
+            - self._estimate_curr_throughput(instance_id)
+        )
+        baseline = self._estimate_baseline_delta_throughput(request, instance_id) * self.delta_throughput_threshold
+        if delta_throughput < baseline:
+            return 0.0
+        if self.instance_to_request_num[instance_id] >= self.max_concurrent_seqs_per_instance:
+            return 0.0
+        return delta_throughput
+
+
+@register_rm_route_strategy("throughput_optimal_with_budget")
+class ThroughputOptimalWithBudgetRewardModelRouteStrategy(ThroughputOptimalRewardModelRouteStrategy):
+    """Throughput-optimal reward-model routing with per-request token budget."""
+
+    def _get_request_token_num(self, request: DataProto, log_len: bool = False) -> int:
+        non_tensor_batch = getattr(request, "non_tensor_batch", {}) or {}
+        raw_prompt_ids = non_tensor_batch.get("raw_prompt_ids")
+        if raw_prompt_ids is None:
+            return super()._get_request_token_num(request, log_len=log_len)
+        prompt_ids = raw_prompt_ids[0] if len(raw_prompt_ids) > 0 else []
+        response_len = non_tensor_batch.get("response_unpadded_len", [0])
+        if hasattr(response_len, "tolist"):
+            response_len = response_len.tolist()
+        if isinstance(response_len, (list, tuple, np.ndarray)):
+            response_len = response_len[0] if len(response_len) > 0 else 0
+        return len(prompt_ids) + ceil((int(response_len) + 1) / self.request_budget) * self.request_budget
+
+    def obtain_instance_token_num_from_engine_status(self, instance_id: int, engine_status: EngineStats) -> int:
+        prompt_token_nums = engine_status.get_req_id_to_prompt_token_num().values()
+        response_token_nums = engine_status.get_req_id_to_response_token_num().values()
+        token_num = 0
+        for prompt_token_num, response_token_num in zip(prompt_token_nums, response_token_nums, strict=False):
+            token_num += int(prompt_token_num)
+            token_num += ceil((int(response_token_num) + 1) / self.request_budget) * self.request_budget
+        return token_num
+
+
+# ---------------------------------------------------------------------------
+# Router actor
+# ---------------------------------------------------------------------------
 @ray.remote(concurrency_groups={"control": 5})
 class PSRL_RewardModelRouter:
-    """
-    Simple round-robin router for reward model replicas.
-    
-    This router accepts Ray ActorHandles and forwards generation requests
-    to the least-loaded replica.
-    
+    """Queue-based reward-model router with pluggable routing strategies.
+
+    The router accepts Ray ActorHandles, queues incoming requests, and forwards
+    each to a replica chosen by the configured ``RewardModelRouteStrategyBase``.
+
     NOTE(zyf): will enable to use http-server instead of ray actor in the future.
     """
 
     def __init__(
         self,
         worker_handles: list[ray.actor.ActorHandle],
+        worker_groups: list[Any] | None,
         config: DictConfig,
         reward_model_config: DictConfig | None = None,
         retry_delay: float = 2.0,
         verbose: bool = False,
+        route_strategy_config: dict | DictConfig | None = None,
     ) -> None:
-        """
-        Initialize the router with reward model worker handles.
-
-        Args:
-            worker_handles: List of Ray ActorHandles for RewardModelWorker instances.
-            config: Full PSRL Hydra config (needs psrl.logging_path for file logging).
-            retry_delay: Delay between retries (in seconds).
-            verbose: Enable verbose logging.
-        """
         self.config = config
         self.verbose = verbose
         self.worker_handles = worker_handles
+        self.worker_groups = worker_groups
         self.reward_model_config = reward_model_config
+        self.rollout_name = str(reward_model_config.rollout.name).lower() if reward_model_config is not None else "vllm"
         self.request_counts = {i: 0 for i in range(len(worker_handles))}
         self.paused_worker_indices: set[int] = set()
         self.retry_delay = retry_delay
         self.request_futures: dict[str, asyncio.Future] = {}
-        # Min-heap items (see _enqueue_request): (missing_flag, buffer_id, fifo_seq, request_key, request).
+        self.routing_status_update_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        self.worker_probe_backoff_until: dict[int, float] = {}
+        # Min-heap items: (missing_flag, buffer_id, fifo_seq, request_key, request).
         # missing_flag: 0 if buffer_id present (routed first), 1 if absent (demoted).
         # buffer_id: normalized id for ordering (smaller first); 0 when missing_flag==1.
         # fifo_seq: monotonic tie-break for FIFO among equal priority.
         self.requests_to_route: list[tuple[int, int, int, str, DataProto]] = []
         self.routing_lock = asyncio.Lock()
-        self.routing_status_update_event = asyncio.Event()
         self._is_routing = False
         self._interrupt_routing = False
         self.scheduler_task: asyncio.Task | None = None
         self._request_key_counter = 0
         self._waiting_seq_counter = 0
+        self._pending_count = 0
+        self.instance_to_engine_status: dict[int, EngineStats] = {}
 
         raw_cap = None
         if self.reward_model_config is not None:
@@ -76,48 +686,180 @@ class PSRL_RewardModelRouter:
                     self.max_concurrent_requests_per_instance = cap
             except (TypeError, ValueError):
                 self.max_concurrent_requests_per_instance = None
+        self.worker_active_task_timeout_s = self._positive_float_config(
+            "router_active_task_timeout_s", 1.0
+        )
+        self.worker_probe_backoff_s = self._positive_float_config(
+            "router_worker_probe_backoff_s", max(1.0, self.worker_active_task_timeout_s)
+        )
+        self.load_cache_ttl_s = self._positive_float_config("router_load_cache_ttl_s", 0.05)
 
-        # Build logger
+        elastic_rm_cfg = self._get_elastic_rm_config()
+        itl_cfg = elastic_rm_cfg.get("itl_policy", {}) if isinstance(elastic_rm_cfg, dict) else {}
+        if not isinstance(itl_cfg, dict):
+            itl_cfg = {}
+        variant = str(elastic_rm_cfg.get("scaling_policy_variant", "normal")).lower()
+        self._itl_router_enable = bool(itl_cfg.get("rm_router_enable", variant == "itl"))
+        raw_max_itl = itl_cfg.get("rm_router_max_itl", itl_cfg.get("rm_router_itl_threshold", None))
+        self._itl_router_max_itl: float | None = None
+        if raw_max_itl is not None:
+            try:
+                max_itl = float(raw_max_itl)
+                if max_itl > 0:
+                    self._itl_router_max_itl = max_itl
+            except (TypeError, ValueError):
+                self._itl_router_max_itl = None
+        self._itl_router_params: ITLModelParams | None = resolve_itl_model_params(
+            role_name="RewardModel",
+            model_name=self._reward_model_name(),
+            itl_config=itl_cfg,
+            fallback_config=elastic_rm_cfg,
+            config=self.config,
+        )
+
+        # Load cache for active task counts.
+        self._load_cache: dict[int, int] = {}
+        self._load_cache_ts: float = -1.0
+
+        # Strategy init.
+        self.route_strategy_config = route_strategy_config or _cfg_get(
+            reward_model_config, "routing_strategy", None
+        )
+        self.waiting_admission_cap: int | None = None
+        raw_waiting_admission_cap = _cfg_get(
+            self.route_strategy_config,
+            "max_num_waiting_reqs_after_preemption",
+            None,
+        )
+        if raw_waiting_admission_cap is not None:
+            try:
+                waiting_admission_cap = int(raw_waiting_admission_cap)
+                if waiting_admission_cap > 0:
+                    self.waiting_admission_cap = waiting_admission_cap
+            except (TypeError, ValueError):
+                self.waiting_admission_cap = None
+        self.route_strategy = self._init_route_strategy()
+        self._request_to_strategy_instance: dict[str, int] = {}
+
+        # Logger.
         self.log_prefix = "RewardModelRouter"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(
-            "RewardModelRouter initialized with %d workers (max_concurrent_requests_per_instance=%s)",
+            (
+                "RewardModelRouter initialized with %d workers "
+                "(max_concurrent_requests_per_instance=%s, strategy=%s, itl_router_enable=%s, "
+                "rm_router_max_itl=%s, waiting_admission_cap=%s, load_cache_ttl_s=%.4f)"
+            ),
             len(worker_handles),
             self.max_concurrent_requests_per_instance,
+            getattr(self.route_strategy, "__class__", type(None)).__name__,
+            self._itl_router_enable,
+            self._itl_router_max_itl,
+            self.waiting_admission_cap,
+            self.load_cache_ttl_s,
         )
 
-    async def _get_worker_active_task_num(self, worker_idx: int) -> int | None:
-        """
-        Best-effort fetch of reward worker's active task number.
-        Returns None on any failure (router should fall back to local counters).
-        """
+    # ---- config helpers --------------------------------------------------
+    def _positive_float_config(self, key: str, default: float) -> float:
+        if self.reward_model_config is None:
+            return float(default)
         try:
-            worker_handle = self.worker_handles[int(worker_idx)]
-            # `get_active_task_num` is a lightweight method on RewardModelWorker.
-            # It may not exist for older worker implementations.
-            return int(await worker_handle.get_active_task_num.remote())
-        except Exception:
-            return None
+            value = float(self.reward_model_config.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+        return value if value > 0 else float(default)
 
+    def _get_elastic_rm_config(self) -> dict[str, Any]:
+        try:
+            cfg = self.config.psrl.deployment.elastic_rm
+        except AttributeError:
+            return {}
+        if hasattr(cfg, "items"):
+            return dict(cfg.items())
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _reward_model_name(self) -> str:
+        if self.reward_model_config is None:
+            return "reward_model"
+        return str(
+            self.reward_model_config.get(
+                "reward_model_name",
+                self.reward_model_config.get("model", {}).get("path", "reward_model"),
+            )
+        )
+
+    # ---- strategy init ---------------------------------------------------
+    def _init_route_strategy(self) -> RewardModelRouteStrategyBase:
+        method = _cfg_get(self.route_strategy_config, "method", None)
+        if method is None:
+            method = "itl" if self._itl_router_enable else "request_num_balance"
+        method = str(method).lower()
+        n_instances = len(self.worker_handles)
+        strategy_kwargs = self._build_strategy_kwargs(n_instances)
+        try:
+            strategy_cls = get_rm_route_strategy_class(method)
+            strategy = strategy_cls(n_instances, strategy_kwargs)
+            psrl_logger.info("Initialized reward-model route strategy: %s.", method)
+            return strategy
+        except Exception as exc:
+            psrl_logger.warning("Reward-model route strategy error: %s.", exc)
+            psrl_logger.warning("Falling back to reward-model round_robin strategy.")
+            return RoundRobinRewardModelRouteStrategy(n_instances, strategy_kwargs)
+
+    def _build_strategy_kwargs(self, n_instances: int) -> dict[str, Any]:
+        rollout_config = _cfg_get(self.reward_model_config, "rollout", {})
+        model_config = _cfg_get(self.reward_model_config, "model", {})
+        model_path = str(_cfg_get(model_config, "path", self._reward_model_name()))
+        model_name = str(_cfg_get(self.reward_model_config, "reward_model_name", os.path.basename(model_path)))
+        tp = int(_cfg_get(rollout_config, "tensor_model_parallel_size", 1) or 1)
+        pp = int(_cfg_get(rollout_config, "pipeline_model_parallel_size", 1) or 1)
+        max_model_len = int(
+            _cfg_get(
+                rollout_config,
+                "max_model_len",
+                _cfg_get(self.config.data, "max_prompt_length", 4096)
+                + _cfg_get(self.route_strategy_config, "request_budget", 1024),
+            )
+            or 4096
+        )
+        max_concurrency = self.max_concurrent_requests_per_instance
+        if max_concurrency is None:
+            max_concurrency = int(_cfg_get(self.route_strategy_config, "max_concurrent_seqs_per_instance", 2**31 - 1))
+        return {
+            "logging_interval_in_ms": _cfg_get(self.route_strategy_config, "logging_interval_in_ms", 1000),
+            "cost_model_path": _cfg_get(self.route_strategy_config, "cost_model_path", ""),
+            "model_name": model_name,
+            "instance_to_tp_pp": {i: f"TP{tp}_PP{pp}" for i in range(n_instances)},
+            "max_num_waiting_reqs_after_preemption": _cfg_get(
+                self.route_strategy_config,
+                "max_num_waiting_reqs_after_preemption",
+                0,
+            ),
+            "balanced_concurrent_seqs_per_instance": max_concurrency,
+            "max_concurrent_seqs_per_instance": max_concurrency,
+            "delta_throughput_threshold": _cfg_get(self.route_strategy_config, "delta_throughput_threshold", 0.0),
+            "max_prompt_length": _cfg_get(self.config.data, "max_prompt_length", 4096),
+            "request_budget": _cfg_get(self.route_strategy_config, "request_budget", 1024),
+            "snapshot_staleness_threshold_in_ms": _cfg_get(
+                self.route_strategy_config,
+                "snapshot_staleness_threshold_in_ms",
+                100,
+            ),
+            "instance_to_max_model_len": {i: max_model_len for i in range(n_instances)},
+            "itl_model_params": self._itl_router_params,
+            "itl_max_itl": self._itl_router_max_itl,
+            "logger": psrl_logger,
+        }
+
+    # ---- public entry points --------------------------------------------
     async def generate(self, request: DataProto) -> DataProto | None:
-        """
-        Route one request through queue-based scheduler.
-
-        Args:
-            request: DataProto containing the input prompt.
-
-        Returns:
-            DataProto from the worker, or None if interrupted.
-        """
+        """Route one request through the queue-based scheduler."""
         return await self.generate_async(request)
 
     async def generate_async(self, request: DataProto) -> DataProto | None:
-        """
-        Queue a request and wait for routing result.
-        """
+        """Queue a request and wait for the routing result."""
         if self.scheduler_task is None:
             self.scheduler_task = asyncio.create_task(self._routing_loop())
-            # Fail fast if the background loop crashes.
             self.scheduler_task.add_done_callback(lambda task: task.result())
             psrl_logger.info("[router] Started reward routing loop")
 
@@ -130,70 +872,94 @@ class PSRL_RewardModelRouter:
         finally:
             self.request_futures.pop(request_key, None)
 
+    # ---- routing loop ----------------------------------------------------
     async def _routing_loop(self):
-        """Continuously pop queued requests and route them."""
+        """Continuously route queued requests using a request-driven loop.
+
+        Per tick: peek the head request, obtain a (cached) load snapshot, then
+        greedily dispatch as many queued requests as the snapshot allows before
+        re-probing. Backoff only when no candidate can accept the head request.
+        """
         while True:
             if self._interrupt_routing:
                 self._is_routing = False
-                self.routing_status_update_event.clear()
-                await self.routing_status_update_event.wait()
+                await self._wait_for_routing_update()
                 continue
 
-            worker_idx = self._select_worker()
-            if worker_idx is None:
+            if not self.requests_to_route:
                 self._is_routing = False
-                self.routing_status_update_event.clear()
-                await self.routing_status_update_event.wait()
+                await self._wait_for_routing_update()
                 continue
 
-            next_request = self._dequeue_request()
-            if next_request is None:
-                self._release_worker(worker_idx)
+            active_loads = await self._get_cached_active_loads()
+            if not active_loads:
                 self._is_routing = False
-                self.routing_status_update_event.clear()
-                await self.routing_status_update_event.wait()
+                await self._wait_for_routing_update(timeout_s=self.worker_probe_backoff_s)
                 continue
 
-            request_key, request = next_request
-            self._is_routing = True
-            task = asyncio.create_task(self._route_single_request(request_key, request, worker_idx))
-            task.add_done_callback(lambda t: t.result())
-            await asyncio.sleep(0)
+            # Refresh strategy counters once per probe snapshot.
+            self.route_strategy.update_instance_loads(active_loads)
 
-    async def _route_single_request(self, request_key: str, request: DataProto, worker_idx: int):
+            dispatched_any = False
+            while self.requests_to_route and not self._interrupt_routing:
+                peeked_key, peeked_request = self._peek_request()
+                worker_idx = self._select_worker_for_request(peeked_request, active_loads)
+                if worker_idx is None:
+                    break
+                # Commit dequeue only after a successful selection.
+                dequeued = self._dequeue_request()
+                if dequeued is None:
+                    self._release_strategy_worker(peeked_key, peeked_request, worker_idx)
+                    break
+                request_key, request = dequeued
+                self._request_to_strategy_instance[request_key] = int(worker_idx)
+                self._is_routing = True
+                inflight_at_dispatch = active_loads.get(int(worker_idx), 0)
+                task = asyncio.create_task(
+                    self._route_single_request(request_key, request, worker_idx, inflight_at_dispatch)
+                )
+                task.add_done_callback(lambda t: t.result())
+                # Optimistic reservation bump so the next greedy pick's cap
+                # filter and strategy see the just-dispatched in-flight count.
+                active_loads[int(worker_idx)] = inflight_at_dispatch + 1
+                dispatched_any = True
+                await asyncio.sleep(0)
+
+            if not dispatched_any:
+                self._is_routing = False
+                await self._wait_for_routing_update(timeout_s=self.worker_probe_backoff_s)
+                continue
+
+    async def _route_single_request(
+        self,
+        request_key: str,
+        request: DataProto,
+        worker_idx: int,
+        inflight_at_dispatch: int,
+    ):
         """Route one request to a selected worker; requeue when needed."""
-        # The caller might have already cancelled/aborted this request.
         if request_key not in self.request_futures:
-            self._release_worker(worker_idx)
+            self._release_strategy_worker(request_key, request, worker_idx)
             return
 
         request_uids = self._format_request_uids(request)
         if self._interrupt_routing:
-            self._release_worker(worker_idx)
+            self._release_strategy_worker(request_key, request, worker_idx)
             self._enqueue_request(request_key, request)
-            psrl_logger.info(
+            psrl_logger.debug(
                 "[router] Routing is interrupted, Request %s, requeueing original request.",
                 request_uids,
             )
             return
 
         worker_handle = self.worker_handles[worker_idx]
-        inflight = await self._get_worker_active_task_num(worker_idx)
-        if inflight is None:
-            inflight = self.request_counts[worker_idx]
-        psrl_logger.info(
-            "[router] Routing reward request %s to worker %d (inflight=%d)",
-            request_uids,
-            worker_idx,
-            inflight,
-        )
         try:
-            result = await worker_handle.generate_async.remote(request)
+            result = await self._generate_with_worker(worker_idx, worker_handle, request)
         finally:
-            self._release_worker(worker_idx)
+            self._release_strategy_worker(request_key, request, worker_idx)
 
         if result is None:
-            psrl_logger.info("Request %s interrupted or unavailable, requeueing original request.", request_uids)
+            psrl_logger.debug("Request %s interrupted or unavailable, requeueing original request.", request_uids)
             self._enqueue_request(request_key, request)
             await asyncio.sleep(self.retry_delay)
             return
@@ -204,56 +970,180 @@ class PSRL_RewardModelRouter:
         except Exception:
             interrupted = False
         if interrupted:
-            # Requeue the partial output to continue generation from existing tokens.
-            psrl_logger.info("Request %s interrupted, requeueing partial output for continuation.", request_uids)
+            psrl_logger.debug("Request %s interrupted, requeueing partial output for continuation.", request_uids)
             self._enqueue_request(request_key, result)
             await asyncio.sleep(self.retry_delay)
             return
 
-        psrl_logger.info("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
+        if psrl_logger.isEnabledFor(logging.DEBUG):
+            psrl_logger.debug("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
         self._set_result(request_key, result)
         return
 
-    def _select_worker(self) -> int | None:
+    async def _generate_with_worker(self, worker_idx: int, worker_handle, request: DataProto) -> DataProto | None:
+        if self.rollout_name in ("transformers", "hf"):
+            if self.worker_groups is None:
+                raise RuntimeError("Transformers reward routing requires worker_groups for all-rank execution.")
+            results = await asyncio.gather(*self.worker_groups[worker_idx].execute_all_async("generate_async", request))
+            return self._select_rank_zero_result(results)
+        return await worker_handle.generate_async.remote(request)
+
+    @staticmethod
+    def _select_rank_zero_result(results) -> DataProto | None:
+        for result in results:
+            if result is not None:
+                return result
+        return None
+
+    # ---- worker selection + load cache ----------------------------------
+    async def _get_worker_active_task_num(self, worker_idx: int) -> int:
+        """Fetch the reward worker's active task number (one Ray remote)."""
+        worker_handle = self.worker_handles[int(worker_idx)]
+        return int(
+            await asyncio.wait_for(
+                worker_handle.get_active_task_num.remote(),
+                timeout=self.worker_active_task_timeout_s,
+            )
+        )
+
+    def _available_indices(self) -> list[int]:
+        now = time.monotonic()
+        return [
+            idx
+            for idx in self.request_counts
+            if idx not in self.paused_worker_indices
+            and self.worker_probe_backoff_until.get(idx, 0.0) <= now
+        ]
+
+    async def _get_cached_active_loads(self) -> dict[int, int]:
+        """Return active loads for available workers, using a short-TTL cache.
+
+        Cached values are reconciled with current router reservations
+        (``request_counts``) so the cap filter and strategies always observe
+        in-flight dispatches even when the probe snapshot is slightly stale.
         """
-        Select the least-loaded worker (simple by request count).
-        """
-        available_indices = [idx for idx in self.request_counts if idx not in self.paused_worker_indices]
-        if self.max_concurrent_requests_per_instance is not None:
-            available_indices = [
-                idx
-                for idx in available_indices
-                if self.request_counts[idx] < self.max_concurrent_requests_per_instance
-            ]
+        available_indices = self._available_indices()
         if not available_indices:
+            return {}
+
+        now = time.monotonic()
+        cache_fresh = (now - self._load_cache_ts) < self.load_cache_ttl_s
+        if (
+            cache_fresh
+            and self._load_cache
+            and all(idx in self._load_cache for idx in available_indices)
+        ):
+            return {
+                idx: max(0, self._load_cache[idx], self.request_counts.get(idx, 0))
+                for idx in available_indices
+            }
+
+        loads = await self._get_available_active_loads(available_indices)
+        if loads:
+            self._load_cache = dict(loads)
+            self._load_cache_ts = now
+        return loads
+
+    async def _get_available_active_loads(self, available_indices: list[int]) -> dict[int, int]:
+        load_results = await asyncio.gather(
+            *(self._get_worker_active_task_num(idx) for idx in available_indices),
+            return_exceptions=True,
+        )
+        active_loads: dict[int, int] = {}
+        for idx, result in zip(available_indices, load_results, strict=True):
+            if isinstance(result, Exception):
+                self.worker_probe_backoff_until[idx] = time.monotonic() + self.worker_probe_backoff_s
+                psrl_logger.warning(
+                    "[router] Excluding worker %d because active task count fetch failed: %s; backoff=%.3fs",
+                    idx,
+                    result,
+                    self.worker_probe_backoff_s,
+                )
+                continue
+            active_loads[idx] = max(0, int(result), self.request_counts.get(idx, 0))
+        return active_loads
+
+    def _select_worker_for_request(
+        self, request: DataProto, active_loads: dict[int, int]
+    ) -> int | None:
+        """Select a worker for a specific request using the active strategy."""
+        now = time.monotonic()
+        candidates_loads = {
+            idx: load
+            for idx, load in active_loads.items()
+            if idx not in self.paused_worker_indices
+            and self.worker_probe_backoff_until.get(idx, 0.0) <= now
+        }
+        if self.waiting_admission_cap is not None:
+            candidates_loads = {
+                idx: load
+                for idx, load in candidates_loads.items()
+                if self._can_admit_without_exceeding_waiting_cap(idx, load)
+            }
+        if not candidates_loads:
             return None
-        worker_idx = min(available_indices, key=lambda idx: self.request_counts[idx])
+        if self.max_concurrent_requests_per_instance is not None:
+            candidates_loads = {
+                idx: load
+                for idx, load in candidates_loads.items()
+                if load < self.max_concurrent_requests_per_instance
+            }
+        if not candidates_loads:
+            return None
+
+        worker_idx = self.route_strategy.route(
+            request,
+            candidates=list(candidates_loads.keys()),
+            route_kwargs={"active_loads": candidates_loads},
+        )
+        if worker_idx is None:
+            return None
+        worker_idx = int(worker_idx)
         self.request_counts[worker_idx] += 1
         return worker_idx
 
+    def _can_admit_without_exceeding_waiting_cap(self, instance_id: int, active_load: int) -> bool:
+        """Keep newly dispatched work within the latest running plus waiting budget."""
+        if self.waiting_admission_cap is None:
+            return True
+
+        engine_status = self.instance_to_engine_status.get(int(instance_id))
+        if engine_status is None:
+            running = 0
+            waiting = 0
+        else:
+            scheduler_stats = engine_status.snapshot.get("scheduler_stats", {})
+            running = max(0, int(scheduler_stats.get("num_running_reqs", 0)))
+            waiting = max(0, int(scheduler_stats.get("num_waiting_reqs", 0)))
+
+        if waiting >= self.waiting_admission_cap:
+            return False
+        return int(active_load) < running + self.waiting_admission_cap
+
+    # ---- release / result ------------------------------------------------
     def _release_worker(self, worker_idx: int) -> None:
-        """
-        Mark worker as free after request completes.
-        """
         self.request_counts[worker_idx] = max(0, self.request_counts[worker_idx] - 1)
-        self.routing_status_update_event.set()
+        self._invalidate_load_cache()
+        self._signal_routing_update()
+
+    def _release_strategy_worker(self, request_key: str, request: DataProto, worker_idx: int) -> None:
+        worker_idx = int(worker_idx)
+        self.route_strategy.pop_request(request, worker_idx)
+        self._request_to_strategy_instance.pop(request_key, None)
+        self._release_worker(worker_idx)
 
     def _set_result(self, request_key: str, result: DataProto | None):
-        """Resolve the waiting future of a routed request."""
         request_future = self.request_futures.get(request_key, None)
-        if request_future is None:
-            return
-        if request_future.done():
+        if request_future is None or request_future.done():
             return
         request_future.set_result(result)
 
-    def _build_request_key(self, request: DataProto) -> str:
-        """
-        Build a unique key for in-flight request tracking.
+    def _invalidate_load_cache(self) -> None:
+        self._load_cache = {}
+        self._load_cache_ts = -1.0
 
-        NOTE: uid may be absent or duplicated in edge cases, so we add a local
-        monotonic suffix to avoid key collision inside the router.
-        """
+    # ---- queue helpers ---------------------------------------------------
+    def _build_request_key(self, request: DataProto) -> str:
         uid_repr = self._format_request_uids(request)
         request_key = f"{uid_repr}#{self._request_key_counter}"
         self._request_key_counter += 1
@@ -261,8 +1151,6 @@ class PSRL_RewardModelRouter:
 
     def _enqueue_request(self, request_key: str, request: DataProto) -> None:
         buffer_id = self._extract_buffer_id(request)
-        # Smaller buffer_id should be routed first. Requests without buffer_id are
-        # demoted behind known buffer_id requests while preserving FIFO order.
         missing_flag = 1 if buffer_id is None else 0
         normalized_buffer_id = buffer_id if buffer_id is not None else 0
         item = (
@@ -274,40 +1162,48 @@ class PSRL_RewardModelRouter:
         )
         self._waiting_seq_counter += 1
         heapq.heappush(self.requests_to_route, item)
-        self.routing_status_update_event.set()
+        self._pending_count += 1
+        self._signal_routing_update()
 
     def _dequeue_request(self) -> tuple[str, DataProto] | None:
         if not self.requests_to_route:
             return None
         _, _, _, request_key, request = heapq.heappop(self.requests_to_route)
+        self._pending_count = max(0, self._pending_count - 1)
         return request_key, request
 
+    def _peek_request(self) -> tuple[str, DataProto] | None:
+        if not self.requests_to_route:
+            return None
+        _, _, _, request_key, request = self.requests_to_route[0]
+        return request_key, request
+
+    # ---- control API -----------------------------------------------------
     @ray.method(concurrency_group="control")
     def pause_instances(self, instance_ids: list[int]):
         for instance_id in instance_ids:
             self.paused_worker_indices.add(int(instance_id))
+        self._invalidate_load_cache()
 
     @ray.method(concurrency_group="control")
     def resume_instances(self, instance_ids: list[int]):
         for instance_id in instance_ids:
-            self.paused_worker_indices.discard(int(instance_id))
-        self.routing_status_update_event.set()
+            instance_id = int(instance_id)
+            self.paused_worker_indices.discard(instance_id)
+            self.worker_probe_backoff_until.pop(instance_id, None)
+        self._invalidate_load_cache()
+        self._signal_routing_update()
 
     @ray.method(concurrency_group="control")
     def is_routing(self) -> bool:
-        """Check whether router is actively dispatching requests."""
         return self._is_routing
 
     @ray.method(concurrency_group="control")
     def get_pending_request_count(self) -> int:
-        """Return waiting-queue depth for reward routing (elastic_rm backlog signal).
-
-        Uses ``requests_to_route`` size: requests not yet dequeued by ``_routing_loop``.
-        Excludes requests already in ``_route_single_request`` or running on a worker.
-        """
+        """Return waiting-queue depth for reward routing (elastic_rm backlog signal)."""
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RewardModelRouter_enter")
-        n = int(len(self.requests_to_route))
+        n = int(self._pending_count)
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RewardModelRouter_exit pending=%d body_s=%.6f",
@@ -317,18 +1213,80 @@ class PSRL_RewardModelRouter:
         return n
 
     @ray.method(concurrency_group="control")
+    def get_pending_request_summary(self, top_t: int | None = None) -> dict[str, int]:
+        """Return count and token load for the leading reward waiting requests."""
+        t0 = time.monotonic()
+        log_elastic_rm_backlog_diag(psrl_logger, "stage=RewardModelRouter_summary_enter")
+        total_pending = int(self._pending_count)
+        limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
+        if limit == 0:
+            requests: list[DataProto] = []
+        else:
+            leading = heapq.nsmallest(limit, self.requests_to_route, key=lambda item: item[:3])
+            requests = [item[4] for item in leading]
+        summary = {
+            "pending": total_pending,
+            "count": len(requests),
+            "total_tokens": sum(self._request_token_num(request) for request in requests),
+        }
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RewardModelRouter_summary_exit pending=%d count=%d total_tokens=%d body_s=%.6f",
+            summary["pending"],
+            summary["count"],
+            summary["total_tokens"],
+            time.monotonic() - t0,
+        )
+        return summary
+
+    @ray.method(concurrency_group="control")
     async def interrupt_routing(self):
         """Pause routing (used during coordinated transitions)."""
         async with self.routing_lock:
             self._interrupt_routing = True
+        self._signal_routing_update()
 
     @ray.method(concurrency_group="control")
     async def resume_routing(self):
         """Resume routing and wake waiting routing loop."""
         async with self.routing_lock:
             self._interrupt_routing = False
-        self.routing_status_update_event.set()
+        self._signal_routing_update()
 
+    @ray.method(concurrency_group="control")
+    def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats]) -> None:
+        """Update route-strategy engine status snapshots."""
+        self.instance_to_engine_status.update(
+            {
+                int(instance_id): engine_status
+                for instance_id, engine_status in instance_to_engine_status.items()
+            }
+        )
+        self.route_strategy.update_instance_to_engine_status(instance_to_engine_status)
+        self._invalidate_load_cache()
+        self._signal_routing_update()
+
+    # ---- wake/sleep helpers ---------------------------------------------
+    async def _wait_for_routing_update(self, timeout_s: float | None = None) -> None:
+        """Wait for a routing-state change without dropping wakeups."""
+        try:
+            if timeout_s is None:
+                await self.routing_status_update_queue.get()
+            else:
+                await asyncio.wait_for(self.routing_status_update_queue.get(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return
+
+    def _signal_routing_update(self) -> None:
+        """Wake the routing loop, keeping at most one pending notification."""
+        if not hasattr(self, "routing_status_update_queue"):
+            return
+        try:
+            self.routing_status_update_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    # ---- request introspection -----------------------------------------
     @staticmethod
     def _format_request_uids(request: DataProto) -> str:
         uid_value = request.non_tensor_batch.get("uid")
@@ -372,42 +1330,49 @@ class PSRL_RewardModelRouter:
                 return normalized
         return None
 
+    @staticmethod
+    def _request_token_num(request: DataProto) -> int:
+        return _request_token_num(request)
 
+
+# ---------------------------------------------------------------------------
+# Launcher
+# ---------------------------------------------------------------------------
 def launch_router_process(
     worker_handles: list[ray.actor.ActorHandle],
+    worker_groups: list[Any] | None,
     config: DictConfig,
     reward_model_config: DictConfig | None = None,
     max_attempts: int = 3,
     retry_delay: float = 2.0,
     verbose: bool = False,
     max_concurrency: int = 1,
+    route_strategy_config: dict | DictConfig | None = None,
 ) -> ray.actor.ActorHandle:
-    """
-    Launch a router process (or return a router handle for direct access).
-    
-    For PSRL training, we return a Ray actor handle instead of starting
-    a separate HTTP server process.
+    """Launch the reward-model router as a Ray actor.
 
     Args:
         worker_handles: List of RewardModelWorker Ray handles.
+        worker_groups: Worker groups for all-rank (transformers) execution.
         config: Full PSRL Hydra config for the router actor.
-        max_attempts: Maximum retry attempts for failed requests.
+        max_attempts: Unused; kept for API compatibility.
         retry_delay: Delay between retries (in seconds).
         verbose: Enable verbose logging.
-        
+        max_concurrency: Ray actor max concurrency.
+        route_strategy_config: Optional RM-specific routing config override.
+
     Returns:
-        Tuple of (router_address, router_handle).
-        - router_address: A placeholder string (since we're not using HTTP).
-        - router_handle: Ray ActorHandle for the router.
+        Ray ActorHandle for the router.
     """
-    # Create a Ray actor for the router
-    reward_model_router_cls = PSRL_RewardModelRouter
-    router_handle = reward_model_router_cls.options(max_concurrency=max_concurrency).remote(
+    del max_attempts
+    router_handle = PSRL_RewardModelRouter.options(max_concurrency=max_concurrency).remote(
         worker_handles=worker_handles,
+        worker_groups=worker_groups,
         config=config,
         reward_model_config=reward_model_config,
         retry_delay=retry_delay,
         verbose=verbose,
+        route_strategy_config=route_strategy_config,
     )
-    psrl_logger.info(f"RewardModelRouter launched as Ray actor")
+    psrl_logger.info("RewardModelRouter launched as Ray actor")
     return router_handle

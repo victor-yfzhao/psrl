@@ -196,6 +196,10 @@ class RolloutConfig(BaseConfig):
 
     enable_prefix_caching: bool = True
 
+    use_psrl_scheduler: bool = True
+
+    disable_kv_cache: bool = False
+
     logprobs_mode: str = "raw_logprobs"
 
     load_format: str = "dummy"

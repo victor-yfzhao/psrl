@@ -8,7 +8,7 @@ fix_weight=${2:-False}
 disable_attn=${3:-False}
 min_awake_per_role=${4:-0}
 project_name='psrl_elastic_rm'
-experiment_name=elastic_min_${min_awake_per_role}_share_8_rm_qwen_8b_rollout_qwen_7b_staleness_${staleness}
+experiment_name=debug_elastic_min_${min_awake_per_role}_share_8_rm_qwen_8b_rollout_qwen_7b_staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/env_311.sh
 
@@ -81,7 +81,7 @@ theta_max=0.8
 cooldown_ms=10000
 max_waiting_queue_for_scale_down=64
 post_scale_up_abort_waiting_ratio=0.8
-throughput_model_dir=psrl/config/throughput_model
+throughput_model_dir=psrl/trainer/config/throughput_model
 throughput_model_output_len=1024
 full_load_mode=any
 
@@ -114,15 +114,15 @@ REWARD_MODELS=(
     reward_models_config.reward_models.2.rollout.mode=psrl_async
     reward_models_config.reward_models.2.rollout.disable_attn=False
     reward_models_config.reward_models.2.rollout.dtype=bfloat16
-    reward_models_config.reward_models.2.rollout.gpu_memory_utilization=0.8
+    reward_models_config.reward_models.2.rollout.gpu_memory_utilization=0.7
     reward_models_config.reward_models.2.rollout.enforce_eager=true
     reward_models_config.reward_models.2.rollout.free_cache_engine=true
     reward_models_config.reward_models.2.rollout.data_parallel_size=1
     reward_models_config.reward_models.2.rollout.expert_parallel_size=1
-    reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=2
+    reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=1
     reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=1
     reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 11 + 1024 * 10))
-    reward_models_config.reward_models.2.rollout.max_num_seqs=10240
+    reward_models_config.reward_models.2.rollout.max_num_seqs=1024
     reward_models_config.reward_models.2.rollout.enable_chunked_prefill=false
     reward_models_config.reward_models.2.rollout.enable_prefix_caching=false
     reward_models_config.reward_models.2.rollout.disable_log_stats=false
@@ -201,7 +201,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \

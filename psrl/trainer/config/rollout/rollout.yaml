@@ -1,8 +1,8 @@
 # Target class for this configuration
 _target_: psrl.workers.config.RolloutConfig
 
-# train_actor_rollout_ref.rollout.name: hf/vllm/sglang.
-# currently we only support vllm
+# train_actor_rollout_ref.rollout.name: vllm/sglang/transformers/hf.
+# transformers/hf currently only supports OPD teacher logprob scoring.
 name: vllm
 
 # Whether to disable the attention
@@ -47,16 +47,20 @@ cudagraph_capture_sizes: null
 # Whether to free engine KVCache after generation.
 free_cache_engine: True
 
-# TP size for rollout. Not effective for hf
+# TP size for rollout.
+# For transformers OPD teacher, this is also the 1D distributed mesh size.
 tensor_model_parallel_size: 2
 
 # DP size for rollout
 data_parallel_size: 1
 
-# PP size for rollout. Not effective for hf and sync mode
+# PP size for rollout. Not effective for hf and sync mode.
+# Transformers OPD teacher currently requires pipeline_model_parallel_size=1.
 pipeline_model_parallel_size: 1
 
-# EP size for rollout. If EP enabled, EP size should be equal to DP size * TP size
+# EP size for rollout.
+# Transformers OPD teacher supports EP via native Transformers distributed_config;
+# currently expert_parallel_size must equal tensor_model_parallel_size when > 1.
 expert_parallel_size: 1
 
 # max number of tokens in a batch
@@ -73,6 +77,10 @@ enable_chunked_prefill: True
 
 # Prefix caching kv-cache blocks is a popular optimization in LLM inference to avoid redundant prompt computations.
 enable_prefix_caching: True
+
+# Whether to disable model KV cache during forward.
+# Transformers OPD teacher defaults to disabled because it only scores prompt+response once.
+disable_kv_cache: False
 
 # The behavior of returned logprobs from rollout engine: raw_logprobs, processed_logprobs
 # raw_logprobs means the values before applying any logit processors, like bad words.

@@ -23,6 +23,7 @@ from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase,
     get_route_strategy_class,
 )
+from psrl.workers.agent_loop.transition_tracker import InstanceTransitionTracker
 from psrl.workers.gen.stats_collector import EngineStats
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -30,7 +31,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote(concurrency_groups={"control": 10, "monitor": 1})
+@ray.remote(concurrency_groups={"control": 1, "transition_wait": 32, "monitor": 1})
 class RolloutRouter:
     def __init__(
         self,
@@ -110,6 +111,10 @@ class RolloutRouter:
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
         # Track the instance ids that are currently paused (not available for routing)
         self.currently_paused_instance_ids = set()
+        # A transition tracks only requests that were in flight when its instances
+        # were paused (plus dispatches that crossed the pause boundary). This keeps
+        # model-sync waits independent from unrelated requests routed afterwards.
+        self._instance_transitions = InstanceTransitionTracker()
         # Track requests in sticky session: {request_id: bool}
         self.sticky_session_requests = {}
 
@@ -145,9 +150,11 @@ class RolloutRouter:
                 i: f"TP{rollout_config.tensor_model_parallel_size}_PP{rollout_config.pipeline_model_parallel_size}"
                 for i in range(n_instances)
             }
+        rollout_model_name = self.config.gen_actor_rollout_ref.model.path.split("/")[-1]
         strategy_kwargs = {
             "logging_interval_in_ms": self.config.psrl.routing_strategy.logging_interval_in_ms,
             "cost_model_path": self.config.psrl.routing_strategy.cost_model_path,
+            "model_name": rollout_model_name,
             "instance_to_tp_pp": instance_to_tp_pp,
             "max_num_waiting_reqs_after_preemption": (
                 self.config.psrl.routing_strategy.max_num_waiting_reqs_after_preemption
@@ -236,6 +243,60 @@ class RolloutRouter:
             self.currently_paused_instance_ids.add(instance_id)
 
     @ray.method(concurrency_group="control")
+    def begin_instance_transition(self, instance_ids: list[int]) -> int:
+        """Pause instances and snapshot requests belonging to this transition."""
+        normalized_ids = {int(instance_id) for instance_id in instance_ids}
+        self.currently_paused_instance_ids.update(normalized_ids)
+        transition_id = self._instance_transitions.begin(
+            normalized_ids,
+            self.instance_to_inflight_request_ids,
+        )
+        pending_ids = self._instance_transitions.pending_request_ids(transition_id) or set()
+        psrl_logger.info(
+            "Started instance transition %d: instances=%s pending_request_ids=%s",
+            transition_id,
+            sorted(normalized_ids),
+            sorted(pending_ids),
+        )
+        return transition_id
+
+    def _track_transition_request_started(self, instance_id: int, request_id: int) -> None:
+        """Capture a dispatch that crossed an already-established pause boundary."""
+        self._instance_transitions.request_started(instance_id, request_id)
+
+    def _track_transition_request_resolved(self, request_id: int) -> None:
+        self._instance_transitions.request_resolved(request_id)
+
+    @ray.method(concurrency_group="transition_wait")
+    async def wait_instance_transition(self, transition_id: int) -> None:
+        """Wait until requests captured by one transition have returned from workers."""
+        transition_id = int(transition_id)
+        psrl_logger.info("Waiting for instance transition %d requests to resolve", transition_id)
+        while self._instance_transitions.pending_request_ids(transition_id):
+            await asyncio.sleep(0.01)
+        psrl_logger.info("Instance transition %d requests resolved", transition_id)
+
+    @ray.method(concurrency_group="control")
+    def finish_instance_transition(
+        self,
+        transition_id: int,
+        resume: bool = True,
+        resume_instance_ids: list[int] | None = None,
+    ) -> None:
+        """Forget transition bookkeeping and optionally make its instances routable."""
+        transition_id = int(transition_id)
+        target_ids = self._instance_transitions.finish(transition_id)
+        resumed_ids = target_ids if resume_instance_ids is None else {int(i) for i in resume_instance_ids}
+        if resume:
+            self.currently_paused_instance_ids.difference_update(resumed_ids)
+        psrl_logger.info(
+            "Finished instance transition %d: instances=%s resumed_instances=%s",
+            transition_id,
+            sorted(target_ids),
+            sorted(resumed_ids) if resume else [],
+        )
+
+    @ray.method(concurrency_group="control")
     async def resume_instances(self, instance_ids: list[int]):
         """Notify the router about resumed instances.
 
@@ -281,6 +342,8 @@ class RolloutRouter:
             for i, version in self.instance_to_version_after_sync.items()
             if i in available_instance_ids and version >= needed_model_version
         ]
+        fallback_candidates = list(candidates)
+        binding_reasons: list[str] = []
         psrl_logger.debug(
             f"Routing candidates of request {request_id} is {candidates}, where "
             f"available instance: {available_instance_ids}, "
@@ -293,6 +356,7 @@ class RolloutRouter:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             if old_instance_id in candidates:
                 candidates = [old_instance_id]
+                binding_reasons.append("rollout_instance_id")
             else:
                 # Elastic scale/sleep may invalidate historical rollout_instance_id.
                 # Degrade gracefully to current candidate set instead of crashing router loop.
@@ -311,6 +375,7 @@ class RolloutRouter:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             if old_instance_id in candidates:
                 candidates = [old_instance_id]
+                binding_reasons.append("sticky_session")
             else:
                 # Sticky binding can also become stale after elastic scaling.
                 psrl_logger.warning(
@@ -347,59 +412,92 @@ class RolloutRouter:
                 )
                 candidates = [group_instance]
 
-        # 4. Filter the rollout instances that can reserve the request for the current instance model version
-        # This is only used when the needed model version is -1 (i.e. new request)
-        if needed_model_version == -1:
-            all_candidate_model_versions = list(
-                set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
-            )
-            can_reserve_results = await self.ps_manager_handle.can_reserve_request.remote(
-                request_id, all_candidate_model_versions, is_validate=is_validate
-            )
-            candidates = [
-                candidate
-                for candidate in candidates
-                if can_reserve_results[
-                    all_candidate_model_versions.index(self.instance_to_version_after_sync[candidate])
+        async def _route_with_candidates(route_candidates: list[int], route_reason: str) -> int | None:
+            # Filter the rollout instances that can reserve the request for the
+            # current instance model version. This is only used when the needed
+            # model version is -1 (i.e. new request).
+            route_candidates = list(route_candidates)
+            if needed_model_version == -1:
+                all_candidate_model_versions = list(
+                    set([self.instance_to_version_after_sync[candidate] for candidate in route_candidates])
+                )
+                if len(all_candidate_model_versions) == 0:
+                    return None
+                can_reserve_results = await self.ps_manager_handle.can_reserve_request.remote(
+                    request_id, all_candidate_model_versions, is_validate=is_validate
+                )
+                route_candidates = [
+                    candidate
+                    for candidate in route_candidates
+                    if can_reserve_results[
+                        all_candidate_model_versions.index(self.instance_to_version_after_sync[candidate])
+                    ]
                 ]
-            ]
 
-        # 5. Provide the indicator list to sort candidates for the route strategy
-        candidate_indicator_list = []
-        if self.config.psrl.routing_strategy.candidate_sort_indicator == "version":
-            for candidate in candidates:
-                version = self.instance_to_version_after_sync[candidate]
-                # New request: sort by version in descending order
-                # Existing request: sort by version in ascending order
-                if needed_model_version == -1:
-                    version_indicator = -version
-                else:
-                    version_indicator = version
-                candidate_indicator_list.append(version_indicator)
-        elif self.config.psrl.routing_strategy.candidate_sort_indicator == "reserve_capability":
-            # Use the (reserve_indicator, version) pair as the final indicator
-            all_candidate_model_versions = list(
-                set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
-            )
-            indicator_results = await self.ps_manager_handle.get_reserve_indicator.remote(
-                request_id, all_candidate_model_versions, is_validate=is_validate
-            )
-            for candidate in candidates:
-                version = self.instance_to_version_after_sync[candidate]
-                if needed_model_version == -1:
-                    version_indicator = -version
-                else:
-                    version_indicator = version
-                reserve_indicator = indicator_results[all_candidate_model_versions.index(version)]
-                candidate_indicator_list.append((reserve_indicator, version_indicator))
-        else:
-            raise ValueError(
-                f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}"
-            )
-        route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
+            # Provide the indicator list to sort candidates for the route strategy.
+            candidate_indicator_list = []
+            if self.config.psrl.routing_strategy.candidate_sort_indicator == "version":
+                for candidate in route_candidates:
+                    version = self.instance_to_version_after_sync[candidate]
+                    # New request: sort by version in descending order.
+                    # Existing request: sort by version in ascending order.
+                    if needed_model_version == -1:
+                        version_indicator = -version
+                    else:
+                        version_indicator = version
+                    candidate_indicator_list.append(version_indicator)
+            elif self.config.psrl.routing_strategy.candidate_sort_indicator == "reserve_capability":
+                # Use the (reserve_indicator, version) pair as the final indicator.
+                all_candidate_model_versions = list(
+                    set([self.instance_to_version_after_sync[candidate] for candidate in route_candidates])
+                )
+                if len(all_candidate_model_versions) == 0:
+                    return None
+                indicator_results = await self.ps_manager_handle.get_reserve_indicator.remote(
+                    request_id, all_candidate_model_versions, is_validate=is_validate
+                )
+                for candidate in route_candidates:
+                    version = self.instance_to_version_after_sync[candidate]
+                    if needed_model_version == -1:
+                        version_indicator = -version
+                    else:
+                        version_indicator = version
+                    reserve_indicator = indicator_results[all_candidate_model_versions.index(version)]
+                    candidate_indicator_list.append((reserve_indicator, version_indicator))
+            else:
+                raise ValueError(
+                    f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}"
+                )
 
-        # 6. Strategy-based routing
-        chosen_rollout_instance = self.route_strategy.route(request, candidates=candidates, route_kwargs=route_kwargs)
+            route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
+            chosen = self.route_strategy.route(request, candidates=route_candidates, route_kwargs=route_kwargs)
+            if chosen is None:
+                psrl_logger.debug(
+                    "No rollout instance selected for request %s with %s candidates=%s.",
+                    request_id,
+                    route_reason,
+                    route_candidates,
+                )
+            return chosen
+
+        # 4-6. Strategy-based routing.
+        chosen_rollout_instance = await _route_with_candidates(candidates, "primary")
+        if (
+            chosen_rollout_instance is None
+            and binding_reasons
+            and set(fallback_candidates) != set(candidates)
+        ):
+            psrl_logger.warning(
+                (
+                    "Request %s could not route with bound candidates=%s "
+                    "(reasons=%s); retrying with version-compatible fallback candidates=%s."
+                ),
+                request_id,
+                candidates,
+                binding_reasons,
+                fallback_candidates,
+            )
+            chosen_rollout_instance = await _route_with_candidates(fallback_candidates, "fallback")
 
         # 7. If not None, the request is routed to the chosen rollout instance
         if chosen_rollout_instance is not None:
@@ -618,6 +716,74 @@ class RolloutRouter:
         )
         return n
 
+    @ray.method(concurrency_group="monitor")
+    def get_pending_request_summary(self, top_t: int | None = None) -> dict[str, int]:
+        """Return count and token load for the leading waiting requests."""
+        t0 = time.monotonic()
+        log_elastic_rm_backlog_diag(psrl_logger, "stage=RolloutRouter_summary_enter")
+        total_pending = int(self.requests_to_route.size())
+        limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
+        requests = list(self._iter_pending_requests_in_route_order(limit))
+        summary = {
+            "pending": total_pending,
+            "count": len(requests),
+            "total_tokens": sum(self._request_token_num(request) for request in requests),
+        }
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutRouter_summary_exit pending=%d count=%d total_tokens=%d body_s=%.6f",
+            summary["pending"],
+            summary["count"],
+            summary["total_tokens"],
+            time.monotonic() - t0,
+        )
+        return summary
+
+    def _iter_pending_requests_in_route_order(self, limit: int):
+        """Yield pending requests in the same priority order used by routing."""
+        if limit <= 0:
+            return
+        yielded = 0
+        if isinstance(self.requests_to_route, MultiPriorityRequestQueue):
+            iterator = (request for _, request in self.requests_to_route.iter_all_requests())
+        else:
+            iterator = self.requests_to_route.iter_priority()
+        for request in iterator:
+            yield request
+            yielded += 1
+            if yielded >= limit:
+                return
+
+    @staticmethod
+    def _request_token_num(request: DataProto) -> int:
+        """Best-effort token count for a queued single-sequence request."""
+        non_tensor_batch = getattr(request, "non_tensor_batch", {}) or {}
+        raw_prompt_ids = non_tensor_batch.get("raw_prompt_ids")
+        if raw_prompt_ids is not None:
+            prompt_ids = raw_prompt_ids[0] if len(raw_prompt_ids) > 0 else []
+            response_len = non_tensor_batch.get("response_unpadded_len", [0])
+            if hasattr(response_len, "tolist"):
+                response_len = response_len.tolist()
+            if isinstance(response_len, (list, tuple, np.ndarray)):
+                response_len = response_len[0] if len(response_len) > 0 else 0
+            return max(0, len(prompt_ids) + int(response_len))
+
+        batch = getattr(request, "batch", None)
+        if batch is None:
+            batch = {}
+        attention_mask = batch.get("attention_mask", None)
+        if attention_mask is not None:
+            if hasattr(attention_mask, "sum"):
+                return max(0, int(attention_mask.sum().item()))
+            return max(0, int(np.asarray(attention_mask).sum()))
+        input_ids = batch.get("input_ids", None)
+        if input_ids is None:
+            return 0
+        shape = getattr(input_ids, "shape", None)
+        if shape is not None and len(shape) > 0:
+            return max(0, int(shape[-1]))
+        return max(0, len(input_ids))
+
     @ray.method(concurrency_group="control")
     async def pause_routing(self):
         """Interrupt the routing."""
@@ -785,6 +951,7 @@ class RolloutRouter:
             self.route_strategy.push_request(request, new_instance_id)
             # Add request to inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
+            self._track_transition_request_started(new_instance_id, request_id)
 
             # Set sampling params
             rollout_config = self.config.gen_actor_rollout_ref.rollout
@@ -826,6 +993,7 @@ class RolloutRouter:
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
                 self.requests_to_route.put(consolidated_output)
+                self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
                 return
             elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
@@ -837,6 +1005,7 @@ class RolloutRouter:
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
                 self.requests_to_route.put(consolidated_output)
+                self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
                 return
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
@@ -848,11 +1017,13 @@ class RolloutRouter:
                     f"length is {response_len}"
                 )
                 result = consolidated_output
+                self._track_transition_request_resolved(request_id)
             else:
                 # Means the request is aborted
                 assert update_status is None, "The update status should be None if the request is aborted"
                 # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is aborted")
                 result = None
+                self._track_transition_request_resolved(request_id)
         else:
             # Means the request is aborted
             # psrl_logger.info(f"Request {request_id} is aborted")
@@ -1119,25 +1290,3 @@ class RolloutRouter:
             raise ValueError(f"Unknown sync indicator: {self.config.psrl.sync_and_mig_strategy.sync.indicator}")
 
         return True
-
-    @ray.method(concurrency_group="control")
-    async def wait_interrupted_partial_requests_loop_back(self, instance_ids: list[int]):
-        """Wait for the interrupted partial requests to be looped back in the priority queue.
-
-        Args:
-            instance_ids (List[int]): The instance IDs to wait for.
-        """
-        finished_instance_ids = set()
-        psrl_logger.info("Waiting for the interrupted partial requests to be looped back in the priority queue")
-        while True:
-            for instance_id in instance_ids:
-                if (
-                    instance_id not in finished_instance_ids
-                    and len(self.instance_to_inflight_request_ids[instance_id]) == 0
-                ):
-                    psrl_logger.info(f"All requests on instance {instance_id} are looped back")
-                    finished_instance_ids.add(instance_id)
-            if len(finished_instance_ids) == len(instance_ids):
-                break
-            await asyncio.sleep(0)
-        psrl_logger.info("The interrupted partial requests are looped back in the priority queue")

@@ -291,8 +291,7 @@ class DummyScalingPolicy(ScalingPolicy):
 
         stale_count = 0
         for signal in signals:
-            snapshot = {"timestamp": signal.snapshot_timestamp}
-            if self._is_snapshot_staled(snapshot):
+            if self._is_signal_staled(signal):
                 stale_count += 1
         if stale_count == len(signals):
             self._policy_log(

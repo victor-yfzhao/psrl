@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -42,7 +43,7 @@ from psrl.utils.logger import deprecated
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import StatCollector
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
@@ -74,8 +75,10 @@ class PSRL_vLLMRollout:
         self.is_teacher_model = is_teacher_model
         if self.is_reward_model:
             self.reward_model_name = kwargs.get("reward_model_name")
+            self.rm_config = kwargs.get("rm_config")
         else:
             self.reward_model_name = None
+            self.rm_config = None
 
         self.is_validate = kwargs.get("is_validate", False)
 
@@ -95,7 +98,6 @@ class PSRL_vLLMRollout:
         # uses execute_rank_zero_async()/workers[0] as the representative.
         # Keep LOCAL_RANK as fallback for safety in non-standard env setup.
         if model_parallel_size > 1:
-            import os
             print(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK')}")
             print(f"RANK: {os.environ.get('RANK')}")
             print(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
@@ -267,13 +269,29 @@ class PSRL_vLLMRollout:
                     served_model_name = served_model_name.split("/")[-1]
                 llm_kwargs["served_model_name"] = served_model_name
 
-        llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
-        max_num_waiting_reqs_after_preemption = psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
+        if config.use_psrl_scheduler:
+            llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
+        if self.is_reward_model and self.rm_config is not None:
+            rm_routing_strategy = self.rm_config.get("routing_strategy", {}) or {}
+            max_num_waiting_reqs_after_preemption = rm_routing_strategy.get(
+                "max_num_waiting_reqs_after_preemption",
+                psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption,
+            )
+        else:
+            max_num_waiting_reqs_after_preemption = psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
         llm_kwargs["additional_config"] = {
             "max_num_waiting_reqs_after_preemption": max_num_waiting_reqs_after_preemption,
             "max_model_len_used_in_estimation": max_model_len
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
+        psrl_logger.info(
+            "vLLM scheduler config: role=%s use_psrl_scheduler=%s scheduler_cls=%s "
+            "max_num_waiting_reqs_after_preemption=%s",
+            "reward" if self.is_reward_model else "rollout",
+            config.use_psrl_scheduler,
+            llm_kwargs.get("scheduler_cls"),
+            max_num_waiting_reqs_after_preemption,
+        )
 
         # Initialize abort queue, events, and request ids
         self.scheduler_abort_queue = RayQueue()
@@ -293,6 +311,21 @@ class PSRL_vLLMRollout:
             vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         else:
             llm_kwargs["model"] = model_path
+            async_engine_init_params = inspect.signature(AsyncEngineArgs.__init__).parameters
+            supports_var_keyword = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in async_engine_init_params.values()
+            )
+            if not supports_var_keyword:
+                supported_keys = {
+                    key for key, param in async_engine_init_params.items() if key != "self"
+                }
+                unsupported_keys = sorted(set(llm_kwargs) - supported_keys)
+                if unsupported_keys:
+                    psrl_logger.warning(
+                        "Drop unsupported AsyncEngineArgs kwargs for compatibility: %s.",
+                        unsupported_keys,
+                    )
+                    llm_kwargs = {key: value for key, value in llm_kwargs.items() if key in supported_keys}
             engine_args = AsyncEngineArgs(**llm_kwargs)
             usage_context = UsageContext.ENGINE_CONTEXT
             vllm_config = engine_args.create_engine_config()
@@ -371,6 +404,22 @@ class PSRL_vLLMRollout:
             for k in config.keys():
                 if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
                     kwargs[k] = config.get(k)
+
+            # GenRM sampling belongs to the reward-model configuration rather
+            # than its rollout config. Apply it while constructing the vLLM
+            # default too, so callers without per-request params still use it.
+            if self.is_reward_model and self.rm_config is not None:
+                sampling_config = self.rm_config.get("sampling_config", None)
+                if sampling_config is not None:
+                    sampling_config = OmegaConf.to_container(sampling_config, resolve=True)
+                    if isinstance(sampling_config, dict):
+                        for key, value in sampling_config.items():
+                            if (
+                                value is not None
+                                and key != "n"
+                                and hasattr(SamplingParams(), str(key))
+                            ):
+                                kwargs[key] = value
             kwargs["n"] = 1  # already repeat in ray_trainer
             psrl_logger.info(f"kwargs: {kwargs}")
             self._sampling_params_kwargs = dict(kwargs)

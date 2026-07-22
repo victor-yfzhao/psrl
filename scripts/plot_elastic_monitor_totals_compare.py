@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compare ElasticMonitor metrics: non-elastic (min_4) vs elastic (min_0).
+Plot ElasticMonitor metrics: elastic alone, or non-elastic (min_4) vs elastic (min_0).
 
 Self-contained: parses ElasticMonitor.log directly (no other plot_* scripts).
 
@@ -9,6 +9,8 @@ Metrics (5 subplots):
 - awake instances / router backlog (from ElasticExecutor summary lines in the same log)
 
 X-axis: elapsed minutes from each log's first aggregated timestamp.
+
+Set PLOT_ELASTIC_ONLY=True to draw only the elastic (min_0) curves.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # --- Parse / plot tuning (edit here) ---
 # Inclusive plot range in minutes from the first aggregated timestamp in each log.
 PLOT_WINDOW_START_MIN = 0.0
-PLOT_WINDOW_END_MIN = 120.0
+PLOT_WINDOW_END_MIN = 300.0
+# If True, only plot elastic (min_0); skip non-elastic overlay.
+PLOT_ELASTIC_ONLY = True
 # Optional y-axis ranges for the five subplots. None = auto-scale.
 PLOT_YLIM_THROUGHPUT: tuple[float, float] | None = None
 PLOT_YLIM_RUNNING: tuple[float, float] | None = None
@@ -33,6 +37,7 @@ PLOT_YLIM_AWAKE: tuple[float, float] | None = None
 PLOT_YLIM_BACKLOG: tuple[float, float] | None = None
 # Merge monitor-cycle timestamps to second resolution before aggregation.
 AGGREGATE_TS_TO_SECOND = True
+STALINESS = 2
 
 FIGSIZE = (13, 14)
 SAVE_DPI = 400
@@ -63,16 +68,32 @@ COLOR_MIN0_ROLLOUT = "#1a5276"
 
 NON_ELASTIC_LOG_PATH = (
     REPO_ROOT
-    / "logs/psrl_elastic_rm/async_elastic_min_4_qwen_30b_a3b_ds_distill_staleness_1/ElasticMonitor.log"
+    / f"logs/verl_deployment_modes/mode1_bs_256_roll_6_rm_18_disaggregated_rollout7b_rm8b/ElasticMonitor.log"
 )
 ELASTIC_LOG_PATH = (
     REPO_ROOT
-    / "logs/psrl_elastic_rm/async_elastic_min_0_qwen_30b_a3b_ds_distill_staleness_1/ElasticMonitor.log"
+    / f"logs/verl_deployment_modes/mode5_bs_128_share_16_elastic_rl_rollout7_ds_7b_rm8b/ElasticMonitor.log"
 )
+_OUT_TAG = "elastic_only" if PLOT_ELASTIC_ONLY else "compare_min0_vs_min4"
 OUT_PATH = (
     REPO_ROOT
-    / "logs/psrl_elastic_rm/compare_elastic_min0_vs_min4_staleness_1/ElasticMonitor_rm_rollout_totals_merged.png"
+    / f"logs/verl_deployment_modes/{_OUT_TAG}_rollout7b_rm8b/"
+    f"rm_rollout_ds_7b_totals_merged_"
+    f"{PLOT_WINDOW_START_MIN}-{PLOT_WINDOW_END_MIN}_min.png"
 )
+
+# NON_ELASTIC_LOG_PATH = (
+#     REPO_ROOT
+#     / f"logs/psrl_elastic_rm/none_elastic_min_4_share_8_train_8_rm_qwen_8b_rollout_qwen_7b_staleness_{STALINESS}/ElasticMonitor.log"
+# )
+# ELASTIC_LOG_PATH = (
+#     REPO_ROOT
+#     / f"logs/psrl_elastic_rm/debug_itl_policy_min_0_share_8_train_8_rm_qwen_8b_rollout_qwen_7b_staleness_{STALINESS}/ElasticMonitor.log"
+# )
+# OUT_PATH = (
+#     REPO_ROOT
+#     / f"logs/psrl_elastic_rm/compare_elastic_min0_vs_min4_itl_policy_min_0_share_8_train_8_rm_qwen_8b_rollout_qwen_7b_staleness_{STALINESS}/Initial_ElasticMonitor_rm_rollout_totals_merged.png"
+# )
 
 
 def _normalize_ts(dt: datetime) -> datetime:
@@ -273,29 +294,44 @@ def prepare_series(
 
 
 def plot_merged(
-    series_a: tuple[
+    series_elastic: tuple[
         list[float],
         dict[str, dict[str, list[float]]],
         dict[str, dict[str, list[float]]],
     ],
-    series_b: tuple[
-        list[float],
-        dict[str, dict[str, list[float]]],
-        dict[str, dict[str, list[float]]],
-    ],
-    label_a: str,
-    label_b: str,
     out_path: Path,
     xlim_min: tuple[float, float],
     ylims: dict[str, tuple[float, float] | None],
     figsize: tuple[float, float],
     dpi: int,
     line_width: float,
+    series_non_elastic: tuple[
+        list[float],
+        dict[str, dict[str, list[float]]],
+        dict[str, dict[str, list[float]]],
+    ]
+    | None = None,
+    label_elastic: str = "min_0 (elastic)",
+    label_non_elastic: str = "min_4 (non-elastic)",
 ) -> None:
+    """
+    Plot ElasticMonitor totals; optionally overlay non-elastic curves.
+
+    Args:
+        series_elastic: Prepared (x, totals, summaries) for the elastic run.
+        out_path (Path): Output PNG path.
+        xlim_min (tuple[float, float]): X-axis window in minutes.
+        ylims (dict[str, tuple[float, float] | None]): Per-metric y limits.
+        figsize (tuple[float, float]): Figure size.
+        dpi (int): Save DPI.
+        line_width (float): Line width.
+        series_non_elastic: Prepared series for non-elastic; None = elastic only.
+        label_elastic (str): Legend label for elastic curves.
+        label_non_elastic (str): Legend label for non-elastic curves.
+    """
     import matplotlib.pyplot as plt
 
-    (x_a, data_a, summary_a) = series_a
-    (x_b, data_b, summary_b) = series_b
+    (x_e, data_e, summary_e) = series_elastic
 
     fig, axes = plt.subplots(5, 1, figsize=figsize, sharex=True, layout="constrained")
 
@@ -315,13 +351,44 @@ def plot_merged(
             str,
             str,
         ]
-    ] = [
-        (label_a, x_a, data_a, summary_a, "RewardModel", COLOR_MIN4_REWARDMODEL),
-        (label_a, x_a, data_a, summary_a, "Rollout", COLOR_MIN4_ROLLOUT),
-        (label_b, x_b, data_b, summary_b, "RewardModel", COLOR_MIN0_REWARDMODEL),
-        (label_b, x_b, data_b, summary_b, "Rollout", COLOR_MIN0_ROLLOUT),
-    ]
+    ] = []
+    if series_non_elastic is not None:
+        x_ne, data_ne, summary_ne = series_non_elastic
+        curve_defs.extend(
+            [
+                (
+                    label_non_elastic,
+                    x_ne,
+                    data_ne,
+                    summary_ne,
+                    "RewardModel",
+                    COLOR_MIN4_REWARDMODEL,
+                ),
+                (
+                    label_non_elastic,
+                    x_ne,
+                    data_ne,
+                    summary_ne,
+                    "Rollout",
+                    COLOR_MIN4_ROLLOUT,
+                ),
+            ]
+        )
+    curve_defs.extend(
+        [
+            (
+                label_elastic,
+                x_e,
+                data_e,
+                summary_e,
+                "RewardModel",
+                COLOR_MIN0_REWARDMODEL,
+            ),
+            (label_elastic, x_e, data_e, summary_e, "Rollout", COLOR_MIN0_ROLLOUT),
+        ]
+    )
 
+    legend_ncol = 2 if series_non_elastic is not None else 1
     for ax, (metric, ylabel) in zip(axes, metric_specs):
         for run_label, x, totals, summaries, role, color in curve_defs:
             series = summaries[role] if metric in SUMMARY_METRICS else totals[role]
@@ -340,13 +407,18 @@ def plot_merged(
             ymin, ymax = ylims[metric]
             ax.set_ylim(ymin, ymax)
         ax.grid(True, alpha=0.35)
-        ax.legend(loc="best", fontsize=8, ncol=2)
+        ax.legend(loc="best", fontsize=8, ncol=legend_ncol)
 
     axes[-1].set_xlabel("Elapsed time from first log timestamp (min)")
-    fig.suptitle(
-        "ElasticMonitor — min_4: light red (RM), light blue (Rollout); "
-        "min_0 (elastic): dark red (RM), dark blue (Rollout); solid lines"
-    )
+    if series_non_elastic is None:
+        fig.suptitle(
+            "ElasticMonitor — elastic only: dark red (RM), dark blue (Rollout); solid lines"
+        )
+    else:
+        fig.suptitle(
+            "ElasticMonitor — min_4: light red (RM), light blue (Rollout); "
+            "min_0 (elastic): dark red (RM), dark blue (Rollout); solid lines"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=dpi)
 
@@ -366,20 +438,24 @@ def main() -> None:
         if ylim is not None and ylim[0] > ylim[1]:
             raise SystemExit(f"Invalid ylim for {metric}: ymin > ymax.")
 
-    non_elastic = prepare_series(NON_ELASTIC_LOG_PATH)
     elastic = prepare_series(ELASTIC_LOG_PATH)
+    non_elastic = None if PLOT_ELASTIC_ONLY else prepare_series(NON_ELASTIC_LOG_PATH)
 
-    print(
-        f"Non-elastic: {len(non_elastic[0])} points | "
-        f"Elastic: {len(elastic[0])} points | "
-        f"Window {PLOT_WINDOW_START_MIN}–{PLOT_WINDOW_END_MIN} min"
-    )
+    if non_elastic is None:
+        print(
+            f"Elastic only: {len(elastic[0])} points | "
+            f"Window {PLOT_WINDOW_START_MIN}–{PLOT_WINDOW_END_MIN} min"
+        )
+    else:
+        print(
+            f"Non-elastic: {len(non_elastic[0])} points | "
+            f"Elastic: {len(elastic[0])} points | "
+            f"Window {PLOT_WINDOW_START_MIN}–{PLOT_WINDOW_END_MIN} min"
+        )
 
     plot_merged(
-        non_elastic,
         elastic,
-        label_a="min_4 (non-elastic)",
-        label_b="min_0 (elastic)",
+        series_non_elastic=non_elastic,
         out_path=OUT_PATH.resolve(),
         xlim_min=(PLOT_WINDOW_START_MIN, PLOT_WINDOW_END_MIN),
         ylims=ylims,

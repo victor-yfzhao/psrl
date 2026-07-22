@@ -76,9 +76,9 @@ fi
 
 # Recommend to use gcc 11.x.x, gcc-toolset-13 may have error with nixl
 echo "2. Install nixl"
-mkdir -p $THIRD_PARTY_PATH/nixl_src
+# mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b 0.10.1 https://github.com/ai-dynamo/nixl.git
+# git clone -b 0.10.1 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend

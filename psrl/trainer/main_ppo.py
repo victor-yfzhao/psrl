@@ -13,6 +13,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
+from psrl.utils.deployment_mode import expand_ngpus_per_node, resolve_deployment_mode
 from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
@@ -242,6 +243,8 @@ class TaskRunner:
 
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
         if deployment_config.heterogeneous_rollout.enable:
+            if deployment_config.elastic_rm.enable:
+                raise ValueError("heterogeneous_rollout is not supported when elastic_rm.enable is True.")
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
             assert (
                 len(heterogeneous_deployment_config.rollout_nnodes_per_instance)
@@ -266,26 +269,80 @@ class TaskRunner:
                     heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance[i]
                 ] * heterogeneous_deployment_config.rollout_nnodes_per_instance[i]
         elif deployment_config.elastic_rm.enable:
-            total_rollout_gpus = (deployment_config.elastic_rm.shared_ngpus_per_node
-                                * deployment_config.elastic_rm.shared_nnodes)
-            deployment_config.n_rollout_instances = (
-                total_rollout_gpus // (
-                    config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size 
-                    * config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
-                    * config.gen_actor_rollout_ref.rollout.data_parallel_size
+            enable_trainer_pool = bool(deployment_config.elastic_rm.get("enable_trainer_pool", False))
+            if enable_trainer_pool and config.psrl.ps_mode not in ("nixl_cpu", "nixl_gpu"):
+                raise ValueError(
+                    "elastic_rm.enable_trainer_pool requires psrl.ps_mode to be 'nixl_cpu' or 'nixl_gpu'."
                 )
+            deployment_mode = deployment_config.get("mode", None)
+            colocated_mode = deployment_mode == "colocated"
+            if colocated_mode:
+                # Mode 2: all three roles share train_pool (colocated), time-multiplexed.
+                # No separate shared_rollout_pool; all rollout/rm replicas live on
+                # train_pool alongside the actor.
+                shared_rollout_gpus = 0
+                shared_rollout_gpu_spec = []
+                trainer_elastic_gpus = (
+                    deployment_config.train_ngpus_per_node * deployment_config.train_nnodes
+                )
+            else:
+                shared_rollout_gpu_spec = expand_ngpus_per_node(
+                    deployment_config.elastic_rm.shared_ngpus_per_node,
+                    deployment_config.elastic_rm.shared_nnodes,
+                    "psrl.deployment.elastic_rm.shared_ngpus_per_node",
+                )
+                shared_rollout_gpus = sum(shared_rollout_gpu_spec)
+                trainer_elastic_gpus = (
+                    deployment_config.train_ngpus_per_node * deployment_config.train_nnodes
+                    if enable_trainer_pool
+                    else 0
+                )
+            rollout_instance_world_size = (
+                config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size
+                * config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
+                * config.gen_actor_rollout_ref.rollout.data_parallel_size
             )
-            print(f"[Elastic RM] Maximum number of rollout instances = {deployment_config.n_rollout_instances}")
-            resource_pool_spec["shared_rollout_pool"] = [
-                deployment_config.elastic_rm.shared_ngpus_per_node
-            ] * deployment_config.elastic_rm.shared_nnodes 
-            rollout_pool_id_list = ["shared_rollout_pool"] * deployment_config.n_rollout_instances       
+            shared_rollout_instances = shared_rollout_gpus // rollout_instance_world_size
+            trainer_rollout_instances = trainer_elastic_gpus // rollout_instance_world_size
+            total_rollout_gpus = shared_rollout_gpus + trainer_elastic_gpus
+            deployment_config.n_rollout_instances = shared_rollout_instances + trainer_rollout_instances
+            print(
+                "[Elastic RM] Maximum number of rollout instances = "
+                f"{deployment_config.n_rollout_instances} "
+                f"(shared={shared_rollout_instances}, trainer_pool={trainer_rollout_instances}, "
+                f"mode={deployment_mode})"
+            )
+            if colocated_mode:
+                # No shared_rollout_pool; rollout/rm replicas are all on train_pool.
+                rollout_pool_id_list = [train_pool_id] * trainer_rollout_instances
+            else:
+                resource_pool_spec["shared_rollout_pool"] = shared_rollout_gpu_spec
+                rollout_pool_id_list = (
+                    ["shared_rollout_pool"] * shared_rollout_instances
+                    + [train_pool_id] * trainer_rollout_instances
+                )
         else:
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
                 resource_pool_spec[rollout_pool_id] = [
                     deployment_config.rollout_ngpus_per_node_per_instance
                 ] * deployment_config.rollout_nnodes_per_instance
+
+            # Mode 4 (trainer_pool_only): append a fixed number of extra rollout
+            # replicas on train_pool. train_pool already exists in resource_pool_spec
+            # (created above for the actor); do NOT overwrite its spec. These replicas
+            # are time-multiplexed with the actor via NIXL sleep/wake.
+            if deployment_config.get("mode", None) == "trainer_pool_only":
+                idle_rollout = int(deployment_config.get("trainer_pool_idle_rollout_instances", 0))
+                if idle_rollout < 0:
+                    raise ValueError("trainer_pool_idle_rollout_instances must be >= 0.")
+                rollout_pool_id_list = rollout_pool_id_list + [train_pool_id] * idle_rollout
+                deployment_config.n_rollout_instances = len(rollout_pool_id_list)
+                print(
+                    f"[Trainer-pool-only] rollout instances = {deployment_config.n_rollout_instances} "
+                    f"(main={deployment_config.n_rollout_instances - idle_rollout}, "
+                    f"train_pool_idle={idle_rollout})"
+                )
 
         # Set the resource pool spec for each validation instance.
         if config.psrl.colocate_validate_and_train:
@@ -301,21 +358,29 @@ class TaskRunner:
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
 
         # Reward model resource pool
-        total_reward_pool_id_list = [] if not deployment_config.elastic_rm.enable else ["shared_rollout_pool"]
+        total_reward_pool_id_list = []
         reward_models_config = config.reward_models_config
         for reward_model in reward_models_config.reward_models:
             if reward_model.reward_loop_type not in ("gen", "opd"):
                 continue
             if deployment_config.elastic_rm.enable:
-                reward_model.num_replicas = (
-                    total_rollout_gpus // (
-                        reward_model.rollout.tensor_model_parallel_size 
-                        * reward_model.rollout.pipeline_model_parallel_size
-                        * reward_model.rollout.data_parallel_size
-                    )
+                reward_model_world_size = (
+                    reward_model.rollout.tensor_model_parallel_size
+                    * reward_model.rollout.pipeline_model_parallel_size
+                    * reward_model.rollout.data_parallel_size
                 )
-                print(f"[Elastic RM] Maximum number of reward model"
-                    f"({reward_model.reward_model_name}) instances = {reward_model.num_replicas}")
+                shared_reward_instances = shared_rollout_gpus // reward_model_world_size
+                trainer_reward_instances = trainer_elastic_gpus // reward_model_world_size
+                reward_model.num_replicas = shared_reward_instances + trainer_reward_instances
+                total_reward_pool_id_list.extend(
+                    ["shared_rollout_pool"] * shared_reward_instances
+                    + [train_pool_id] * trainer_reward_instances
+                )
+                print(
+                    f"[Elastic RM] Maximum number of reward model({reward_model.reward_model_name}) "
+                    f"instances = {reward_model.num_replicas} "
+                    f"(shared={shared_reward_instances}, trainer_pool={trainer_reward_instances})"
+                )
             elif reward_model.enable_resource_pool:
                 if reward_model.n_gpus_per_node <= 0:
                     raise ValueError("reward_model.n_gpus_per_node must be greater than 0")
@@ -332,6 +397,19 @@ class TaskRunner:
                         reward_model.rollout_ngpus_per_instance_per_node
                     ] * reward_model.rollout_nnodes_per_instance
                 total_reward_pool_id_list.extend(reward_pool_id_list)
+                # Mode 4: append fixed extra RM replicas on train_pool (time-multiplexed
+                # with the actor). train_pool spec already exists; do not overwrite.
+                if deployment_config.get("mode", None) == "trainer_pool_only":
+                    idle_rm = int(deployment_config.get("trainer_pool_idle_rm_instances", 0))
+                    if idle_rm < 0:
+                        raise ValueError("trainer_pool_idle_rm_instances must be >= 0.")
+                    reward_model.num_replicas = reward_model_instances + idle_rm
+                    total_reward_pool_id_list.extend([train_pool_id] * idle_rm)
+                    print(
+                        f"[Trainer-pool-only] reward model({reward_model_name}) replicas = "
+                        f"{reward_model.num_replicas} (main={reward_model_instances}, "
+                        f"train_pool_idle={idle_rm})"
+                    )
             else:
                 raise ValueError("reward_model.enable_resource_pool must be True when elastic_rm.enable is False")
 
@@ -401,6 +479,13 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
+
+        # Resolve the unified deployment.mode into concrete elastic_rm flags BEFORE
+        # laying out resource pools / adding workers, so init_resource_pool_mgr and
+        # the trainer both observe a consistent flag set (modes 2/3 force
+        # elastic_rm.enable=True even though the user only set deployment.mode).
+        resolved_mode = resolve_deployment_mode(config)
+        print(f"[Deployment] resolved mode = {resolved_mode}")
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)

@@ -13,6 +13,82 @@ from psrl.utils.logger import DualOutputHandler, FileOnlyHandler
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+
+@dataclass(frozen=True)
+class _BranchCheck:
+    """Single predicate within a policy branch (for structured decision logs)."""
+
+    name: str
+    met: bool
+    criterion: str
+    actual: str
+
+
+class _DecisionCycleLogger:
+    """One decide() call = one flushed log block, separated by cycle id."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._cycle_id = 0
+        self._lines: list[str] = []
+
+    def start(self) -> int:
+        if not self._enabled:
+            return 0
+        self._cycle_id += 1
+        self._lines = []
+        return self._cycle_id
+
+    @property
+    def cycle_id(self) -> int:
+        return self._cycle_id
+
+    def section(self, title: str) -> None:
+        self._lines.append(f"--- {title} ---")
+
+    def kv(self, **pairs: Any) -> None:
+        parts = [f"{k}={v}" for k, v in pairs.items()]
+        self._lines.append("  " + " ".join(parts))
+
+    def branch(
+        self,
+        branch_id: str,
+        title: str,
+        checks: list[_BranchCheck],
+        *,
+        applicable: bool = True,
+        triggered: bool = False,
+        outcome: str = "SKIP",
+    ) -> None:
+        if not applicable:
+            self._lines.append(f"[{branch_id}] {title} -> N/A (precondition false)")
+            return
+        tag = "TRIGGER" if triggered else outcome
+        self._lines.append(f"[{branch_id}] {title} -> {tag}")
+        for check in checks:
+            mark = "OK" if check.met else "NO"
+            self._lines.append(
+                f"    [{mark}] {check.name}: require {check.criterion} | actual {check.actual}"
+            )
+
+    def note(self, msg: str) -> None:
+        self._lines.append(f"  * {msg}")
+
+    def outcome(self, kind: str, reason: str, **extra: Any) -> None:
+        self._lines.append(f">>> OUTCOME: {kind} | reason={reason}")
+        for key in sorted(extra):
+            self._lines.append(f"    {key}={extra[key]}")
+
+    def flush(self) -> None:
+        if not self._enabled or not self._lines:
+            return
+        cid = self._cycle_id
+        psrl_logger.info("elastic_rm_policy ========== cycle %d BEGIN ==========", cid)
+        for line in self._lines:
+            psrl_logger.info("elastic_rm_policy cycle=%d | %s", cid, line)
+        psrl_logger.info("elastic_rm_policy ========== cycle %d END ==========", cid)
+
+
 @dataclass
 class InstanceSignal:
     role_name: PSRL_Role
@@ -24,10 +100,12 @@ class InstanceSignal:
     waiting_queue_num: int
     generation_throughput: float
     total_token_num: int
+    is_training: bool = False
+    pool_id: str | None = None
     snapshot_timestamp: str | None = None
     # Global placement-group bundle indices [start, end) occupied by this instance (half-open).
     # Populated by ElasticExecutor from SubRayResourcePool bundle_range; None if unknown.
-    bundle_keys: frozenset[int] | None = None
+    bundle_keys: frozenset[tuple[str, int]] | None = None
 
 
 @dataclass
@@ -234,24 +312,93 @@ class ScalingPolicy:
         self.log_prefix = "ScalingPolicy"
         psrl_logger.propagate = False
         psrl_logger.addHandler(FileOnlyHandler(self.config.psrl.logging_path, self.log_prefix))
+        self._cycle_log = _DecisionCycleLogger(self.log_scaling_decisions)
+
+    @staticmethod
+    def _chk(name: str, met: bool, criterion: str, actual: Any) -> _BranchCheck:
+        return _BranchCheck(name=name, met=met, criterion=criterion, actual=str(actual))
+
+    @staticmethod
+    def _inst_ref(signal: InstanceSignal | None) -> str:
+        if signal is None:
+            return "none"
+        return f"{signal.role_name.name}/{signal.model_name}#{signal.instance_id}"
+
+    def _finish_cycle(self, kind: str, reason: str, **extra: Any) -> None:
+        self._cycle_log.outcome(kind, reason, **extra)
+        self._cycle_log.flush()
+
+    @staticmethod
+    def _router_backlog_positive(router_backlog_by_role: dict[PSRL_Role, Any] | None) -> bool:
+        for value in (router_backlog_by_role or {}).values():
+            try:
+                if isinstance(value, dict):
+                    count = value.get("pending", value.get("count", 0))
+                else:
+                    count = value
+                if int(count) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _policy_log(self, event: str, **kwargs: Any) -> None:
+        """Unstructured log line (DummyScalingPolicy and legacy callers)."""
         if not self.log_scaling_decisions:
             return
         parts = [f"{k}={kwargs[k]!r}" for k in sorted(kwargs.keys())]
         psrl_logger.info("elastic_rm_policy %s | %s", event, " ".join(parts))
 
     def _policy_log_no_action(self, final_reason: str, diagnostics: list[str], detail: list[str]) -> None:
+        """Unstructured no-action log (DummyScalingPolicy)."""
         if not self.log_scaling_decisions:
             return
-        psrl_logger.info("elastic_rm_policy decision | outcome=no_action reason=%s", final_reason)
+        self._cycle_log.start()
+        self._cycle_log.outcome("no_action", final_reason)
         if diagnostics:
-            psrl_logger.info(
-                "elastic_rm_policy no_action | diagnostics=%s",
-                "|".join(sorted(diagnostics)),
-            )
+            self._cycle_log.note(f"diagnostics={'|'.join(sorted(diagnostics))}")
         for ln in detail:
-            psrl_logger.info("elastic_rm_policy no_action_detail | %s", ln)
+            self._cycle_log.note(ln)
+        self._cycle_log.flush()
+
+    def _no_action_detail_strings(
+        self,
+        *,
+        trainer_busy: bool,
+        pending_total: int,
+        waiting_on: str,
+        rollout_full: bool,
+        rm_full: bool,
+        rollout_low: bool,
+        rm_low: bool,
+        rollout_down_waiting: int,
+        rm_down_waiting: int,
+        rollout_up: InstanceSignal | None,
+        rm_up: InstanceSignal | None,
+        rollout_down: InstanceSignal | None,
+        rm_down: InstanceSignal | None,
+        rollout_down_transfer: InstanceSignal | None = None,
+        rm_down_transfer: InstanceSignal | None = None,
+        rollout_free_up: InstanceSignal | None = None,
+        rm_free_up: InstanceSignal | None = None,
+        rollout_down_xfer: InstanceSignal | None = None,
+        rm_down_xfer: InstanceSignal | None = None,
+        p2_gain_rejected: float | None = None,
+        p2_branch_notes: list[str] | None = None,
+    ) -> list[str]:
+        """Compact no-action trace for DummyScalingPolicy."""
+        notes = list(p2_branch_notes or [])
+        if p2_gain_rejected is not None:
+            notes.append(f"p2_reject best_gain={p2_gain_rejected:.6f} hysteresis={self.hysteresis}")
+        notes.extend(
+            [
+                f"trainer_busy={trainer_busy} pending={pending_total} waiting_on={waiting_on!r}",
+                f"rollout_full={rollout_full} rm_full={rm_full} rollout_low={rollout_low} rm_low={rm_low}",
+                f"rollout_down={self._inst_ref(rollout_down)} rm_down={self._inst_ref(rm_down)}",
+                f"rollout_down_waiting={rollout_down_waiting} rm_down_waiting={rm_down_waiting}",
+            ]
+        )
+        return notes
 
     @staticmethod
     def _is_snapshot_staled(snapshot: dict, max_staleness_seconds: float = 5.0) -> bool:
@@ -263,6 +410,12 @@ class ScalingPolicy:
         except ValueError:
             return True
         return (datetime.now() - dt).total_seconds() > max_staleness_seconds
+
+    @classmethod
+    def _is_signal_staled(cls, signal: InstanceSignal) -> bool:
+        if not signal.is_awaken:
+            return False
+        return cls._is_snapshot_staled({"timestamp": signal.snapshot_timestamp})
 
     @staticmethod
     def _pre_sleep_other_if_colocated(
@@ -299,15 +452,22 @@ class ScalingPolicy:
         }
 
     @staticmethod
-    def _awake_bundle_keys(signals: list[InstanceSignal], exclude: set[tuple[PSRL_Role, str, int]] | None = None) -> set[int]:
+    def _awake_bundle_keys(
+        signals: list[InstanceSignal],
+        exclude: set[tuple[PSRL_Role, str, int]] | None = None,
+    ) -> set[tuple[str, int]]:
         excluded = exclude or set()
-        out: set[int] = set()
+        out: set[tuple[str, int]] = set()
         for signal in signals:
             key = (signal.role_name, signal.model_name, int(signal.instance_id))
             if not signal.is_awaken or key in excluded or not signal.bundle_keys:
                 continue
             out.update(signal.bundle_keys)
         return out
+
+    @staticmethod
+    def _is_scale_up_available(signal: InstanceSignal) -> bool:
+        return (not signal.is_awaken) and (not signal.is_training)
 
     def _pick_migration_targets_for_conflicts(
         self,
@@ -328,14 +488,14 @@ class ScalingPolicy:
         occupied = self._awake_bundle_keys(target_role_signals)
         occupied.update(self._awake_bundle_keys(other_role_signals, exclude=conflict_keys))
         picked: list[InstanceSignal] = []
-        picked_bundle_keys: set[int] = set()
+        picked_bundle_keys: set[tuple[str, int]] = set()
 
         for conflict in conflicts:
             candidates = [
                 s
                 for s in other_role_signals
                 if (
-                    not s.is_awaken
+                    self._is_scale_up_available(s)
                     and s.model_name == conflict.model_name
                     and s.bundle_keys
                     and not s.bundle_keys.intersection(wake.bundle_keys)
@@ -394,7 +554,7 @@ class ScalingPolicy:
                         s
                         for s in target_role_signals
                         if (
-                            not s.is_awaken
+                            self._is_scale_up_available(s)
                             and s.bundle_keys
                             and s.bundle_keys.issubset(victim.bundle_keys or frozenset())
                         )
@@ -606,7 +766,7 @@ class ScalingPolicy:
         role_signals: list[InstanceSignal],
         instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
-        asleep = [s for s in role_signals if not s.is_awaken]
+        asleep = [s for s in role_signals if self._is_scale_up_available(s)]
         if not asleep:
             return None
         asleep.sort(
@@ -622,7 +782,7 @@ class ScalingPolicy:
         instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> InstanceSignal | None:
         """Pick an asleep target, preferring placements with more currently free devices."""
-        asleep = [s for s in role_signals if not s.is_awaken]
+        asleep = [s for s in role_signals if self._is_scale_up_available(s)]
         if not asleep:
             return None
         other_awake_bundle_keys = self._awake_bundle_keys(other_role_signals)
@@ -654,7 +814,7 @@ class ScalingPolicy:
             s
             for s in role_signals
             if (
-                not s.is_awaken
+                self._is_scale_up_available(s)
                 and s.bundle_keys
                 and s.bundle_keys.intersection(victim.bundle_keys)
             )
@@ -686,7 +846,7 @@ class ScalingPolicy:
         If no GPU mapping / no colocation, fall back to global highest-``mu`` asleep
         candidate with victim None.
         """
-        asleep = [s for s in role_signals if not s.is_awaken]
+        asleep = [s for s in role_signals if self._is_scale_up_available(s)]
         if not asleep:
             return None
 
@@ -743,14 +903,14 @@ class ScalingPolicy:
 
         Returns the highest-mu free candidate, or None if no such instance exists.
         """
-        other_awake_bundle_keys: set[int] = set()
+        other_awake_bundle_keys: set[tuple[str, int]] = set()
         for s in other_role_signals:
             if s.is_awaken and s.bundle_keys:
                 other_awake_bundle_keys.update(s.bundle_keys)
 
         free_candidates: list[InstanceSignal] = []
         for s in full_role_signals:
-            if s.is_awaken:
+            if not self._is_scale_up_available(s):
                 continue
             if not s.bundle_keys:
                 continue
@@ -774,14 +934,14 @@ class ScalingPolicy:
         instance_mu: dict[tuple[PSRL_Role, str, int], float],
     ) -> list[InstanceSignal]:
         """Return all free-GPU asleep candidates sorted by descending mu."""
-        other_awake_bundle_keys: set[int] = set()
+        other_awake_bundle_keys: set[tuple[str, int]] = set()
         for s in other_role_signals:
             if s.is_awaken and s.bundle_keys:
                 other_awake_bundle_keys.update(s.bundle_keys)
 
         free_candidates: list[InstanceSignal] = []
         for s in full_role_signals:
-            if s.is_awaken:
+            if not self._is_scale_up_available(s):
                 continue
             if not s.bundle_keys:
                 continue
@@ -889,72 +1049,6 @@ class ScalingPolicy:
             return False
         return any(self._get_signal_load_value(s) <= theta_low for s in awaken)
 
-    def _no_action_detail_strings(
-        self,
-        *,
-        trainer_busy: bool,
-        pending_total: int,
-        waiting_on: str,
-        rollout_full: bool,
-        rm_full: bool,
-        rollout_low: bool,
-        rm_low: bool,
-        rollout_down_waiting: int,
-        rm_down_waiting: int,
-        rollout_up: InstanceSignal | None,
-        rm_up: InstanceSignal | None,
-        rollout_down: InstanceSignal | None,
-        rm_down: InstanceSignal | None,
-        rollout_free_up: InstanceSignal | None,
-        rm_free_up: InstanceSignal | None,
-        rollout_down_xfer: InstanceSignal | None,
-        rm_down_xfer: InstanceSignal | None,
-        p2_gain_rejected: float | None,
-        p2_branch_notes: list[str],
-    ) -> list[str]:
-        """Human-readable reasons why lower-priority branches did not scale (for logs)."""
-        out: list[str] = []
-        out.append(
-            f"p-1_skip trainer_busy={trainer_busy} pending_total={pending_total} waiting_on={waiting_on!r} "
-            f"(needs idle trainer + pending>0 + waiting_on rollout|reward)"
-        )
-        # Priority 1: RM-only-full branch
-        if rm_full and not rollout_full:
-            out.append(
-                f"p1_rm_full_only rm_free_up={rm_free_up is not None} "
-                f"rm_up={rm_up is not None} rollout_down_theta_low={rollout_down is not None} "
-                f"(free_gpu tried first, fallback needs rm_up+rollout_down)"
-            )
-        # Priority 1: Rollout-only-full branch
-        if rollout_full and not rm_full:
-            out.append(
-                f"p1_rollout_full_only rollout_free_up={rollout_free_up is not None} "
-                f"rollout_up={rollout_up is not None} rm_down_theta_low={rm_down is not None} "
-                f"(free_gpu tried first, fallback needs rollout_up+rm_down)"
-            )
-        if not rm_full and not rollout_full:
-            out.append("p1_skip neither_side_full")
-        # Priority 2
-        out.append(
-            f"p2_context both_full={rollout_full and rm_full} "
-            f"rollout_down_xfer={rollout_down_xfer is not None} rm_down_xfer={rm_down_xfer is not None} "
-            f"rm_up={rm_up is not None} rollout_up={rollout_up is not None}"
-        )
-        out.extend(p2_branch_notes)
-        if p2_gain_rejected is not None:
-            out.append(f"p2_reject best_gain={p2_gain_rejected:.6f} hysteresis={self.hysteresis}")
-        out.append(
-            f"p3_rollout_self_down_unmet rollout_low={rollout_low} "
-            f"rollout_down_theta_low={rollout_down is not None} rm_full={rm_full} "
-            f"down_waiting={rollout_down_waiting} waiting_max={self.max_waiting_queue_for_scale_down}"
-        )
-        out.append(
-            f"p3_rm_self_down_unmet rm_low={rm_low} rm_down_theta_low={rm_down is not None} "
-            f"rollout_full={rollout_full} down_waiting={rm_down_waiting} "
-            f"waiting_max={self.max_waiting_queue_for_scale_down}"
-        )
-        return out
-
     def _make_stepwise_decision(
         self,
         grouped: dict[PSRL_Role, list[InstanceSignal]],
@@ -965,15 +1059,18 @@ class ScalingPolicy:
     ) -> tuple[list[ScalingAction], str]:
         rollout_role = PSRL_Role.Rollout
         rm_role = PSRL_Role.RewardModel
+        cy = self._cycle_log
         rollout_signals = grouped.get(rollout_role, [])
         rm_signals = grouped.get(rm_role, [])
         if not rollout_signals or not rm_signals:
-            self._policy_log(
-                "decision",
-                outcome="no_action",
-                reason="skip_decision_missing_rollout_or_rm_signals",
-                has_rm_signals=bool(rm_signals),
-                has_rollout_signals=bool(rollout_signals),
+            cy.branch(
+                "precheck",
+                "rollout+rm signals present",
+                [
+                    self._chk("has_rollout_signals", bool(rollout_signals), "true", bool(rollout_signals)),
+                    self._chk("has_rm_signals", bool(rm_signals), "true", bool(rm_signals)),
+                ],
+                outcome="BLOCK",
             )
             return [], "skip_decision_missing_rollout_or_rm_signals"
 
@@ -1002,35 +1099,50 @@ class ScalingPolicy:
         )
         rollout_down = self._pick_scale_down_candidate(rollout_signals, instance_mu)
         rm_down = self._pick_scale_down_candidate(rm_signals, instance_mu)
+        # For single-side-full transfer, pick cede candidates without theta_low gate.
+        rollout_down_transfer = self._pick_scale_down_candidate_for_bottleneck_transfer(
+            rollout_signals, instance_mu
+        )
+        rm_down_transfer = self._pick_scale_down_candidate_for_bottleneck_transfer(
+            rm_signals, instance_mu
+        )
 
         actions: list[ScalingAction] = []
-        diagnostics: list[str] = []
         rollout_down_waiting = rollout_down.waiting_queue_num if rollout_down is not None else -1
         rm_down_waiting = rm_down.waiting_queue_num if rm_down is not None else -1
         n_rollout_awaken = sum(1 for s in rollout_signals if s.is_awaken)
-        n_rollout_asleep = sum(1 for s in rollout_signals if not s.is_awaken)
+        n_rollout_asleep = sum(1 for s in rollout_signals if self._is_scale_up_available(s))
         n_rm_awaken = sum(1 for s in rm_signals if s.is_awaken)
-        n_rm_asleep = sum(1 for s in rm_signals if not s.is_awaken)
-        self._policy_log(
-            "tick_context",
+        n_rm_asleep = sum(1 for s in rm_signals if self._is_scale_up_available(s))
+
+        cy.section("load_snapshot")
+        cy.kv(
+            metric=self.load_threshold_metric,
             full_load_mode=self.full_load_mode,
-            load_threshold_metric=self.load_threshold_metric,
-            n_rm_asleep=n_rm_asleep,
-            n_rm_awaken=n_rm_awaken,
-            n_rollout_asleep=n_rollout_asleep,
-            n_rollout_awaken=n_rollout_awaken,
-            rm_full=rm_full,
-            rm_low=rm_low,
-            rollout_full=rollout_full,
-            rollout_low=rollout_low,
             theta_low=self.theta_low,
             theta_max=self.theta_max,
-        )
-        self._policy_log(
-            "tick_context_waiting_guard",
-            max_waiting_queue_for_scale_down=self.max_waiting_queue_for_scale_down,
-            rm_down_waiting=rm_down_waiting,
+            rollout_full=rollout_full,
+            rm_full=rm_full,
+            rollout_low=rollout_low,
+            rm_low=rm_low,
+            n_rollout_awaken=n_rollout_awaken,
+            n_rollout_asleep=n_rollout_asleep,
+            n_rm_awaken=n_rm_awaken,
+            n_rm_asleep=n_rm_asleep,
+            max_waiting_for_scale_down=self.max_waiting_queue_for_scale_down,
             rollout_down_waiting=rollout_down_waiting,
+            rm_down_waiting=rm_down_waiting,
+        )
+        cy.section("candidates")
+        cy.kv(
+            rollout_free_up=self._inst_ref(rollout_free_up),
+            rm_free_up=self._inst_ref(rm_free_up),
+            rollout_up=self._inst_ref(rollout_up),
+            rm_up=self._inst_ref(rm_up),
+            rollout_down=self._inst_ref(rollout_down),
+            rm_down=self._inst_ref(rm_down),
+            rollout_down_transfer=self._inst_ref(rollout_down_transfer),
+            rm_down_transfer=self._inst_ref(rm_down_transfer),
         )
 
         # Priority -1: keep trainer continuously training.
@@ -1040,16 +1152,36 @@ class ScalingPolicy:
         trainer_busy = bool(hint.get("trainer_busy", True))
         waiting_on = str(hint.get("waiting_on", "none")).lower()
         pending_total = int((hint.get("breakdown") or {}).get("pending_total", 0))
-        if not trainer_busy and pending_total > 0 and waiting_on in {"rollout", "reward"}:
+        p_neg1_applicable = not trainer_busy and pending_total > 0 and waiting_on in {"rollout", "reward"}
+        p_neg1_checks = [
+            self._chk("trainer_idle", not trainer_busy, "trainer_busy=false", trainer_busy),
+            self._chk("pending_work", pending_total > 0, "pending_total>0", pending_total),
+            self._chk(
+                "waiting_on_rollout_or_reward",
+                waiting_on in {"rollout", "reward"},
+                "waiting_on in {rollout,reward}",
+                waiting_on,
+            ),
+        ]
+        if p_neg1_applicable:
             if waiting_on == "rollout":
-                if rollout_up is None:
-                    self._policy_log(
-                        "decision",
-                        outcome="no_action",
-                        reason="trainer_idle_waiting_rollout_but_no_scaleup_candidate",
-                        pending_total=pending_total,
-                        waiting_on=waiting_on,
-                    )
+                has_candidate = rollout_up is not None
+                cy.branch(
+                    "p-1",
+                    "trainer idle, scale up rollout bottleneck",
+                    p_neg1_checks
+                    + [
+                        self._chk(
+                            "rollout_scale_up_candidate",
+                            has_candidate,
+                            "rollout_up exists",
+                            self._inst_ref(rollout_up),
+                        )
+                    ],
+                    triggered=has_candidate,
+                    outcome="BLOCK(no rollout_up)" if not has_candidate else "SKIP",
+                )
+                if not has_candidate:
                     return [], "trainer_idle_waiting_rollout_but_no_scaleup_candidate"
                 actions.append(
                     self._build_scale_up_action_with_elastic_placement(
@@ -1060,24 +1192,24 @@ class ScalingPolicy:
                         reason="trainer_idle_waiting_rollout_scale_up",
                     )
                 )
-                self._policy_log(
-                    "decision",
-                    action="scale_up",
-                    instance_id=rollout_up.instance_id,
-                    model_name=rollout_up.model_name,
-                    outcome="action",
-                    policy_branch="p-1_trainer_idle_rollout",
-                    reason="trainer_idle_waiting_rollout",
-                )
                 return actions, "trainer_idle_waiting_rollout"
-            if rm_up is None:
-                self._policy_log(
-                    "decision",
-                    outcome="no_action",
-                    reason="trainer_idle_waiting_reward_but_no_scaleup_candidate",
-                    pending_total=pending_total,
-                    waiting_on=waiting_on,
-                )
+            has_candidate = rm_up is not None
+            cy.branch(
+                "p-1",
+                "trainer idle, scale up reward bottleneck",
+                p_neg1_checks
+                + [
+                    self._chk(
+                        "rm_scale_up_candidate",
+                        has_candidate,
+                        "rm_up exists",
+                        self._inst_ref(rm_up),
+                    )
+                ],
+                triggered=has_candidate,
+                outcome="BLOCK(no rm_up)" if not has_candidate else "SKIP",
+            )
+            if not has_candidate:
                 return [], "trainer_idle_waiting_reward_but_no_scaleup_candidate"
             actions.append(
                 self._build_scale_up_action_with_elastic_placement(
@@ -1088,16 +1220,13 @@ class ScalingPolicy:
                     reason="trainer_idle_waiting_reward_scale_up",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_up",
-                instance_id=rm_up.instance_id,
-                model_name=rm_up.model_name,
-                outcome="action",
-                policy_branch="p-1_trainer_idle_reward",
-                reason="trainer_idle_waiting_reward",
-            )
             return actions, "trainer_idle_waiting_reward"
+        cy.branch(
+            "p-1",
+            "trainer idle, bias scale-up to bottleneck stage",
+            p_neg1_checks,
+            outcome="SKIP",
+        )
 
         # ── Priority 1 (new) ─────────────────────────────────────────────────────
         # If there are free devices and at least one side can wake without ceding
@@ -1106,8 +1235,20 @@ class ScalingPolicy:
         backlog_map = router_backlog_by_role or {}
         rollout_backlog = max(0, int(backlog_map.get(rollout_role, 0)))
         rm_backlog = max(0, int(backlog_map.get(rm_role, 0)))
+        cy.kv(rollout_backlog=rollout_backlog, rm_backlog=rm_backlog)
 
-        if rollout_free_up is not None and rm_free_up is not None and (rollout_backlog > 0 or rm_backlog > 0):
+        p1_backlog_both_checks = [
+            self._chk("rollout_free_gpu", rollout_free_up is not None, "rollout_free_up", self._inst_ref(rollout_free_up)),
+            self._chk("rm_free_gpu", rm_free_up is not None, "rm_free_up", self._inst_ref(rm_free_up)),
+            self._chk(
+                "router_backlog_positive",
+                rollout_backlog > 0 or rm_backlog > 0,
+                "rollout_backlog>0 OR rm_backlog>0",
+                f"rollout={rollout_backlog} rm={rm_backlog}",
+            ),
+        ]
+        p1_backlog_both = all(c.met for c in p1_backlog_both_checks)
+        if p1_backlog_both:
             pick_rollout = rollout_backlog >= rm_backlog
             chosen = rollout_free_up if pick_rollout else rm_free_up
             chosen_role = rollout_role if pick_rollout else rm_role
@@ -1122,21 +1263,35 @@ class ScalingPolicy:
                     reason="free_resource_backlog_priority_scale_up",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_up",
-                instance_id=chosen.instance_id,
-                model_name=chosen.model_name,
-                num_instances=actions[-1].num_instances,
-                rollout_backlog=rollout_backlog,
-                rm_backlog=rm_backlog,
-                outcome="action",
-                policy_branch="p1_free_resource_backlog_priority",
-                reason=f"free_resource_backlog_priority_{chosen_role.name}",
+            cy.branch(
+                "p1_backlog",
+                "both sides have free GPU, pick larger backlog",
+                p1_backlog_both_checks
+                + [
+                    self._chk(
+                        "pick_higher_backlog_side",
+                        True,
+                        f"{'rollout' if pick_rollout else 'rm'} backlog >= other",
+                        f"pick={chosen_role.name} backlog={chosen_backlog}",
+                    )
+                ],
+                triggered=True,
             )
+            cy.note(f"batch num_instances={actions[-1].num_instances} wake={self._inst_ref(chosen)}")
             return actions, f"free_resource_backlog_priority_{chosen_role.name}"
 
-        if rollout_free_up is not None and rm_free_up is None and rollout_backlog > 0 and rollout_backlog >= rm_backlog:
+        p1_backlog_rollout_checks = [
+            self._chk("rollout_free_gpu", rollout_free_up is not None, "rollout_free_up", self._inst_ref(rollout_free_up)),
+            self._chk("rm_no_free_gpu", rm_free_up is None, "rm_free_up is none", self._inst_ref(rm_free_up)),
+            self._chk("rollout_backlog>0", rollout_backlog > 0, "rollout_backlog>0", rollout_backlog),
+            self._chk(
+                "rollout_backlog>=rm",
+                rollout_backlog >= rm_backlog,
+                "rollout_backlog>=rm_backlog",
+                f"{rollout_backlog}>={rm_backlog}",
+            ),
+        ]
+        if all(c.met for c in p1_backlog_rollout_checks):
             actions.append(
                 self._build_backlog_batch_scale_up_action(
                     role_name=rollout_role,
@@ -1146,21 +1301,23 @@ class ScalingPolicy:
                     reason="free_resource_backlog_priority_scale_up_rollout",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_up",
-                instance_id=rollout_free_up.instance_id,
-                model_name=rollout_free_up.model_name,
-                num_instances=actions[-1].num_instances,
-                rollout_backlog=rollout_backlog,
-                rm_backlog=rm_backlog,
-                outcome="action",
-                policy_branch="p1_free_resource_backlog_priority",
-                reason="free_resource_backlog_priority_rollout",
-            )
+            cy.branch("p1_backlog", "rollout-only free GPU + backlog", p1_backlog_rollout_checks, triggered=True)
+            cy.note(f"batch num_instances={actions[-1].num_instances}")
             return actions, "free_resource_backlog_priority_rollout"
+        cy.branch("p1_backlog", "rollout-only free GPU + backlog", p1_backlog_rollout_checks, outcome="SKIP")
 
-        if rm_free_up is not None and rollout_free_up is None and rm_backlog > 0 and rm_backlog >= rollout_backlog:
+        p1_backlog_rm_checks = [
+            self._chk("rm_free_gpu", rm_free_up is not None, "rm_free_up", self._inst_ref(rm_free_up)),
+            self._chk("rollout_no_free_gpu", rollout_free_up is None, "rollout_free_up is none", self._inst_ref(rollout_free_up)),
+            self._chk("rm_backlog>0", rm_backlog > 0, "rm_backlog>0", rm_backlog),
+            self._chk(
+                "rm_backlog>=rollout",
+                rm_backlog >= rollout_backlog,
+                "rm_backlog>=rollout_backlog",
+                f"{rm_backlog}>={rollout_backlog}",
+            ),
+        ]
+        if all(c.met for c in p1_backlog_rm_checks):
             actions.append(
                 self._build_backlog_batch_scale_up_action(
                     role_name=rm_role,
@@ -1170,31 +1327,29 @@ class ScalingPolicy:
                     reason="free_resource_backlog_priority_scale_up_rm",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_up",
-                instance_id=rm_free_up.instance_id,
-                model_name=rm_free_up.model_name,
-                num_instances=actions[-1].num_instances,
-                rollout_backlog=rollout_backlog,
-                rm_backlog=rm_backlog,
-                outcome="action",
-                policy_branch="p1_free_resource_backlog_priority",
-                reason="free_resource_backlog_priority_rm",
-            )
+            cy.branch("p1_backlog", "rm-only free GPU + backlog", p1_backlog_rm_checks, triggered=True)
+            cy.note(f"batch num_instances={actions[-1].num_instances}")
             return actions, "free_resource_backlog_priority_rm"
+        cy.branch("p1_backlog", "rm-only free GPU + backlog", p1_backlog_rm_checks, outcome="SKIP")
+        cy.branch("p1_backlog", "both sides free GPU + backlog", p1_backlog_both_checks, outcome="SKIP")
 
         # ── Priority 2  ──────────────────────────────────────────────────────────
         # Applies when EXACTLY one side is full.
         # Step A: try to wake an instance of the full side on a GPU that is
         #         completely idle for the other side (no scale_down needed).
-        # Step B: fall back to ceding a low-load instance from the other side.
+        # Step B: fall back to ceding one instance from the other side.
         # Both-full case is handled by Priority 3 below.
         # ─────────────────────────────────────────────────────────────────────────
 
-        # P1a: only RM is full
-        if rm_full and not rollout_full:
-            # Step A: free-GPU scale-up — no resource taken from Rollout
+        rm_only_full = rm_full and not rollout_full
+        p1_rm_full_pre = [
+            self._chk("rm_full", rm_full, f"load>={self.theta_max} ({self.full_load_mode})", rm_full),
+            self._chk("rollout_not_full", not rollout_full, "rollout_full=false", rollout_full),
+        ]
+        if rm_only_full:
+            p1_rm_free_checks = p1_rm_full_pre + [
+                self._chk("rm_free_gpu_wake", rm_free_up is not None, "rm_free_up", self._inst_ref(rm_free_up)),
+            ]
             if rm_free_up is not None:
                 actions.append(
                     self._build_scale_up_action_with_elastic_placement(
@@ -1205,21 +1360,22 @@ class ScalingPolicy:
                         reason="rm_full_free_gpu_scale_up",
                     )
                 )
-                self._policy_log(
-                    "decision",
-                    action="scale_up",
-                    free_gpu=True,
-                    instance_id=rm_free_up.instance_id,
-                    model_name=rm_free_up.model_name,
-                    outcome="action",
-                    policy_branch="p1_rm_full_free_gpu",
-                    reason="rm_full_free_gpu_scale_up",
-                )
+                cy.branch("p1_rm_full", "RM full, free-GPU scale-up (step A)", p1_rm_free_checks, triggered=True)
                 return actions, "rm_full_free_gpu_scale_up"
-            # Step B: fall back — cede a low-load Rollout instance
-            if rm_up is not None and rollout_down is not None:
+            cy.branch("p1_rm_full", "RM full, free-GPU scale-up (step A)", p1_rm_free_checks, outcome="SKIP")
+
+            p1_rm_xfer_checks = p1_rm_full_pre + [
+                self._chk("rm_wake_candidate", rm_up is not None, "rm_up", self._inst_ref(rm_up)),
+                self._chk(
+                    "rollout_cede_candidate",
+                    rollout_down_transfer is not None,
+                    "rollout_down_transfer",
+                    self._inst_ref(rollout_down_transfer),
+                ),
+            ]
+            if rm_up is not None and rollout_down_transfer is not None:
                 rm_transfer_up = self._pick_scale_up_candidate_for_victim(
-                    rm_signals, rollout_down, instance_mu
+                    rm_signals, rollout_down_transfer, instance_mu
                 ) or rm_up
                 actions.append(
                     self._build_scale_up_action_with_elastic_placement(
@@ -1230,22 +1386,39 @@ class ScalingPolicy:
                         reason="rm_full_rollout_cede_transfer",
                     )
                 )
-                self._policy_log(
-                    "decision",
-                    action="scale_up",
-                    free_gpu=False,
-                    instance_id=rm_transfer_up.instance_id,
-                    model_name=rm_transfer_up.model_name,
-                    outcome="action",
-                    policy_branch="p1_transfer_rollout_to_rm",
-                    reason="transfer_rollout_to_rm",
-                    pre_sleep_other=actions[-1].pre_sleep_other_preferred,
+                cy.branch(
+                    "p1_rm_full",
+                    "RM full, cede rollout then scale up (step B)",
+                    p1_rm_xfer_checks
+                    + [
+                        self._chk(
+                            "wake_target",
+                            True,
+                            "rm_transfer_up",
+                            self._inst_ref(rm_transfer_up),
+                        )
+                    ],
+                    triggered=True,
                 )
                 return actions, "transfer_rollout_to_rm"
+            cy.branch("p1_rm_full", "RM full, cede rollout then scale up (step B)", p1_rm_xfer_checks, outcome="SKIP")
+        else:
+            cy.branch("p1_rm_full", "only RM is full-load", p1_rm_full_pre, applicable=rm_only_full, outcome="SKIP")
 
-        # P1b: only Rollout is full
-        if rollout_full and not rm_full:
-            # Step A: free-GPU scale-up — no resource taken from RM
+        rollout_only_full = rollout_full and not rm_full
+        p1_rollout_full_pre = [
+            self._chk("rollout_full", rollout_full, f"load>={self.theta_max} ({self.full_load_mode})", rollout_full),
+            self._chk("rm_not_full", not rm_full, "rm_full=false", rm_full),
+        ]
+        if rollout_only_full:
+            p1_rollout_free_checks = p1_rollout_full_pre + [
+                self._chk(
+                    "rollout_free_gpu_wake",
+                    rollout_free_up is not None,
+                    "rollout_free_up",
+                    self._inst_ref(rollout_free_up),
+                ),
+            ]
             if rollout_free_up is not None:
                 actions.append(
                     self._build_scale_up_action_with_elastic_placement(
@@ -1256,21 +1429,32 @@ class ScalingPolicy:
                         reason="rollout_full_free_gpu_scale_up",
                     )
                 )
-                self._policy_log(
-                    "decision",
-                    action="scale_up",
-                    free_gpu=True,
-                    instance_id=rollout_free_up.instance_id,
-                    model_name=rollout_free_up.model_name,
-                    outcome="action",
-                    policy_branch="p1_rollout_full_free_gpu",
-                    reason="rollout_full_free_gpu_scale_up",
+                cy.branch(
+                    "p1_rollout_full",
+                    "Rollout full, free-GPU scale-up (step A)",
+                    p1_rollout_free_checks,
+                    triggered=True,
                 )
                 return actions, "rollout_full_free_gpu_scale_up"
-            # Step B: fall back — cede a low-load RM instance
-            if rollout_up is not None and rm_down is not None:
+            cy.branch(
+                "p1_rollout_full",
+                "Rollout full, free-GPU scale-up (step A)",
+                p1_rollout_free_checks,
+                outcome="SKIP",
+            )
+
+            p1_rollout_xfer_checks = p1_rollout_full_pre + [
+                self._chk("rollout_wake_candidate", rollout_up is not None, "rollout_up", self._inst_ref(rollout_up)),
+                self._chk(
+                    "rm_cede_candidate",
+                    rm_down_transfer is not None,
+                    "rm_down_transfer",
+                    self._inst_ref(rm_down_transfer),
+                ),
+            ]
+            if rollout_up is not None and rm_down_transfer is not None:
                 rollout_transfer_up = self._pick_scale_up_candidate_for_victim(
-                    rollout_signals, rm_down, instance_mu
+                    rollout_signals, rm_down_transfer, instance_mu
                 ) or rollout_up
                 actions.append(
                     self._build_scale_up_action_with_elastic_placement(
@@ -1281,18 +1465,37 @@ class ScalingPolicy:
                         reason="rollout_full_rm_cede_transfer",
                     )
                 )
-                self._policy_log(
-                    "decision",
-                    action="scale_up",
-                    free_gpu=False,
-                    instance_id=rollout_transfer_up.instance_id,
-                    model_name=rollout_transfer_up.model_name,
-                    outcome="action",
-                    policy_branch="p1_transfer_rm_to_rollout",
-                    reason="transfer_rm_to_rollout",
-                    pre_sleep_other=actions[-1].pre_sleep_other_preferred,
+                cy.branch(
+                    "p1_rollout_full",
+                    "Rollout full, cede RM then scale up (step B)",
+                    p1_rollout_xfer_checks
+                    + [
+                        self._chk(
+                            "wake_target",
+                            True,
+                            "rollout_transfer_up",
+                            self._inst_ref(rollout_transfer_up),
+                        )
+                    ],
+                    triggered=True,
                 )
                 return actions, "transfer_rm_to_rollout"
+            cy.branch(
+                "p1_rollout_full",
+                "Rollout full, cede RM then scale up (step B)",
+                p1_rollout_xfer_checks,
+                outcome="SKIP",
+            )
+        else:
+            cy.branch(
+                "p1_rollout_full",
+                "only Rollout is full-load",
+                p1_rollout_full_pre,
+                applicable=rollout_only_full,
+                outcome="SKIP",
+            )
+        if not rm_only_full and not rollout_only_full:
+            cy.note("p1_single_side_full: neither side exclusively full-load")
 
         # ── Priority 3 ────────────────────────────────────────────────────────────
         # Both sides full → optimize bottleneck throughput by one-step transfer.
@@ -1301,6 +1504,11 @@ class ScalingPolicy:
         # Sleep-side candidates ignore theta_low: full KV on both sides is normal
         # here; theta_low remains the gate for *spontaneous* shrink in Priority 4.
         # ─────────────────────────────────────────────────────────────────────────
+        both_full = rollout_full and rm_full
+        p2_pre = [
+            self._chk("rollout_full", rollout_full, f"load>={self.theta_max}", rollout_full),
+            self._chk("rm_full", rm_full, f"load>={self.theta_max}", rm_full),
+        ]
         bottleneck_before = min(
             self._estimate_role_total_mu_with_rebalance(rollout_signals),
             self._estimate_role_total_mu_with_rebalance(rm_signals),
@@ -1308,9 +1516,8 @@ class ScalingPolicy:
         transfer_candidates: list[tuple[float, ScalingAction, str]] = []
         rollout_down_xfer: InstanceSignal | None = None
         rm_down_xfer: InstanceSignal | None = None
-        p2_branch_notes: list[str] = []
         p2_gain_rejected: float | None = None
-        if rollout_full and rm_full:
+        if both_full:
             rollout_down_xfer = self._pick_scale_down_candidate_for_bottleneck_transfer(
                 rollout_signals, instance_mu
             )
@@ -1321,6 +1528,11 @@ class ScalingPolicy:
             if rollout_down_xfer is not None
             else None
         ) or rm_up
+        p2_r2m_gain: float | None = None
+        p2_r2m_checks = p2_pre + [
+            self._chk("rollout_down_xfer", rollout_down_xfer is not None, "pick rollout sleep", self._inst_ref(rollout_down_xfer)),
+            self._chk("rm_up_xfer", rm_up_xfer is not None, "pick rm wake", self._inst_ref(rm_up_xfer)),
+        ]
         if rollout_down_xfer is not None and rm_up_xfer is not None:
             rollout_mu = self._estimate_role_total_mu_with_rebalance(
                 rollout_signals,
@@ -1330,8 +1542,13 @@ class ScalingPolicy:
                 rm_signals,
                 scale_up_signal=rm_up_xfer,
             )
-            if rollout_mu >= 0 and rm_mu >= 0:
+            sim_ok = rollout_mu >= 0 and rm_mu >= 0
+            p2_r2m_checks.append(
+                self._chk("mu_sim_valid", sim_ok, "rollout_mu>=0 AND rm_mu>=0", f"rollout_mu={rollout_mu} rm_mu={rm_mu}")
+            )
+            if sim_ok:
                 bottleneck_after = min(rollout_mu, rm_mu)
+                p2_r2m_gain = bottleneck_after - bottleneck_before
                 action = self._build_scale_up_action_with_elastic_placement(
                     wake=rm_up_xfer,
                     target_role_signals=rm_signals,
@@ -1339,28 +1556,28 @@ class ScalingPolicy:
                     instance_mu=instance_mu,
                     reason="optimize_bottleneck_rollout_to_rm",
                 )
-                transfer_candidates.append(
-                    (
-                        bottleneck_after - bottleneck_before,
-                        action,
-                        "optimize_rollout_to_rm",
-                    )
+                transfer_candidates.append((p2_r2m_gain, action, "optimize_rollout_to_rm"))
+                p2_r2m_checks.append(
+                    self._chk("gain", True, "computed", f"{p2_r2m_gain:.6f} bottleneck_before={bottleneck_before:.2f}")
                 )
-            else:
-                p2_branch_notes.append(
-                    f"p2_opt_rollout_to_rm_sim_invalid rollout_mu={rollout_mu} rm_mu={rm_mu}"
-                )
-        elif rollout_full and rm_full:
-            if rollout_down_xfer is None:
-                p2_branch_notes.append("p2_opt_rollout_to_rm_skip_no_rollout_down_xfer")
-            if rm_up is None:
-                p2_branch_notes.append("p2_opt_rollout_to_rm_skip_no_rm_up")
+        cy.branch(
+            "p2_bottleneck",
+            "both full: transfer rollout->rm",
+            p2_r2m_checks,
+            applicable=both_full,
+            outcome="SKIP" if p2_r2m_gain is None else "candidate",
+        )
 
         rollout_up_xfer = (
             self._pick_scale_up_candidate_for_victim(rollout_signals, rm_down_xfer, instance_mu)
             if rm_down_xfer is not None
             else None
         ) or rollout_up
+        p2_m2r_gain: float | None = None
+        p2_m2r_checks = p2_pre + [
+            self._chk("rm_down_xfer", rm_down_xfer is not None, "pick rm sleep", self._inst_ref(rm_down_xfer)),
+            self._chk("rollout_up_xfer", rollout_up_xfer is not None, "pick rollout wake", self._inst_ref(rollout_up_xfer)),
+        ]
         if rm_down_xfer is not None and rollout_up_xfer is not None:
             rollout_mu = self._estimate_role_total_mu_with_rebalance(
                 rollout_signals,
@@ -1370,8 +1587,13 @@ class ScalingPolicy:
                 rm_signals,
                 scale_down_signal=rm_down_xfer,
             )
-            if rollout_mu >= 0 and rm_mu >= 0:
+            sim_ok = rollout_mu >= 0 and rm_mu >= 0
+            p2_m2r_checks.append(
+                self._chk("mu_sim_valid", sim_ok, "rollout_mu>=0 AND rm_mu>=0", f"rollout_mu={rollout_mu} rm_mu={rm_mu}")
+            )
+            if sim_ok:
                 bottleneck_after = min(rollout_mu, rm_mu)
+                p2_m2r_gain = bottleneck_after - bottleneck_before
                 action = self._build_scale_up_action_with_elastic_placement(
                     wake=rollout_up_xfer,
                     target_role_signals=rollout_signals,
@@ -1379,49 +1601,77 @@ class ScalingPolicy:
                     instance_mu=instance_mu,
                     reason="optimize_bottleneck_rm_to_rollout",
                 )
-                transfer_candidates.append(
-                    (
-                        bottleneck_after - bottleneck_before,
-                        action,
-                        "optimize_rm_to_rollout",
-                    )
+                transfer_candidates.append((p2_m2r_gain, action, "optimize_rm_to_rollout"))
+                p2_m2r_checks.append(
+                    self._chk("gain", True, "computed", f"{p2_m2r_gain:.6f} bottleneck_before={bottleneck_before:.2f}")
                 )
-            else:
-                p2_branch_notes.append(
-                    f"p2_opt_rm_to_rollout_sim_invalid rollout_mu={rollout_mu} rm_mu={rm_mu}"
-                )
-        elif rollout_full and rm_full:
-            if rm_down_xfer is None:
-                p2_branch_notes.append("p2_opt_rm_to_rollout_skip_no_rm_down_xfer")
-            if rollout_up is None:
-                p2_branch_notes.append("p2_opt_rm_to_rollout_skip_no_rollout_up")
+        cy.branch(
+            "p2_bottleneck",
+            "both full: transfer rm->rollout",
+            p2_m2r_checks,
+            applicable=both_full,
+            outcome="SKIP" if p2_m2r_gain is None else "candidate",
+        )
 
         if transfer_candidates:
             transfer_candidates.sort(key=lambda x: x[0], reverse=True)
             best_gain, best_action, reason = transfer_candidates[0]
-            if best_gain > self.hysteresis:
+            gain_ok = best_gain > self.hysteresis
+            cy.branch(
+                "p2_bottleneck",
+                "pick best transfer by simulated gain",
+                [
+                    self._chk("has_candidates", True, "len>=1", len(transfer_candidates)),
+                    self._chk(
+                        "best_gain>hysteresis",
+                        gain_ok,
+                        f"gain>{self.hysteresis}",
+                        f"best_gain={best_gain:.6f}",
+                    ),
+                ],
+                applicable=both_full,
+                triggered=gain_ok,
+                outcome="SKIP(gain too small)" if not gain_ok else "SKIP",
+            )
+            if gain_ok:
                 actions.append(best_action)
-                self._policy_log(
-                    "decision",
-                    action=best_action.action_type,
-                    bottleneck_before=bottleneck_before,
-                    gain=best_gain,
-                    instance_id=(best_action.preferred_instance_ids or [None])[0],
-                    model_name=best_action.model_name,
-                    outcome="action",
-                    policy_branch="p2_bottleneck_transfer",
-                    reason=f"{reason}_gain_{best_gain:.6f}",
+                cy.note(
+                    f"chosen={reason} wake={best_action.preferred_instance_ids} "
+                    f"gain={best_gain:.6f}"
                 )
                 return actions, f"{reason}_gain_{best_gain:.6f}"
             p2_gain_rejected = best_gain
+        elif both_full:
+            cy.branch(
+                "p2_bottleneck",
+                "pick best transfer by simulated gain",
+                [self._chk("has_candidates", False, "len>=1", 0)],
+                applicable=True,
+                outcome="SKIP(no valid transfer)",
+            )
 
         # Priority 4: purely underloaded side can scale down itself.
-        if (
-            rollout_low
-            and rollout_down is not None
-            and not rm_full
-            and rollout_down.waiting_queue_num <= self.max_waiting_queue_for_scale_down
-        ):
+        rollout_self_down_checks = [
+            self._chk("rollout_low", rollout_low, f"any awake load<={self.theta_low}", rollout_low),
+            self._chk("rollout_down_candidate", rollout_down is not None, f"load<={self.theta_low} + min_awake", self._inst_ref(rollout_down)),
+            self._chk("rm_not_full", not rm_full, "rm_full=false", rm_full),
+            self._chk(
+                "waiting_queue_guard",
+                rollout_down is not None
+                and rollout_down.waiting_queue_num <= self.max_waiting_queue_for_scale_down,
+                f"waiting<={self.max_waiting_queue_for_scale_down}",
+                rollout_down_waiting,
+            ),
+        ]
+        rollout_self_down = all(c.met for c in rollout_self_down_checks)
+        cy.branch(
+            "p4_rollout_self_down",
+            "spontaneous rollout shrink",
+            rollout_self_down_checks,
+            triggered=rollout_self_down,
+            outcome="SKIP",
+        )
+        if rollout_self_down:
             actions.append(
                 ScalingAction(
                     action_type="scale_down",
@@ -1431,22 +1681,29 @@ class ScalingPolicy:
                     reason="rollout_low_scale_down",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_down",
-                instance_id=rollout_down.instance_id,
-                model_name=rollout_down.model_name,
-                outcome="action",
-                policy_branch="p3_rollout_self_down",
-                reason="rollout_low_scale_down",
-            )
             return actions, "rollout_low_scale_down"
-        if (
-            rm_low
-            and rm_down is not None
-            and not rollout_full
-            and rm_down.waiting_queue_num <= self.max_waiting_queue_for_scale_down
-        ):
+
+        rm_self_down_checks = [
+            self._chk("rm_low", rm_low, f"any awake load<={self.theta_low}", rm_low),
+            self._chk("rm_down_candidate", rm_down is not None, f"load<={self.theta_low} + min_awake", self._inst_ref(rm_down)),
+            self._chk("rollout_not_full", not rollout_full, "rollout_full=false", rollout_full),
+            self._chk(
+                "waiting_queue_guard",
+                rm_down is not None
+                and rm_down.waiting_queue_num <= self.max_waiting_queue_for_scale_down,
+                f"waiting<={self.max_waiting_queue_for_scale_down}",
+                rm_down_waiting,
+            ),
+        ]
+        rm_self_down = all(c.met for c in rm_self_down_checks)
+        cy.branch(
+            "p4_rm_self_down",
+            "spontaneous RM shrink",
+            rm_self_down_checks,
+            triggered=rm_self_down,
+            outcome="SKIP",
+        )
+        if rm_self_down:
             actions.append(
                 ScalingAction(
                     action_type="scale_down",
@@ -1456,48 +1713,12 @@ class ScalingPolicy:
                     reason="rm_low_scale_down",
                 )
             )
-            self._policy_log(
-                "decision",
-                action="scale_down",
-                instance_id=rm_down.instance_id,
-                model_name=rm_down.model_name,
-                outcome="action",
-                policy_branch="p3_rm_self_down",
-                reason="rm_low_scale_down",
-            )
             return actions, "rm_low_scale_down"
 
-        detail = self._no_action_detail_strings(
-            trainer_busy=trainer_busy,
-            pending_total=pending_total,
-            waiting_on=waiting_on,
-            rollout_full=rollout_full,
-            rm_full=rm_full,
-            rollout_low=rollout_low,
-            rm_low=rm_low,
-            rollout_down_waiting=rollout_down_waiting,
-            rm_down_waiting=rm_down_waiting,
-            rollout_up=rollout_up,
-            rm_up=rm_up,
-            rollout_down=rollout_down,
-            rm_down=rm_down,
-            rollout_free_up=rollout_free_up,
-            rm_free_up=rm_free_up,
-            rollout_down_xfer=rollout_down_xfer,
-            rm_down_xfer=rm_down_xfer,
-            p2_gain_rejected=p2_gain_rejected,
-            p2_branch_notes=p2_branch_notes,
-        )
-        if diagnostics:
-            diagnostics.sort()
-            merged = "|".join(diagnostics + detail)
-            final_reason = f"no_action_{merged}"[:4096]
-            self._policy_log_no_action(final_reason, diagnostics, detail)
-            return [], final_reason
-        merged_detail = " ;; ".join(detail)
-        final_reason = f"no_action_{merged_detail}"[:4096]
-        self._policy_log_no_action(final_reason, [], detail)
-        return [], final_reason
+        if p2_gain_rejected is not None:
+            cy.note(f"p2_bottleneck: best_gain={p2_gain_rejected:.6f} <= hysteresis={self.hysteresis}")
+
+        return [], "no_action_all_branches_skipped"
 
     def decide(
         self,
@@ -1531,16 +1752,32 @@ class ScalingPolicy:
             ScalingDecision with actions (if any), reason string, ``estimated_lambda``,
             and ``role_to_total_mu`` for logging and telemetry.
         """
+        cy = self._cycle_log
+        cy.start()
+        cy.section("inputs")
+        cy.kv(
+            n_signals=len(signals),
+            execution_in_progress=execution_in_progress,
+            router_backlog=router_backlog_by_role,
+            pending_scale_up=pending_scale_up_by_role,
+        )
+
         if not self.enable:
-            self._policy_log("decision", outcome="skipped", reason="policy_disabled")
+            self._finish_cycle("skipped", "policy_disabled")
             return ScalingDecision(actions=[], reason="policy_disabled", estimated_lambda=0.0, role_to_total_mu={})
         if not signals:
-            self._policy_log("decision", outcome="skipped", reason="empty_signals")
+            self._finish_cycle("skipped", "empty_signals")
             return ScalingDecision(actions=[], reason="empty_signals", estimated_lambda=0.0, role_to_total_mu={})
-        
+
         # HIGHEST RULE: Must guarantee that any decision's execution is an ATOMIC operation.
         if execution_in_progress:
-            self._policy_log("decision", outcome="skipped", reason="decision_execution_in_progress")
+            cy.branch(
+                "guard",
+                "no concurrent scaling execution",
+                [self._chk("executor_idle", False, "execution_in_progress=false", execution_in_progress)],
+                outcome="BLOCK",
+            )
+            self._finish_cycle("skipped", "decision_execution_in_progress")
             return ScalingDecision(
                 actions=[],
                 reason="decision_execution_in_progress",
@@ -1552,19 +1789,16 @@ class ScalingPolicy:
         instance_mu, role_total_mu, instance_mu_source = self._build_mu_maps(signals)
         estimated_lambda = self._estimate_lambda(signals, role_total_mu)
         source_counts: dict[str, int] = {}
-        source_details: list[str] = []
         for signal in signals:
             key = (signal.role_name, signal.model_name, signal.instance_id)
             source = instance_mu_source.get(key, "unknown")
             source_counts[source] = source_counts.get(source, 0) + 1
-            source_details.append(
-                f"{signal.role_name.name}/{signal.model_name}/{signal.instance_id}:{source}"
-            )
-        self._policy_log(
-            "mu_source",
-            details="|".join(source_details),
+        cy.section("mu_estimate")
+        cy.kv(
+            estimated_lambda=f"{estimated_lambda:.2f}",
             formula_count=source_counts.get("formula", 0),
             fallback_runtime_count=source_counts.get("fallback_runtime", 0),
+            role_total_mu={k.name: f"{v:.2f}" for k, v in role_total_mu.items()},
         )
 
         # Hard guarantee: if one role has zero awaken instances but router backlog exists,
@@ -1575,9 +1809,21 @@ class ScalingPolicy:
         for role_name, role_signals in grouped.items():
             awaken_cnt = sum(1 for s in role_signals if s.is_awaken)
             backlog_cnt = int(backlog_map.get(role_name, 0))
+            pending_cnt = int(pending_up.get(role_name, 0))
+            force_checks = [
+                self._chk("zero_awake", awaken_cnt == 0, "awaken_cnt==0", awaken_cnt),
+                self._chk("router_backlog>0", backlog_cnt > 0, "backlog_cnt>0", backlog_cnt),
+                self._chk("no_pending_wake", pending_cnt == 0, "pending_scale_up==0", pending_cnt),
+            ]
             if awaken_cnt > 0 or backlog_cnt <= 0:
                 continue
-            if int(pending_up.get(role_name, 0)) > 0:
+            if pending_cnt > 0:
+                cy.branch(
+                    "force_wake",
+                    f"{role_name.name} has backlog but wake in flight",
+                    force_checks,
+                    outcome="SKIP(pending wake)",
+                )
                 continue
             other_role = PSRL_Role.RewardModel if role_name == PSRL_Role.Rollout else PSRL_Role.Rollout
             other_signals = grouped.get(other_role, [])
@@ -1587,13 +1833,14 @@ class ScalingPolicy:
             role_tag = role_name.name
             if force_pair is None:
                 r = f"force_wake_needed_but_no_candidate_{role_tag}_backlog_{backlog_cnt}"
-                self._policy_log(
-                    "decision",
-                    backlog_cnt=backlog_cnt,
-                    outcome="no_action",
-                    reason=r,
-                    role_name=role_name,
+                cy.branch(
+                    "force_wake",
+                    f"{role_name.name} zero awake with router backlog",
+                    force_checks
+                    + [self._chk("force_wake_candidate", False, "pick by force", "none")],
+                    outcome="BLOCK",
                 )
+                self._finish_cycle("no_action", r, backlog_cnt=backlog_cnt)
                 return ScalingDecision(
                     actions=[],
                     reason=r,
@@ -1612,17 +1859,27 @@ class ScalingPolicy:
                 action.pre_sleep_other_preferred = [self._signal_entry(sleep_victim)]
             self.last_action_time_ms = now_ms
             fw_reason = f"force_wake_{role_tag}_backlog_{backlog_cnt}"
-            self._policy_log(
-                "decision",
+            cy.branch(
+                "force_wake",
+                f"{role_name.name} zero awake with router backlog",
+                force_checks
+                + [
+                    self._chk("force_wake_candidate", True, "wake target", self._inst_ref(force_up)),
+                    self._chk(
+                        "pre_sleep_victim",
+                        sleep_victim is None or action.pre_sleep_other_preferred is not None,
+                        "optional colocated sleep",
+                        self._inst_ref(sleep_victim),
+                    ),
+                ],
+                triggered=True,
+            )
+            self._finish_cycle(
+                "action",
+                fw_reason,
                 action="scale_up",
+                wake=self._inst_ref(force_up),
                 backlog_cnt=backlog_cnt,
-                instance_id=force_up.instance_id,
-                model_name=force_up.model_name,
-                outcome="action",
-                policy_branch="force_wake_backlog",
-                reason=fw_reason,
-                role_name=role_name,
-                pre_sleep_other=action.pre_sleep_other_preferred,
             )
             return ScalingDecision(
                 actions=[action],
@@ -1631,32 +1888,52 @@ class ScalingPolicy:
                 role_to_total_mu=role_total_mu,
             )
 
-        if now_ms - self.last_action_time_ms < self.cooldown_ms:
-            remain = self.cooldown_ms - (now_ms - self.last_action_time_ms)
-            self._policy_log(
-                "decision",
-                cooldown_remaining_ms=remain,
-                outcome="skipped",
-                reason="cooldown",
-            )
+        remain_ms = self.cooldown_ms - (now_ms - self.last_action_time_ms)
+        in_cooldown = now_ms - self.last_action_time_ms < self.cooldown_ms
+        cy.branch(
+            "guard",
+            "cooldown between scaling actions",
+            [
+                self._chk(
+                    "cooldown_elapsed",
+                    not in_cooldown,
+                    f"elapsed>={self.cooldown_ms}ms",
+                    f"remain_ms={max(0, remain_ms):.0f}",
+                )
+            ],
+            outcome="BLOCK" if in_cooldown else "PASS",
+        )
+        if in_cooldown:
+            self._finish_cycle("skipped", "cooldown", cooldown_remaining_ms=f"{max(0, remain_ms):.0f}")
             return ScalingDecision(actions=[], reason="cooldown", estimated_lambda=0.0, role_to_total_mu={})
 
-        # Safety guard: skip aggressive scale decisions when snapshots are stale.
-        # all signals are unreliable, so we skip the decision.
         stale_count = 0
         for signal in signals:
             snapshot = {"timestamp": signal.snapshot_timestamp}
-            if self._is_snapshot_staled(snapshot):
+            if self._is_signal_staled(signal):
                 stale_count += 1
-        if stale_count == len(signals):
-            self._policy_log(
-                "decision",
-                outcome="skipped",
-                reason="all_signals_stale",
-                stale_count=stale_count,
-            )
+        all_stale = stale_count == len(signals)
+        cy.branch(
+            "guard",
+            "snapshot freshness",
+            [
+                self._chk(
+                    "not_all_stale",
+                    not all_stale,
+                    "stale_count < n_signals",
+                    f"stale={stale_count}/{len(signals)}",
+                )
+            ],
+            outcome="BLOCK" if all_stale else "PASS",
+        )
+        backlog_positive = self._router_backlog_positive(router_backlog_by_role)
+        if all_stale and not backlog_positive:
+            self._finish_cycle("skipped", "all_signals_stale", stale_count=stale_count)
             return ScalingDecision(actions=[], reason="all_signals_stale", estimated_lambda=0.0, role_to_total_mu={})
-        
+        if all_stale and backlog_positive:
+            cy.note("all instance snapshots are stale, but router backlog is positive; continuing for backlog-driven wake")
+
+        cy.section("stepwise_policy")
         actions, reason = self._make_stepwise_decision(
             grouped,
             instance_mu,
@@ -1667,13 +1944,23 @@ class ScalingPolicy:
 
         if actions:
             self.last_action_time_ms = now_ms
-        self._policy_log(
-            "decision_summary",
-            actions_count=len(actions),
-            estimated_lambda=estimated_lambda,
-            reason=reason,
-            role_to_total_mu=dict(role_total_mu),
-        )
+            action = actions[0]
+            self._finish_cycle(
+                "action",
+                reason,
+                action_type=action.action_type,
+                role=action.role_name.name,
+                model=action.model_name,
+                instances=action.preferred_instance_ids,
+                num_instances=action.num_instances,
+                estimated_lambda=f"{estimated_lambda:.2f}",
+            )
+        else:
+            self._finish_cycle(
+                "no_action",
+                reason,
+                estimated_lambda=f"{estimated_lambda:.2f}",
+            )
         return ScalingDecision(
             actions=actions,
             reason=reason,

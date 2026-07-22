@@ -144,3 +144,5 @@ outputs
 docs/
 
 vllm_bench_results/
+
+.codex

@@ -157,6 +157,8 @@ class CommandExtension:
         """
         self._command_results = {}
         self._command_events = {}
+        self._command_status = {}
+        self._timed_out_command_ids: set[int] = set()
         self._command_counter = 0
         self.command_queue = asyncio.Queue()  # For async commands like abort
 
@@ -188,6 +190,7 @@ class CommandExtension:
         command_event = CommandEvent(command_id)
         self._command_events[command_id] = command_event
         self._command_results[command_id] = None
+        self._command_status[command_id] = "QUEUED"
 
         command._kwargs["id"] = command_id
         self.command_queue.put_nowait(command)
@@ -200,11 +203,13 @@ class CommandExtension:
         # Wait for the command to complete
         success = await command_event.wait(timeout=timeout)
         if not success:
-            if command_id in self._command_results:
-                del self._command_results[command_id]
-            if command_id in self._command_events:
-                del self._command_events[command_id]
-            return None
+            # Timeout is not cancellation. Keep the event/result so callers can
+            # synchronize with the original operation instead of issuing a duplicate.
+            self._timed_out_command_ids.add(command_id)
+            return {
+                "status": self._command_status.get(command_id, "PENDING"),
+                "command_id": command_id,
+            }
 
         result = self._command_results.get(command_id, None)
         psrl_logger.debug(f"Command {command_id} completed with result: {result}")
@@ -212,6 +217,8 @@ class CommandExtension:
             del self._command_results[command_id]
         if command_id in self._command_events:
             del self._command_events[command_id]
+        self._command_status.pop(command_id, None)
+        self._timed_out_command_ids.discard(command_id)
 
         return result
 
@@ -240,8 +247,23 @@ class CommandExtension:
             del self._command_results[command_id]
         if command_id in self._command_events:
             del self._command_events[command_id]
+        self._command_status.pop(command_id, None)
+        self._timed_out_command_ids.discard(command_id)
 
         return result
+
+    def get_command_status(self, command_id: int) -> dict[str, Any]:
+        """Return a non-destructive command lifecycle snapshot."""
+        command_id = int(command_id)
+        return {
+            "command_id": command_id,
+            "status": self._command_status.get(command_id, "UNKNOWN"),
+            "result": self._command_results.get(command_id),
+        }
+
+    def _start_command(self, command_id: int) -> None:
+        if command_id in self._command_status:
+            self._command_status[command_id] = "RUNNING"
 
     def _complete_command(self, command_id: int, result: Any):
         """Set the command result, mark it as completed and notify the event waiter."""
@@ -255,6 +277,7 @@ class CommandExtension:
             )
             return
         self._command_results[command_id] = result
+        self._command_status[command_id] = "SUCCEEDED" if result is not False else "FAILED"
         psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
         if command_id in self._command_events:
             self._command_events[command_id].set()
