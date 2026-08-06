@@ -19,6 +19,11 @@ Objective difference vs ``ITLScalingPolicy``:
   the whole objective collapses to 0, and it is dominated by the weaker side
   while still rewarding improvements on either side.
 
+  Set ``itl_policy.harmonic_denominator_use_max`` to use the maximum of the
+  two reciprocal-throughput terms as the denominator instead of their sum.
+  This preserves the numerator and weight semantics while making the objective
+  more bottleneck-like.
+
 The per-role throughput estimates (``balanced_min`` vs ``sum``), the
 ``role_throughput_weight_basis`` (``request_count`` / ``token_count`` /
 ``none``), and the ``role_throughput_weight_mode`` (``share`` / ``raw``) all
@@ -99,18 +104,31 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
         """
         return 0.0
 
-    @staticmethod
-    def _weighted_system_throughput(rollout_tp: float, rm_tp: float, w_rollout: float, w_rm: float) -> float:
+    def _weighted_system_throughput(
+        self,
+        rollout_tp: float,
+        rm_tp: float,
+        w_rollout: float,
+        w_rm: float,
+    ) -> float:
         """Apply per-role throughput divisors and return the weighted harmonic mean.
 
+        By default,
         ``H = (w_rollout + w_rm) / (w_rollout / rollout_tp + w_rm / rm_tp)``.
+        When ``harmonic_denominator_use_max`` is enabled, the denominator is
+        ``max(w_rollout / rollout_tp, w_rm / rm_tp)`` instead.
         Zero-weight sides fall back to divisor 1.0 (same convention as the
         bottleneck variant) so a disabled/uniform configuration reduces to the
         standard harmonic mean.
         """
         wr = w_rollout if w_rollout > 0.0 else 1.0
         wm = w_rm if w_rm > 0.0 else 1.0
-        denom = wr * _inv_throughput(rollout_tp) + wm * _inv_throughput(rm_tp)
+        rollout_term = wr * _inv_throughput(rollout_tp)
+        rm_term = wm * _inv_throughput(rm_tp)
+        if self.harmonic_denominator_use_max:
+            denom = max(rollout_term, rm_term)
+        else:
+            denom = rollout_term + rm_term
         if math.isinf(denom):
             # At least one role has zero throughput -> harmonic mean is 0.
             return 0.0
@@ -127,6 +145,7 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
         router_backlog_by_role: dict[PSRL_Role, Any] | None = None,
         wake_ids_by_role: dict[PSRL_Role, set[int]] | None = None,
         sleep_ids_by_role: dict[PSRL_Role, set[int]] | None = None,
+        load_overrides_by_role: dict[PSRL_Role, dict[int, tuple[float, float]]] | None = None,
     ) -> float:
         """System throughput: weighted harmonic mean across Rollout and RewardModel.
 
@@ -140,6 +159,7 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
         backlog_map = router_backlog_by_role or {}
         wake_map = wake_ids_by_role or {}
         sleep_map = sleep_ids_by_role or {}
+        load_override_map = load_overrides_by_role or {}
         rollout_signals = grouped.get(PSRL_Role.Rollout, [])
         rm_signals = grouped.get(PSRL_Role.RewardModel, [])
         rollout_waiting = self._normalize_router_waiting_load(backlog_map.get(PSRL_Role.Rollout))
@@ -151,6 +171,7 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
                 rollout_waiting,
                 wake_map.get(PSRL_Role.Rollout),
                 sleep_map.get(PSRL_Role.Rollout),
+                load_override_map.get(PSRL_Role.Rollout),
             )
             rm_tp = self._role_throughput_sum(
                 rm_signals,
@@ -158,6 +179,7 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
                 rm_waiting,
                 wake_map.get(PSRL_Role.RewardModel),
                 sleep_map.get(PSRL_Role.RewardModel),
+                load_override_map.get(PSRL_Role.RewardModel),
             )
         else:
             rollout_tp = self._role_throughput(rollout_signals, rollout_n, rollout_waiting)
@@ -189,6 +211,47 @@ class ITLHarmonicScalingPolicy(ITLScalingPolicy):
         if starved_role == PSRL_Role.Rollout:
             return self._degraded_loaded_throughput(rm_signals, rm_n, rm_waiting, w_rm)
         return self._degraded_loaded_throughput(rollout_signals, rollout_n, rollout_waiting, w_rollout)
+
+    def _combine_request_level_role_throughputs(
+        self,
+        grouped: dict[PSRL_Role, list[InstanceSignal]],
+        role_throughputs: dict[PSRL_Role, float],
+        router_backlog_by_role: dict[PSRL_Role, Any] | None,
+    ) -> float:
+        """Apply harmonic/starvation math to request-level role simulations."""
+        backlog_map = router_backlog_by_role or {}
+        rollout_signals = grouped.get(PSRL_Role.Rollout, [])
+        rm_signals = grouped.get(PSRL_Role.RewardModel, [])
+        rollout_waiting = self._normalize_router_waiting_load(
+            backlog_map.get(PSRL_Role.Rollout)
+        )
+        rm_waiting = self._normalize_router_waiting_load(
+            backlog_map.get(PSRL_Role.RewardModel)
+        )
+        w_rollout, w_rm = self._role_throughput_weights(
+            rollout_signals,
+            rm_signals,
+            rollout_waiting,
+            rm_waiting,
+        )
+        starved_role = self._detect_starved_role(
+            rollout_signals=rollout_signals,
+            rm_signals=rm_signals,
+            rollout_waiting=rollout_waiting,
+            rm_waiting=rm_waiting,
+        )
+        if starved_role == PSRL_Role.Rollout:
+            divisor = w_rm if w_rm > 0.0 else 1.0
+            return role_throughputs[PSRL_Role.RewardModel] / divisor
+        if starved_role == PSRL_Role.RewardModel:
+            divisor = w_rollout if w_rollout > 0.0 else 1.0
+            return role_throughputs[PSRL_Role.Rollout] / divisor
+        return self._weighted_system_throughput(
+            role_throughputs[PSRL_Role.Rollout],
+            role_throughputs[PSRL_Role.RewardModel],
+            w_rollout,
+            w_rm,
+        )
 
     def _degraded_loaded_throughput(
         self,

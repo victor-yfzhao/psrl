@@ -10,6 +10,9 @@ import numpy as np
 from verl import DataProto
 
 from psrl.utils.cost_model_path import resolve_cost_model_json_path
+from psrl.utils.elastic_rm.candidate_routing import (
+    select_throughput_optimal_candidate,
+)
 from psrl.workers.gen.stats_collector import EngineStats
 
 _ROUTE_STRATEGY_REGISTRY: dict[str, type["RouteStrategyBase"]] = {}
@@ -556,6 +559,18 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
     def _estimate_baseline_delta_throughput(self, request: DataProto, instance_id: int) -> float:
         return 1 / self._estimate_latency(instance_id, 1, self._get_request_token_num(request))
 
+    def force_route(self, request: DataProto, instance_id: int) -> int | None:
+        """Commit a prepared migration to one target after hard-cap checks."""
+        instance_id = int(instance_id)
+        if not self._can_run_directly(request, instance_id):
+            return None
+        if self.instance_to_request_num[instance_id] >= self.max_concurrent_seqs_per_instance:
+            return None
+        self.instance_to_request_num[instance_id] += 1
+        self.instance_to_running_request_num[instance_id] += 1
+        self.instance_to_token_num[instance_id] += self._get_request_token_num(request)
+        return instance_id
+
     def route(
         self,
         request: DataProto,
@@ -579,6 +594,31 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
             f"be the same, but have {len(candidates)} candidates and "
             f"{len(candidate_indicator_list)} candidate indicator list"
         )
+        shared_selection = select_throughput_optimal_candidate(
+            candidates=candidates,
+            candidate_indicators=candidate_indicator_list,
+            can_run_directly=lambda instance_id: self._can_run_directly(
+                request,
+                instance_id,
+            ),
+            current_throughput=self._estimate_curr_throughput,
+            next_throughput=lambda instance_id: (
+                self._estimate_curr_throughput_after_route_request(
+                    request,
+                    instance_id,
+                )
+            ),
+            baseline_delta_throughput=lambda instance_id: (
+                self._estimate_baseline_delta_throughput(request, instance_id)
+            ),
+            within_request_cap=lambda instance_id: (
+                self.instance_to_request_num[instance_id]
+                < self.max_concurrent_seqs_per_instance
+            ),
+            delta_throughput_threshold=self.delta_throughput_threshold,
+        )
+        if shared_selection is None:
+            return None
         indicator_to_candidates = {}
         for candidate, indicator in zip(candidates, candidate_indicator_list):
             if indicator not in indicator_to_candidates:
@@ -657,6 +697,10 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                 best_delta_throughput >= threshold
                 and self.instance_to_request_num[best_candidate] < self.max_concurrent_seqs_per_instance
             ):
+                assert best_candidate == shared_selection, (
+                    "shared throughput-optimal selector diverged from live route path: "
+                    f"shared={shared_selection}, live={best_candidate}"
+                )
                 # if best_delta_throughput >= threshold:
                 _old_request_num = self.instance_to_request_num[best_candidate]
                 self.instance_to_request_num[best_candidate] += 1

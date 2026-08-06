@@ -14,13 +14,16 @@ from omegaconf import DictConfig
 from verl import DataProto
 
 from psrl.utils.cost_model_path import resolve_cost_model_json_path
+from psrl.utils.elastic_rm.candidate_routing import select_itl_candidate
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.elastic_rm.itl_scaling_policy import (
     ITLModelParams,
     compute_itl,
     resolve_itl_model_params,
 )
+from psrl.utils.elastic_rm.overhead import RequestMigrationOverheadTracker
 from psrl.utils.logger import DualOutputHandler
+from psrl.utils.rollout.request_id import canonical_psrl_request_id
 from psrl.workers.gen.stats_collector import EngineStats
 
 psrl_logger = logging.getLogger("reward_model_router")
@@ -250,25 +253,22 @@ class ITLBalanceRewardModelRouteStrategy(RewardModelRouteStrategyBase):
             candidates = list(active_loads.keys())
         if not candidates:
             return None
-        best_key: tuple | None = None
-        best_idx: int | None = None
-        for idx in candidates:
-            idx = int(idx)
-            load = int(active_loads.get(idx, 0))
+
+        def _next_itl(instance_id: int, load: int) -> float:
             if self._itl_params is None:
-                next_itl = float(load + 1)
-            else:
-                next_itl = compute_itl(
-                    self._itl_params,
-                    total_token_num=0.0,
-                    running_queue_num=load + 1,
-                )
-            if self._itl_max_itl is not None and next_itl > self._itl_max_itl:
-                continue
-            key = (next_itl, load, idx)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_idx = idx
+                return float(load + 1)
+            return compute_itl(
+                self._itl_params,
+                total_token_num=0.0,
+                running_queue_num=load + 1,
+            )
+
+        best_idx = select_itl_candidate(
+            candidates=candidates,
+            active_loads=active_loads,
+            next_itl=_next_itl,
+            max_itl=self._itl_max_itl,
+        )
         if best_idx is None:
             self.logger.warning(
                 "[router] No reward workers under ITL threshold %s; active_loads=%s.",
@@ -740,6 +740,17 @@ class PSRL_RewardModelRouter:
                 self.waiting_admission_cap = None
         self.route_strategy = self._init_route_strategy()
         self._request_to_strategy_instance: dict[str, int] = {}
+        self._migration_overhead = RequestMigrationOverheadTracker()
+        self._candidate_evaluation_inflight_requests: dict[str, DataProto] = {}
+        self._uid_to_inflight_instance: dict[str, int] = {}
+        self._planned_migration_destinations: dict[str, int] = {}
+        self._planned_migration_counters = {
+            "planned": 0,
+            "accepted": 0,
+            "skipped": 0,
+            "forced": 0,
+            "fallback": 0,
+        }
 
         # Logger.
         self.log_prefix = "RewardModelRouter"
@@ -913,6 +924,9 @@ class PSRL_RewardModelRouter:
                     break
                 request_key, request = dequeued
                 self._request_to_strategy_instance[request_key] = int(worker_idx)
+                self._candidate_evaluation_inflight_requests[request_key] = request
+                for request_uid in self._request_uid_values(request):
+                    self._uid_to_inflight_instance[request_uid] = int(worker_idx)
                 self._is_routing = True
                 inflight_at_dispatch = active_loads.get(int(worker_idx), 0)
                 task = asyncio.create_task(
@@ -940,6 +954,8 @@ class PSRL_RewardModelRouter:
         """Route one request to a selected worker; requeue when needed."""
         if request_key not in self.request_futures:
             self._release_strategy_worker(request_key, request, worker_idx)
+            for request_uid in self._request_uid_values(request):
+                self._planned_migration_destinations.pop(request_uid, None)
             return
 
         request_uids = self._format_request_uids(request)
@@ -953,12 +969,34 @@ class PSRL_RewardModelRouter:
             return
 
         worker_handle = self.worker_handles[worker_idx]
+        request_uid_values = self._request_uid_values(request)
+        for request_uid in request_uid_values:
+            dispatch_overhead = self._migration_overhead.mark_dispatched(request_uid, worker_idx)
+            if dispatch_overhead is not None:
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=request_migration_dispatch "
+                    "scope=post_scale_up_rebalance role=RewardModel migration_id=%s decision_id=%s "
+                    "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
+                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f "
+                    "network_scope=abort_to_redispatch",
+                    dispatch_overhead.get("migration_id"),
+                    dispatch_overhead.get("decision_id"),
+                    request_uid,
+                    dispatch_overhead.get("source_instance_id"),
+                    dispatch_overhead.get("destination_instance_id"),
+                    dispatch_overhead.get("selected_count"),
+                    dispatch_overhead["planner_s"],
+                    dispatch_overhead["planner_share_s"],
+                    dispatch_overhead["network_s"],
+                )
         try:
             result = await self._generate_with_worker(worker_idx, worker_handle, request)
         finally:
             self._release_strategy_worker(request_key, request, worker_idx)
 
         if result is None:
+            for request_uid in request_uid_values:
+                self._migration_overhead.mark_requeued(request_uid)
             psrl_logger.debug("Request %s interrupted or unavailable, requeueing original request.", request_uids)
             self._enqueue_request(request_key, request)
             await asyncio.sleep(self.retry_delay)
@@ -970,13 +1008,52 @@ class PSRL_RewardModelRouter:
         except Exception:
             interrupted = False
         if interrupted:
+            for request_uid in request_uid_values:
+                self._migration_overhead.mark_requeued(request_uid)
             psrl_logger.debug("Request %s interrupted, requeueing partial output for continuation.", request_uids)
             self._enqueue_request(request_key, result)
             await asyncio.sleep(self.retry_delay)
             return
 
+        for request_uid in request_uid_values:
+            migration_overhead, completion_status = self._migration_overhead.complete_with_status(
+                request_uid,
+                result,
+            )
+            if completion_status == "completed" and migration_overhead is not None:
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=post_scale_up_rebalance "
+                    "scope=post_scale_up_rebalance role=RewardModel migration_id=%s decision_id=%s "
+                    "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
+                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f reprefill_s=%.6f "
+                    "migration_s=%.6f network_scope=abort_to_redispatch "
+                    "reprefill_scope=vllm_scheduled_to_first_token",
+                    migration_overhead.get("migration_id"),
+                    migration_overhead.get("decision_id"),
+                    request_uid,
+                    migration_overhead.get("source_instance_id"),
+                    migration_overhead.get("destination_instance_id"),
+                    migration_overhead.get("selected_count"),
+                    migration_overhead["planner_s"],
+                    migration_overhead["planner_share_s"],
+                    migration_overhead["network_s"],
+                    migration_overhead["reprefill_s"],
+                    migration_overhead["migration_s"],
+                )
+            elif completion_status == "missing_vllm_prefill" and migration_overhead is not None:
+                psrl_logger.warning(
+                    "RM migration completion has no vLLM prefill metric: "
+                    "request=%s migration_id=%s network_s=%.6f; dropping terminal tracker state.",
+                    request_uid,
+                    migration_overhead.get("migration_id"),
+                    migration_overhead["network_s"],
+                )
+                self._migration_overhead.discard(request_uid)
+
         if psrl_logger.isEnabledFor(logging.DEBUG):
             psrl_logger.debug("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
+        for request_uid in request_uid_values:
+            self._planned_migration_destinations.pop(request_uid, None)
         self._set_result(request_key, result)
         return
 
@@ -1091,6 +1168,34 @@ class PSRL_RewardModelRouter:
         if not candidates_loads:
             return None
 
+        request_uids = self._request_uid_values(request)
+        planned_destinations = {
+            self._planned_migration_destinations[request_uid]
+            for request_uid in request_uids
+            if request_uid in self._planned_migration_destinations
+        }
+        if planned_destinations:
+            destination = next(iter(planned_destinations)) if len(planned_destinations) == 1 else None
+            for request_uid in request_uids:
+                self._planned_migration_destinations.pop(request_uid, None)
+            if destination is not None and destination in candidates_loads:
+                self.request_counts[destination] += 1
+                self._planned_migration_counters["forced"] += len(request_uids)
+                psrl_logger.info(
+                    "Forced planned RM migration: request=%s destination=%s",
+                    self._format_request_uids(request),
+                    destination,
+                )
+                return int(destination)
+            self._planned_migration_counters["fallback"] += len(request_uids)
+            psrl_logger.info(
+                "Planned RM migration target invalid; request=%s destinations=%s candidates=%s. "
+                "Falling back immediately.",
+                self._format_request_uids(request),
+                sorted(planned_destinations),
+                sorted(candidates_loads),
+            )
+
         worker_idx = self.route_strategy.route(
             request,
             candidates=list(candidates_loads.keys()),
@@ -1130,6 +1235,9 @@ class PSRL_RewardModelRouter:
         worker_idx = int(worker_idx)
         self.route_strategy.pop_request(request, worker_idx)
         self._request_to_strategy_instance.pop(request_key, None)
+        self._candidate_evaluation_inflight_requests.pop(request_key, None)
+        for request_uid in self._request_uid_values(request):
+            self._uid_to_inflight_instance.pop(request_uid, None)
         self._release_worker(worker_idx)
 
     def _set_result(self, request_key: str, result: DataProto | None):
@@ -1195,6 +1303,73 @@ class PSRL_RewardModelRouter:
         self._signal_routing_update()
 
     @ray.method(concurrency_group="control")
+    def mark_migration_requests(self, instance_to_uids: dict, migration_context: dict) -> None:
+        """Start distributed overhead tracking before selected requests are aborted."""
+        self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+
+    @ray.method(concurrency_group="control")
+    def prepare_request_migrations(self, request_migrations: list[dict]) -> dict:
+        """Validate sources and register destination intent without changing counts."""
+        instance_to_uids: dict[int, list[str]] = {}
+        accepted = 0
+        skipped = 0
+        skip_reasons: dict[str, int] = {}
+        skip_samples: dict[str, list[str]] = {}
+
+        def record_skip(reason: str, request_id: str) -> None:
+            nonlocal skipped
+            skipped += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            samples = skip_samples.setdefault(reason, [])
+            if len(samples) < 3:
+                samples.append(request_id)
+
+        for migration in request_migrations or []:
+            engine_request_id = str(migration.get("request_id", ""))
+            logical_request_uid = canonical_psrl_request_id(engine_request_id)
+            try:
+                source = int(migration["source_instance_id"])
+                destination = int(migration["destination_instance_id"])
+            except (KeyError, TypeError, ValueError):
+                record_skip("invalid_migration", engine_request_id)
+                continue
+            if not engine_request_id:
+                record_skip("invalid_request_id", engine_request_id)
+                continue
+            current_source = self._uid_to_inflight_instance.get(logical_request_uid)
+            if current_source is None:
+                record_skip("request_not_inflight", engine_request_id)
+                continue
+            if current_source != source:
+                record_skip("source_changed", engine_request_id)
+                continue
+            self._planned_migration_destinations[logical_request_uid] = destination
+            # Preserve the scheduler/vLLM ID for worker abort. The destination
+            # intent is consumed by logical UID when the partial request returns.
+            instance_to_uids.setdefault(source, []).append(engine_request_id)
+            accepted += 1
+        self._planned_migration_counters["accepted"] += accepted
+        self._planned_migration_counters["skipped"] += skipped
+        self._planned_migration_counters["planned"] += len(request_migrations or [])
+        psrl_logger.info(
+            "Prepared RM request migrations: planned=%d accepted=%d skipped=%d "
+            "skip_reasons=%s skip_samples=%s sources=%s",
+            len(request_migrations or []),
+            accepted,
+            skipped,
+            skip_reasons,
+            skip_samples,
+            sorted(instance_to_uids),
+        )
+        return {
+            "instance_to_uids": instance_to_uids,
+            "planned": len(request_migrations or []),
+            "accepted": accepted,
+            "skipped": skipped,
+            "skip_reasons": skip_reasons,
+        }
+
+    @ray.method(concurrency_group="control")
     def is_routing(self) -> bool:
         return self._is_routing
 
@@ -1238,6 +1413,116 @@ class PSRL_RewardModelRouter:
             time.monotonic() - t0,
         )
         return summary
+
+    @ray.method(concurrency_group="control")
+    async def get_candidate_evaluation_snapshot(self, top_t: int | None = None) -> dict:
+        """Return a compact, immutable-by-convention request/router snapshot."""
+        active_loads = await self._get_cached_active_loads()
+        total_pending = int(self._pending_count)
+        limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
+        leading = (
+            []
+            if limit == 0
+            else heapq.nsmallest(limit, self.requests_to_route, key=lambda item: item[:3])
+        )
+        pending_rows = [
+            {
+                "request_id": self._format_request_uids(item[4]),
+                "seq_len": self._request_token_num(item[4]),
+                "source_instance_id": None,
+                "is_waiting": True,
+                "route_order": route_order,
+                "routing_priority": list(item[:3]),
+            }
+            for route_order, item in enumerate(leading)
+        ]
+
+        request_by_uid: dict[str, DataProto] = {}
+        for request in self._candidate_evaluation_inflight_requests.values():
+            for request_uid in self._request_uid_values(request):
+                request_by_uid[request_uid] = request
+
+        instances: list[dict] = []
+        inflight_route_order = total_pending
+        for instance_id in sorted(self.request_counts):
+            engine_status = self.instance_to_engine_status.get(instance_id)
+            scheduler_stats = (
+                engine_status.snapshot.get("scheduler_stats", {})
+                if engine_status is not None
+                else {}
+            )
+            prompt_map = {
+                str(request_id): int(value)
+                for request_id, value in (
+                    scheduler_stats.get("req_id_to_prompt_token_num", {}) or {}
+                ).items()
+            }
+            response_map = {
+                str(request_id): int(value)
+                for request_id, value in (
+                    scheduler_stats.get("req_id_to_response_token_num", {}) or {}
+                ).items()
+            }
+            waiting_ids = {
+                str(request_id)
+                for request_id in scheduler_stats.get("req_id_in_waiting", []) or []
+            }
+            request_rows = []
+            for request_uid in sorted(set(prompt_map) | set(response_map)):
+                request = request_by_uid.get(canonical_psrl_request_id(request_uid))
+                buffer_id = self._extract_buffer_id(request) if request is not None else None
+                request_rows.append(
+                    {
+                        "request_id": request_uid,
+                        "seq_len": (
+                            self._request_token_num(request)
+                            if request is not None
+                            else prompt_map.get(request_uid, 0)
+                            + response_map.get(request_uid, 0)
+                        ),
+                        "source_instance_id": instance_id,
+                        "is_waiting": request_uid in waiting_ids,
+                        "route_order": inflight_route_order,
+                        "routing_priority": [
+                            1 if buffer_id is None else 0,
+                            0 if buffer_id is None else buffer_id,
+                            self._waiting_seq_counter + inflight_route_order,
+                        ],
+                    }
+                )
+                inflight_route_order += 1
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "is_awake": instance_id not in self.paused_worker_indices,
+                    "model_version": (
+                        int(engine_status.model_version) if engine_status is not None else 0
+                    ),
+                    "requests": request_rows,
+                    "route_request_count": max(
+                        self.request_counts.get(instance_id, 0),
+                        active_loads.get(instance_id, 0),
+                    ),
+                    "running_count": int(scheduler_stats.get("num_running_reqs", 0)),
+                    "waiting_count": int(scheduler_stats.get("num_waiting_reqs", 0)),
+                    "token_count": sum(prompt_map.values()) + sum(response_map.values()),
+                }
+            )
+        return {
+            "role": "RewardModel",
+            "strategy": (
+                "itl"
+                if isinstance(self.route_strategy, ITLBalanceRewardModelRouteStrategy)
+                else self.route_strategy.__class__.__name__
+            ),
+            "instances": instances,
+            "pending_requests": pending_rows,
+            "pending_total": total_pending,
+            "max_concurrent_requests": self.max_concurrent_requests_per_instance,
+            "waiting_admission_cap": self.waiting_admission_cap,
+            "itl_max_itl": self._itl_router_max_itl,
+            "migration_counters": dict(self._planned_migration_counters),
+        }
 
     @ray.method(concurrency_group="control")
     async def interrupt_routing(self):
@@ -1288,17 +1573,22 @@ class PSRL_RewardModelRouter:
 
     # ---- request introspection -----------------------------------------
     @staticmethod
-    def _format_request_uids(request: DataProto) -> str:
+    def _request_uid_values(request: DataProto) -> list[str]:
         uid_value = request.non_tensor_batch.get("uid")
         if uid_value is None:
-            return "unknown"
+            return []
         if hasattr(uid_value, "tolist"):
             uid_value = uid_value.tolist()
         if isinstance(uid_value, (list, tuple)):
-            if len(uid_value) == 1:
-                return str(uid_value[0])
-            return ",".join(str(u) for u in uid_value)
-        return str(uid_value)
+            return [str(uid) for uid in uid_value]
+        return [str(uid_value)]
+
+    @staticmethod
+    def _format_request_uids(request: DataProto) -> str:
+        uid_values = PSRL_RewardModelRouter._request_uid_values(request)
+        if not uid_values:
+            return "unknown"
+        return ",".join(uid_values)
 
     @staticmethod
     def _extract_buffer_id(request: DataProto) -> int | None:

@@ -1,5 +1,7 @@
 import logging
 import os
+import socket
+import time
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
@@ -13,6 +15,12 @@ from vllm_patches.core import min_vllm_version, vLLMPatch
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+_ORIGINAL_WORKER_LOAD_MODEL = Worker.load_model
+
+
+def _should_restore_sleep_buffers(tags: list[str] | None) -> bool:
+    return tags is None or "kv_cache" in tags
+
 
 @min_vllm_version("0.18.1")
 class TMSWorkerPatch(vLLMPatch[Worker]):
@@ -23,53 +31,124 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
     Compatible with vLLM 0.18.1+
     """
 
+    def load_model(self) -> None:
+        _ORIGINAL_WORKER_LOAD_MODEL(self)
+        from vllm_patches.patches.weight_arena import finalize_pending_weight_arena
+
+        finalize_pending_weight_arena(self.model_runner)
+
+    def log_tms_timing(self, operation: str, stage: str, elapsed_s: float, tag: str | None = None) -> None:
+        timing = getattr(self, "_psrl_current_tms_timing", None)
+        if timing is not None and timing.get("operation") == operation:
+            timing["stages"].append(
+                {
+                    "stage": stage,
+                    "tag": tag or "none",
+                    "elapsed_s": elapsed_s,
+                }
+            )
+            if stage == "total":
+                setattr(self, f"_psrl_last_{operation}_timing", timing)
+        psrl_logger.warning(
+            "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker operation=%s stage=%s tag=%s "
+            "host=%s rank=%s local_rank=%s pid=%s elapsed_s=%.6f",
+            operation,
+            stage,
+            tag or "none",
+            socket.gethostname(),
+            self.rank,
+            self.local_rank,
+            os.getpid(),
+            elapsed_s,
+        )
+
     def sleep(self, level: int = 1) -> None:
         """Put the worker into sleep mode to free up GPU memory."""
         from torch_memory_saver import torch_memory_saver
 
+        total_start = time.perf_counter()
+        self._psrl_current_tms_timing = {"operation": "sleep", "stages": []}
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
         if level == 2:
+            stage_start = time.perf_counter()
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+            self.log_tms_timing("sleep", "save_buffers", time.perf_counter() - stage_start)
 
         if level == 1:
             raise NotImplementedError(
                 "Level 1 sleep is not implemented for TMS because we always need to save kv cache."
             )
         else:
+            stage_start = time.perf_counter()
             torch_memory_saver.pause("weights")
+            self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="weights")
+            stage_start = time.perf_counter()
             torch_memory_saver.pause("kv_cache")
+            self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="kv_cache")
             if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
+                stage_start = time.perf_counter()
                 torch_memory_saver.pause("graph")
+                self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="graph")
 
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
+        device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        gib = 1024**3
         psrl_logger.info(
-            "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
-            format_gib(freed_bytes),
-            format_gib(used_bytes),
+            "[VLLM_SLEEP_MEMORY] stage=worker_after_sleep host=%s rank=%s local_rank=%s "
+            "pid=%s device=cuda:%s gpu_uuid=%s gpu_name=%s freed=%.2f GB "
+            "torch_allocated=%.2f GB torch_reserved=%.2f GB "
+            "device_used=%.2f GB device_free=%.2f GB device_total=%.2f GB",
+            socket.gethostname(),
+            self.rank,
+            self.local_rank,
+            os.getpid(),
+            device,
+            str(getattr(properties, "uuid", "unknown")),
+            properties.name,
+            freed_bytes / gib,
+            torch.cuda.memory_allocated(device) / gib,
+            torch.cuda.memory_reserved(device) / gib,
+            used_bytes / gib,
+            free_bytes_after_sleep / gib,
+            total / gib,
         )
+        self.log_tms_timing("sleep", "total", time.perf_counter() - total_start)
+        # psrl_logger.info(
+        #     "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
+        #     format_gib(freed_bytes),
+        #     format_gib(used_bytes),
+        # )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up from sleep mode and restore memory."""
         from torch_memory_saver import torch_memory_saver
 
+        total_start = time.perf_counter()
+        self._psrl_current_tms_timing = {"operation": "wake", "stages": []}
         free_bytes_before_wake_up = torch.cuda.mem_get_info()[0]
 
         for tag in tags:
+            stage_start = time.perf_counter()
             torch_memory_saver.resume(tag)
+            self.log_tms_timing("wake", "resume", time.perf_counter() - stage_start, tag=tag)
 
         # Restore the buffers after level 2 sleep
-        if len(self._sleep_saved_buffers):
+        if _should_restore_sleep_buffers(tags) and len(self._sleep_saved_buffers):
+            stage_start = time.perf_counter()
             model = self.model_runner.model
             for name, buffer in model.named_buffers():
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            torch.cuda.synchronize()
             self._sleep_saved_buffers = {}
+            self.log_tms_timing("wake", "restore_buffers", time.perf_counter() - stage_start)
 
         # If the KV cache has just been woken up,
         # the internal state of cache_engine must be reset,
@@ -90,6 +169,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             format_gib(increased_bytes),
             format_gib(used_bytes),
         )
+        self.log_tms_timing("wake", "total", time.perf_counter() - total_start)
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         """Get the memory pool context manager if sleep mode is enabled."""

@@ -10,14 +10,20 @@ from tensordict import TensorDict
 from verl import DataProto
 from vllm.sampling_params import RequestOutputKind
 
+from psrl.utils.elastic_rm.candidate_routing import resolve_candidate_model_versions
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
+from psrl.utils.elastic_rm.overhead import RequestMigrationOverheadTracker
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.utils.rollout.request_id import canonical_psrl_request_id
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.request_queue import (
     MultiPriorityRequestQueue,
     PriorityRequestQueue,
     RequestSortIndicator,
+    get_priority_by_version,
+    get_priority_by_version_and_id,
+    get_priority_by_version_and_token_num,
 )
 from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase,
@@ -117,6 +123,20 @@ class RolloutRouter:
         self._instance_transitions = InstanceTransitionTracker()
         # Track requests in sticky session: {request_id: bool}
         self.sticky_session_requests = {}
+        self._migration_overhead = RequestMigrationOverheadTracker()
+        # Compact metadata retained while a request is dispatched. It is used
+        # only to build read-only candidate-evaluation snapshots.
+        self._candidate_evaluation_inflight_requests: dict[str, DataProto] = {}
+        # request id -> planned destination. Counters are changed only when the
+        # interrupted request actually returns to the normal dispatch path.
+        self._planned_migration_destinations: dict[str, int] = {}
+        self._planned_migration_counters = {
+            "planned": 0,
+            "accepted": 0,
+            "skipped": 0,
+            "forced": 0,
+            "fallback": 0,
+        }
 
         # Build logger
         self.log_prefix = "RolloutRouter"
@@ -306,6 +326,88 @@ class RolloutRouter:
         for instance_id in instance_ids:
             self.currently_paused_instance_ids.discard(instance_id)
 
+    @ray.method(concurrency_group="control")
+    def mark_migration_requests(self, instance_to_uids: dict, migration_context: dict) -> None:
+        """Start distributed overhead tracking before selected requests are aborted."""
+        self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+
+    @ray.method(concurrency_group="control")
+    def prepare_request_migrations(self, request_migrations: list[dict]) -> dict:
+        """Validate planned sources and register destination intent without counters."""
+        instance_to_uids: dict[int, list[str]] = {}
+        accepted = 0
+        skipped = 0
+        skip_reasons: dict[str, int] = {}
+        skip_samples: dict[str, list[str]] = {}
+        source_by_uid = {
+            str(request_id): int(instance_id)
+            for request_id, instance_id in self.incomplete_request_to_instance.items()
+        }
+        future_by_uid = {
+            str(request_id): request_future
+            for request_id, request_future in self.request_futures.items()
+        }
+
+        def record_skip(reason: str, request_id: str) -> None:
+            nonlocal skipped
+            skipped += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            samples = skip_samples.setdefault(reason, [])
+            if len(samples) < 3:
+                samples.append(request_id)
+
+        for migration in request_migrations or []:
+            engine_request_id = str(migration.get("request_id", ""))
+            logical_request_id = canonical_psrl_request_id(engine_request_id)
+            try:
+                source = int(migration["source_instance_id"])
+                destination = int(migration["destination_instance_id"])
+            except (KeyError, TypeError, ValueError):
+                record_skip("invalid_migration", engine_request_id)
+                continue
+            if not engine_request_id:
+                record_skip("invalid_request_id", engine_request_id)
+                continue
+            current_source = source_by_uid.get(logical_request_id)
+            future = future_by_uid.get(logical_request_id)
+            if future is None:
+                record_skip("request_missing", engine_request_id)
+                continue
+            if future.done():
+                record_skip("request_completed", engine_request_id)
+                continue
+            if current_source is None:
+                record_skip("request_not_inflight", engine_request_id)
+                continue
+            if current_source != source:
+                record_skip("source_changed", engine_request_id)
+                continue
+            self._planned_migration_destinations[logical_request_id] = destination
+            # Workers abort by scheduler/vLLM ID, while the router consumes the
+            # destination intent later by logical UID after the request returns.
+            instance_to_uids.setdefault(source, []).append(engine_request_id)
+            accepted += 1
+        self._planned_migration_counters["accepted"] += accepted
+        self._planned_migration_counters["skipped"] += skipped
+        self._planned_migration_counters["planned"] += len(request_migrations or [])
+        psrl_logger.info(
+            "Prepared rollout request migrations: planned=%d accepted=%d skipped=%d "
+            "skip_reasons=%s skip_samples=%s sources=%s",
+            len(request_migrations or []),
+            accepted,
+            skipped,
+            skip_reasons,
+            skip_samples,
+            sorted(instance_to_uids),
+        )
+        return {
+            "instance_to_uids": instance_to_uids,
+            "planned": len(request_migrations or []),
+            "accepted": accepted,
+            "skipped": skipped,
+            "skip_reasons": skip_reasons,
+        }
+
     async def _choose_new_rollout_instance(self, request: DataProto) -> int:
         """Select the best rollout instance for handling the generation request.
 
@@ -412,7 +514,12 @@ class RolloutRouter:
                 )
                 candidates = [group_instance]
 
-        async def _route_with_candidates(route_candidates: list[int], route_reason: str) -> int | None:
+        async def _route_with_candidates(
+            route_candidates: list[int],
+            route_reason: str,
+            *,
+            force_destination: bool = False,
+        ) -> int | None:
             # Filter the rollout instances that can reserve the request for the
             # current instance model version. This is only used when the needed
             # model version is -1 (i.e. new request).
@@ -470,7 +577,17 @@ class RolloutRouter:
                 )
 
             route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
-            chosen = self.route_strategy.route(request, candidates=route_candidates, route_kwargs=route_kwargs)
+            if force_destination and len(route_candidates) == 1 and hasattr(
+                self.route_strategy,
+                "force_route",
+            ):
+                chosen = self.route_strategy.force_route(request, route_candidates[0])
+            else:
+                chosen = self.route_strategy.route(
+                    request,
+                    candidates=route_candidates,
+                    route_kwargs=route_kwargs,
+                )
             if chosen is None:
                 psrl_logger.debug(
                     "No rollout instance selected for request %s with %s candidates=%s.",
@@ -480,8 +597,39 @@ class RolloutRouter:
                 )
             return chosen
 
-        # 4-6. Strategy-based routing.
-        chosen_rollout_instance = await _route_with_candidates(candidates, "primary")
+        # 4-6. A prepared migration may force one destination, but only while it
+        # remains version/reserve/capacity compatible. Invalid intents are
+        # cleared immediately and normal strategy selection proceeds.
+        migration_key = str(request_id)
+        planned_destination = self._planned_migration_destinations.get(migration_key)
+        chosen_rollout_instance = None
+        if planned_destination is not None:
+            if int(planned_destination) in fallback_candidates:
+                chosen_rollout_instance = await _route_with_candidates(
+                    [int(planned_destination)],
+                    "planned_migration",
+                    force_destination=True,
+                )
+            self._planned_migration_destinations.pop(migration_key, None)
+            if chosen_rollout_instance is None:
+                self._planned_migration_counters["fallback"] += 1
+                psrl_logger.info(
+                    "Planned rollout migration target invalid; request=%s destination=%s "
+                    "fallback_candidates=%s. Falling back immediately.",
+                    request_id,
+                    planned_destination,
+                    fallback_candidates,
+                )
+            else:
+                self._planned_migration_counters["forced"] += 1
+                psrl_logger.info(
+                    "Forced planned rollout migration: request=%s destination=%s",
+                    request_id,
+                    chosen_rollout_instance,
+                )
+
+        if chosen_rollout_instance is None:
+            chosen_rollout_instance = await _route_with_candidates(candidates, "primary")
         if (
             chosen_rollout_instance is None
             and binding_reasons
@@ -739,6 +887,305 @@ class RolloutRouter:
         )
         return summary
 
+    @staticmethod
+    def _candidate_evaluation_scalar(value):
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
+
+    def _candidate_evaluation_queue_priority(self, request: DataProto):
+        indicator = RequestSortIndicator(
+            self.config.psrl.routing_strategy.request_sort_indicator
+        )
+        if indicator == RequestSortIndicator.SHORT_LENGTH:
+            request_priority = get_priority_by_version_and_token_num(
+                request,
+                self.staleness,
+                True,
+            )
+        elif indicator == RequestSortIndicator.LONG_LENGTH:
+            request_priority = get_priority_by_version_and_token_num(
+                request,
+                self.staleness,
+                False,
+            )
+        else:
+            request_priority = get_priority_by_version_and_id(
+                request,
+                self.staleness,
+            )
+        if isinstance(self.requests_to_route, MultiPriorityRequestQueue):
+            return (
+                get_priority_by_version(request, self.staleness),
+                request_priority,
+            )
+        return (request_priority,)
+
+    async def _candidate_evaluation_request_row(
+        self,
+        request: DataProto,
+        *,
+        route_order: int,
+        source_instance_id: int | None,
+        is_waiting: bool,
+        candidate_instance_versions: dict[int, int],
+        evaluation_request_id: str | None = None,
+    ) -> dict:
+        non_tensor_batch = getattr(request, "non_tensor_batch", {}) or {}
+        request_id = self._candidate_evaluation_scalar(non_tensor_batch.get("uid", ""))
+        needed_version = int(
+            self._candidate_evaluation_scalar(non_tensor_batch.get("version_tag", -1))
+        )
+        is_validate = bool(getattr(request, "meta_info", {}).get("validate", False))
+        if self.config.psrl.fuse_rollout_with_validate:
+            available_ids = list(range(self.rollout_wg_size))
+        elif is_validate:
+            available_ids = list(
+                range(
+                    self.rollout_wg_size - self.n_validate_instances,
+                    self.rollout_wg_size,
+                )
+            )
+        else:
+            available_ids = list(range(self.rollout_wg_size - self.n_validate_instances))
+        fallback_ids = [
+            instance_id
+            for instance_id in available_ids
+            if candidate_instance_versions.get(instance_id, -1) >= needed_version
+        ]
+        if needed_version == -1 and fallback_ids:
+            versions = sorted(
+                {candidate_instance_versions[instance_id] for instance_id in fallback_ids}
+            )
+            can_reserve = await self.ps_manager_handle.can_reserve_request.remote(
+                request_id,
+                versions,
+                is_validate=is_validate,
+            )
+            allowed_versions = {
+                version for version, allowed in zip(versions, can_reserve, strict=True) if allowed
+            }
+            fallback_ids = [
+                instance_id
+                for instance_id in fallback_ids
+                if candidate_instance_versions[instance_id] in allowed_versions
+            ]
+
+        eligible_ids = list(fallback_ids)
+        old_instance = self._candidate_evaluation_scalar(
+            non_tensor_batch.get("rollout_instance_id")
+        )
+        if old_instance is not None:
+            old_instance = int(old_instance)
+            if (
+                not self.config.psrl.sync_and_mig_strategy.mig.enable
+                or self.sticky_session_requests.get(request_id, False)
+            ) and old_instance in eligible_ids:
+                eligible_ids = [old_instance]
+
+        priority_by_id: dict[int, object] = {}
+        priority_ids = list(fallback_ids)
+        if priority_ids:
+            if self.config.psrl.routing_strategy.candidate_sort_indicator == "version":
+                for instance_id in priority_ids:
+                    version = candidate_instance_versions[instance_id]
+                    priority_by_id[instance_id] = -version if needed_version == -1 else version
+            else:
+                versions = sorted(
+                    {candidate_instance_versions[instance_id] for instance_id in priority_ids}
+                )
+                reserve_indicators = await self.ps_manager_handle.get_reserve_indicator.remote(
+                    request_id,
+                    versions,
+                    is_validate=is_validate,
+                )
+                indicator_by_version = dict(zip(versions, reserve_indicators, strict=True))
+                for instance_id in priority_ids:
+                    version = candidate_instance_versions[instance_id]
+                    version_indicator = -version if needed_version == -1 else version
+                    reserve_indicator = self._candidate_evaluation_scalar(
+                        indicator_by_version[version]
+                    )
+                    priority_by_id[instance_id] = (reserve_indicator, version_indicator)
+
+        return {
+            "request_id": str(request_id if evaluation_request_id is None else evaluation_request_id),
+            "seq_len": self._request_token_num(request),
+            "source_instance_id": source_instance_id,
+            "is_waiting": bool(is_waiting),
+            "route_order": int(route_order),
+            "routing_priority": self._candidate_evaluation_queue_priority(request),
+            "eligible_instance_ids": eligible_ids,
+            "fallback_instance_ids": fallback_ids,
+            "candidate_priorities": [
+                [instance_id, priority_by_id.get(instance_id, 0)]
+                for instance_id in priority_ids
+            ],
+        }
+
+    @ray.method(concurrency_group="monitor")
+    async def get_candidate_evaluation_snapshot(self, top_t: int | None = None) -> dict:
+        """Return a compact, read-only snapshot for request-level simulation."""
+        if not hasattr(self, "route_strategy"):
+            raise RuntimeError("rollout route strategy is not initialized")
+        current_ps_model_version = int(
+            await self.ps_manager_handle.get_ps_model_version.remote(
+                debug_info="candidate_evaluation_snapshot"
+            )
+        )
+        paused_instance_ids = frozenset(
+            int(instance_id) for instance_id in self.currently_paused_instance_ids
+        )
+        candidate_instance_versions = resolve_candidate_model_versions(
+            self.instance_to_version_after_sync,
+            paused_instance_ids,
+            current_ps_model_version,
+        )
+        total_pending = int(self.requests_to_route.size())
+        limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
+        pending_requests = list(self._iter_pending_requests_in_route_order(limit))
+        pending_rows = await asyncio.gather(
+            *(
+                self._candidate_evaluation_request_row(
+                    request,
+                    route_order=index,
+                    source_instance_id=None,
+                    is_waiting=True,
+                    candidate_instance_versions=candidate_instance_versions,
+                )
+                for index, request in enumerate(pending_requests)
+            )
+        )
+
+        instances: list[dict] = []
+        inflight_route_order = total_pending
+        for instance_id in range(self.rollout_wg_size):
+            engine_status = self.route_strategy.instance_to_engine_status.get(instance_id)
+            scheduler_stats = (
+                engine_status.snapshot.get("scheduler_stats", {})
+                if engine_status is not None
+                else {}
+            )
+            prompt_map = {
+                str(request_id): int(value)
+                for request_id, value in (
+                    scheduler_stats.get("req_id_to_prompt_token_num", {}) or {}
+                ).items()
+            }
+            response_map = {
+                str(request_id): int(value)
+                for request_id, value in (
+                    scheduler_stats.get("req_id_to_response_token_num", {}) or {}
+                ).items()
+            }
+            waiting_ids = {
+                str(request_id)
+                for request_id in scheduler_stats.get("req_id_in_waiting", []) or []
+            }
+            request_ids = sorted(
+                {str(request_id) for request_id in prompt_map}
+                | {str(request_id) for request_id in response_map}
+            )
+            request_rows: list[dict] = []
+            for request_key in request_ids:
+                logical_request_id = canonical_psrl_request_id(request_key)
+                inflight_request = self._candidate_evaluation_inflight_requests.get(logical_request_id)
+                if inflight_request is None:
+                    request_rows.append(
+                        {
+                            "request_id": request_key,
+                            "seq_len": int(prompt_map.get(request_key, 0))
+                            + int(response_map.get(request_key, 0)),
+                            "source_instance_id": instance_id,
+                            "is_waiting": request_key in waiting_ids,
+                            "route_order": inflight_route_order,
+                        }
+                    )
+                else:
+                    request_rows.append(
+                        await self._candidate_evaluation_request_row(
+                            inflight_request,
+                            route_order=inflight_route_order,
+                            source_instance_id=instance_id,
+                            is_waiting=request_key in waiting_ids,
+                            candidate_instance_versions=candidate_instance_versions,
+                            evaluation_request_id=request_key,
+                        )
+                    )
+                inflight_route_order += 1
+            tp_pp = getattr(self.route_strategy, "instance_to_tp_pp", {}).get(instance_id)
+            route_model = getattr(self.route_strategy, "cost_model", {}).get(tp_pp, {})
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "is_awake": instance_id not in paused_instance_ids,
+                    "model_version": self.instance_to_version_after_sync.get(instance_id, 0),
+                    "candidate_model_version": candidate_instance_versions.get(instance_id, 0),
+                    "requests": request_rows,
+                    "route_request_count": getattr(
+                        self.route_strategy,
+                        "instance_to_request_num",
+                        {},
+                    ).get(instance_id, len(request_rows)),
+                    "running_count": getattr(
+                        self.route_strategy,
+                        "instance_to_running_request_num",
+                        {},
+                    ).get(instance_id, scheduler_stats.get("num_running_reqs", 0)),
+                    "waiting_count": getattr(
+                        self.route_strategy,
+                        "instance_to_waiting_request_num",
+                        {},
+                    ).get(instance_id, scheduler_stats.get("num_waiting_reqs", 0)),
+                    "token_count": getattr(
+                        self.route_strategy,
+                        "instance_to_token_num",
+                        {},
+                    ).get(
+                        instance_id,
+                        sum(prompt_map.values()) + sum(response_map.values()),
+                    ),
+                    "max_model_len": getattr(
+                        self.route_strategy,
+                        "instance_to_max_model_len",
+                        {},
+                    ).get(instance_id, 2**63 - 1),
+                    "route_cost_params": [
+                        route_model.get("other_threshold", 0.0),
+                        route_model.get("other_latency_b", 0.0),
+                        route_model.get("other_latency_k", 1.0),
+                        route_model.get("attn_latency_b", 0.0),
+                        route_model.get("attn_latency_k", 0.0),
+                    ],
+                }
+            )
+        return {
+            "role": "Rollout",
+            "strategy": (
+                "throughput_optimal"
+                if self.route_strategy.__class__.__name__
+                == "ThroughputOptimalRouteStrategy"
+                else self.route_strategy.__class__.__name__.lower()
+            ),
+            "instances": instances,
+            "pending_requests": pending_rows,
+            "pending_total": total_pending,
+            "current_ps_model_version": current_ps_model_version,
+            "max_concurrent_requests": getattr(
+                self.route_strategy,
+                "max_concurrent_seqs_per_instance",
+                None,
+            ),
+            "delta_throughput_threshold": getattr(
+                self.route_strategy,
+                "delta_throughput_threshold",
+                0.0,
+            ),
+            "migration_counters": dict(self._planned_migration_counters),
+        }
+
     def _iter_pending_requests_in_route_order(self, limit: int):
         """Yield pending requests in the same priority order used by routing."""
         if limit <= 0:
@@ -947,6 +1394,8 @@ class RolloutRouter:
         # )
 
         if update_status_success[0]:
+            self._migration_overhead.mark_dispatched(request_id, new_instance_id)
+            self._candidate_evaluation_inflight_requests[str(request_id)] = request
             # Change engine status
             self.route_strategy.push_request(request, new_instance_id)
             # Add request to inflight request ids for the instance
@@ -977,9 +1426,31 @@ class RolloutRouter:
             consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async(
                 "generate_async", request, sampling_params
             )
+            migration_overhead = self._migration_overhead.complete(request_id, consolidated_output)
+            if migration_overhead is not None:
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=post_scale_up_rebalance "
+                    "scope=post_scale_up_rebalance migration_id=%s decision_id=%s "
+                    "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
+                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f reprefill_s=%.6f "
+                    "migration_s=%.6f network_scope=abort_to_redispatch "
+                    "reprefill_scope=vllm_scheduled_to_first_token",
+                    migration_overhead.get("migration_id"),
+                    migration_overhead.get("decision_id"),
+                    request_id,
+                    migration_overhead.get("source_instance_id"),
+                    migration_overhead.get("destination_instance_id"),
+                    migration_overhead.get("selected_count"),
+                    migration_overhead["planner_s"],
+                    migration_overhead["planner_share_s"],
+                    migration_overhead["network_s"],
+                    migration_overhead["reprefill_s"],
+                    migration_overhead["migration_s"],
+                )
 
             # Change engine status
             self.route_strategy.pop_request(request, new_instance_id)
+            self._candidate_evaluation_inflight_requests.pop(str(request_id), None)
             # Remove request from inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
 
@@ -992,6 +1463,7 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self._migration_overhead.mark_requeued(request_id)
                 self.requests_to_route.put(consolidated_output)
                 self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
@@ -1004,11 +1476,13 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self._migration_overhead.mark_requeued(request_id)
                 self.requests_to_route.put(consolidated_output)
                 self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
                 return
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
+                self._planned_migration_destinations.pop(str(request_id), None)
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
                 parent_prompt_id = request_id // rollout_n
                 psrl_logger.debug(
@@ -1021,12 +1495,14 @@ class RolloutRouter:
             else:
                 # Means the request is aborted
                 assert update_status is None, "The update status should be None if the request is aborted"
+                self._planned_migration_destinations.pop(str(request_id), None)
                 # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is aborted")
                 result = None
                 self._track_transition_request_resolved(request_id)
         else:
             # Means the request is aborted
             # psrl_logger.info(f"Request {request_id} is aborted")
+            self._planned_migration_destinations.pop(str(request_id), None)
             result = None
 
         # Set the result for the request

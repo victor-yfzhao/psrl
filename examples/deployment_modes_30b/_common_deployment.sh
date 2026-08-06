@@ -101,7 +101,8 @@ launch_deployment_mode() {
 
     project_name='verl_deployment_modes'
     MODEL_NAME='Qwen2.5-32B'
-    RM_MODEL_NAME='DeepSeek-R1-Distill-Qwen-32B'
+    # RM_MODEL_NAME='DeepSeek-R1-Distill-Qwen-32B'
+    RM_MODEL_NAME='Qwen3-30B-A3B-Thinking-2507'
     experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
 
     source ${PSRL_WORKSPACE}/env/env_311.sh

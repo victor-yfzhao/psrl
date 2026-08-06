@@ -22,23 +22,23 @@ source "${SCRIPT_DIR}/_common_deployment.sh"
 # Fixed extra replicas woken on train_pool while the trainer is idle.
 # Rollout idle bundles are allocated first, then rm (disjoint). Default 4+4
 # fills an 8-GPU train_pool; override via IDLE_ROLLOUT_INSTANCES / IDLE_RM_INSTANCES.
-IDLE_ROLLOUT_INSTANCES=${IDLE_ROLLOUT_INSTANCES:-8}
-IDLE_RM_INSTANCES=${IDLE_RM_INSTANCES:-8}
+IDLE_ROLLOUT_INSTANCES=${IDLE_ROLLOUT_INSTANCES:-4}
+IDLE_RM_INSTANCES=${IDLE_RM_INSTANCES:-4}
 
 export PSRL_DEPLOY_MODE=trainer_pool_only
-export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_8_rm_8_trainer_pool_only_rollout7b_rm8b
+export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_2_rm_6_trainer_pool_only
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 # Mode 4 is a disaggregated concurrent pipeline (like mode 1) PLUS fixed idle
 # replicas on train_pool. 
 # With sync reward the rollout worker would block on the rm per request and the
 # "running concurrently" intent would be lost.
 export PSRL_DEPLOY_RM_ASYNC=False
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=2
+export PSRL_DEPLOY_NNODES=2
+export PSRL_DEPLOY_TRAIN_NNODES=1
 export PSRL_DEPLOY_TRAIN_NGPUS=8
 export PSRL_DEPLOY_SHARED_NNODES=1
-export PSRL_DEPLOY_SHARED_NGPUS=8
-export PSRL_DEPLOY_RM_NUM_REPLICAS=8
+export PSRL_DEPLOY_SHARED_NGPUS=2
+export PSRL_DEPLOY_RM_NUM_REPLICAS=6
 export PSRL_DEPLOY_SMOKE=${1:-0}
 shift || true
 

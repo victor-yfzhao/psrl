@@ -192,6 +192,28 @@ class PSRL_vLLMRollout:
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        weight_arena_config = psrl_config.nixl.get("weight_arena", {})
+        if OmegaConf.is_config(weight_arena_config):
+            weight_arena_config = OmegaConf.to_container(weight_arena_config, resolve=True)
+        else:
+            weight_arena_config = dict(weight_arena_config)
+        arena_role = "reward" if self.is_reward_model else "rollout"
+        arena_enabled_key = f"{arena_role}_enabled"
+        arena_materialization_key = f"{arena_role}_materialization"
+        direct_arena = weight_arena_config.get(
+            arena_enabled_key, False
+        ) and weight_arena_config.get(arena_materialization_key, "direct") == "direct"
+        if direct_arena:
+            if load_format != "dummy":
+                raise RuntimeError(
+                    f"Direct {arena_role} weight arena requires the dummy/empty initialization path, "
+                    f"got load_format={load_format!r}."
+                )
+            if model_config.lora_rank > 0:
+                raise RuntimeError(f"Direct {arena_role} weight arena does not support LoRA.")
+            if getattr(config, "quantization", None) is not None or engine_kwargs.get("quantization") is not None:
+                raise RuntimeError(f"Direct {arena_role} weight arena currently supports unquantized models only.")
+            load_format = "psrl_arena_dummy"
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -283,6 +305,8 @@ class PSRL_vLLMRollout:
             "max_num_waiting_reqs_after_preemption": max_num_waiting_reqs_after_preemption,
             "max_model_len_used_in_estimation": max_model_len
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
+            "psrl_nixl_weight_arena": weight_arena_config,
+            "psrl_role": "reward" if self.is_reward_model else "rollout",
         }
         psrl_logger.info(
             "vLLM scheduler config: role=%s use_psrl_scheduler=%s scheduler_cls=%s "

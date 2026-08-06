@@ -1,5 +1,7 @@
+import gc
 import logging
 import os
+import socket
 import time
 from contextlib import nullcontext
 from copy import copy, deepcopy
@@ -20,6 +22,7 @@ from verl.utils.device import get_device_id
 # from vllm.config import get_current_vllm_config
 # from vllm.platforms import current_platform
 from verl.utils.fs import copy_to_local
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.model_executor.model_loader import get_model_loader
@@ -114,6 +117,11 @@ class vLLMWorkerExtension:
                 cache.append((name, tensor.detach().cpu().clone()))
 
             self._psrl_cpu_weight_cache = cache
+            self._psrl_reward_weight_cache_state = {
+                "ready": True,
+                "source": "checkpoint",
+                "checkpoint_tensor_count": len(cache),
+            }
             psrl_logger.info("Preloaded %d reward model tensors to CPU cache.", len(cache))
             return len(cache)
         except Exception as e:
@@ -123,23 +131,145 @@ class vLLMWorkerExtension:
         """
         Load reward-model weights from the worker-local CPU cache to GPU.
         """
+        total_start = time.perf_counter()
+        gpu_copy_elapsed_s = 0.0
+        empty_cache_elapsed_s = 0.0
+        arena_snapshot_elapsed_s = 0.0
+        cache_release_elapsed_s = 0.0
+        arena_restore_bytes = 0
+        cache_source = "checkpoint"
+        cache_transitioned = False
+        model_validation_elapsed_s = 0.0
+        arena_handle = getattr(self.model_runner, "_psrl_weight_arena_handle", None)
+        arena_cache = getattr(self, "_psrl_weight_arena_cpu_cache", None)
         try:
-            if not hasattr(self, "_psrl_cpu_weight_cache"):
-                raise RuntimeError("CPU weight cache is not initialized.")
+            model = self.model_runner.get_model()
+            cache_state = getattr(self, "_psrl_reward_weight_cache_state", None)
+            if arena_handle is not None:
+                validation_start = time.perf_counter()
+                arena_handle.assert_module_weights_in_arena(model)
+                model_validation_elapsed_s += time.perf_counter() - validation_start
 
-            current_device = torch.cuda.current_device()
+            if arena_cache is not None:
+                if arena_handle is None:
+                    raise RuntimeError("Reward arena CPU cache exists without a weight arena handle.")
+                if cache_state is None or not cache_state.get("ready") or cache_state.get("source") != "arena":
+                    raise RuntimeError(f"Reward arena CPU cache has invalid state: {cache_state!r}.")
+                from psrl.utils.weight_arena import restore_weight_arena_from_cpu
 
-            def cached_weights_generator():
-                for name, tensor in self._psrl_cpu_weight_cache:
-                    yield (name, tensor.to(current_device, non_blocking=True))
-
-            torch.cuda.synchronize()
-            with self._maybe_tms_weights_region():
-                loaded_params = self.model_runner.model.load_weights(weights=cached_weights_generator())
-            if blocking:
+                cache_source = "arena"
                 torch.cuda.synchronize()
+                gpu_copy_start = time.perf_counter()
+                arena_restore_bytes = restore_weight_arena_from_cpu(arena_handle, arena_cache)
+                gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
+                validation_start = time.perf_counter()
+                arena_handle.assert_module_weights_in_arena(model)
+                model_validation_elapsed_s += time.perf_counter() - validation_start
+                loaded_params = {"__psrl_weight_arena_restore__"}
+            else:
+                if not hasattr(self, "_psrl_cpu_weight_cache"):
+                    raise RuntimeError("CPU weight cache is not initialized.")
+                if cache_state is None or not cache_state.get("ready") or cache_state.get("source") != "checkpoint":
+                    raise RuntimeError(f"Reward checkpoint CPU cache has invalid state: {cache_state!r}.")
+                if arena_handle is not None and not blocking:
+                    raise RuntimeError("Reward arena snapshot requires blocking=True.")
+
+                current_device = torch.cuda.current_device()
+
+                def cached_weights_generator():
+                    for name, tensor in self._psrl_cpu_weight_cache:
+                        yield (name, tensor.to(current_device, non_blocking=True))
+
+                torch.cuda.synchronize()
+                gpu_copy_start = time.perf_counter()
+                with self._maybe_tms_weights_region():
+                    loaded_params = model.load_weights(weights=cached_weights_generator())
+                if loaded_params is None:
+                    raise RuntimeError("Reward checkpoint loader returned no load result.")
+                if blocking:
+                    torch.cuda.synchronize()
+                    gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
+                    if arena_handle is not None:
+                        validation_start = time.perf_counter()
+                        arena_handle.assert_module_weights_in_arena(model)
+                        model_validation_elapsed_s += time.perf_counter() - validation_start
+                    # Release checkpoint-layout CPU-to-GPU staging tensors before
+                    # taking the persistent arena snapshot.
+                    empty_cache_start = time.perf_counter()
+                    aggressive_empty_cache(force_sync=True)
+                    empty_cache_elapsed_s = time.perf_counter() - empty_cache_start
+
+                if arena_handle is not None:
+                    from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
+
+                    arena_config = (self.model_runner.vllm_config.additional_config or {}).get(
+                        "psrl_nixl_weight_arena", {}
+                    )
+                    pin_memory = bool(arena_config.get("reward_cpu_cache_pin_memory", False))
+                    snapshot_start = time.perf_counter()
+                    self._psrl_weight_arena_cpu_cache = snapshot_weight_arena_to_cpu(
+                        arena_handle,
+                        pin_memory=pin_memory,
+                    )
+                    arena_snapshot_elapsed_s = time.perf_counter() - snapshot_start
+                    arena_bytes = sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in self._psrl_weight_arena_cpu_cache
+                    )
+                    self._psrl_reward_weight_cache_state = {
+                        "ready": True,
+                        "source": "arena",
+                        "arena_count": len(self._psrl_weight_arena_cpu_cache),
+                        "arena_bytes": arena_bytes,
+                        "pin_memory": pin_memory,
+                    }
+                    cache_transitioned = True
+                    release_start = time.perf_counter()
+                    del self._psrl_cpu_weight_cache
+                    gc.collect()
+                    cache_release_elapsed_s = time.perf_counter() - release_start
         except Exception as e:
             raise ValueError(f"Error in vLLMWorkerExtension.load_weights_from_cpu_cache: {e}") from e
+        elapsed_s = time.perf_counter() - total_start
+        arena_count = len(arena_handle.arenas) if arena_handle is not None else 0
+        arena_bytes = sum(arena.numel() * arena.element_size() for arena in arena_handle.arenas) if arena_handle else 0
+        self._psrl_worker_stage_timings = getattr(self, "_psrl_worker_stage_timings", {})
+        self._psrl_worker_stage_timings["load_weights_from_cpu_cache"] = {
+            "cache_source": cache_source,
+            "gpu_copy_elapsed_s": gpu_copy_elapsed_s,
+            "empty_cache_elapsed_s": empty_cache_elapsed_s,
+            "arena_snapshot_elapsed_s": arena_snapshot_elapsed_s,
+            "cache_release_elapsed_s": cache_release_elapsed_s,
+            "arena_restore_bytes": arena_restore_bytes,
+            "arena_count": arena_count,
+            "arena_bytes": arena_bytes,
+            "cache_transitioned": cache_transitioned,
+            "model_validation_elapsed_s": model_validation_elapsed_s,
+            "elapsed_s": elapsed_s,
+        }
+        psrl_logger.warning(
+            "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker operation=wake "
+            "stage=load_weights_from_cpu_cache host=%s rank=%s tp_rank=%s pid=%s "
+            "cache_source=%s gpu_copy_elapsed_s=%.6f empty_cache_elapsed_s=%.6f "
+            "arena_snapshot_elapsed_s=%.6f cache_release_elapsed_s=%.6f "
+            "arena_restore_bytes=%d arena_count=%d arena_bytes=%d cache_transitioned=%s "
+            "model_validation_elapsed_s=%.6f elapsed_s=%.6f",
+            socket.gethostname(),
+            self.get_instance_local_rank(),
+            self.get_instance_local_tp_rank(),
+            os.getpid(),
+            cache_source,
+            gpu_copy_elapsed_s,
+            empty_cache_elapsed_s,
+            arena_snapshot_elapsed_s,
+            cache_release_elapsed_s,
+            arena_restore_bytes,
+            arena_count,
+            arena_bytes,
+            cache_transitioned,
+            model_validation_elapsed_s,
+            elapsed_s,
+        )
         return loaded_params
 
     def load_weights(self, weights, blocking: bool = True):
@@ -202,6 +332,103 @@ class vLLMWorkerExtension:
         except Exception as e:
             raise ValueError(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}") from e
         return None
+
+    def get_gpu_memory_snapshot(self) -> dict[str, int | str]:
+        """Return process-local and device-wide CUDA memory from this vLLM worker."""
+        try:
+            device = torch.cuda.current_device()
+            torch.cuda.synchronize(device)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            properties = torch.cuda.get_device_properties(device)
+            return {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "node_id": self.get_node_id(),
+                "rank": self.get_instance_local_rank(),
+                "tp_rank": self.get_instance_local_tp_rank(),
+                "device": device,
+                "device_name": properties.name,
+                "device_uuid": str(getattr(properties, "uuid", "unknown")),
+                "torch_allocated_bytes": torch.cuda.memory_allocated(device),
+                "torch_reserved_bytes": torch.cuda.memory_reserved(device),
+                "device_used_bytes": total_bytes - free_bytes,
+                "device_free_bytes": free_bytes,
+                "device_total_bytes": total_bytes,
+            }
+        except Exception as e:
+            raise ValueError(f"Error in vLLMWorkerExtension.get_gpu_memory_snapshot: {e}") from e
+
+    def get_last_tms_sleep_wake_timing(self, operation: str) -> dict:
+        """Return the last TMS timing captured inside this GPU worker."""
+        if operation not in ("sleep", "wake"):
+            raise ValueError(f"Unsupported TMS timing operation: {operation}")
+        return {
+            "hostname": socket.gethostname(),
+            "rank": self.get_instance_local_rank(),
+            "tp_rank": self.get_instance_local_tp_rank(),
+            "pid": os.getpid(),
+            "timing": getattr(self, f"_psrl_last_{operation}_timing", None),
+        }
+
+    def get_last_worker_stage_timing(self, stage: str) -> dict:
+        """Return the latest timing for a worker-extension stage."""
+        timings = getattr(self, "_psrl_worker_stage_timings", {})
+        return {
+            "hostname": socket.gethostname(),
+            "rank": self.get_instance_local_rank(),
+            "tp_rank": self.get_instance_local_tp_rank(),
+            "pid": os.getpid(),
+            "timing": timings.get(stage),
+        }
+
+    def get_weight_arena_info(self) -> dict:
+        """Return JSON-safe arena and latest NIXL registration state."""
+        handle = getattr(self.model_runner, "_psrl_weight_arena_handle", None)
+        arena_cache = getattr(self, "_psrl_weight_arena_cpu_cache", None)
+        cache_state = getattr(self, "_psrl_reward_weight_cache_state", None)
+        cache_info = None
+        if arena_cache is not None:
+            cache_info = {
+                "arena_count": len(arena_cache),
+                "total_bytes": sum(tensor.numel() * tensor.element_size() for tensor in arena_cache),
+                "pin_memory": all(tensor.is_pinned() for tensor in arena_cache),
+            }
+        registration_timing = None
+        nixl_client = getattr(self, "nixl_storage_client", None)
+        if nixl_client is not None:
+            registration_timing = getattr(nixl_client, "_last_reregister_timing", None)
+        if handle is None:
+            return {
+                "enabled": False,
+                "hostname": socket.gethostname(),
+                "node_id": self.get_node_id(),
+                "rank": self.get_instance_local_rank(),
+                "tp_rank": self.get_instance_local_tp_rank(),
+                "pid": os.getpid(),
+                "stats": None,
+                "base_addresses": [],
+                "reward_cpu_cache": cache_info,
+                "reward_cpu_cache_state": cache_state,
+                "nixl_registration": registration_timing,
+            }
+        handle.assert_virtual_addresses_unchanged()
+        return {
+            "enabled": True,
+            "hostname": socket.gethostname(),
+            "node_id": self.get_node_id(),
+            "rank": self.get_instance_local_rank(),
+            "tp_rank": self.get_instance_local_tp_rank(),
+            "pid": os.getpid(),
+            "stats": handle.stats.to_dict(),
+            "base_addresses": list(handle.base_addresses),
+            "reward_cpu_cache": cache_info,
+            "reward_cpu_cache_state": cache_state,
+            "nixl_registration": registration_timing,
+        }
+
+    def get_worker_stage_timing(self, stage: str) -> dict:
+        """Return the latest extension timing with arena metadata."""
+        return self.get_last_worker_stage_timing(stage)
 
     def patch_vllm_moe_model_weight_loader(self) -> None:
         """Patch the vLLM model weight loader for MoE models."""
@@ -272,9 +499,7 @@ class vLLMWorkerExtension:
         """
         from transformers import AutoConfig
 
-        vllm_model = self.model_runner.model
-        if isinstance(vllm_model, CUDAGraphWrapper):
-            vllm_model = vllm_model.unwrap()
+        vllm_model = self.model_runner.get_model()
         model_config = AutoConfig.from_pretrained(
             copy_to_local(config.model.path),
             trust_remote_code=config.model.get("trust_remote_code", False),
@@ -330,13 +555,56 @@ class vLLMWorkerExtension:
         1. Reset nixl agent (clears UCX rcache)
         2. Re-registers memory with new physical pages (generates new rkeys)
         """
+        total_start = time.perf_counter()
+        sync_start = time.perf_counter()
         torch.cuda.synchronize()
+        sync_elapsed_s = time.perf_counter() - sync_start
+        arena_handle = getattr(self.model_runner, "_psrl_weight_arena_handle", None)
+        arena_addresses = arena_handle.assert_virtual_addresses_unchanged() if arena_handle is not None else None
         # Reset nixl agent and reregister to handle physical memory changes
+        register_start = time.perf_counter()
         self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
+        register_elapsed_s = time.perf_counter() - register_start
+        elapsed_s = time.perf_counter() - total_start
+        self._psrl_worker_stage_timings = getattr(self, "_psrl_worker_stage_timings", {})
+        self._psrl_worker_stage_timings["nixl_register_after_wake_up"] = {
+            "cuda_sync_elapsed_s": sync_elapsed_s,
+            "register_elapsed_s": register_elapsed_s,
+            "elapsed_s": elapsed_s,
+            "arena_virtual_addresses": arena_addresses,
+        }
+        psrl_logger.warning(
+            "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker operation=wake "
+            "stage=nixl_register_after_wake_up host=%s rank=%s tp_rank=%s pid=%s "
+            "cuda_sync_elapsed_s=%.6f register_elapsed_s=%.6f elapsed_s=%.6f "
+            "arena_address_check=%s arena_count=%d",
+            socket.gethostname(),
+            self.get_instance_local_rank(),
+            self.get_instance_local_tp_rank(),
+            os.getpid(),
+            sync_elapsed_s,
+            register_elapsed_s,
+            elapsed_s,
+            "passed" if arena_addresses is not None else "disabled",
+            len(arena_addresses or ()),
+        )
 
     def nixl_deregister(self):
         """Deregister the model parameters from NIXL."""
+        start = time.perf_counter()
         self.nixl_storage_client.deregister_local_tensors()
+        elapsed_s = time.perf_counter() - start
+        self._psrl_worker_stage_timings = getattr(self, "_psrl_worker_stage_timings", {})
+        self._psrl_worker_stage_timings["nixl_deregister"] = {"elapsed_s": elapsed_s}
+        psrl_logger.warning(
+            "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker operation=sleep "
+            "stage=nixl_deregister host=%s rank=%s tp_rank=%s pid=%s elapsed_s=%.6f",
+            socket.gethostname(),
+            self.get_instance_local_rank(),
+            self.get_instance_local_tp_rank(),
+            os.getpid(),
+            elapsed_s,
+        )
 
     def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
         """
@@ -377,8 +645,9 @@ class vLLMWorkerExtension:
         if not hasattr(self, "pull_times"):
             self.pull_times = 0
         self.pull_times += 1
+        total_start = time.perf_counter()
         wait_operations = []
-        time_start = time.time()
+        issue_reads_start = time.perf_counter()
         for key in self.unified_state_dict:
             for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
                 shards_to_transfer = self.nixl_storage_client.client_read(
@@ -392,7 +661,9 @@ class vLLMWorkerExtension:
                 # )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
+        issue_reads_elapsed_s = time.perf_counter() - issue_reads_start
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        wait_start = time.perf_counter()
         for key, target_client_name, shards_to_transfer in wait_operations:
             self.nixl_storage_client.wait(
                 key,
@@ -401,14 +672,24 @@ class vLLMWorkerExtension:
                 target_client=target_client_name,
             )
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
+        wait_elapsed_s = time.perf_counter() - wait_start
+        finish_start = time.perf_counter()
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
         # self.nixl_log_shard_info(label=f"AFTER_GEN_PULL_{self.pull_times}")
         self.nixl_storage_client.clear_intermediate_cached_data()
-        time_end = time.time()
+        finish_elapsed_s = time.perf_counter() - finish_start
+        elapsed_s = time.perf_counter() - total_start
+        self._psrl_worker_stage_timings = getattr(self, "_psrl_worker_stage_timings", {})
+        self._psrl_worker_stage_timings["nixl_pull_model_core"] = {
+            "issue_reads_elapsed_s": issue_reads_elapsed_s,
+            "wait_elapsed_s": wait_elapsed_s,
+            "finish_elapsed_s": finish_elapsed_s,
+            "elapsed_s": elapsed_s,
+        }
         psrl_logger.info(
             f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "
-            f"time: {time_end - time_start}s"
+            f"time: {elapsed_s}s"
         )
 
     def estimate_max_model_len(self):

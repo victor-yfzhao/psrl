@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -67,18 +68,13 @@ def _load_round_robin_strategy():
     sys.modules.update(stub_modules)
     try:
         module_path = (
-            Path(__file__).resolve().parents[3]
-            / "psrl"
-            / "workers"
-            / "reward"
-            / "reward_model"
-            / "router.py"
+            Path(__file__).resolve().parents[3] / "psrl" / "workers" / "reward" / "reward_model" / "router.py"
         )
         spec = importlib.util.spec_from_file_location("reward_model_router_for_test", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.RoundRobinRewardModelRouteStrategy
+        return module
     finally:
         for name, previous_module in previous_modules.items():
             if previous_module is None:
@@ -87,7 +83,8 @@ def _load_round_robin_strategy():
                 sys.modules[name] = previous_module
 
 
-RoundRobinRewardModelRouteStrategy = _load_round_robin_strategy()
+ROUTER_MODULE = _load_round_robin_strategy()
+RoundRobinRewardModelRouteStrategy = ROUTER_MODULE.RoundRobinRewardModelRouteStrategy
 
 
 def _route_counts(strategy, candidates: list[int], request_count: int) -> Counter:
@@ -108,3 +105,136 @@ def test_round_robin_returns_none_without_candidates():
     strategy = RoundRobinRewardModelRouteStrategy(n_instances=22)
 
     assert strategy.route(object(), candidates=[]) is None
+
+
+def _request(uid):
+    return types.SimpleNamespace(non_tensor_batch={"uid": [uid]})
+
+
+def test_prepare_request_migrations_accepts_only_matching_inflight_sources():
+    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router._uid_to_inflight_instance = {"active": 0, "moved": 1, "389": 6}
+    router._planned_migration_destinations = {}
+    router._planned_migration_counters = {
+        "planned": 0,
+        "accepted": 0,
+        "skipped": 0,
+        "forced": 0,
+        "fallback": 0,
+    }
+
+    result = router.prepare_request_migrations(
+        [
+            {
+                "request_id": "active",
+                "source_instance_id": 0,
+                "destination_instance_id": 2,
+            },
+            {
+                "request_id": "completed",
+                "source_instance_id": 0,
+                "destination_instance_id": 2,
+            },
+            {
+                "request_id": "moved",
+                "source_instance_id": 0,
+                "destination_instance_id": 2,
+            },
+            {
+                "request_id": "389-b51b174a",
+                "source_instance_id": 6,
+                "destination_instance_id": 3,
+            },
+        ]
+    )
+
+    assert result == {
+        "instance_to_uids": {0: ["active"], 6: ["389-b51b174a"]},
+        "planned": 4,
+        "accepted": 2,
+        "skipped": 2,
+        "skip_reasons": {"request_not_inflight": 1, "source_changed": 1},
+    }
+    assert router._planned_migration_destinations == {"active": 2, "389": 3}
+
+
+def test_rm_planned_destination_forces_valid_target_and_invalid_target_falls_back():
+    class _Strategy:
+        def __init__(self):
+            self.calls = []
+
+        def route(self, request, candidates, route_kwargs):
+            self.calls.append((list(candidates), dict(route_kwargs["active_loads"])))
+            return min(candidates) if candidates else None
+
+    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router.paused_worker_indices = set()
+    router.worker_probe_backoff_until = {}
+    router.waiting_admission_cap = None
+    router.max_concurrent_requests_per_instance = 4
+    router.request_counts = {0: 0, 1: 0}
+    router.instance_to_engine_status = {}
+    router.route_strategy = _Strategy()
+    router._planned_migration_destinations = {"forced": 1}
+    router._planned_migration_counters = {
+        "planned": 0,
+        "accepted": 0,
+        "skipped": 0,
+        "forced": 0,
+        "fallback": 0,
+    }
+
+    assert router._select_worker_for_request(_request("forced"), {0: 0, 1: 0}) == 1
+    assert router.request_counts == {0: 0, 1: 1}
+    assert router.route_strategy.calls == []
+    assert router._planned_migration_destinations == {}
+
+    router._planned_migration_destinations["fallback"] = 9
+    assert router._select_worker_for_request(_request("fallback"), {0: 0, 1: 1}) == 0
+    assert router.route_strategy.calls == [([0, 1], {0: 0, 1: 1})]
+    assert router._planned_migration_destinations == {}
+    assert router._planned_migration_counters["fallback"] == 1
+
+
+def test_rm_interrupted_result_requeues_before_migration_completion():
+    class _Tracker:
+        def __init__(self):
+            self.requeued = []
+            self.completed = []
+
+        def mark_dispatched(self, request_uid, worker_idx):
+            return None
+
+        def mark_requeued(self, request_uid):
+            self.requeued.append(request_uid)
+
+        def complete_with_status(self, request_uid, result):
+            self.completed.append(request_uid)
+            return None, "not_tracked"
+
+    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    tracker = _Tracker()
+    request = types.SimpleNamespace(non_tensor_batch={"uid": ["42"]})
+    result = types.SimpleNamespace(
+        non_tensor_batch={"uid": ["42"], "interrupted": [True]},
+        meta_info={},
+    )
+    requeued = []
+    router.request_futures = {"request-key": object()}
+    router._interrupt_routing = False
+    router.worker_handles = [object()]
+    router._migration_overhead = tracker
+    router.retry_delay = 0.0
+    router._release_strategy_worker = lambda *args: None
+    router._enqueue_request = lambda request_key, queued: requeued.append((request_key, queued))
+
+    async def _generate_with_worker(*args):
+        return result
+
+    router._generate_with_worker = _generate_with_worker
+
+    asyncio.run(router._route_single_request("request-key", request, 0, 0))
+
+    assert tracker.requeued == ["42"]
+    assert tracker.completed == []
+    assert requeued == [("request-key", result)]

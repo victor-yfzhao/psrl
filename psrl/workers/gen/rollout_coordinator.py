@@ -481,14 +481,38 @@ class RolloutCoordinator(CommandExtension):
                 if command_type == CommandType.ABORT:
                     instance_to_uids = command_args.get("instance_to_uids", None)
                     instance_ids = command_args.get("instance_ids", None)
-                    if instance_to_uids is None and instance_ids is None:
-                        raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
+                    request_migrations = command_args.get("request_migrations", None)
+                    migration_context = command_args.get("migration_context")
+                    if instance_to_uids is None and instance_ids is None and request_migrations is None:
+                        raise ValueError(
+                            "ABORT command must contain 'instance_to_uids', 'instance_ids', "
+                            "or 'request_migrations' in args."
+                        )
+
+                    if request_migrations is not None:
+                        if self.rollout_router is None:
+                            instance_to_uids = {}
+                        else:
+                            prepared = await self.rollout_router.prepare_request_migrations.remote(
+                                request_migrations
+                            )
+                            instance_to_uids = prepared.get("instance_to_uids", {})
+                            psrl_logger.info(
+                                "Prepared rollout request migrations before ABORT: %s",
+                                prepared,
+                            )
 
                     psrl_logger.info(
                         f"Received ABORT command with instance_to_uids: "
                         f"{instance_to_uids} and instance_ids: {instance_ids}"
                     )
                     futures = []
+
+                    if migration_context and instance_to_uids is not None and self.rollout_router is not None:
+                        await self.rollout_router.mark_migration_requests.remote(
+                            instance_to_uids,
+                            migration_context,
+                        )
 
                     if instance_to_uids is not None:
                         for instance_id, uids in instance_to_uids.items():
@@ -607,9 +631,18 @@ class RolloutCoordinator(CommandExtension):
                         instance_ids = [instance_ids]
                     if -1 in instance_ids:
                         instance_ids = list(range(self.rollout_wg_size))
+                    overhead_started_s = time.monotonic()
+                    pause_s = 0.0
+                    state_probe_s = 0.0
+                    interrupt_s = 0.0
+                    engine_sleep_s = 0.0
+                    success = False
                     try:
                         if self.rollout_router is not None:
+                            stage_started_s = time.monotonic()
                             await self.rollout_router.pause_instances.remote(instance_ids)
+                            pause_s = time.monotonic() - stage_started_s
+                        stage_started_s = time.monotonic()
                         sleeping_flags = await asyncio.gather(
                             *[
                                 self.gen_wg_list[instance_id].execute_rank_zero_async(
@@ -618,11 +651,13 @@ class RolloutCoordinator(CommandExtension):
                                 for instance_id in instance_ids
                             ]
                         )
+                        state_probe_s = time.monotonic() - stage_started_s
                         awake_instance_ids = [
                             instance_id
                             for instance_id, is_sleeping in zip(instance_ids, sleeping_flags)
                             if not is_sleeping
                         ]
+                        stage_started_s = time.monotonic()
                         interrupted_request_nums = await asyncio.gather(
                             *[
                                 self.rollout_wg_list[instance_id].execute_rank_zero_async(
@@ -631,26 +666,43 @@ class RolloutCoordinator(CommandExtension):
                                 for instance_id in awake_instance_ids
                             ]
                         )
+                        interrupt_s = time.monotonic() - stage_started_s
                         interrupted_request_num = np.sum(interrupted_request_nums)
                         psrl_logger.info(
                             "Received SLEEP command for instances %s, interrupted %s requests",
                             instance_ids,
                             interrupted_request_num,
                         )
+                        stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
                                 self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_sleep")
                                 for instance_id in awake_instance_ids
                             ]
                         )
+                        engine_sleep_s = time.monotonic() - stage_started_s
                     except Exception:
                         psrl_logger.exception("SLEEP command failed for instances %s", instance_ids)
                         if self.rollout_router is not None:
                             await self.rollout_router.resume_instances.remote(instance_ids)
                         self._complete_command(command_id, False)
                     else:
+                        success = True
                         psrl_logger.info("SLEEP command for instances %s completed", instance_ids)
                         self._complete_command(command_id, True)
+                    finally:
+                        psrl_logger.info(
+                            "[ELASTIC_OVERHEAD] operation=sleep role=Rollout instances=%s success=%s "
+                            "router_pause_s=%.6f state_probe_s=%.6f interrupt_s=%.6f "
+                            "engine_sleep_s=%.6f total_s=%.6f",
+                            instance_ids,
+                            success,
+                            pause_s,
+                            state_probe_s,
+                            interrupt_s,
+                            engine_sleep_s,
+                            time.monotonic() - overhead_started_s,
+                        )
                 
                 elif command_type == CommandType.WAKE_UP:
                     instance_ids = command_args.get("instance_ids", None)
@@ -667,7 +719,15 @@ class RolloutCoordinator(CommandExtension):
                     target_ps_version = int(command_args.get("target_ps_model_version", self.ps_model_version))
                     resume_instances = bool(command_args.get("resume_instances", True))
 
+                    overhead_started_s = time.monotonic()
+                    state_probe_s = 0.0
+                    engine_wakeup_s = 0.0
+                    router_update_s = 0.0
+                    model_sync_s = 0.0
+                    router_resume_s = 0.0
+                    success = False
                     try:
+                        stage_started_s = time.monotonic()
                         sleeping_flags = await asyncio.gather(
                             *[
                                 self.gen_wg_list[instance_id].execute_rank_zero_async(
@@ -676,6 +736,8 @@ class RolloutCoordinator(CommandExtension):
                                 for instance_id in instance_ids
                             ]
                         )
+                        state_probe_s = time.monotonic() - stage_started_s
+                        stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
                                 self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up")
@@ -683,17 +745,21 @@ class RolloutCoordinator(CommandExtension):
                                 if is_sleeping
                             ]
                         )
+                        engine_wakeup_s = time.monotonic() - stage_started_s
                         psrl_logger.info("WAKE_UP command for instances %s completed", instance_ids)
 
+                        stage_started_s = time.monotonic()
                         await self.rollout_router.update_currently_syncing_instances.remote(
                             instance_ids, target_ps_version
                         )
+                        router_update_s = time.monotonic() - stage_started_s
                         psrl_logger.info(
                             "Updated currently syncing instances to %s with PS model version %d",
                             instance_ids,
                             target_ps_version,
                         )
 
+                        stage_started_s = time.monotonic()
                         sync_futures = []
                         for instance_id in instance_ids:
                             active_tasks = await self.gen_wg_list[instance_id].execute_rank_zero_async(
@@ -715,8 +781,11 @@ class RolloutCoordinator(CommandExtension):
                                 )
                             )
                         await asyncio.gather(*sync_futures)
+                        model_sync_s = time.monotonic() - stage_started_s
                         if self.rollout_router is not None and resume_instances:
+                            stage_started_s = time.monotonic()
                             await self.rollout_router.resume_instances.remote(instance_ids)
+                            router_resume_s = time.monotonic() - stage_started_s
                     except Exception:
                         psrl_logger.exception(
                             "WAKE_UP command failed for instances %s at PS version %d",
@@ -725,12 +794,27 @@ class RolloutCoordinator(CommandExtension):
                         )
                         self._complete_command(command_id, False)
                     else:
+                        success = True
                         psrl_logger.info(
                             "Synced with PS for instances %s with PS model version %d",
                             instance_ids,
                             target_ps_version,
                         )
                         self._complete_command(command_id, True)
+                    finally:
+                        psrl_logger.info(
+                            "[ELASTIC_OVERHEAD] operation=wakeup role=Rollout instances=%s success=%s "
+                            "state_probe_s=%.6f engine_wakeup_s=%.6f router_update_s=%.6f "
+                            "model_sync_s=%.6f router_resume_s=%.6f total_s=%.6f",
+                            instance_ids,
+                            success,
+                            state_probe_s,
+                            engine_wakeup_s,
+                            router_update_s,
+                            model_sync_s,
+                            router_resume_s,
+                            time.monotonic() - overhead_started_s,
+                        )
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 
@@ -846,6 +930,12 @@ class RolloutCoordinator(CommandExtension):
             time.monotonic() - t_enter,
         )
         return summary
+
+    async def get_candidate_evaluation_snapshot(self, top_t: int | None = None) -> dict:
+        """Proxy the compact request-level snapshot from the rollout router."""
+        if self.rollout_router is None:
+            raise RuntimeError("rollout router is not initialized")
+        return await self.rollout_router.get_candidate_evaluation_snapshot.remote(top_t)
 
     async def _broadcast_status_to_router(self):
         """

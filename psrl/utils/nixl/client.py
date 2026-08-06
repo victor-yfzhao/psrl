@@ -398,64 +398,126 @@ class NIXLStorageClient:
             and self.local_client_info is not None
             and self.local_client_info.is_registered
         ):
+            total_start = time.perf_counter()
+            stage_seconds: dict[str, float] = {}
             # Re-register local tensors
             assert self._mtype_to_reg_region_lists is not None, "No registered regions found."
+            stage_start = time.perf_counter()
+            registered_region_count = 0
+            registered_bytes = 0
             for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                 if not reg_list:
                     continue
+                registered_region_count += len(reg_list)
+                registered_bytes += sum(int(region[1]) for region in reg_list)
                 reg_descs = self._register_memory(mem_type, reg_list)
                 self._track_registered_desc(reg_descs)
+            stage_seconds["register_memory"] = time.perf_counter() - stage_start
 
             # Rebuild desc bytes for all shards. Group by mem_type to batch all
             # get_xfer_descs calls: O(mem_types) round-trips instead of O(N_shards).
 
             # Precompute {shard_idx: local_pos} for each key: O(1) lookup vs O(S) list.index()
+            stage_start = time.perf_counter()
             reregister_shard_pos_cache: dict[str, dict] = {
                 key: {s: i for i, s in enumerate(ti.sharding.shard_indices)}
                 for key, ti in self.local_client_info.tensor_infos.items()
             }
+            stage_seconds["build_shard_index"] = time.perf_counter() - stage_start
 
             # --- contig_desc_slice_map ---
+            stage_start = time.perf_counter()
             contig_by_memtype: dict[str, list[tuple]] = defaultdict(list)
             for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
                 slice_addr, slice_len, device_id, mem_type = slice_info
                 contig_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+            stage_seconds["group_contig_descs"] = time.perf_counter() - stage_start
 
+            contig_get_xfer_descs_s = 0.0
+            contig_serialize_descs_s = 0.0
             for mem_type, entries in contig_by_memtype.items():
                 batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                stage_start = time.perf_counter()
                 xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                contig_get_xfer_descs_s += time.perf_counter() - stage_start
                 assert xfer_descs.descCount() == len(entries), (
                     f"{self.client_name}: re-register get_xfer_descs returned {xfer_descs.descCount()} descs "
                     f"for {len(entries)} contig inputs (mem_type={mem_type})."
                 )
                 desc_type = xfer_descs.getType()
+                stage_start = time.perf_counter()
                 for i, (key, shard_idx, _, _, _) in enumerate(entries):
                     single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
                     desc_bytes = self.agent.get_serialized_descs(single)
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
+                contig_serialize_descs_s += time.perf_counter() - stage_start
+            stage_seconds["contig_get_xfer_descs"] = contig_get_xfer_descs_s
+            stage_seconds["contig_serialize_descs"] = contig_serialize_descs_s
 
             # --- temp_desc_slice_map ---
+            stage_start = time.perf_counter()
             temp_by_memtype: dict[str, list[tuple]] = defaultdict(list)
             for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
                 slice_addr, slice_len, device_id, mem_type = slice_info
                 temp_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+            stage_seconds["group_temp_descs"] = time.perf_counter() - stage_start
 
+            temp_get_xfer_descs_s = 0.0
+            temp_serialize_descs_s = 0.0
             for mem_type, entries in temp_by_memtype.items():
                 batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                stage_start = time.perf_counter()
                 xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                temp_get_xfer_descs_s += time.perf_counter() - stage_start
                 assert xfer_descs.descCount() == len(entries), (
                     f"{self.client_name}: re-register get_xfer_descs returned {xfer_descs.descCount()} descs "
                     f"for {len(entries)} temp inputs (mem_type={mem_type})."
                 )
                 desc_type = xfer_descs.getType()
+                stage_start = time.perf_counter()
                 for i, (key, shard_idx, _, _, _) in enumerate(entries):
                     single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
                     desc_bytes = self.agent.get_serialized_descs(single)
                     self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
-            return
+                temp_serialize_descs_s += time.perf_counter() - stage_start
+            stage_seconds["temp_get_xfer_descs"] = temp_get_xfer_descs_s
+            stage_seconds["temp_serialize_descs"] = temp_serialize_descs_s
+            stage_seconds["total"] = time.perf_counter() - total_start
+            self._last_reregister_timing = {
+                **stage_seconds,
+                "registered_regions": registered_region_count,
+                "registered_bytes": registered_bytes,
+                "logical_slices": len(self.contig_desc_slice_map) + len(self.temp_desc_slice_map),
+                "contig_descs": len(self.contig_desc_slice_map),
+                "temp_descs": len(self.temp_desc_slice_map),
+            }
+            psrl_logger.warning(
+                "[TRAINER_WAKE_TIMING] scope=nixl_client client=%s stage=reregister "
+                "total_s=%.6f register_memory_s=%.6f build_shard_index_s=%.6f "
+                "group_contig_descs_s=%.6f contig_get_xfer_descs_s=%.6f "
+                "contig_serialize_descs_s=%.6f group_temp_descs_s=%.6f "
+                "temp_get_xfer_descs_s=%.6f temp_serialize_descs_s=%.6f "
+                "registered_regions=%d registered_bytes=%d logical_slices=%d contig_descs=%d temp_descs=%d",
+                self.client_name,
+                stage_seconds["total"],
+                stage_seconds["register_memory"],
+                stage_seconds["build_shard_index"],
+                stage_seconds["group_contig_descs"],
+                stage_seconds["contig_get_xfer_descs"],
+                stage_seconds["contig_serialize_descs"],
+                stage_seconds["group_temp_descs"],
+                stage_seconds["temp_get_xfer_descs"],
+                stage_seconds["temp_serialize_descs"],
+                registered_region_count,
+                registered_bytes,
+                len(self.contig_desc_slice_map) + len(self.temp_desc_slice_map),
+                len(self.contig_desc_slice_map),
+                len(self.temp_desc_slice_map),
+            )
+            return dict(self._last_reregister_timing)
 
         tms_ctx = torch_memory_saver.region(tag="nixl") if self.enable_tms_for_temp_buffers else nullcontext()
         with tms_ctx:

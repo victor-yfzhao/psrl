@@ -16,13 +16,13 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=rollout_rm_colocated
-export PSRL_DEPLOY_EXPERIMENT=mode3_bs_128_rollout_rm_colocated_rollout7b_rm8b
+export PSRL_DEPLOY_EXPERIMENT=mode3_bs_128_rollout_rm_colocated_share_8
 export PSRL_DEPLOY_STALENESS=2
 export PSRL_DEPLOY_RM_ASYNC=True
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=2
+export PSRL_DEPLOY_NNODES=2
+export PSRL_DEPLOY_TRAIN_NNODES=1
 export PSRL_DEPLOY_TRAIN_NGPUS=8
-export PSRL_DEPLOY_SHARED_NNODES=2
+export PSRL_DEPLOY_SHARED_NNODES=1
 export PSRL_DEPLOY_SHARED_NGPUS=8
 export PSRL_DEPLOY_RM_NUM_REPLICAS=0
 export PSRL_DEPLOY_SMOKE=${1:-0}

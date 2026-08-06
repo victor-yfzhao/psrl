@@ -92,13 +92,28 @@ def register_patches():
     from vllm_patches.patches.cudagraph_utils import TMSCudaGraphManagerPatch
     from vllm_patches.patches.executor import TMSExecutorPatch
     from vllm_patches.patches.gpu_worker import TMSWorkerPatch
+    from vllm_patches.patches.weight_arena import (
+        WeightArenaModelRunnerPatch,
+        register_direct_weight_arena_loader,
+    )
 
     manager.register("TMSWorkerPatch", TMSWorkerPatch)
     manager.register("TMSCudaGraphManagerPatch", TMSCudaGraphManagerPatch)
     manager.register("TMSCUDAGraphWrapperPatch", TMSCUDAGraphWrapperPatch)
     manager.register("TMSExecutorPatch", TMSExecutorPatch)
+    manager.register("WeightArenaModelRunnerPatch", WeightArenaModelRunnerPatch)
 
     # Apply patches based on environment configuration
     manager.apply_from_env()
+    weight_arena_requested = any(
+        os.environ.get(name, "0") == "1"
+        for name in ("PSRL_VLLM_WEIGHT_ARENA", "VLLM_PSRL_WEIGHT_ARENA")
+    )
+    if weight_arena_requested:
+        register_direct_weight_arena_loader()
+        applied = manager.apply_patch("WeightArenaModelRunnerPatch")
+        target_patches = getattr(WeightArenaModelRunnerPatch._patch_target, "_applied_patches", {})
+        if not applied or target_patches.get("load_model") != "WeightArenaModelRunnerPatch":
+            raise RuntimeError("Failed to apply the required WeightArenaModelRunnerPatch.")
 
     logger.info("=" * 60)

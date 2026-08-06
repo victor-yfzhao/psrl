@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import subprocess
@@ -9,12 +10,15 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from psrl.workers.gen.gen_worker import GenInterface, PSRL_GenWorker
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 from tensordict import TensorDict
 from transformers import AutoTokenizer
 from verl import DataProto
-
-from psrl.workers.gen.gen_worker import GenInterface, PSRL_GenWorker
 
 # Production elastic RM defaults (rollout_qwen_7b_rm_qwen_8b_fsdp.sh).
 _PROD_PROMPT_LENGTH = 1024 * 11
@@ -66,7 +70,96 @@ def _gpu_memory_snapshot(stage: str) -> dict[str, str]:
     }
 
 
-def _print_cluster_gpu_memory(stage: str) -> None:
+@ray.remote(num_cpus=0)
+def _probe_node_identity() -> dict[str, str]:
+    return {
+        "node_id": ray.get_runtime_context().get_node_id(),
+        "node_ip": ray.util.get_node_ip_address(),
+    }
+
+
+@ray.remote(num_cpus=0, num_gpus=1)
+def _probe_bundle_gpu_identity() -> dict[str, object]:
+    return {
+        "node_id": ray.get_runtime_context().get_node_id(),
+        "node_ip": ray.util.get_node_ip_address(),
+        "gpu_ids": [str(gpu_id) for gpu_id in ray.get_gpu_ids()],
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    }
+
+
+@ray.remote(num_cpus=0)
+class _NIXLProbeMetaServer:
+    def __init__(self, nixl_config, expected_agents: int):
+        from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+        from psrl.utils.nixl import NIXLMetaServer
+
+        self.server = NIXLMetaServer(NIXL_META_SERVER_NAME, nixl_config)
+        self.expected_agents = expected_agents
+
+    def ready(self) -> bool:
+        return True
+
+    def protocol(self, timeout_s: int) -> None:
+        self.server.wait_for_client_shardings(self.expected_agents, timeout=timeout_s)
+        self.server.make_unified_sharding()
+        self.server.notify_all_client_shardings()
+        self.server.wait_for_client_infos(self.expected_agents, timeout=timeout_s)
+        self.server.make_comm_plan()
+        self.server.notify_all_client_infos_and_comm_plan()
+        self.server.wait_for_client_temp_mappings(self.expected_agents, timeout=timeout_s)
+        self.server.notify_all_client_temp_mappings()
+
+    def shutdown(self) -> None:
+        self.server.shutdown()
+
+
+@ray.remote(num_cpus=0)
+class _NIXLProbePSControl:
+    def __init__(self):
+        self.agent_names = None
+        self.gen_storage_client_names = None
+        self.version = 0
+        self.instance_versions = {}
+        self.shared_pull_count = 0
+
+    def set_endpoints(self, agent_names: list[str], gen_storage_client_names: list[str]) -> None:
+        self.agent_names = agent_names
+        self.gen_storage_client_names = gen_storage_client_names
+
+    def get_ps_nixl_agent_names(self) -> list[str]:
+        assert self.agent_names is not None
+        return self.agent_names
+
+    def get_ps_nixl_gen_storage_client_names(self) -> list[str]:
+        assert self.gen_storage_client_names is not None
+        return self.gen_storage_client_names
+
+    def pull_model_state_dict_nixl(self, rollout_instance_id: int) -> int:
+        self.instance_versions[rollout_instance_id] = self.version
+        return self.version
+
+    def get_rollout_instance_model_version(self, rollout_instance_id: int) -> int:
+        return self.instance_versions.get(rollout_instance_id, self.version)
+
+    def update_request_status(self, request_ids: list[int] | int, *_args, **_kwargs) -> list[bool] | bool:
+        if isinstance(request_ids, list):
+            return [True] * len(request_ids)
+        return True
+
+    def update_request_version_tag(self, *_args, **_kwargs) -> None:
+        return None
+
+    def _try_acquire_shared_pull_lock(self) -> bool:
+        self.shared_pull_count += 1
+        return True
+
+    def _release_shared_pull_lock(self) -> None:
+        assert self.shared_pull_count > 0
+        self.shared_pull_count -= 1
+
+
+def _print_cluster_gpu_memory(stage: str) -> list[dict[str, str]]:
     snapshots = _collect_gpu_snapshots(stage)
     print(f"\n========== GPU memory snapshot: {stage} ==========", flush=True)
     for snapshot in sorted(snapshots, key=lambda item: item["node_ip"]):
@@ -79,6 +172,7 @@ def _print_cluster_gpu_memory(stage: str) -> None:
         print("Compute apps (gpu_uuid, pid, process_name, used MiB):", flush=True)
         print(snapshot["compute_apps"], flush=True)
     print("====================================================\n", flush=True)
+    return snapshots
 
 
 def _free_port() -> str:
@@ -134,9 +228,9 @@ def _default_model_path() -> str:
 
 
 def _build_psrl_config(tmp_path: Path, *, load_real_weights_at_init: bool):
-    # elastic_rm.enable in gen_worker only gates whether init_model loads GPU weights
-    # after CPU preload. When load_real_weights_at_init=True we set it False so init
-    # loads real weights, while all other rollout/vLLM settings stay on the prod profile.
+    # Without an arena, elastic_rm.enable gates whether init_model loads GPU weights
+    # after CPU preload. Arena-backed reward workers always construct the final CPU
+    # mirror during init so the first wake is not a checkpoint-layout reload.
     elastic_rm_enable = _env_bool("PSRL_RM_SMOKE_ELASTIC_RM", True)
     if load_real_weights_at_init:
         elastic_rm_enable = False
@@ -267,16 +361,20 @@ def _build_prompt(model_path: str, uid: int) -> DataProto:
         batch=batch,
         non_tensor_batch={
             "uid": np.array([uid], dtype=object),
+            "version_tag": np.array([0], dtype=int),
             "raw_prompt_ids": raw_prompt_ids,
             "raw_response_ids": raw_response_ids,
         },
     )
 
 
-def _assert_generated(output: DataProto, stage: str) -> None:
+def _assert_generated(output: DataProto | tuple[DataProto, object], stage: str) -> DataProto:
+    if isinstance(output, tuple):
+        output = output[0]
     assert output is not None, f"{stage} returned None"
     assert "raw_response_ids" in output.non_tensor_batch, f"{stage} did not return raw_response_ids"
     assert len(output.non_tensor_batch["raw_response_ids"]) == 1
+    return output
 
 
 def _init_timeout_s() -> int:
@@ -617,5 +715,1512 @@ def test_rm_tms_sleep_bisect_experiments(tmp_path: Path):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        if started_ray:
+            ray.shutdown()
+
+
+def _tms_vllm_model_path(env_name: str, relative_path: str) -> str:
+    repo_root = Path(__file__).resolve().parents[3]
+    return os.environ.get(env_name, str(repo_root / relative_path))
+
+
+def _build_tms_comparison_reward_config(model_path: str, tp_size: int, ep_size: int = 1):
+    reward_config = _build_reward_config(model_path)
+    max_model_len = int(os.environ.get("PSRL_TMS_VLLM_MAX_MODEL_LEN", "16384"))
+    reward_config.rollout.tensor_model_parallel_size = tp_size
+    reward_config.rollout.expert_parallel_size = ep_size
+    reward_config.rollout.prompt_length = int(
+        os.environ.get("PSRL_TMS_VLLM_PROMPT_LENGTH", "1024")
+    )
+    reward_config.rollout.response_length = int(
+        os.environ.get("PSRL_TMS_VLLM_MAX_TOKENS", "32")
+    )
+    reward_config.rollout.max_model_len = max_model_len
+    reward_config.rollout.max_num_batched_tokens = int(
+        os.environ.get("PSRL_TMS_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
+    )
+    reward_config.rollout.max_num_seqs = int(
+        os.environ.get("PSRL_TMS_VLLM_MAX_NUM_SEQS", "64")
+    )
+    reward_config.rollout.gpu_memory_utilization = float(
+        os.environ.get("PSRL_TMS_VLLM_GPU_MEMORY_UTILIZATION", "0.7")
+    )
+    reward_config.rollout.enforce_eager = _env_bool(
+        "PSRL_TMS_VLLM_ENFORCE_EAGER", False
+    )
+    reward_config.rollout.enable_chunked_prefill = True
+    reward_config.rollout.enable_prefix_caching = False
+    reward_config.rollout.disable_kv_cache = False
+    reward_config.rollout.use_psrl_scheduler = False
+    return reward_config
+
+
+def _record_tms_vllm_memory(
+    report: dict[str, object], case_name: str, stage: str
+) -> None:
+    snapshots = _print_cluster_gpu_memory(f"tms_{case_name}_{stage}")
+    report.setdefault("memory_snapshots", {})[stage] = snapshots
+
+
+def _wait_concurrent_refs(refs_by_instance: dict[int, ray.ObjectRef]) -> dict[str, object]:
+    """Wait for a concurrent wave and retain each instance's completion offset."""
+    started_at = time.perf_counter()
+    pending = {ref: instance_id for instance_id, ref in refs_by_instance.items()}
+    completion_s = {}
+    while pending:
+        ready, _ = ray.wait(list(pending), num_returns=1)
+        for ref in ready:
+            instance_id = pending.pop(ref)
+            ray.get(ref)
+            completion_s[str(instance_id)] = time.perf_counter() - started_at
+    return {
+        "wall_s": time.perf_counter() - started_at,
+        "instance_completion_s": completion_s,
+    }
+
+
+def _tms_generation_summary(output: DataProto) -> dict[str, object]:
+    response_ids = [int(token_id) for token_id in output.non_tensor_batch["raw_response_ids"][0]]
+    return {"num_output_tokens": len(response_ids), "response_ids": response_ids}
+
+
+def _validate_weight_arena_infos(
+    infos: list[dict[str, object]],
+    *,
+    tp_size: int,
+    expected_node_id: str,
+    expected_base_addresses: dict[int, list[int]] | None = None,
+) -> dict[int, list[int]]:
+    """Validate arena activation and address stability across all TP ranks."""
+    if len(infos) != tp_size:
+        raise AssertionError(f"Expected {tp_size} arena worker infos, got {len(infos)}.")
+    by_rank: dict[int, list[int]] = {}
+    for info in infos:
+        if not info.get("enabled"):
+            raise AssertionError(f"Weight arena was not enabled in worker info: {info}")
+        if info.get("node_id") != expected_node_id:
+            raise AssertionError(f"Arena worker escaped the local node: {info}")
+        rank = int(info["tp_rank"])
+        addresses = [int(address) for address in info["base_addresses"]]
+        stats = info.get("stats") or {}
+        if int(stats.get("arena_count", 0)) <= 0:
+            raise AssertionError(f"Arena worker reported no allocations: {info}")
+        by_rank[rank] = addresses
+        if expected_base_addresses is not None and addresses != expected_base_addresses.get(rank):
+            raise AssertionError(
+                f"Arena virtual addresses changed for TP rank {rank}: "
+                f"expected {expected_base_addresses.get(rank)}, got {addresses}."
+            )
+    if set(by_rank) != set(range(tp_size)):
+        raise AssertionError(f"Missing TP ranks in arena info: {sorted(by_rank)}")
+    return by_rank
+
+
+def _validate_reward_arena_cache_infos(infos: list[dict[str, object]]) -> None:
+    """Validate that every reward TP rank owns a complete arena-layout CPU mirror."""
+    for info in infos:
+        stats = info.get("stats") or {}
+        cache = info.get("reward_cpu_cache") or {}
+        state = info.get("reward_cpu_cache_state") or {}
+        if state.get("source") != "arena" or not state.get("ready"):
+            raise AssertionError(f"Reward arena CPU cache is not ready: {info}")
+        if int(cache.get("arena_count", 0)) != int(stats.get("arena_count", -1)):
+            raise AssertionError(f"Reward CPU cache count does not match the GPU arena: {info}")
+        if int(cache.get("total_bytes", 0)) != int(stats.get("total_arena_bytes", -1)):
+            raise AssertionError(f"Reward CPU cache bytes do not match the GPU arena: {info}")
+
+
+@pytest.mark.integration
+@pytest.mark.skipduringci
+@pytest.mark.parametrize(
+    ("case_name", "model_env", "relative_model_path", "tp_size", "ep_size"),
+    [
+        pytest.param(
+            "qwen2_5_7b_tp1",
+            "PSRL_TMS_VLLM_7B_MODEL",
+            "models/Qwen2.5-7B",
+            1,
+            1,
+            id="qwen2.5-7b-tp1",
+        ),
+        pytest.param(
+            "qwen2_5_32b_tp4",
+            "PSRL_TMS_VLLM_32B_MODEL",
+            "models/Qwen2.5-32B",
+            4,
+            1,
+            id="qwen2.5-32b-tp4",
+        ),
+        pytest.param(
+            "qwen3_30b_a3b_tp4",
+            "PSRL_TMS_VLLM_MOE_MODEL",
+            "models/Qwen3-30B-A3B-Thinking-2507",
+            4,
+            1,
+            id="qwen3-30b-a3b-tp4",
+        ),
+        pytest.param(
+            "qwen3_30b_a3b_tp4_ep4",
+            "PSRL_TMS_VLLM_MOE_MODEL",
+            "models/Qwen3-30B-A3B-Thinking-2507",
+            4,
+            4,
+            id="qwen3-30b-a3b-tp4-ep4",
+        ),
+    ],
+)
+def test_tms_vllm_level2_sleep_memory(
+    tmp_path: Path,
+    case_name: str,
+    model_env: str,
+    relative_model_path: str,
+    tp_size: int,
+    ep_size: int,
+):
+    """Measure TMS-managed vLLM sleep over two wake cycles."""
+    if os.environ.get("PSRL_RUN_TMS_VLLM_SLEEP_SMOKE") != "1":
+        pytest.skip(
+            "Set PSRL_RUN_TMS_VLLM_SLEEP_SMOKE=1 to run TMS vLLM sleep probes."
+        )
+
+    model_path = _tms_vllm_model_path(model_env, relative_model_path)
+    if not (Path(model_path) / "config.json").exists():
+        pytest.skip(f"TMS vLLM sleep model is unavailable: {model_path}")
+    tp_size = int(os.environ.get("PSRL_TMS_VLLM_TP_SIZE", str(tp_size)))
+
+    started_ray = False
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, include_dashboard=False)
+        started_ray = True
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < tp_size:
+        if started_ray:
+            ray.shutdown()
+        pytest.skip(f"{case_name} needs {tp_size} GPUs, but Ray sees {available_gpus}")
+
+    probe_role = os.environ.get("PSRL_TMS_VLLM_PROBE_ROLE", "reward").strip().lower()
+    if probe_role not in {"reward", "rollout"}:
+        raise ValueError(f"PSRL_TMS_VLLM_PROBE_ROLE must be reward or rollout, got {probe_role!r}")
+
+    load_real_weights_at_init = _env_bool("PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", False)
+    psrl_config = _build_psrl_config(
+        tmp_path,
+        load_real_weights_at_init=load_real_weights_at_init,
+    )
+    psrl_config.tms.enable_cuda_graph = probe_role == "rollout"
+    if probe_role == "rollout":
+        psrl_config.ps_mode = "nixl_cpu"
+        psrl_config.tms.enable_nixl = True
+    weight_arena_enabled = _env_bool("PSRL_TMS_VLLM_WEIGHT_ARENA", False)
+    if weight_arena_enabled:
+        psrl_config.nixl.weight_arena = OmegaConf.create(
+            {
+                "actor_enabled": False,
+                "rollout_enabled": probe_role == "rollout",
+                "reward_enabled": probe_role == "reward",
+                "rollout_materialization": "direct",
+                "reward_materialization": "direct",
+                "reward_cpu_cache_pin_memory": _env_bool(
+                    "PSRL_TMS_VLLM_REWARD_CPU_CACHE_PIN_MEMORY", True
+                ),
+                "max_chunk_bytes": int(
+                    os.environ.get("PSRL_TMS_VLLM_WEIGHT_ARENA_MAX_CHUNK_BYTES", str(4 * 1024**3))
+                ),
+                "alignment_bytes": int(os.environ.get("PSRL_TMS_VLLM_WEIGHT_ARENA_ALIGNMENT_BYTES", "256")),
+            }
+        )
+    local_node_only = _env_bool("PSRL_TMS_VLLM_LOCAL_NODE_ONLY", False)
+    verify_generation = probe_role == "rollout" and _env_bool(
+        "PSRL_TMS_VLLM_VERIFY_GENERATION", False
+    )
+    reward_config = _build_tms_comparison_reward_config(model_path, tp_size, ep_size)
+    init_timeout_s = int(os.environ.get("PSRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
+    operation_timeout_s = int(
+        os.environ.get("PSRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
+    )
+    timings: dict[str, float] = {}
+    generations: dict[str, object] = {}
+    worker_stage_timings: dict[str, list[dict[str, object]]] = {}
+    arena_base_addresses: dict[int, list[int]] | None = None
+    registration_samples: list[float] = []
+    reward_restore_samples: list[float] = []
+    report: dict[str, object] = {
+        "case": case_name,
+        "probe_role": probe_role,
+        "model_path": model_path,
+        "tp_size": tp_size,
+        "ep_size": ep_size,
+        "weight_arena_enabled": weight_arena_enabled,
+        "elastic_rm_enabled": bool(psrl_config.deployment.elastic_rm.enable),
+        "local_node_only": local_node_only,
+        "verify_generation": verify_generation,
+        "reward_config": OmegaConf.to_container(reward_config, resolve=True),
+        "timings_s": timings,
+        "generations": generations,
+    }
+
+    output_dir_raw = os.environ.get("PSRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_name = case_name if probe_role == "reward" else f"{probe_role}_{case_name}"
+    report_path = output_dir / f"tms_vllm_sleep_{report_name}.json"
+
+    resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+        config=reward_config,
+        psrl_config=psrl_config,
+        num_gpus=1,
+        dp_idx=0,
+        bundle_indices=list(range(tp_size)),
+        role=probe_role,
+    )
+    actor_env = {
+        **env_vars,
+        "WG_BACKEND": "ray",
+        "WORLD_SIZE": str(tp_size),
+        "RANK": "0",
+        "LOCAL_WORLD_SIZE": str(tp_size),
+        "LOCAL_RANK": "0",
+        "RAY_LOCAL_WORLD_SIZE": str(tp_size),
+        "RAY_LOCAL_RANK": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": _free_port(),
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    tms_info = {
+        "psrl_vllm_patches": actor_env.get("PSRL_VLLM_PATCHES", ""),
+        "psrl_vllm_weight_arena": actor_env.get("PSRL_VLLM_WEIGHT_ARENA", ""),
+        "vllm_psrl_weight_arena": actor_env.get("VLLM_PSRL_WEIGHT_ARENA", ""),
+        "ld_preload": actor_env.get("LD_PRELOAD", ""),
+        "tms_init_enable": actor_env.get("TMS_INIT_ENABLE", ""),
+        "tms_init_enable_cpu_backup": actor_env.get(
+            "TMS_INIT_ENABLE_CPU_BACKUP", ""
+        ),
+    }
+    expected_patch = "TMS:GRAPH" if probe_role == "rollout" else "TMS"
+    if tms_info["psrl_vllm_patches"] != expected_patch:
+        raise RuntimeError(f"TMS patch is not configured: {tms_info}")
+    if "torch_memory_saver_hook_mode_preload" not in tms_info["ld_preload"]:
+        raise RuntimeError(f"TMS LD_PRELOAD hook is not configured: {tms_info}")
+    report["tms"] = tms_info
+
+    actor = None
+    probe_pg = None
+    meta_server = None
+    ps_control = None
+    ps_actor = None
+    nixl_interface = None
+    ps_preload_ref = None
+    try:
+        _record_tms_vllm_memory(report, case_name, "before_actor_start")
+        bundle = {"CPU": 1, "GPU": 1}
+        local_node = None
+        if local_node_only:
+            local_node_ip = ray.util.get_node_ip_address()
+            local_node = next(
+                (
+                    node
+                    for node in ray.nodes()
+                    if node.get("Alive", False) and node.get("NodeManagerAddress") == local_node_ip
+                ),
+                None,
+            )
+            if local_node is None:
+                raise RuntimeError(f"Cannot resolve local Ray node for IP {local_node_ip}.")
+            local_node_resource = f"node:{local_node_ip}"
+            if local_node_resource not in local_node["Resources"]:
+                raise RuntimeError(f"Local Ray node does not advertise {local_node_resource}.")
+            bundle[local_node_resource] = 0.001
+        probe_pg = placement_group([dict(bundle) for _ in range(tp_size)], strategy="STRICT_PACK")
+        ray.get(probe_pg.ready(), timeout=init_timeout_s)
+
+        identity = ray.get(
+            _probe_node_identity.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    probe_pg,
+                    placement_group_bundle_index=0,
+                )
+            ).remote(),
+            timeout=60,
+        )
+        if local_node is not None and identity["node_id"] != local_node["NodeID"]:
+            raise RuntimeError(
+                f"Probe placement escaped the local node: expected {local_node['NodeID']}, got {identity['node_id']}."
+            )
+        if probe_role == "rollout":
+            from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+            from psrl.workers.ps import PSStoragePlan, PSStorageWorker
+
+            server_port = ray.get(
+                GLOBAL_PORT_SCANNER.find_free_port.remote(host=identity["node_ip"]),
+                timeout=60,
+            )
+            nixl_runtime_config = {
+                "server_ip": identity["node_ip"],
+                "server_port": server_port,
+                "max_pinned_temp_memory_slots": 64,
+                "enable_tms_for_temp_buffers": True,
+            }
+            if weight_arena_enabled:
+                nixl_runtime_config["weight_arena"] = OmegaConf.to_container(
+                    psrl_config.nixl.weight_arena,
+                    resolve=True,
+                )
+            psrl_config.nixl = OmegaConf.create(nixl_runtime_config)
+            nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
+            node_affinity = NodeAffinitySchedulingStrategy(
+                node_id=identity["node_id"],
+                soft=False,
+            )
+            meta_server = _NIXLProbeMetaServer.options(
+                scheduling_strategy=node_affinity,
+            ).remote(psrl_config.nixl, tp_size + 1)
+            ray.get(meta_server.ready.remote(), timeout=60)
+            ps_control = _NIXLProbePSControl.options(
+                scheduling_strategy=node_affinity,
+            ).remote()
+
+            PSActor = ray.remote(num_cpus=0)(PSStorageWorker)
+            ps_actor = PSActor.options(
+                scheduling_strategy=node_affinity,
+                runtime_env={
+                    "env_vars": {
+                        "WORLD_SIZE": "1",
+                        "RANK": "0",
+                        "PS_NODE_IP": identity["node_ip"],
+                    }
+                },
+            ).remote(
+                PSStoragePlan(
+                    train_model_dtype=torch.bfloat16,
+                    gen_model_dtype=torch.bfloat16,
+                ),
+                reward_config.model,
+                psrl_config,
+                nixl_interface,
+            )
+            ps_init_start = time.perf_counter()
+            ps_actor.init_nixl_client.remote()
+            ps_actor.init_model.remote()
+            ps_preload_ref = ps_actor.preload_checkpoint_to_cpu.remote()
+            report["ps_probe"] = {
+                "node_id": identity["node_id"],
+                "node_ip": identity["node_ip"],
+                "server_port": server_port,
+                "expected_nixl_agents": tp_size + 1,
+            }
+
+        RewardWorker = ray.remote(
+            max_concurrency=10000,
+            num_gpus=resources.get("num_gpus", 1),
+            num_cpus=resources.get("num_cpus", 1),
+            runtime_env={"env_vars": actor_env},
+        )(PSRL_GenWorker)
+        actor = RewardWorker.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                probe_pg,
+                placement_group_bundle_index=0,
+                placement_group_capture_child_tasks=True,
+            )
+        ).remote(
+            config=reward_config,
+            role=probe_role,
+            psrl_config=psrl_config,
+            gen_interface=GenInterface(
+                rollout_instance_id=0,
+                status_queue=ray.util.queue.Queue(),
+                ps_manager_handle=ps_control,
+            ),
+            nixl_interface=nixl_interface,
+            instance_id=0,
+            reward_model_name="rm_tms_sleep_probe",
+            **init_kwargs,
+        )
+
+        start = time.perf_counter()
+        ray.get(actor.init_model.remote("empty"), timeout=init_timeout_s)
+        timings["engine_init"] = time.perf_counter() - start
+        print(f"TMS vLLM probe environment: {tms_info}", flush=True)
+        if weight_arena_enabled:
+            arena_infos = ray.get(actor.get_weight_arena_info.remote(), timeout=operation_timeout_s)
+            arena_base_addresses = _validate_weight_arena_infos(
+                arena_infos,
+                tp_size=tp_size,
+                expected_node_id=identity["node_id"],
+            )
+            if probe_role == "reward":
+                _validate_reward_arena_cache_infos(arena_infos)
+                worker_stage_timings["initial_weight_cache_transition"] = ray.get(
+                    actor.get_worker_stage_timing.remote("load_weights_from_cpu_cache"),
+                    timeout=operation_timeout_s,
+                )
+                for worker_timing in worker_stage_timings["initial_weight_cache_transition"]:
+                    timing = worker_timing.get("timing") or {}
+                    if timing.get("cache_source") != "checkpoint" or not timing.get("cache_transitioned"):
+                        raise AssertionError(
+                            f"Reward init did not transition checkpoint cache to arena cache: {worker_timing}"
+                        )
+            report["weight_arena"] = {"after_engine_init": arena_infos}
+        _record_tms_vllm_memory(report, case_name, "after_engine_init")
+
+        if probe_role == "rollout":
+            assert ps_actor is not None
+            assert ps_control is not None
+            assert meta_server is not None
+            assert ps_preload_ref is not None
+
+            ray.get(ps_preload_ref, timeout=init_timeout_s)
+            timings["ps_init_and_checkpoint_preload"] = time.perf_counter() - ps_init_start
+
+            start = time.perf_counter()
+            ray.get(actor.init_nixl_client.remote(), timeout=operation_timeout_s)
+            ray.get(actor.nixl_convert_params.remote(), timeout=operation_timeout_s)
+            timings["rollout_nixl_client_init_and_convert"] = time.perf_counter() - start
+
+            start = time.perf_counter()
+            protocol_refs = [
+                meta_server.protocol.remote(operation_timeout_s),
+                ps_actor.nixl_protocol.remote(),
+                actor.nixl_protocol.remote(),
+            ]
+            ray.get(protocol_refs, timeout=operation_timeout_s)
+            timings["nixl_protocol"] = time.perf_counter() - start
+
+            start = time.perf_counter()
+            ray.get(
+                ps_actor.write_checkpoint_to_registered_tensors.remote(),
+                timeout=init_timeout_s,
+            )
+            timings["ps_write_checkpoint"] = time.perf_counter() - start
+
+            ps_agent_name = ray.get(ps_actor.get_nixl_agent_name.remote(), timeout=60)
+            ps_gen_client_name = ray.get(
+                ps_actor.get_nixl_gen_storage_client_name.remote(),
+                timeout=60,
+            )
+            ray.get(
+                ps_control.set_endpoints.remote([ps_agent_name], [ps_gen_client_name]),
+                timeout=60,
+            )
+            start = time.perf_counter()
+            ray.get(actor.pull_model_async.remote(), timeout=operation_timeout_s)
+            timings["initial_pull_from_ps"] = time.perf_counter() - start
+            _record_tms_vllm_memory(report, case_name, "after_initial_pull_from_ps")
+
+        sampling_params = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_tokens": reward_config.rollout.response_length,
+        }
+        if probe_role == "reward":
+            ray.get(actor.resume_generation.remote(), timeout=operation_timeout_s)
+            start = time.perf_counter()
+            baseline = ray.get(
+                actor.generate_async.remote(_build_prompt(model_path, uid=0), sampling_params),
+                timeout=operation_timeout_s,
+            )
+            timings["baseline_generate"] = time.perf_counter() - start
+            baseline = _assert_generated(baseline, "baseline generate")
+            generations["baseline"] = _tms_generation_summary(baseline)
+            _record_tms_vllm_memory(report, case_name, "after_baseline_generate")
+
+        start = time.perf_counter()
+        sleep_ref = actor.nixl_sleep.remote() if probe_role == "rollout" else actor.sleep.remote()
+        ray.get(sleep_ref, timeout=operation_timeout_s)
+        timings["first_sleep_level2"] = time.perf_counter() - start
+        _record_tms_vllm_memory(report, case_name, "after_first_sleep_level2")
+
+        start = time.perf_counter()
+        wake_ref = actor.nixl_wake_up.remote() if probe_role == "rollout" else actor.wake_up.remote()
+        ray.get(wake_ref, timeout=operation_timeout_s)
+        timings["first_wake"] = time.perf_counter() - start
+        if probe_role == "rollout":
+            pull_start = time.perf_counter()
+            ray.get(actor.pull_model_async.remote(), timeout=operation_timeout_s)
+            timings["first_pull_from_ps"] = time.perf_counter() - pull_start
+            timings["first_wake_and_pull"] = time.perf_counter() - start
+            registration_infos = ray.get(actor.get_weight_arena_info.remote(), timeout=operation_timeout_s)
+            report.setdefault("nixl_registration", {})["after_first_wake"] = registration_infos
+            for info in registration_infos:
+                registration = info.get("nixl_registration")
+                if registration is None:
+                    raise AssertionError(f"Missing NIXL registration timing: {info}")
+                registration_samples.append(float(registration["register_memory"]))
+            worker_stage_timings["first_wake"] = ray.get(
+                actor.get_worker_stage_timing.remote("nixl_register_after_wake_up"),
+                timeout=operation_timeout_s,
+            )
+            if weight_arena_enabled:
+                _validate_weight_arena_infos(
+                    registration_infos,
+                    tp_size=tp_size,
+                    expected_node_id=report["ps_probe"]["node_id"],
+                    expected_base_addresses=arena_base_addresses,
+                )
+                report["weight_arena"]["after_first_wake"] = registration_infos
+                for info in registration_infos:
+                    registration = info["nixl_registration"]
+                    arena_count = int(info["stats"]["arena_count"])
+                    if int(registration["registered_regions"]) != arena_count:
+                        raise AssertionError(f"NIXL regions do not match arenas: {info}")
+        elif weight_arena_enabled:
+            arena_infos = ray.get(actor.get_weight_arena_info.remote(), timeout=operation_timeout_s)
+            _validate_weight_arena_infos(
+                arena_infos,
+                tp_size=tp_size,
+                expected_node_id=identity["node_id"],
+                expected_base_addresses=arena_base_addresses,
+            )
+            _validate_reward_arena_cache_infos(arena_infos)
+            report["weight_arena"]["after_first_wake"] = arena_infos
+            worker_stage_timings["first_wake"] = ray.get(
+                actor.get_worker_stage_timing.remote("load_weights_from_cpu_cache"),
+                timeout=operation_timeout_s,
+            )
+            for worker_timing in worker_stage_timings["first_wake"]:
+                timing = worker_timing.get("timing") or {}
+                if timing.get("cache_source") != "arena":
+                    raise AssertionError(f"Reward wake did not use the arena CPU cache: {worker_timing}")
+                if int(timing.get("arena_restore_bytes", 0)) != int(timing.get("arena_bytes", -1)):
+                    raise AssertionError(f"Reward wake restored incomplete arena bytes: {worker_timing}")
+                reward_restore_samples.append(float(timing["gpu_copy_elapsed_s"]))
+        _record_tms_vllm_memory(report, case_name, "after_first_wake")
+
+        start = time.perf_counter()
+        if probe_role == "reward":
+            first = ray.get(
+                actor.generate_async.remote(
+                    _build_prompt(model_path, uid=1), sampling_params
+                ),
+                timeout=operation_timeout_s,
+            )
+            timings["first_generate"] = time.perf_counter() - start
+            first = _assert_generated(first, "first generate")
+            generations["first"] = _tms_generation_summary(first)
+            assert generations["first"]["response_ids"] == generations["baseline"]["response_ids"], (
+                "Reward output changed after the first TMS wake."
+            )
+            _record_tms_vllm_memory(report, case_name, "after_first_generate")
+        else:
+            ray.get(actor.resume_generation.remote(), timeout=operation_timeout_s)
+            if verify_generation:
+                first = ray.get(
+                    actor.generate_async.remote(_build_prompt(model_path, uid=1), sampling_params),
+                    timeout=operation_timeout_s,
+                )
+                timings["first_generate"] = time.perf_counter() - start
+                first = _assert_generated(first, "first rollout generate")
+                generations["first"] = _tms_generation_summary(first)
+            else:
+                generations["first"] = {"skipped": "rollout timing probe pulled weights from PS"}
+
+        start = time.perf_counter()
+        sleep_ref = actor.nixl_sleep.remote() if probe_role == "rollout" else actor.sleep.remote()
+        ray.get(sleep_ref, timeout=operation_timeout_s)
+        timings["second_sleep_level2"] = time.perf_counter() - start
+        _record_tms_vllm_memory(report, case_name, "after_second_sleep_level2")
+
+        start = time.perf_counter()
+        wake_ref = actor.nixl_wake_up.remote() if probe_role == "rollout" else actor.wake_up.remote()
+        ray.get(wake_ref, timeout=operation_timeout_s)
+        timings["second_wake"] = time.perf_counter() - start
+        if probe_role == "rollout":
+            pull_start = time.perf_counter()
+            ray.get(actor.pull_model_async.remote(), timeout=operation_timeout_s)
+            timings["second_pull_from_ps"] = time.perf_counter() - pull_start
+            timings["second_wake_and_pull"] = time.perf_counter() - start
+            registration_infos = ray.get(actor.get_weight_arena_info.remote(), timeout=operation_timeout_s)
+            report.setdefault("nixl_registration", {})["after_second_wake"] = registration_infos
+            for info in registration_infos:
+                registration = info.get("nixl_registration")
+                if registration is None:
+                    raise AssertionError(f"Missing NIXL registration timing: {info}")
+                registration_samples.append(float(registration["register_memory"]))
+            worker_stage_timings["second_wake"] = ray.get(
+                actor.get_worker_stage_timing.remote("nixl_register_after_wake_up"),
+                timeout=operation_timeout_s,
+            )
+            if weight_arena_enabled:
+                _validate_weight_arena_infos(
+                    registration_infos,
+                    tp_size=tp_size,
+                    expected_node_id=report["ps_probe"]["node_id"],
+                    expected_base_addresses=arena_base_addresses,
+                )
+                report["weight_arena"]["after_second_wake"] = registration_infos
+                for info in registration_infos:
+                    registration = info["nixl_registration"]
+                    arena_count = int(info["stats"]["arena_count"])
+                    if int(registration["registered_regions"]) != arena_count:
+                        raise AssertionError(f"NIXL regions do not match arenas: {info}")
+                if float(np.percentile(registration_samples, 95)) > 2.0:
+                    raise AssertionError(
+                        "Rollout arena post-wake NIXL register p95 exceeded 2 seconds: "
+                        f"{np.percentile(registration_samples, 95):.6f}s"
+                    )
+        elif weight_arena_enabled:
+            arena_infos = ray.get(actor.get_weight_arena_info.remote(), timeout=operation_timeout_s)
+            _validate_weight_arena_infos(
+                arena_infos,
+                tp_size=tp_size,
+                expected_node_id=identity["node_id"],
+                expected_base_addresses=arena_base_addresses,
+            )
+            _validate_reward_arena_cache_infos(arena_infos)
+            report["weight_arena"]["after_second_wake"] = arena_infos
+            worker_stage_timings["second_wake"] = ray.get(
+                actor.get_worker_stage_timing.remote("load_weights_from_cpu_cache"),
+                timeout=operation_timeout_s,
+            )
+            for worker_timing in worker_stage_timings["second_wake"]:
+                timing = worker_timing.get("timing") or {}
+                if timing.get("cache_source") != "arena":
+                    raise AssertionError(f"Reward wake did not use the arena CPU cache: {worker_timing}")
+                if int(timing.get("arena_restore_bytes", 0)) != int(timing.get("arena_bytes", -1)):
+                    raise AssertionError(f"Reward wake restored incomplete arena bytes: {worker_timing}")
+                reward_restore_samples.append(float(timing["gpu_copy_elapsed_s"]))
+            restore_p95 = float(np.percentile(reward_restore_samples, 95))
+            restore_limit_s = float(os.environ.get("PSRL_TMS_VLLM_REWARD_RESTORE_P95_LIMIT_S", "2.0"))
+            if restore_p95 > restore_limit_s:
+                raise AssertionError(
+                    "Reward arena H2D restore p95 exceeded the configured limit: "
+                    f"p95={restore_p95:.6f}s limit={restore_limit_s:.6f}s"
+                )
+        _record_tms_vllm_memory(report, case_name, "after_second_wake")
+
+        start = time.perf_counter()
+        if probe_role == "reward":
+            second = ray.get(
+                actor.generate_async.remote(
+                    _build_prompt(model_path, uid=2), sampling_params
+                ),
+                timeout=operation_timeout_s,
+            )
+            timings["second_generate"] = time.perf_counter() - start
+            second = _assert_generated(second, "second generate")
+            generations["second"] = _tms_generation_summary(second)
+            assert generations["second"]["response_ids"] == generations["baseline"]["response_ids"], (
+                "Reward output changed after the second TMS wake."
+            )
+            generations["exact_match_across_wakes"] = True
+            _record_tms_vllm_memory(report, case_name, "after_second_generate")
+        else:
+            ray.get(actor.resume_generation.remote(), timeout=operation_timeout_s)
+            if verify_generation:
+                second = ray.get(
+                    actor.generate_async.remote(_build_prompt(model_path, uid=2), sampling_params),
+                    timeout=operation_timeout_s,
+                )
+                timings["second_generate"] = time.perf_counter() - start
+                second = _assert_generated(second, "second rollout generate")
+                generations["second"] = _tms_generation_summary(second)
+                assert generations["second"]["response_ids"] == generations["first"]["response_ids"], (
+                    "Deterministic rollout output changed across TMS/NIXL wake cycles."
+                )
+                generations["exact_match_across_wakes"] = True
+            else:
+                generations["second"] = {"skipped": "rollout timing probe pulled weights from PS"}
+    except Exception as exc:
+        report["error"] = repr(exc)
+        raise
+    finally:
+        cleanup_errors = []
+        if actor is not None:
+            try:
+                ray.get(actor.shutdown_rollout_engine.remote(), timeout=180)
+            except Exception as exc:
+                cleanup_errors.append(f"rollout: {exc!r}")
+            ray.kill(actor, no_restart=True)
+        if ps_actor is not None:
+            try:
+                ray.get(ps_actor.shutdown.remote(), timeout=60)
+            except Exception as exc:
+                cleanup_errors.append(f"ps: {exc!r}")
+            ray.kill(ps_actor, no_restart=True)
+        if meta_server is not None:
+            try:
+                ray.get(meta_server.shutdown.remote(), timeout=60)
+            except Exception as exc:
+                cleanup_errors.append(f"meta_server: {exc!r}")
+            ray.kill(meta_server, no_restart=True)
+        if ps_control is not None:
+            ray.kill(ps_control, no_restart=True)
+        if cleanup_errors:
+            report["cleanup_errors"] = cleanup_errors
+        if worker_stage_timings:
+            report["worker_stage_timings"] = worker_stage_timings
+        if registration_samples:
+            registration_summary = {
+                "samples": registration_samples,
+                "mean": float(np.mean(registration_samples)),
+                "p95": float(np.percentile(registration_samples, 95)),
+                "max": float(np.max(registration_samples)),
+            }
+            report.setdefault("nixl_registration", {})["register_memory_s_summary"] = registration_summary
+            if weight_arena_enabled:
+                report.setdefault("weight_arena", {})["register_memory_s_summary"] = registration_summary
+        if reward_restore_samples:
+            report.setdefault("weight_arena", {})["reward_restore_s_summary"] = {
+                "samples": reward_restore_samples,
+                "mean": float(np.mean(reward_restore_samples)),
+                "p95": float(np.percentile(reward_restore_samples, 95)),
+                "max": float(np.max(reward_restore_samples)),
+            }
+        if probe_pg is not None:
+            remove_placement_group(probe_pg)
+        if actor is not None or probe_pg is not None:
+            time.sleep(10)
+            _record_tms_vllm_memory(report, case_name, "after_actor_kill")
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"TMS vLLM sleep memory report: {report_path}", flush=True)
+        if started_ray:
+            ray.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipduringci
+@pytest.mark.parametrize(
+    ("case_name", "model_env", "relative_model_path", "tp_size"),
+    [
+        pytest.param(
+            "qwen2_5_7b_tp1",
+            "PSRL_TMS_VLLM_7B_MODEL",
+            "models/Qwen2.5-7B",
+            1,
+            id="qwen2.5-7b-tp1",
+        ),
+        pytest.param(
+            "qwen2_5_32b_tp4",
+            "PSRL_TMS_VLLM_32B_MODEL",
+            "models/Qwen2.5-32B",
+            4,
+            id="qwen2.5-32b-tp4",
+        ),
+    ],
+)
+def test_tms_rollout_concurrent_sleep_wake(
+    tmp_path: Path,
+    case_name: str,
+    model_env: str,
+    relative_model_path: str,
+    tp_size: int,
+) -> None:
+    """Run coordinator-shaped concurrent sleep/wake/sync waves."""
+    if os.environ.get("PSRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE") != "1":
+        pytest.skip("Set PSRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE=1 to run this probe.")
+
+    model_path = _tms_vllm_model_path(model_env, relative_model_path)
+    if not (Path(model_path) / "config.json").exists():
+        pytest.skip(f"TMS vLLM sleep model is unavailable: {model_path}")
+
+    num_instances = int(os.environ.get("PSRL_TMS_VLLM_NUM_INSTANCES", "4"))
+    if num_instances < 2:
+        raise ValueError("Concurrent rollout probe needs at least two instances.")
+    wake_schedule = os.environ.get(
+        "PSRL_TMS_VLLM_WAKE_SCHEDULE", "concurrent"
+    )
+    if wake_schedule not in {"concurrent", "node_serial"}:
+        raise ValueError(
+            "PSRL_TMS_VLLM_WAKE_SCHEDULE must be concurrent or node_serial."
+        )
+    ucx_device_groups_raw = os.environ.get(
+        "PSRL_TMS_VLLM_UCX_DEVICE_GROUPS", ""
+    ).strip()
+    ucx_device_groups = [
+        group.strip()
+        for group in ucx_device_groups_raw.split("|")
+        if group.strip()
+    ]
+    probe_variant = os.environ.get(
+        "PSRL_TMS_VLLM_PROBE_VARIANT",
+        f"{wake_schedule}_hca_split" if ucx_device_groups else wake_schedule,
+    ).strip()
+    if not probe_variant:
+        raise ValueError("PSRL_TMS_VLLM_PROBE_VARIANT must not be empty.")
+
+    started_ray = False
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, include_dashboard=False)
+        started_ray = True
+    required_gpus = num_instances * tp_size
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < required_gpus:
+        if started_ray:
+            ray.shutdown()
+        pytest.skip(
+            f"{case_name} x{num_instances} needs {required_gpus} GPUs, "
+            f"but Ray sees {available_gpus}"
+        )
+
+    psrl_config = _build_psrl_config(tmp_path, load_real_weights_at_init=True)
+    psrl_config.ps_mode = "nixl_cpu"
+    psrl_config.tms.enable_nixl = True
+    psrl_config.tms.enable_cuda_graph = True
+    rollout_config = _build_tms_comparison_reward_config(model_path, tp_size)
+    init_timeout_s = int(os.environ.get("PSRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
+    operation_timeout_s = int(
+        os.environ.get("PSRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
+    )
+    report: dict[str, object] = {
+        "case": case_name,
+        "probe_role": "rollout",
+        "model_path": model_path,
+        "tp_size": tp_size,
+        "num_instances": num_instances,
+        "required_gpus": required_gpus,
+        "wake_schedule": wake_schedule,
+        "probe_variant": probe_variant,
+        "ucx_device_groups": ucx_device_groups,
+        "rollout_config": OmegaConf.to_container(rollout_config, resolve=True),
+        "setup_timings_s": {},
+        "waves": [],
+    }
+    output_dir_raw = os.environ.get("PSRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / (
+        f"tms_rollout_concurrent_{case_name}_x{num_instances}_{probe_variant}.json"
+    )
+
+    actors = []
+    probe_pgs = []
+    meta_server = None
+    ps_control = None
+    ps_actor = None
+    try:
+        _record_tms_vllm_memory(report, f"{case_name}_x{num_instances}", "before_actor_start")
+        probe_pgs = [
+            placement_group(
+                [{"CPU": 1, "GPU": 1} for _ in range(tp_size)],
+                strategy="STRICT_PACK",
+            )
+            for _ in range(num_instances)
+        ]
+        ray.get([pg.ready() for pg in probe_pgs], timeout=init_timeout_s)
+        identities = ray.get(
+            [
+                _probe_node_identity.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        pg,
+                        placement_group_bundle_index=0,
+                    )
+                ).remote()
+                for pg in probe_pgs
+            ],
+            timeout=60,
+        )
+        report["instance_placement"] = {
+            str(instance_id): identity
+            for instance_id, identity in enumerate(identities)
+        }
+        gpu_identity_refs = {
+            (instance_id, bundle_idx): _probe_bundle_gpu_identity.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    pg,
+                    placement_group_bundle_index=bundle_idx,
+                )
+            ).remote()
+            for instance_id, pg in enumerate(probe_pgs)
+            for bundle_idx in range(tp_size)
+        }
+        gpu_identities = dict(
+            zip(
+                gpu_identity_refs,
+                ray.get(list(gpu_identity_refs.values()), timeout=60),
+            )
+        )
+        instance_gpu_ids = {
+            instance_id: sorted(
+                gpu_identities[(instance_id, bundle_idx)]["gpu_ids"][0]
+                for bundle_idx in range(tp_size)
+            )
+            for instance_id in range(num_instances)
+        }
+        report["instance_gpu_ids"] = {
+            str(instance_id): gpu_ids
+            for instance_id, gpu_ids in instance_gpu_ids.items()
+        }
+        node_instance_ids: dict[str, list[int]] = {}
+        for instance_id, identity in enumerate(identities):
+            node_instance_ids.setdefault(identity["node_id"], []).append(instance_id)
+        for instance_ids in node_instance_ids.values():
+            instance_ids.sort(
+                key=lambda instance_id: min(
+                    int(float(gpu_id))
+                    for gpu_id in instance_gpu_ids[instance_id]
+                )
+            )
+        instance_ucx_devices: dict[int, str] = {}
+        if ucx_device_groups:
+            max_instances_per_node = max(map(len, node_instance_ids.values()))
+            if len(ucx_device_groups) < max_instances_per_node:
+                raise ValueError(
+                    "PSRL_TMS_VLLM_UCX_DEVICE_GROUPS must provide at least "
+                    f"{max_instances_per_node} groups separated by '|', got "
+                    f"{len(ucx_device_groups)}."
+                )
+            for instance_ids in node_instance_ids.values():
+                for local_instance_idx, instance_id in enumerate(instance_ids):
+                    instance_ucx_devices[instance_id] = ucx_device_groups[
+                        local_instance_idx
+                    ]
+        report["instance_ucx_devices"] = {
+            str(instance_id): devices
+            for instance_id, devices in instance_ucx_devices.items()
+        }
+        node_serial_rounds = [
+            [instance_ids[round_idx] for instance_ids in node_instance_ids.values() if round_idx < len(instance_ids)]
+            for round_idx in range(max(map(len, node_instance_ids.values())))
+        ]
+        report["node_instance_ids"] = node_instance_ids
+        report["node_serial_rounds"] = node_serial_rounds
+
+        from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+        from psrl.workers.ps import PSStoragePlan, PSStorageWorker
+
+        server_port = ray.get(
+            GLOBAL_PORT_SCANNER.find_free_port.remote(host=identities[0]["node_ip"]),
+            timeout=60,
+        )
+        psrl_config.nixl = OmegaConf.create(
+            {
+                "server_ip": identities[0]["node_ip"],
+                "server_port": server_port,
+                "max_pinned_temp_memory_slots": 64,
+                "enable_tms_for_temp_buffers": True,
+            }
+        )
+        nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
+        ps_node_affinity = NodeAffinitySchedulingStrategy(
+            node_id=identities[0]["node_id"],
+            soft=False,
+        )
+        meta_server = _NIXLProbeMetaServer.options(
+            scheduling_strategy=ps_node_affinity,
+        ).remote(psrl_config.nixl, required_gpus + 1)
+        ray.get(meta_server.ready.remote(), timeout=60)
+        ps_control = _NIXLProbePSControl.options(
+            scheduling_strategy=ps_node_affinity,
+        ).remote()
+        PSActor = ray.remote(num_cpus=0)(PSStorageWorker)
+        ps_actor = PSActor.options(
+            scheduling_strategy=ps_node_affinity,
+            runtime_env={
+                "env_vars": {
+                    "WORLD_SIZE": "1",
+                    "RANK": "0",
+                    "PS_NODE_IP": identities[0]["node_ip"],
+                }
+            },
+        ).remote(
+            PSStoragePlan(
+                train_model_dtype=torch.bfloat16,
+                gen_model_dtype=torch.bfloat16,
+            ),
+            rollout_config.model,
+            psrl_config,
+            nixl_interface,
+        )
+        setup_timings = report["setup_timings_s"]
+        ps_init_start = time.perf_counter()
+        ps_actor.init_nixl_client.remote()
+        ps_actor.init_model.remote()
+        ps_preload_ref = ps_actor.preload_checkpoint_to_cpu.remote()
+
+        GenActor = ray.remote(max_concurrency=10000)(PSRL_GenWorker)
+        for instance_id, (pg, identity) in enumerate(zip(probe_pgs, identities)):
+            resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+                config=rollout_config,
+                psrl_config=psrl_config,
+                num_gpus=1,
+                dp_idx=instance_id,
+                bundle_indices=list(range(tp_size)),
+                role="rollout",
+            )
+            master_port = ray.get(
+                GLOBAL_PORT_SCANNER.find_free_port.remote(host=identity["node_ip"]),
+                timeout=60,
+            )
+            actor_env = {
+                **env_vars,
+                "WG_BACKEND": "ray",
+                "WORLD_SIZE": str(tp_size),
+                "RANK": "0",
+                "LOCAL_WORLD_SIZE": str(tp_size),
+                "LOCAL_RANK": "0",
+                "RAY_LOCAL_WORLD_SIZE": str(tp_size),
+                "RAY_LOCAL_RANK": "0",
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": str(master_port),
+                "TOKENIZERS_PARALLELISM": "false",
+            }
+            if instance_id in instance_ucx_devices:
+                actor_env["UCX_NET_DEVICES"] = instance_ucx_devices[instance_id]
+                print(
+                    "HCA isolation: "
+                    f"instance={instance_id} node={identity['node_ip']} "
+                    f"gpu_ids={instance_gpu_ids[instance_id]} "
+                    f"UCX_NET_DEVICES={instance_ucx_devices[instance_id]}",
+                    flush=True,
+                )
+            actors.append(
+                GenActor.options(
+                    num_gpus=resources.get("num_gpus", 1),
+                    num_cpus=resources.get("num_cpus", 1),
+                    runtime_env={"env_vars": actor_env},
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        pg,
+                        placement_group_bundle_index=0,
+                        placement_group_capture_child_tasks=True,
+                    ),
+                ).remote(
+                    config=rollout_config,
+                    role="rollout",
+                    psrl_config=psrl_config,
+                    gen_interface=GenInterface(
+                        rollout_instance_id=instance_id,
+                        status_queue=ray.util.queue.Queue(),
+                        ps_manager_handle=ps_control,
+                    ),
+                    nixl_interface=nixl_interface,
+                    instance_id=instance_id,
+                    reward_model_name="rollout_tms_concurrent_probe",
+                    **init_kwargs,
+                )
+            )
+
+        setup_timings["engine_init_wave"] = _wait_concurrent_refs(
+            {
+                instance_id: actor.init_model.remote("empty")
+                for instance_id, actor in enumerate(actors)
+            }
+        )
+        ray.get(ps_preload_ref, timeout=init_timeout_s)
+        setup_timings["ps_init_and_checkpoint_preload_wall_s"] = (
+            time.perf_counter() - ps_init_start
+        )
+        _record_tms_vllm_memory(report, f"{case_name}_x{num_instances}", "after_engine_init")
+
+        setup_timings["rollout_nixl_client_init"] = _wait_concurrent_refs(
+            {
+                instance_id: actor.init_nixl_client.remote()
+                for instance_id, actor in enumerate(actors)
+            }
+        )
+        setup_timings["rollout_nixl_convert_params"] = _wait_concurrent_refs(
+            {
+                instance_id: actor.nixl_convert_params.remote()
+                for instance_id, actor in enumerate(actors)
+            }
+        )
+        protocol_start = time.perf_counter()
+        ray.get(
+            [
+                meta_server.protocol.remote(operation_timeout_s),
+                ps_actor.nixl_protocol.remote(),
+                *[actor.nixl_protocol.remote() for actor in actors],
+            ],
+            timeout=operation_timeout_s,
+        )
+        setup_timings["nixl_protocol_wall_s"] = time.perf_counter() - protocol_start
+        ps_write_start = time.perf_counter()
+        ray.get(
+            ps_actor.write_checkpoint_to_registered_tensors.remote(),
+            timeout=init_timeout_s,
+        )
+        setup_timings["ps_write_checkpoint_s"] = time.perf_counter() - ps_write_start
+        ps_agent_name = ray.get(ps_actor.get_nixl_agent_name.remote(), timeout=60)
+        ps_gen_client_name = ray.get(
+            ps_actor.get_nixl_gen_storage_client_name.remote(),
+            timeout=60,
+        )
+        ray.get(
+            ps_control.set_endpoints.remote([ps_agent_name], [ps_gen_client_name]),
+            timeout=60,
+        )
+        setup_timings["initial_pull_wave"] = _wait_concurrent_refs(
+            {
+                instance_id: actor.pull_model_async.remote()
+                for instance_id, actor in enumerate(actors)
+            }
+        )
+        _record_tms_vllm_memory(report, f"{case_name}_x{num_instances}", "after_initial_pull")
+
+        for cycle in (1, 2):
+            wave = {"cycle": cycle}
+            wave["sleep"] = _wait_concurrent_refs(
+                {
+                    instance_id: actor.nixl_sleep.remote()
+                    for instance_id, actor in enumerate(actors)
+                }
+            )
+            _record_tms_vllm_memory(
+                report,
+                f"{case_name}_x{num_instances}",
+                f"after_sleep_{cycle}",
+            )
+            if wake_schedule == "concurrent":
+                wave["wake"] = _wait_concurrent_refs(
+                    {
+                        instance_id: actor.nixl_wake_up.remote()
+                        for instance_id, actor in enumerate(actors)
+                    }
+                )
+            else:
+                wake_started_at = time.perf_counter()
+                round_reports = []
+                for round_idx, instance_ids in enumerate(node_serial_rounds):
+                    round_report = _wait_concurrent_refs(
+                        {
+                            instance_id: actors[instance_id].nixl_wake_up.remote()
+                            for instance_id in instance_ids
+                        }
+                    )
+                    round_report["round"] = round_idx
+                    round_report["instance_ids"] = instance_ids
+                    round_reports.append(round_report)
+                wave["wake"] = {
+                    "wall_s": time.perf_counter() - wake_started_at,
+                    "rounds": round_reports,
+                }
+            wave["sync_with_ps"] = _wait_concurrent_refs(
+                {
+                    instance_id: actor.sync_with_ps.remote(
+                        ps_version=0,
+                        interrupt_generation=False,
+                        sync_after_wake_up=True,
+                    )
+                    for instance_id, actor in enumerate(actors)
+                }
+            )
+            wave["wake_and_sync_wall_s"] = (
+                wave["wake"]["wall_s"] + wave["sync_with_ps"]["wall_s"]
+            )
+            report["waves"].append(wave)
+            _record_tms_vllm_memory(
+                report,
+                f"{case_name}_x{num_instances}",
+                f"after_wake_and_sync_{cycle}",
+            )
+    except Exception as exc:
+        report["error"] = repr(exc)
+        raise
+    finally:
+        cleanup_errors = []
+        if actors:
+            try:
+                ray.get(
+                    [actor.shutdown_rollout_engine.remote() for actor in actors],
+                    timeout=180,
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"rollouts: {exc!r}")
+            for actor in actors:
+                ray.kill(actor, no_restart=True)
+        if ps_actor is not None:
+            try:
+                ray.get(ps_actor.shutdown.remote(), timeout=60)
+            except Exception as exc:
+                cleanup_errors.append(f"ps: {exc!r}")
+            ray.kill(ps_actor, no_restart=True)
+        if meta_server is not None:
+            try:
+                ray.get(meta_server.shutdown.remote(), timeout=60)
+            except Exception as exc:
+                cleanup_errors.append(f"meta_server: {exc!r}")
+            ray.kill(meta_server, no_restart=True)
+        if ps_control is not None:
+            ray.kill(ps_control, no_restart=True)
+        for pg in probe_pgs:
+            remove_placement_group(pg)
+        if cleanup_errors:
+            report["cleanup_errors"] = cleanup_errors
+        if actors or probe_pgs:
+            time.sleep(10)
+            _record_tms_vllm_memory(
+                report,
+                f"{case_name}_x{num_instances}",
+                "after_actor_kill",
+            )
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Concurrent rollout timing report: {report_path}", flush=True)
+        if started_ray:
+            ray.shutdown()
+
+
+_NATIVE_VLLM_ACTOR_ENV = {
+    # The plugin is installed in this checkout, so explicitly keep the native
+    # vLLM CuMemAllocator implementation active for this probe.
+    "PSRL_VLLM_PATCHES": "",
+    "TMS_INIT_ENABLE": "0",
+    "TMS_INIT_ENABLE_CPU_BACKUP": "0",
+    "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+    "VLLM_RAY_PER_WORKER_GPUS": "1",
+    "VLLM_RAY_BUNDLE_INDICES": "",
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+    "TOKENIZERS_PARALLELISM": "false",
+}
+
+
+@ray.remote(num_cpus=1, runtime_env={"env_vars": _NATIVE_VLLM_ACTOR_ENV})
+class _NativeVLLMSleepProbe:
+    def __init__(self):
+        self.llm = None
+
+    def initialize(self, engine_config: dict) -> dict[str, str]:
+        if os.environ.get("PSRL_VLLM_PATCHES"):
+            raise RuntimeError(
+                "Native vLLM sleep probe must run without PSRL_VLLM_PATCHES; "
+                f"got {os.environ['PSRL_VLLM_PATCHES']!r}."
+            )
+
+        import vllm
+        from vllm import LLM
+        from vllm.v1.worker.gpu_worker import Worker
+
+        self.llm = LLM(**engine_config)
+        sleep_impl = f"{Worker.sleep.__module__}.{Worker.sleep.__qualname__}"
+        if Worker.sleep.__module__ != "vllm.v1.worker.gpu_worker":
+            raise RuntimeError(f"Worker.sleep is patched, not native vLLM: {sleep_impl}")
+        return {"vllm_version": vllm.__version__, "sleep_impl": sleep_impl}
+
+    def sleep_level2(self) -> float:
+        assert self.llm is not None
+        start = time.perf_counter()
+        self.llm.sleep(level=2)
+        return time.perf_counter() - start
+
+    def wake_weights(self) -> float:
+        assert self.llm is not None
+        start = time.perf_counter()
+        self.llm.wake_up(tags=["weights"])
+        return time.perf_counter() - start
+
+    def reload_weights(self) -> float:
+        assert self.llm is not None
+        start = time.perf_counter()
+        self.llm.collective_rpc("reload_weights")
+        return time.perf_counter() - start
+
+    def wake_kv_cache(self) -> float:
+        assert self.llm is not None
+        start = time.perf_counter()
+        self.llm.wake_up(tags=["kv_cache"])
+        return time.perf_counter() - start
+
+    def generate(self, max_tokens: int) -> dict[str, object]:
+        assert self.llm is not None
+        from vllm import SamplingParams
+
+        start = time.perf_counter()
+        outputs = self.llm.generate(
+            ["Hello, please answer with one short sentence."],
+            SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_tokens),
+            use_tqdm=False,
+        )
+        elapsed = time.perf_counter() - start
+        output = outputs[0].outputs[0]
+        return {
+            "elapsed_s": elapsed,
+            "text": output.text,
+            "num_output_tokens": len(output.token_ids),
+        }
+
+
+def _native_vllm_model_path(env_name: str, relative_path: str) -> str:
+    repo_root = Path(__file__).resolve().parents[3]
+    return os.environ.get(env_name, str(repo_root / relative_path))
+
+
+def _native_vllm_engine_config(model_path: str, tp_size: int) -> dict[str, object]:
+    max_model_len = int(os.environ.get("PSRL_NATIVE_VLLM_MAX_MODEL_LEN", "16384"))
+    max_num_batched_tokens = int(
+        os.environ.get("PSRL_NATIVE_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
+    )
+    return {
+        "model": model_path,
+        "enable_sleep_mode": True,
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": 1,
+        "distributed_executor_backend": "ray",
+        "dtype": "bfloat16",
+        "gpu_memory_utilization": float(os.environ.get("PSRL_NATIVE_VLLM_GPU_MEMORY_UTILIZATION", "0.7")),
+        "enforce_eager": _env_bool("PSRL_NATIVE_VLLM_ENFORCE_EAGER", False),
+        "max_model_len": max_model_len,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "max_num_seqs": int(os.environ.get("PSRL_NATIVE_VLLM_MAX_NUM_SEQS", "64")),
+        "enable_chunked_prefill": True,
+        "enable_prefix_caching": False,
+        "disable_custom_all_reduce": True,
+        "trust_remote_code": False,
+        "load_format": "auto",
+        "disable_log_stats": True,
+    }
+
+
+def _record_native_vllm_memory(
+    report: dict[str, object], case_name: str, stage: str
+) -> None:
+    snapshots = _print_cluster_gpu_memory(f"native_{case_name}_{stage}")
+    report.setdefault("memory_snapshots", {})[stage] = snapshots
+
+
+@pytest.mark.integration
+@pytest.mark.skipduringci
+@pytest.mark.parametrize(
+    ("case_name", "model_env", "relative_model_path", "tp_size"),
+    [
+        pytest.param(
+            "qwen2_5_7b_tp1",
+            "PSRL_NATIVE_VLLM_7B_MODEL",
+            "models/Qwen2.5-7B",
+            1,
+            id="qwen2.5-7b-tp1",
+        ),
+        pytest.param(
+            "qwen2_5_32b_tp4",
+            "PSRL_NATIVE_VLLM_32B_MODEL",
+            "models/Qwen2.5-32B",
+            4,
+            id="qwen2.5-32b-tp4",
+        ),
+    ],
+)
+def test_native_vllm_level2_sleep_memory(
+    tmp_path: Path,
+    case_name: str,
+    model_env: str,
+    relative_model_path: str,
+    tp_size: int,
+):
+    """Measure native vLLM level-2 sleep over two wake/generate cycles.
+
+    The 7B case uses TP1 and the 32B case uses TP4. Each wake follows the
+    native level-2 contract: allocate weights, reload them from disk, then
+    allocate KV cache before inference.
+    """
+    if os.environ.get("PSRL_RUN_NATIVE_VLLM_SLEEP_SMOKE") != "1":
+        pytest.skip(
+            "Set PSRL_RUN_NATIVE_VLLM_SLEEP_SMOKE=1 to run native vLLM sleep probes."
+        )
+
+    model_path = _native_vllm_model_path(model_env, relative_model_path)
+    if not (Path(model_path) / "config.json").exists():
+        pytest.skip(f"Native vLLM sleep model is unavailable: {model_path}")
+
+    started_ray = False
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, include_dashboard=False)
+        started_ray = True
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < tp_size:
+        if started_ray:
+            ray.shutdown()
+        pytest.skip(f"{case_name} needs {tp_size} GPUs, but Ray sees {available_gpus}")
+
+    engine_config = _native_vllm_engine_config(model_path, tp_size)
+    max_tokens = int(os.environ.get("PSRL_NATIVE_VLLM_MAX_TOKENS", "32"))
+    init_timeout_s = int(os.environ.get("PSRL_NATIVE_VLLM_INIT_TIMEOUT_S", "1800"))
+    operation_timeout_s = int(os.environ.get("PSRL_NATIVE_VLLM_OPERATION_TIMEOUT_S", "900"))
+    report: dict[str, object] = {
+        "case": case_name,
+        "model_path": model_path,
+        "tp_size": tp_size,
+        "engine_config": engine_config,
+        "timings_s": {},
+        "generations": {},
+    }
+
+    output_dir_raw = os.environ.get("PSRL_NATIVE_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"native_vllm_sleep_{case_name}.json"
+
+    actor = None
+    probe_pg = None
+    try:
+        _record_native_vllm_memory(report, case_name, "before_actor_start")
+        probe_pg = placement_group(
+            [{"CPU": 1}] + [{"GPU": 1} for _ in range(tp_size)],
+            strategy="STRICT_PACK",
+        )
+        ray.get(probe_pg.ready(), timeout=init_timeout_s)
+        actor = _NativeVLLMSleepProbe.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                probe_pg,
+                placement_group_bundle_index=0,
+                placement_group_capture_child_tasks=True,
+            )
+        ).remote()
+        native_info = ray.get(actor.initialize.remote(engine_config), timeout=init_timeout_s)
+        report["native_vllm"] = native_info
+        print(f"Native vLLM probe implementation: {native_info}", flush=True)
+        _record_native_vllm_memory(report, case_name, "after_engine_init")
+
+        timings = report["timings_s"]
+        generations = report["generations"]
+
+        timings["first_sleep_level2"] = ray.get(
+            actor.sleep_level2.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_first_sleep_level2")
+
+        timings["first_wake_weights"] = ray.get(
+            actor.wake_weights.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_first_weights_reallocated")
+        timings["first_reload_weights"] = ray.get(
+            actor.reload_weights.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_first_weights_reloaded")
+        timings["first_wake_kv_cache"] = ray.get(
+            actor.wake_kv_cache.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_first_kv_cache_reallocated")
+
+        first_generation = ray.get(
+            actor.generate.remote(max_tokens), timeout=operation_timeout_s
+        )
+        assert first_generation["num_output_tokens"] > 0
+        generations["first"] = first_generation
+        _record_native_vllm_memory(report, case_name, "after_first_generate")
+
+        timings["second_sleep_level2"] = ray.get(
+            actor.sleep_level2.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_second_sleep_level2")
+
+        timings["second_wake_weights"] = ray.get(
+            actor.wake_weights.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_second_weights_reallocated")
+        timings["second_reload_weights"] = ray.get(
+            actor.reload_weights.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_second_weights_reloaded")
+        timings["second_wake_kv_cache"] = ray.get(
+            actor.wake_kv_cache.remote(), timeout=operation_timeout_s
+        )
+        _record_native_vllm_memory(report, case_name, "after_second_kv_cache_reallocated")
+
+        second_generation = ray.get(
+            actor.generate.remote(max_tokens), timeout=operation_timeout_s
+        )
+        assert second_generation["num_output_tokens"] > 0
+        generations["second"] = second_generation
+        _record_native_vllm_memory(report, case_name, "after_second_generate")
+    except Exception as exc:
+        report["error"] = repr(exc)
+        raise
+    finally:
+        if actor is not None:
+            ray.kill(actor, no_restart=True)
+        if probe_pg is not None:
+            remove_placement_group(probe_pg)
+        if actor is not None or probe_pg is not None:
+            time.sleep(10)
+            _record_native_vllm_memory(report, case_name, "after_actor_kill")
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Native vLLM sleep memory report: {report_path}", flush=True)
         if started_ray:
             ray.shutdown()

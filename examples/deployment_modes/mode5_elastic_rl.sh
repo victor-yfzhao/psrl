@@ -14,14 +14,14 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=elastic_rl
-export PSRL_DEPLOY_EXPERIMENT=mode5_bs_128_share_8_8_8_elastic_rl
+export PSRL_DEPLOY_EXPERIMENT=test_none_request_level_candidate_evaluation_mode5_bs_128_share_16_elastic_rl
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 export PSRL_DEPLOY_RM_ASYNC=False
 export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=1
+export PSRL_DEPLOY_TRAIN_NNODES=2
 export PSRL_DEPLOY_TRAIN_NGPUS=8
-export PSRL_DEPLOY_SHARED_NNODES=3
-export PSRL_DEPLOY_SHARED_NGPUS="[8, 8, 8]"
+export PSRL_DEPLOY_SHARED_NNODES=2
+export PSRL_DEPLOY_SHARED_NGPUS="[8,8]"
 export PSRL_DEPLOY_RM_NUM_REPLICAS=0
 export PSRL_DEPLOY_SMOKE=${1:-0}
 shift || true

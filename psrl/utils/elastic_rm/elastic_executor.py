@@ -129,6 +129,7 @@ class ElasticExecutor:
         self._next_policy_scaling_owner_token = 1
         self._policy_scaling_waiters: list[asyncio.Future] = []
         self._next_decision_id = 1
+        self._next_migration_sequence = 1
         self._decision_pending_action_counts: dict[int, int] = {}
         self._decision_gate_tokens: dict[int, int] = {}
         # Consecutive monitor ticks where policy is blocked by an unfinished scale decision.
@@ -148,6 +149,7 @@ class ElasticExecutor:
         )
         self.router_backlog_by_role: dict[PSRL_Role, int] = {}
         self.router_backlog_summary_by_role: dict[PSRL_Role, dict[str, int]] = {}
+        self.request_level_snapshots_by_role: dict[PSRL_Role, object] = {}
         self.trainer_waiting_hint: dict[str, object] = {
             "trainer_busy": not self._train_pool_available,
             "waiting_buffer_id": None,
@@ -752,6 +754,12 @@ class ElasticExecutor:
                 # Pull fresh engine status from coordinators first, then decide scaling.
                 await self._sync_engine_status_from_coordinators()
                 await self._sync_router_backlog_from_coordinators()
+                if getattr(
+                    self.scaling_policy,
+                    "enable_request_level_candidate_evaluation",
+                    False,
+                ):
+                    await self._sync_request_level_snapshots_from_coordinators()
                 await self._sync_trainer_waiting_hint()
                 signals = self._build_instance_signals()
                 self._maybe_log_instance_signals(signals)
@@ -760,11 +768,23 @@ class ElasticExecutor:
                     if isinstance(self.scaling_policy, ITLScalingPolicy)
                     else self.router_backlog_by_role
                 )
-                decision = self.scaling_policy.decide(
-                    signals,
-                    execution_in_progress=not self._policy_scaling_idle.is_set(),
-                    router_backlog_by_role=router_backlog_for_policy,
-                    trainer_waiting_hint=self.trainer_waiting_hint,
+                planner_started_s = time.monotonic()
+                decision_kwargs = {
+                    "execution_in_progress": not self._policy_scaling_idle.is_set(),
+                    "router_backlog_by_role": router_backlog_for_policy,
+                    "trainer_waiting_hint": self.trainer_waiting_hint,
+                }
+                if isinstance(self.scaling_policy, ITLScalingPolicy):
+                    decision_kwargs["request_level_snapshots_by_role"] = (
+                        self.request_level_snapshots_by_role
+                    )
+                decision = self.scaling_policy.decide(signals, **decision_kwargs)
+                planner_elapsed_s = time.monotonic() - planner_started_s
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=policy_planner planner_s=%.6f actions=%d reason=%s",
+                    planner_elapsed_s,
+                    len(decision.actions),
+                    decision.reason,
                 )
                 if not decision.actions and decision.reason == "decision_execution_in_progress":
                     # perform_sync_swap clears the same idle event but does not use
@@ -821,6 +841,7 @@ class ElasticExecutor:
                                 "reason": action.reason,
                                 "pre_sleep_other_preferred": action.pre_sleep_other_preferred,
                                 "pre_wake_other_preferred": action.pre_wake_other_preferred,
+                                "planned_request_migrations": action.planned_request_migrations,
                             }
                             for action in decision.actions
                         ],
@@ -834,8 +855,10 @@ class ElasticExecutor:
                             "preferred_instance_ids": action.preferred_instance_ids or [],
                             "reason": action.reason,
                             "decision_id": decision_id,
+                            "planner_elapsed_s": planner_elapsed_s,
                             "pre_sleep_other_preferred": action.pre_sleep_other_preferred or [],
                             "pre_wake_other_preferred": action.pre_wake_other_preferred or [],
+                            "planned_request_migrations": action.planned_request_migrations or [],
                         }
                         if action.action_type == "scale_up":
                             self.scale_up_task_queue.put_nowait(task)
@@ -862,32 +885,22 @@ class ElasticExecutor:
 
             role_need_to_scale_up = self.scale_up_task_queue.get_nowait()
             decision_id = role_need_to_scale_up.get("decision_id")
+            action_started_s = time.monotonic()
+            sleep_elapsed_s = 0.0
+            wake_elapsed_s = 0.0
+            migration_elapsed_s = 0.0
             try:
                 psrl_logger.info(
                     "elastic_rm scale_up_handler decision_id=%s begin task=%s",
                     decision_id,
                     role_need_to_scale_up,
                 )
-                instances_to_pre_wake = self._resolve_preferred_instances_to_scaled_up(
-                    role_need_to_scale_up.get("pre_wake_other_preferred") or []
+                instances_to_pre_wake = (
+                    self._resolve_preferred_instances_to_scaled_up(
+                        role_need_to_scale_up.get("pre_wake_other_preferred") or []
+                    )
+                    or []
                 )
-                if instances_to_pre_wake:
-                    psrl_logger.info(
-                        "elastic_rm scale_up_handler decision_id=%s pre_wake_migration count=%s detail=%s",
-                        decision_id,
-                        len(instances_to_pre_wake),
-                        instances_to_pre_wake,
-                    )
-                    await asyncio.gather(
-                        *[self._scale_up_instance(instance) for instance in instances_to_pre_wake]
-                    )
-                    psrl_logger.info(
-                        "elastic_rm scale_up_handler decision_id=%s pre_wake_migration done",
-                        decision_id,
-                    )
-
-                sleep_elapsed_s = 0.0
-                wake_elapsed_s = 0.0
                 instances_to_scaled_down = self._find_instances_to_scaled_down_for_other_roles(role_need_to_scale_up)
                 if instances_to_scaled_down:
                     psrl_logger.info(
@@ -908,26 +921,90 @@ class ElasticExecutor:
                 if not instances_to_scaled_up:
                     psrl_logger.warning("No instances can be scaled up for role %s", role_need_to_scale_up)
                     continue
+                instances_to_wake = instances_to_pre_wake + instances_to_scaled_up
                 psrl_logger.info(
-                    "elastic_rm scale_up_handler decision_id=%s wake_targets=%s",
+                    "elastic_rm scale_up_handler decision_id=%s combined_wake "
+                    "pre_wake_targets=%s wake_targets=%s",
                     decision_id,
+                    instances_to_pre_wake,
                     instances_to_scaled_up,
                 )
                 t0 = time.monotonic()
-                await self._scale_up_instances(instances_to_scaled_up)
+                await self._scale_up_instances(instances_to_wake)
                 wake_elapsed_s = time.monotonic() - t0
                 self._record_policy_migration_observation(sleep_elapsed_s, wake_elapsed_s)
                 psrl_logger.info(
-                    "elastic_rm scale_up_handler decision_id=%s wake_targets done; post_scale_up_abort",
+                    "elastic_rm scale_up_handler decision_id=%s wake_targets done; post_scale_up_rebalance",
                     decision_id,
                 )
-                await self._interrupt_waiting_after_scale_up(
-                    role_name=role_need_to_scale_up["role_name"],
-                    model_name=role_need_to_scale_up["model_name"],
-                    wake_instance_ids={int(item["instance_id"]) for item in instances_to_scaled_up},
+                migration_started_s = time.monotonic()
+                request_level_enabled = bool(
+                    getattr(
+                        getattr(self, "scaling_policy", None),
+                        "enable_request_level_candidate_evaluation",
+                        False,
+                    )
                 )
+                if request_level_enabled:
+                    primary_wake_succeeded = all(
+                        self.instances_status_flags
+                        .get(item["role_name"], {})
+                        .get(item["model_name"], {})
+                        .get(int(item["instance_id"]))
+                        == InstanceStatus.AWAKEN
+                        for item in instances_to_scaled_up
+                    )
+                    if primary_wake_succeeded:
+                        await self._execute_planned_request_migrations(
+                            role_name=role_need_to_scale_up["role_name"],
+                            model_name=role_need_to_scale_up["model_name"],
+                            request_migrations=(
+                                role_need_to_scale_up.get("planned_request_migrations") or []
+                            ),
+                            decision_id=decision_id,
+                        )
+                    else:
+                        psrl_logger.warning(
+                            "Skip planned request migrations because primary wake did not fully "
+                            "reach AWAKEN: decision_id=%s wake_targets=%s",
+                            decision_id,
+                            instances_to_scaled_up,
+                        )
+                else:
+                    await self._interrupt_waiting_after_scale_up(
+                        role_name=role_need_to_scale_up["role_name"],
+                        model_name=role_need_to_scale_up["model_name"],
+                        wake_instance_ids={int(item["instance_id"]) for item in instances_to_scaled_up},
+                        decision_id=decision_id,
+                    )
+                migration_elapsed_s = time.monotonic() - migration_started_s
                 psrl_logger.info("elastic_rm scale_up_handler decision_id=%s post_scale_up_abort done", decision_id)
+            except Exception:
+                psrl_logger.exception(
+                    "elastic_rm scale_up_handler decision_id=%s failed; continue processing queued actions.",
+                    decision_id,
+                )
             finally:
+                execution_elapsed_s = time.monotonic() - action_started_s
+                policy_planner_s = float(role_need_to_scale_up.get("planner_elapsed_s", 0.0))
+                handler_other_s = max(
+                    0.0,
+                    execution_elapsed_s - sleep_elapsed_s - wake_elapsed_s - migration_elapsed_s,
+                )
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=scale_up decision_id=%s planner_s=%.6f "
+                    "planner_scope=decision_batch sleep_s=%.6f wakeup_s=%.6f "
+                    "post_scale_up_rebalance_trigger_s=%.6f handler_other_s=%.6f "
+                    "execution_s=%.6f total_s=%.6f",
+                    decision_id,
+                    policy_planner_s,
+                    sleep_elapsed_s,
+                    wake_elapsed_s,
+                    migration_elapsed_s,
+                    handler_other_s,
+                    execution_elapsed_s,
+                    policy_planner_s + execution_elapsed_s,
+                )
                 self._mark_decision_action_finished(decision_id)
 
     async def _scale_down_handler_loop(self):
@@ -938,6 +1015,8 @@ class ElasticExecutor:
 
             role_need_to_scale_down = self.scale_down_task_queue.get_nowait()
             decision_id = role_need_to_scale_down.get("decision_id")
+            action_started_s = time.monotonic()
+            sleep_elapsed_s = 0.0
             try:
                 psrl_logger.info(
                     "elastic_rm scale_down_handler decision_id=%s begin task=%s",
@@ -953,9 +1032,31 @@ class ElasticExecutor:
                     decision_id,
                     instances_to_scaled_down,
                 )
+                sleep_started_s = time.monotonic()
                 await self._scale_down_instances(instances_to_scaled_down)
+                sleep_elapsed_s = time.monotonic() - sleep_started_s
                 psrl_logger.info("elastic_rm scale_down_handler decision_id=%s sleep_targets done", decision_id)
+            except Exception:
+                psrl_logger.exception(
+                    "elastic_rm scale_down_handler decision_id=%s failed; continue processing queued actions.",
+                    decision_id,
+                )
             finally:
+                execution_elapsed_s = time.monotonic() - action_started_s
+                policy_planner_s = float(role_need_to_scale_down.get("planner_elapsed_s", 0.0))
+                handler_other_s = max(0.0, execution_elapsed_s - sleep_elapsed_s)
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=scale_down decision_id=%s planner_s=%.6f "
+                    "planner_scope=decision_batch sleep_s=%.6f wakeup_s=0.000000 "
+                    "post_scale_up_rebalance_trigger_s=0.000000 handler_other_s=%.6f "
+                    "execution_s=%.6f total_s=%.6f",
+                    decision_id,
+                    policy_planner_s,
+                    sleep_elapsed_s,
+                    handler_other_s,
+                    execution_elapsed_s,
+                    policy_planner_s + execution_elapsed_s,
+                )
                 self._mark_decision_action_finished(decision_id)
 
     def _abandon_in_flight_decision(self, *, reason: str, stall_ticks: int) -> None:
@@ -1398,12 +1499,14 @@ class ElasticExecutor:
         role_name: PSRL_Role,
         model_name: str,
         wake_instance_ids: set[int] | None = None,
+        decision_id: int | None = None,
     ):
         # Rebalance only after the wake step is done. We approximate the new
         # post-scale-up steady state from scheduler stats, then choose the
         # smallest interrupt set that moves the donor side toward even
         # request-count and sequence-length balance. New wake targets are
         # excluded from donors.
+        planner_started_s = time.monotonic()
         wake_ids = {int(i) for i in (wake_instance_ids or set())}
         candidates_by_instance, total_requests, total_tokens = self._build_post_scale_up_request_candidates(
             role_name=role_name,
@@ -1538,18 +1641,35 @@ class ElasticExecutor:
         if not instance_to_uids:
             return
 
+        planner_elapsed_s = time.monotonic() - planner_started_s
+        migration_sequence = int(getattr(self, "_next_migration_sequence", 1))
+        self._next_migration_sequence = migration_sequence + 1
+        migration_id = f"{decision_id}:{migration_sequence}:{getattr(role_name, 'name', role_name)}:{model_name}"
+        migration_context = {
+            "migration_id": migration_id,
+            "decision_id": decision_id,
+            "role_name": getattr(role_name, "name", str(role_name)),
+            "model_name": model_name,
+            "planner_s": planner_elapsed_s,
+            "selected_count": selected_total,
+            "selected_tokens": selected_tokens,
+        }
+
         try:
+            network_trigger_started_s = time.monotonic()
             interrupted_request_num = await self._await_elastic_coordinator_command(
                 coordinator,
                 Command(
                     type=CommandType.ABORT,
                     instance_to_uids=instance_to_uids,
+                    migration_context=migration_context,
                 ),
                 stage=(
                     f"ABORT_post_scale_up_rebalance role={getattr(role_name, 'name', role_name)} model={model_name} "
                     f"wake_instances={sorted(wake_ids)} donor_instances={sorted(instance_to_uids.keys())}"
                 ),
             )
+            network_trigger_elapsed_s = time.monotonic() - network_trigger_started_s
             if interrupted_request_num is None:
                 psrl_logger.warning(
                     "elastic_rm post-scale-up rebalance ABORT returned None (timeout?); role=%s model=%s",
@@ -1557,6 +1677,19 @@ class ElasticExecutor:
                     model_name,
                 )
                 return
+            psrl_logger.info(
+                "[ELASTIC_OVERHEAD] operation=post_scale_up_rebalance_trigger "
+                "scope=post_scale_up_rebalance migration_id=%s decision_id=%s "
+                "planner_s=%.6f network_trigger_s=%.6f reprefill_s=pending selected=%d "
+                "interrupted=%s selected_tokens=%.0f",
+                migration_id,
+                decision_id,
+                planner_elapsed_s,
+                network_trigger_elapsed_s,
+                selected_total,
+                interrupted_request_num,
+                selected_tokens,
+            )
             psrl_logger.info(
                 (
                     "Post-scale-up rebalancing executed: role=%s model=%s wake_instances=%s donor_instances=%s "
@@ -1590,13 +1723,81 @@ class ElasticExecutor:
         role_name: PSRL_Role,
         model_name: str,
         wake_instance_ids: set[int] | None = None,
+        decision_id: int | None = None,
     ):
         wake_ids = {int(i) for i in (wake_instance_ids or set())}
         await self._interrupt_waiting_after_scale_up_balanced_candidates(
             role_name=role_name,
             model_name=model_name,
             wake_instance_ids=wake_ids,
+            decision_id=decision_id,
         )
+
+    async def _execute_planned_request_migrations(
+        self,
+        *,
+        role_name: PSRL_Role,
+        model_name: str,
+        request_migrations: list[dict],
+        decision_id: int | None,
+    ) -> int:
+        """Trigger only the request migrations selected by candidate evaluation."""
+        planned = len(request_migrations)
+        if planned == 0:
+            psrl_logger.info(
+                "Request-level rebalance selected no migrations: decision_id=%s role=%s model=%s; "
+                "legacy rebalance remains disabled for this action.",
+                decision_id,
+                role_name,
+                model_name,
+            )
+            return 0
+        coordinator = self.coordinators.get(role_name, {}).get(model_name)
+        if coordinator is None:
+            psrl_logger.warning(
+                "Skip planned request migrations: coordinator missing role=%s model=%s",
+                role_name,
+                model_name,
+            )
+            return 0
+        migration_sequence = int(getattr(self, "_next_migration_sequence", 1))
+        self._next_migration_sequence = migration_sequence + 1
+        migration_id = (
+            f"{decision_id}:{migration_sequence}:"
+            f"{getattr(role_name, 'name', role_name)}:{model_name}:planned"
+        )
+        migration_context = {
+            "migration_id": migration_id,
+            "decision_id": decision_id,
+            "role_name": getattr(role_name, "name", str(role_name)),
+            "model_name": model_name,
+            "selected_count": planned,
+            "planner_s": 0.0,
+        }
+        interrupted = await self._await_elastic_coordinator_command(
+            coordinator,
+            Command(
+                type=CommandType.ABORT,
+                request_migrations=request_migrations,
+                migration_context=migration_context,
+            ),
+            stage=(
+                f"ABORT_planned_request_migrations role="
+                f"{getattr(role_name, 'name', role_name)} model={model_name} planned={planned}"
+            ),
+        )
+        interrupted_count = 0 if interrupted is None else int(interrupted)
+        psrl_logger.info(
+            "[ELASTIC_OVERHEAD] operation=planned_request_rebalance migration_id=%s "
+            "decision_id=%s role=%s model=%s planned=%d interrupted=%d",
+            migration_id,
+            decision_id,
+            getattr(role_name, "name", role_name),
+            model_name,
+            planned,
+            interrupted_count,
+        )
+        return interrupted_count
 
     async def _scale_down_instance(self, instance_to_scaled_down: dict) -> bool:
         return await self._scale_down_instances([instance_to_scaled_down])
@@ -1915,9 +2116,9 @@ class ElasticExecutor:
             for instance_id in filtered_ids[:num_instances]
         ]
 
-    def _resolve_preferred_instances_to_scaled_up(self, preferred_entries: list[dict]):
+    def _resolve_preferred_instances_to_scaled_up(self, preferred_entries: list[dict]) -> list[dict]:
         if not preferred_entries:
-            return None
+            return []
         resolved: list[dict] = []
         seen: set[tuple[PSRL_Role, str, int]] = set()
         for entry in preferred_entries:
@@ -1941,7 +2142,7 @@ class ElasticExecutor:
                 continue
             resolved.append({"role_name": role_name, "model_name": model_name, "instance_id": instance_id})
             seen.add(key)
-        return resolved if resolved else None
+        return resolved
 
     def _find_instances_to_scaled_down_for_other_roles(self, role_need_to_scale_up: dict):
         target_role = role_need_to_scale_up["role_name"]
@@ -2240,6 +2441,52 @@ class ElasticExecutor:
                 }
         self.router_backlog_by_role = role_backlog
         self.router_backlog_summary_by_role = role_summary
+
+    async def _sync_request_level_snapshots_from_coordinators(self) -> None:
+        """Fetch rollout/RM compact snapshots concurrently for one policy tick."""
+        refs = []
+        task_keys: list[tuple[PSRL_Role, str]] = []
+        router_waiting_top_t = int(
+            getattr(self.scaling_policy, "router_waiting_top_t", 0)
+        )
+        top_t = None if router_waiting_top_t < 0 else router_waiting_top_t
+        for role_name, model_name in self.roles:
+            coordinator = self.coordinators.get(role_name, {}).get(model_name)
+            if coordinator is None:
+                continue
+            refs.append(coordinator.get_candidate_evaluation_snapshot.remote(top_t))
+            task_keys.append((role_name, model_name))
+        if not refs:
+            self.request_level_snapshots_by_role = {}
+            return
+        results = await self._await_coordinator_refs_with_per_ref_timeout(
+            refs,
+            task_keys,
+            op_label="get_candidate_evaluation_snapshot",
+        )
+        grouped_results: dict[PSRL_Role, list[tuple[str, object]]] = defaultdict(list)
+        for (role_name, model_name), result in zip(task_keys, results, strict=True):
+            grouped_results[role_name].append((model_name, result))
+
+        snapshots: dict[PSRL_Role, object] = {}
+        for role_name in (PSRL_Role.Rollout, PSRL_Role.RewardModel):
+            role_results = grouped_results.get(role_name, [])
+            if len(role_results) != 1:
+                snapshots[role_name] = RuntimeError(
+                    f"request-level evaluation requires one router snapshot for "
+                    f"{role_name.name}, got {len(role_results)}"
+                )
+                continue
+            model_name, result = role_results[0]
+            if isinstance(result, Exception):
+                psrl_logger.warning(
+                    "Failed to fetch request-level snapshot role=%s model=%s: %s",
+                    role_name,
+                    model_name,
+                    result,
+                )
+            snapshots[role_name] = result
+        self.request_level_snapshots_by_role = snapshots
 
     async def _sync_trainer_waiting_hint(self):
         # trainer_busy is owned by the executor via _train_pool_available, which

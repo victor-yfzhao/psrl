@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # --- Parse / plot tuning (edit here) ---
 PLOT_WINDOW_START_MIN = 0.0
 PLOT_WINDOW_END_MIN = 300.0
-PLOT_ELASTIC_ONLY = True
+PLOT_ELASTIC_ONLY = False
 # A collector is considered active only while it continues emitting snapshots.
 # This prevents stopped/slept instances from being forward-filled indefinitely.
 ACTIVE_SNAPSHOT_MAX_AGE_SEC = 3.0
@@ -48,17 +48,17 @@ COLOR_MIN0_ROLLOUT = "#1a5276"
 
 NON_ELASTIC_LOG_DIR = (
     REPO_ROOT
-    / "logs/verl_deployment_modes/mode1_bs_256_roll_6_rm_18_disaggregated_rollout7b_rm8b"
+    / "logs/verl_deployment_modes/mixed_test_none_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl_Qwen2.5-32B_Qwen3-30B-A3B-Thinking-2507"
 )
 ELASTIC_LOG_DIR = (
     REPO_ROOT
-    / "logs/verl_deployment_modes/mode5_bs_256_share_24_elastic_rl_rollout7b_rm8b"
+    / "logs/verl_deployment_modes/mixed_test_new_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl_Qwen2.5-32B_Qwen3-30B-A3B-Thinking-2507"
 )
-_OUT_TAG = "elastic_only" if PLOT_ELASTIC_ONLY else "compare_min0_vs_min4"
+_OUT_TAG = "elastic_only" if PLOT_ELASTIC_ONLY else "compare_none_vs_new"
 OUT_PATH = (
     REPO_ROOT
-    / f"logs/verl_deployment_modes/{_OUT_TAG}_rollout7b_rm8b/"
-    f"StatCollector_rm_rollout_totals_{PLOT_WINDOW_START_MIN}-{PLOT_WINDOW_END_MIN}_min.png"
+    / f"logs/verl_deployment_modes/{_OUT_TAG}_none_new/"
+    f"StatCollector_none_new_share_32_totals_{PLOT_WINDOW_START_MIN}-{PLOT_WINDOW_END_MIN}_min.png"
 )
 
 RE_TIMESTAMP = re.compile(r"'timestamp':\s*'(?P<timestamp>[^']+)'")

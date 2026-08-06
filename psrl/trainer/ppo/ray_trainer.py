@@ -2,8 +2,8 @@ import json
 import logging
 import math
 import os
-import uuid
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1297,7 +1297,16 @@ class PSRL_RayPPOTrainer:
         if getattr(self, "actor_wg", None) is None:
             raise RuntimeError("Actor worker group must be initialized before sleeping trainer.")
         psrl_logger.info("Elastic trainer pool: sleeping trainer actor.")
+        sleep_started_s = time.perf_counter()
         ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full"))
+        sleep_elapsed_s = time.perf_counter() - sleep_started_s
+        psrl_logger.warning(
+            "[ELASTIC_OVERHEAD] operation=sleep role=Trainer world_size=%d "
+            "engine_sleep_s=%.6f total_s=%.6f",
+            self.actor_wg.world_size,
+            sleep_elapsed_s,
+            sleep_elapsed_s,
+        )
         self._elastic_trainer_pool_trainer_sleeping = True
 
     def _wake_trainer_for_elastic_trainer_pool(self):
@@ -1311,15 +1320,47 @@ class PSRL_RayPPOTrainer:
             psrl_logger,
             event_type=EventType.SWITCH,
         ):
+            total_start = time.perf_counter()
             psrl_logger.info("Elastic trainer pool: waking trainer actor.")
+            stage_start = time.perf_counter()
             ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
+            wake_rpc_s = time.perf_counter() - stage_start
             updated_client_names = [train_client_name(i) for i in range(self.actor_wg.world_size)]
             futures = []
+            stage_start = time.perf_counter()
             futures.extend(self.actor_wg.execute_all_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME))
             futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.actor_wg.world_size))
             ray.get(futures)
+            gather_infos_s = time.perf_counter() - stage_start
+            stage_start = time.perf_counter()
             self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
+            broadcast_infos_s = time.perf_counter() - stage_start
+            stage_start = time.perf_counter()
             ray.get(self.actor_wg.execute_all_async("pull_model"))
+            pull_model_s = time.perf_counter() - stage_start
+            total_s = time.perf_counter() - total_start
+            psrl_logger.warning(
+                "[TRAINER_WAKE_TIMING] scope=trainer_controller world_size=%d "
+                "wake_rpc_s=%.6f gather_infos_s=%.6f broadcast_infos_s=%.6f "
+                "pull_model_s=%.6f total_s=%.6f",
+                self.actor_wg.world_size,
+                wake_rpc_s,
+                gather_infos_s,
+                broadcast_infos_s,
+                pull_model_s,
+                total_s,
+            )
+            psrl_logger.warning(
+                "[ELASTIC_OVERHEAD] operation=wakeup role=Trainer world_size=%d "
+                "engine_wakeup_s=%.6f gather_infos_s=%.6f broadcast_infos_s=%.6f "
+                "pull_model_s=%.6f total_s=%.6f",
+                self.actor_wg.world_size,
+                wake_rpc_s,
+                gather_infos_s,
+                broadcast_infos_s,
+                pull_model_s,
+                total_s,
+            )
         self._elastic_trainer_pool_trainer_sleeping = False
 
     def _trainer_pool_only_replica_entries(self) -> list[dict]:
@@ -1841,6 +1882,7 @@ class PSRL_RayPPOTrainer:
 
         elastic_base_pools: dict[str, RayResourcePool] = {}
         elastic_subpool_group_idx_by_group: dict[tuple[str, str], int] = {}
+        trainer_pool_next_bundle_index: dict[str, int] = {}
 
         if self.elastic_rm_mode:
             elastic_shared_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, 0)
@@ -1915,17 +1957,40 @@ class PSRL_RayPPOTrainer:
             # Align starts by subgroup size so a larger-parallelism instance maps to a group of
             # smaller power-of-two instances, e.g. [0, 4) corresponds to [0, 2) and [2, 4).
             #
-            # Bundle-index counter key:
+            # Bundle-index allocation:
             # - colocated (mode 2): rollout and rm time-multiplex the SAME bundles on train_pool,
             #   so keep separate group_key counters that both cycle from bundle 0.
-            # - all other modes on train_pool (mode 4 idle replicas, mode 5 elastic trainer-pool
-            #   replicas): rollout and rm may be awake concurrently, so allocate disjoint bundles
-            #   via one shared sequential counter per pool.
-            if pool_id == "train_pool" and not self.colocated_mode:
+            # - trainer-pool-only (mode 4): all idle replicas may be awake concurrently, so allocate
+            #   disjoint ranges using a bundle cursor. An instance counter is incorrect when TP sizes
+            #   differ because changing the TP size rescales the counter and can wrap onto live ranges.
+            # - other non-colocated train-pool modes share an instance counter across roles.
+            if pool_id == "train_pool" and self.trainer_pool_only_mode:
+                next_bundle_index = trainer_pool_next_bundle_index.get(pool_id, 0)
+                start_bundle_index = (
+                    (next_bundle_index + subgroup_world_size - 1) // subgroup_world_size
+                ) * subgroup_world_size
+                end_bundle = start_bundle_index + subgroup_world_size
+                if end_bundle > elastic_pool.world_size:
+                    raise ValueError(
+                        f"Trainer-pool-only idle replicas exceed train_pool capacity while placing {tag}: "
+                        f"aligned bundle_range=[{start_bundle_index}, {end_bundle}), "
+                        f"train_pool world_size={elastic_pool.world_size}. "
+                        "Idle rollout and reward-model replicas must use disjoint GPU bundles."
+                    )
+                trainer_pool_next_bundle_index[pool_id] = end_bundle
+                group_idx = start_bundle_index // subgroup_world_size
+            elif pool_id == "train_pool" and not self.colocated_mode:
                 group_idx_key = (pool_id, "__sequential__")
+                group_idx = elastic_subpool_group_idx_by_group.get(group_idx_key, 0)
+                slots_per_cycle = elastic_pool.world_size // subgroup_world_size
+                start_bundle_index = (group_idx % slots_per_cycle) * subgroup_world_size
+                elastic_subpool_group_idx_by_group[group_idx_key] = group_idx + 1
             else:
                 group_idx_key = (pool_id, group_key)
-            group_idx = elastic_subpool_group_idx_by_group.get(group_idx_key, 0)
+                group_idx = elastic_subpool_group_idx_by_group.get(group_idx_key, 0)
+                slots_per_cycle = elastic_pool.world_size // subgroup_world_size
+                start_bundle_index = (group_idx % slots_per_cycle) * subgroup_world_size
+                elastic_subpool_group_idx_by_group[group_idx_key] = group_idx + 1
             if elastic_pool.world_size % subgroup_world_size != 0:
                 raise ValueError(
                     f"subgroup_world_size={subgroup_world_size} must divide shared pool world_size="
@@ -1936,9 +2001,6 @@ class PSRL_RayPPOTrainer:
                     f"subgroup_world_size={subgroup_world_size} must be a power of two for elastic_rm "
                     f"different-parallelism placement ({tag}, pool_id={pool_id})."
                 )
-            slots_per_cycle = elastic_pool.world_size // subgroup_world_size
-            start_bundle_index = (group_idx % slots_per_cycle) * subgroup_world_size
-            elastic_subpool_group_idx_by_group[group_idx_key] = group_idx + 1
 
             sub_rp = SubRayResourcePool(
                 process_on_nodes=elastic_pool.store,

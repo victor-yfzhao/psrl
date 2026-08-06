@@ -21,6 +21,12 @@
 #                                set to 0 to leave default
 #   PSRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
 #   PSRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
+#   PSRL_DEPLOY_MODEL_NAME    rollout model directory name (default: Qwen2.5-7B)
+#   PSRL_DEPLOY_RM_MODEL_NAME reward model directory name (default: DeepSeek-R1-Distill-Qwen-7B)
+#   PSRL_DEPLOY_MODEL_PATH    optional absolute rollout model path
+#   PSRL_DEPLOY_RM_MODEL_PATH optional absolute reward model path
+#   PSRL_DEPLOY_ROLLOUT_TP    rollout tensor parallelism (default: 1)
+#   PSRL_DEPLOY_RM_TP         reward-model tensor parallelism (default: 1)
 #   PSRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
 #
 # Optional positional args to launch_deployment_mode are forwarded to main_ppo.
@@ -100,8 +106,10 @@ launch_deployment_mode() {
     fi
 
     project_name='verl_deployment_modes'
-    MODEL_NAME='Qwen2.5-7B'
-    RM_MODEL_NAME='DeepSeek-R1-Distill-Qwen-7B'
+    MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-Qwen2.5-7B}
+    RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
+    # MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
+    # RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-Qwen3-8B}
     experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
 
     source ${PSRL_WORKSPACE}/env/env_311.sh
@@ -109,8 +117,8 @@ launch_deployment_mode() {
     HOME=${PSRL_WORKSPACE}
     PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
     
-    HF_MODEL_PATH=${PSRL_WORKSPACE}/models/${MODEL_NAME}
-    RM_MODEL_PATH=${PSRL_WORKSPACE}/models/${RM_MODEL_NAME}
+    HF_MODEL_PATH=${PSRL_DEPLOY_MODEL_PATH:-${PSRL_WORKSPACE}/models/${MODEL_NAME}}
+    RM_MODEL_PATH=${PSRL_DEPLOY_RM_MODEL_PATH:-${PSRL_WORKSPACE}/models/${RM_MODEL_NAME}}
 
     # Data config (Hydra / OmegaConf), aligned with psrl/trainer/config/data/multi_datasets.yaml
     GSM8K_TRAIN="${PSRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
@@ -151,9 +159,14 @@ launch_deployment_mode() {
     esac
 
     # rollout settings
-    GEN_TP=1
+    GEN_TP=${PSRL_DEPLOY_ROLLOUT_TP:-1}
     GEN_PP=1
     GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
+
+    # reward-model rollout settings
+    RM_TP=${PSRL_DEPLOY_RM_TP:-1}
+    RM_PP=1
+    RM_NGPUS_PER_NODE_PER_INSTANCE=$(( ${RM_TP} * ${RM_PP} ))
 
     # validation settings (on train_pool; does not use elastic path)
     VAL_TP=4
@@ -208,7 +221,7 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.reward_fn='["default"]'
         reward_models_config.reward_models.2.reward_model_name=${RM_MODEL_NAME}
         reward_models_config.reward_models.2.enable_resource_pool=True
-        reward_models_config.reward_models.2.rollout_ngpus_per_instance_per_node=1
+        reward_models_config.reward_models.2.rollout_ngpus_per_instance_per_node=${RM_NGPUS_PER_NODE_PER_INSTANCE}
         reward_models_config.reward_models.2.rollout_nnodes_per_instance=1
         reward_models_config.reward_models.2.max_concurrent_requests_per_instance=128
         reward_models_config.reward_models.2.model.path=${RM_MODEL_PATH}
@@ -223,8 +236,8 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.rollout.free_cache_engine=true
         reward_models_config.reward_models.2.rollout.data_parallel_size=1
         reward_models_config.reward_models.2.rollout.expert_parallel_size=1
-        reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=1
-        reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=1
+        reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=${RM_TP}
+        reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=${RM_PP}
         reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 21 + 1024 * 15))
         reward_models_config.reward_models.2.rollout.max_num_seqs=1024
         reward_models_config.reward_models.2.rollout.enable_chunked_prefill=false

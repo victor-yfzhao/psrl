@@ -14,7 +14,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=elastic_rl
-export PSRL_DEPLOY_EXPERIMENT=mode5_bs_128_share_32_elastic_rl
+export PSRL_DEPLOY_EXPERIMENT=test_none_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 export PSRL_DEPLOY_RM_ASYNC=False
 export PSRL_DEPLOY_NNODES=8
@@ -48,7 +48,7 @@ psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_enable=true \
 psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_basis=request_count \
 psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_mode=raw \
 +reward_models_config.reward_models.2.routing_strategy.method=itl \
-+reward_models_config.reward_models.2.routing_strategy.cost_model_path=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/psrl/trainer/config/cost_model/deepseek_r1_distill_qwen_32b.json \
++reward_models_config.reward_models.2.routing_strategy.cost_model_path=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/psrl/trainer/config/cost_model/qwen3_30b_a3b_thinking_2507.json \
 +reward_models_config.reward_models.2.routing_strategy.delta_throughput_threshold=0.005 \
 +reward_models_config.reward_models.2.routing_strategy.request_budget=1024 \
 +reward_models_config.reward_models.2.routing_strategy.max_num_waiting_reqs_after_preemption=3 \

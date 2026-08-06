@@ -14,17 +14,17 @@ source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=disaggregated
 # export PSRL_DEPLOY_EXPERIMENT=psrl_roll_3_rm_9_mode1_disaggregated_rollout7b_rm8b
-export PSRL_DEPLOY_EXPERIMENT=mode1_bs_128_roll_8_rm_8_disaggregated_rollout_ds_7b_rm8b
+export PSRL_DEPLOY_EXPERIMENT=mode1_bs_128_roll_2_rm_6_disaggregated
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 export PSRL_DEPLOY_RM_ASYNC=True
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=2
+export PSRL_DEPLOY_NNODES=2
+export PSRL_DEPLOY_TRAIN_NNODES=1
 export PSRL_DEPLOY_TRAIN_NGPUS=8
 # Independent rollout pool (1 node x 4 GPUs -> 4 rollout instances).
 export PSRL_DEPLOY_SHARED_NNODES=1
-export PSRL_DEPLOY_SHARED_NGPUS=8
+export PSRL_DEPLOY_SHARED_NGPUS=2
 # Independent gen-RM pool (1 node x 4 GPUs -> 4 RM replicas, 1 GPU each).
-export PSRL_DEPLOY_RM_NUM_REPLICAS=8
+export PSRL_DEPLOY_RM_NUM_REPLICAS=6
 export PSRL_DEPLOY_SMOKE=${1:-0}
 shift || true
 

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -142,6 +143,130 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         else:
             self.memory_logger = None
 
+    def _actor_weight_arena_config(self, role: str):
+        if role != "actor":
+            return None
+        arena_config = self.psrl_config.nixl.get("weight_arena", None)
+        if arena_config is None or not arena_config.get("actor_enabled", False):
+            return None
+        if self.psrl_config.ps_mode not in ("nixl_cpu", "nixl_gpu"):
+            raise RuntimeError(
+                "psrl.nixl.weight_arena.actor_enabled requires psrl.ps_mode to be nixl_cpu or nixl_gpu."
+            )
+        if self.psrl_config.tms.range not in ("train", "all"):
+            raise RuntimeError(
+                "psrl.nixl.weight_arena.actor_enabled requires psrl.tms.range to be train or all."
+            )
+        if self.config.actor.strategy != "fsdp2":
+            raise RuntimeError("Actor weight arena only supports the fsdp2 strategy.")
+        if self.config.actor.fsdp_config.get("offload_policy", False) or self.config.actor.fsdp_config.get(
+            "param_offload", False
+        ):
+            raise RuntimeError("Actor weight arena does not support FSDP2 parameter offloading.")
+        return arena_config
+
+    def _log_actor_weight_arena(self, *, materialization: str) -> None:
+        stats = self._nixl_weight_arena_handle.stats
+        psrl_logger.warning(
+            "[NIXL_WEIGHT_ARENA] role=actor rank=%d materialization=%s arenas=%d unique_storages=%d "
+            "tensor_bindings=%d storage_bytes=%d arena_bytes=%d largest_storage_bytes=%d pack_s=%.6f "
+            "tms_source_reserved_bytes=%d tms_source_active_bytes=%d tms_source_active_allocations=%d "
+            "base_addresses=%s",
+            self.rank,
+            materialization,
+            stats.arena_count,
+            stats.unique_storage_count,
+            stats.tensor_binding_count,
+            stats.total_storage_bytes,
+            stats.total_arena_bytes,
+            stats.largest_storage_bytes,
+            stats.pack_seconds,
+            stats.tms_source_reserved_bytes,
+            stats.tms_source_active_bytes,
+            stats.tms_source_active_allocations,
+            self._nixl_weight_arena_handle.base_addresses,
+        )
+
+    def _materialize_fsdp2_model_before_load(self, actor_module_fsdp: torch.nn.Module, role: str):
+        arena_config = self._actor_weight_arena_config(role)
+        if arena_config is None:
+            return None
+        materialization = str(arena_config.get("actor_materialization", "direct"))
+        if materialization == "repack":
+            return None
+        if materialization != "direct":
+            raise RuntimeError(
+                "psrl.nixl.weight_arena.actor_materialization must be 'direct' or 'repack', "
+                f"got {materialization!r}."
+            )
+
+        from psrl.utils.weight_arena import materialize_fsdp2_model_weights_in_arena
+
+        self._nixl_weight_arena_handle = materialize_fsdp2_model_weights_in_arena(
+            actor_module_fsdp,
+            device=torch.device("cuda", get_device_id()),
+            max_chunk_bytes=int(arena_config.max_chunk_bytes),
+            alignment_bytes=int(arena_config.alignment_bytes),
+        )
+        self._nixl_weight_arena_materialization = materialization
+        return self._nixl_weight_arena_handle
+
+    def _prepare_fsdp2_model_before_shard(
+        self, actor_module: torch.nn.Module, role: str, full_state: dict[str, torch.Tensor]
+    ) -> None:
+        arena_config = self._actor_weight_arena_config(role)
+        if arena_config is None:
+            return
+        materialization = str(arena_config.get("actor_materialization", "direct"))
+        if materialization == "repack":
+            return
+        if materialization != "direct":
+            raise RuntimeError(
+                "psrl.nixl.weight_arena.actor_materialization must be 'direct' or 'repack', "
+                f"got {materialization!r}."
+            )
+        non_cpu_state = [name for name, tensor in full_state.items() if tensor.device.type != "cpu"]
+        if non_cpu_state:
+            raise RuntimeError(
+                "Actor direct weight arena requires the pre-FSDP full state on CPU so it does not retain an "
+                f"old CUDA weight allocation; first_tensors={non_cpu_state[:8]}."
+            )
+        actor_module.to_empty(device="meta")
+        non_meta = [name for name, tensor in actor_module.state_dict().items() if tensor.device.type != "meta"]
+        if non_meta:
+            raise RuntimeError(
+                "Actor direct weight arena failed to dematerialize the model before fully_shard: "
+                f"first_tensors={non_meta[:8]}."
+            )
+
+    def _post_fsdp2_model_load(self, actor_module_fsdp: torch.nn.Module, role: str) -> None:
+        arena_config = self._actor_weight_arena_config(role)
+        if arena_config is None:
+            return
+        materialization = str(arena_config.get("actor_materialization", "direct"))
+        if materialization == "direct":
+            handle = getattr(self, "_nixl_weight_arena_handle", None)
+            if handle is None or getattr(self, "_nixl_weight_arena_materialization", None) != "direct":
+                raise RuntimeError("Actor direct weight arena was not materialized before FSDP2 state loading.")
+            handle.assert_fsdp_bindings_unchanged()
+            self._log_actor_weight_arena(materialization=materialization)
+            return
+        if materialization != "repack":
+            raise RuntimeError(
+                "psrl.nixl.weight_arena.actor_materialization must be 'direct' or 'repack', "
+                f"got {materialization!r}."
+            )
+
+        from psrl.utils.weight_arena import pack_fsdp2_model_weights_in_fresh_tms_pool
+
+        self._nixl_weight_arena_handle = pack_fsdp2_model_weights_in_fresh_tms_pool(
+            actor_module_fsdp,
+            max_chunk_bytes=int(arena_config.max_chunk_bytes),
+            alignment_bytes=int(arena_config.alignment_bytes),
+        )
+        self._nixl_weight_arena_materialization = materialization
+        self._log_actor_weight_arena(materialization=materialization)
+
     @property
     def is_train_representative_rank(self) -> bool:
         """
@@ -191,6 +316,45 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self.actor_module_fsdp,
             fsdp_strategy=self.config.actor.strategy,
         )
+
+    def get_nixl_weight_fingerprint(self, chunk_bytes: int = 64 * 1024**2) -> dict:
+        """Hash every logical tensor registered for NIXL without sampling."""
+        import hashlib
+
+        if chunk_bytes <= 0:
+            raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}.")
+        tensor_mapping = self.nixl_storage_client.get_original_tensor_mapping()
+        if not tensor_mapping:
+            raise RuntimeError("NIXL tensor mapping is empty; run nixl_protocol before fingerprinting weights.")
+
+        global_hasher = hashlib.sha256()
+        tensor_digests: dict[str, str] = {}
+        total_bytes = 0
+        for (key, shard_idx), tensor in sorted(tensor_mapping.items(), key=lambda item: item[0]):
+            tensor_bytes = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            metadata = (
+                f"{key}\0{shard_idx}\0{tensor.dtype}\0{tuple(tensor.shape)}\0"
+                f"{tuple(tensor.stride())}\0{tensor_bytes.numel()}"
+            ).encode()
+            tensor_hasher = hashlib.sha256(metadata)
+            for offset in range(0, tensor_bytes.numel(), chunk_bytes):
+                length = min(chunk_bytes, tensor_bytes.numel() - offset)
+                cpu_chunk = tensor_bytes.narrow(0, offset, length).cpu()
+                tensor_hasher.update(cpu_chunk.numpy().tobytes())
+            digest = tensor_hasher.hexdigest()
+            logical_name = f"{key}|{shard_idx}"
+            tensor_digests[logical_name] = digest
+            global_hasher.update(metadata)
+            global_hasher.update(bytes.fromhex(digest))
+            total_bytes += tensor_bytes.numel()
+
+        return {
+            "rank": self.rank,
+            "digest": global_hasher.hexdigest(),
+            "logical_tensor_count": len(tensor_digests),
+            "total_bytes": total_bytes,
+            "tensor_digests": tensor_digests,
+        }
 
     def nixl_protocol(self, mode: str = "full"):
         """Run the NIXL server protocol.
@@ -243,10 +407,12 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """
         from torch.distributed._composable.fsdp import FSDPModule
 
+        from psrl.utils.weight_arena import get_fsdp_param_groups
+
         dirty_count = 0
         for module in self.actor_module_fsdp.modules():
             if isinstance(module, FSDPModule):
-                for pg in module._get_fsdp_state()._fsdp_param_groups:
+                for pg in get_fsdp_param_groups(module._get_fsdp_state()):
                     for fp in pg.fsdp_params:
                         if fp.unsharded_accumulated_grad is not None:
                             psrl_logger.debug(
@@ -280,13 +446,12 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     def nixl_sleep(self, mode: str = "full"):
         """Deregister the model weights for NIXL and free up GPU memory."""
+        if mode != "meta":
+            if self.nixl_storage_client.local_client_info is None:
+                psrl_logger.warning("Skip NIXL deregistration because local tensors are not registered.")
+            else:
+                self.nixl_storage_client.deregister_local_tensors()
         self.sleep_fsdp_model()
-        if mode == "meta":
-            return
-        if self.nixl_storage_client.local_client_info is None:
-            psrl_logger.warning("Skip NIXL deregistration because local tensors are not registered.")
-            return
-        self.nixl_storage_client.deregister_local_tensors()
 
     def sleep_fsdp_model(self):
         """
@@ -346,9 +511,41 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         This method restores GPU memory allocation and performs NIXL re-registration
         to handle memory changes after sleep/wake_up cycle.
         """
+        total_start = time.perf_counter()
+        stage_start = time.perf_counter()
         self.wake_up_fsdp_model()
+        resume_s = time.perf_counter() - stage_start
+        arena_handle = getattr(self, "_nixl_weight_arena_handle", None)
+        arena_addresses = arena_handle.assert_virtual_addresses_unchanged() if arena_handle is not None else None
         # Reset nixl agent and reregister to handle physical memory changes
-        self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
+        stage_start = time.perf_counter()
+        client_timing = self.nixl_storage_client.register_local_tensors(
+            self.unified_state_dict,
+            self.unified_sharding_dict,
+        )
+        reregister_s = time.perf_counter() - stage_start
+        total_s = time.perf_counter() - total_start
+        result = {
+            "rank": self.rank,
+            "node_id": self.get_node_id(),
+            "resume_s": resume_s,
+            "reregister_s": reregister_s,
+            "total_s": total_s,
+            "nixl_client": dict(client_timing) if client_timing is not None else None,
+            "arena_virtual_addresses": arena_addresses,
+        }
+        psrl_logger.warning(
+            "[TRAINER_WAKE_TIMING] scope=train_worker rank=%d node_id=%s "
+            "resume_s=%.6f reregister_s=%.6f total_s=%.6f arena_address_check=%s arena_count=%d",
+            self.rank,
+            result["node_id"],
+            resume_s,
+            reregister_s,
+            total_s,
+            "passed" if arena_addresses is not None else "disabled",
+            len(arena_addresses or ()),
+        )
+        return result
 
     def wake_up_fsdp_model(self):
         """
@@ -473,7 +670,16 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             skip_load_weight = init_mode == "empty"
-            ActorRolloutRefWorker.init_model(self, skip_load_weight)
+            skip_random_init = skip_load_weight and os.getenv("PSRL_EMPTY_INIT_NO_RANDOM_WEIGHTS", "0") == "1"
+            if skip_random_init:
+                from transformers.modeling_utils import no_init_weights
+
+                psrl_logger.info("Skipping random weight initialization for empty FSDP model initialization.")
+                init_context = no_init_weights()
+            else:
+                init_context = nullcontext()
+            with init_context:
+                ActorRolloutRefWorker.init_model(self, skip_load_weight)
 
     def _build_rollout(self, trust_remote_code: bool = False):
         pass

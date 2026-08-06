@@ -54,6 +54,8 @@ def _policy(
     role_throughput_weight_enable: bool = False,
     role_throughput_weight_basis: str = "request_count",
     role_throughput_weight_mode: str = "share",
+    harmonic_denominator_use_max: bool | str = False,
+    enable_heterogeneous_parallelism_candidates: bool = False,
     policy_cls: type[ITLScalingPolicy] = ITLScalingPolicy,
 ) -> ITLScalingPolicy:
     return policy_cls(
@@ -73,6 +75,8 @@ def _policy(
                 "role_throughput_weight_enable": role_throughput_weight_enable,
                 "role_throughput_weight_basis": role_throughput_weight_basis,
                 "role_throughput_weight_mode": role_throughput_weight_mode,
+                "harmonic_denominator_use_max": harmonic_denominator_use_max,
+                "enable_heterogeneous_parallelism_candidates": enable_heterogeneous_parallelism_candidates,
                 "model_params": model_params or {"default": {"A": 0.0, "B": 10.0, "C": 1.0, "D": 0.0}},
             },
         },
@@ -86,7 +90,7 @@ def _signal(
     awake: bool,
     running: int,
     tokens: int,
-    bundle: int,
+    bundle: int | tuple[int, ...],
     waiting: int = 0,
     pool_id: str | None = "shared_rollout_pool",
 ) -> InstanceSignal:
@@ -101,7 +105,9 @@ def _signal(
         generation_throughput=0.0,
         total_token_num=tokens,
         snapshot_timestamp=datetime.now().isoformat(),
-        bundle_keys=frozenset({(pool_id, bundle)}),
+        bundle_keys=frozenset(
+            (pool_id, bundle_index) for bundle_index in ((bundle,) if isinstance(bundle, int) else bundle)
+        ),
         pool_id=pool_id,
     )
 
@@ -509,6 +515,21 @@ def test_harmonic_system_throughput_unweighted_is_standard_harmonic_mean():
     assert tp == pytest.approx(2.0 * 1.0 * 0.5 / (1.0 + 0.5))
 
 
+def test_harmonic_max_denominator_switch_preserves_default_and_uses_larger_term():
+    # rollout tp=1.0, rm tp=0.5. Uniform weights produce reciprocal terms
+    # 0.5 and 1.0: the default sum denominator is 1.5, while the enabled
+    # max denominator is 1.0.
+    default_policy = _policy(policy_cls=ITLHarmonicScalingPolicy)
+    max_policy = _policy(
+        policy_cls=ITLHarmonicScalingPolicy,
+        harmonic_denominator_use_max="true",
+    )
+
+    assert default_policy._weighted_system_throughput(1.0, 0.5, 0.5, 0.5) == pytest.approx(2.0 / 3.0)
+    assert max_policy._weighted_system_throughput(1.0, 0.5, 0.5, 0.5) == pytest.approx(1.0)
+    assert max_policy.harmonic_denominator_use_max is True
+
+
 def test_harmonic_idle_instance_contributes_zero_not_infinite():
     # Under the harmonic policy an instance with no requests contributes 0
     # throughput, not inf. Adding an idle instance to a role that already has
@@ -767,6 +788,176 @@ def test_itl_keeps_single_step_candidates_by_default():
 
     assert candidates, "expected at least one candidate"
     assert all(c.action.num_instances == 1 for c in candidates)
+
+
+def test_heterogeneous_switch_preserves_equal_parallel_log_fixture():
+    # Fixture shape and preferred ids come from ScalingPolicy/ElasticExecutor
+    # cycle 7816 (decision 354): eight TP1 rollout wakes competing with TP1 RM.
+    wake_ids = (6, 12, 20, 22, 16, 1, 2, 11)
+    running_loads = (39, 38, 39, 38, 39, 38, 39, 38)
+    token_loads = (167963, 163713, 158012, 159014, 145643, 166654, 159014, 163713)
+    rollout = [
+        _signal(PSRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
+        for instance_id in wake_ids
+    ]
+    rm = [
+        _signal(
+            PSRL_Role.RewardModel,
+            instance_id,
+            awake=True,
+            running=running,
+            tokens=tokens,
+            bundle=instance_id,
+        )
+        for instance_id, running, tokens in zip(wake_ids, running_loads, token_loads)
+    ]
+    rm.append(_signal(PSRL_Role.RewardModel, 99, awake=True, running=38, tokens=159014, bundle=99))
+
+    legacy = _policy(max_scale_instances_per_action=8, throughput_objective="sum")
+    enabled = _policy(
+        max_scale_instances_per_action=8,
+        throughput_objective="sum",
+        enable_heterogeneous_parallelism_candidates=True,
+    )
+    legacy_plans = legacy._wake_prefix_plans_for_role(
+        target_signals=rollout,
+        other_signals=rm,
+        current_other_n=9,
+        max_batch=8,
+    )
+    enabled_plans = enabled._wake_prefix_plans_for_role(
+        target_signals=rollout,
+        other_signals=rm,
+        current_other_n=9,
+        max_batch=8,
+    )
+
+    def summarize(plans):
+        return {
+            count: (
+                tuple(signal.instance_id for signal in plan.wakes),
+                tuple(signal.instance_id for signal in plan.pre_sleep),
+                tuple(signal.instance_id for signal in plan.pre_wake),
+            )
+            for count, plan in plans.items()
+        }
+
+    assert summarize(enabled_plans) == summarize(legacy_plans)
+
+
+@pytest.mark.parametrize("policy_cls", [ITLScalingPolicy, ITLHarmonicScalingPolicy])
+def test_heterogeneous_large_wake_migrates_small_conflicts_and_preserves_load(policy_cls):
+    # RM loads are sampled from ScalingPolicy cycle 7815. A TP4 rollout wake
+    # displaces two TP1 RM instances, which can move to free TP1 placements.
+    policy = _policy(
+        model_params={"default": {"A": 1e-6, "B": 10.0, "C": 1.0, "D": 0.0}},
+        throughput_objective="sum",
+        enable_heterogeneous_parallelism_candidates=True,
+        policy_cls=policy_cls,
+    )
+    rollout = [
+        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=(12, 13, 14, 15)),
+        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
+    ]
+    rm = [
+        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
+        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=1),
+        _signal(PSRL_Role.RewardModel, 2, awake=False, running=0, tokens=0, bundle=8),
+        _signal(PSRL_Role.RewardModel, 3, awake=False, running=0, tokens=0, bundle=9),
+    ]
+    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+
+    candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
+    candidate = next(
+        item
+        for item in candidates
+        if item.action.action_type == "scale_up" and item.action.role_name == PSRL_Role.Rollout
+    )
+
+    assert candidate.action.preferred_instance_ids == [1]
+    assert candidate.action.pre_sleep_other_preferred == [
+        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 0},
+        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 1},
+    ]
+    assert candidate.action.pre_wake_other_preferred == [
+        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 2},
+        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 3},
+    ]
+    assert candidate.rollout_n == 2
+    assert candidate.rm_n == 2
+    assert candidate.load_overrides_by_role == {PSRL_Role.RewardModel: {2: (39.0, 167963.0), 3: (38.0, 163713.0)}}
+    assert candidate.next_throughput > 0.0
+
+    disabled = _policy(throughput_objective="sum")
+    disabled_plans = disabled._wake_prefix_plans_for_role(
+        target_signals=rollout,
+        other_signals=rm,
+        current_other_n=2,
+        max_batch=1,
+    )
+    assert disabled_plans == {}
+
+
+def test_heterogeneous_wake_cost_treats_conflict_free_as_zero_phi():
+    policy = _policy(enable_heterogeneous_parallelism_candidates=True)
+    rollout = [
+        _signal(PSRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
+        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(4, 5, 6, 7)),
+    ]
+    rm = [
+        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
+        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=8),
+    ]
+
+    plans = policy._wake_prefix_plans_for_role(
+        target_signals=rollout,
+        other_signals=rm,
+        current_other_n=2,
+        max_batch=1,
+    )
+
+    assert [signal.instance_id for signal in plans[1].wakes] == [1]
+    assert plans[1].pre_sleep == ()
+    assert plans[1].pre_wake == ()
+
+
+def test_heterogeneous_small_wakes_charge_large_victim_phi_once():
+    policy = _policy(
+        model_params={"default": {"A": 0.001, "B": 10.0, "C": 1.0, "D": 0.0}},
+        max_scale_instances_per_action=4,
+        throughput_objective="sum",
+        enable_heterogeneous_parallelism_candidates=True,
+    )
+    rollout = [
+        _signal(PSRL_Role.Rollout, 8, awake=True, running=3, tokens=30, bundle=8),
+        *[
+            _signal(PSRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
+            for instance_id in range(8)
+        ],
+    ]
+    rm = [
+        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=(0, 1, 2, 3)),
+        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=159014, bundle=(4, 5, 6, 7)),
+    ]
+    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+
+    candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
+    candidate = next(
+        item
+        for item in candidates
+        if item.action.action_type == "scale_up"
+        and item.action.role_name == PSRL_Role.Rollout
+        and item.action.num_instances == 4
+    )
+
+    assert candidate.action.preferred_instance_ids == [0, 1, 2, 3]
+    assert candidate.action.pre_sleep_other_preferred == [
+        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 0}
+    ]
+    assert candidate.action.pre_wake_other_preferred is None
+    assert candidate.rm_n == 1
+    assert candidate.phi == pytest.approx(policy._sleep_phi([rm[0]]))
+    assert candidate.phi != pytest.approx(4.0 * policy._sleep_phi([rm[0]]))
 
 
 def test_itl_scale_up_prefers_share_pool_over_train_pool():

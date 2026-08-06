@@ -249,3 +249,317 @@ def test_sync_swap_batch_reuses_outer_gate_for_all_pairs():
 
     asyncio.run(scenario())
     assert operations == [("wake", 8), ("sleep", 0), ("wake", 9), ("sleep", 1)]
+
+
+def test_scale_up_handler_sleeps_then_combines_migration_and_primary_wakes():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {
+            "decision_id": 17,
+            "role_name": "Rollout",
+            "model_name": "rollout-model",
+            "pre_wake_other_preferred": [{"instance_id": 4}],
+        }
+    )
+    operations = []
+    pre_wake = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 4}
+    pre_sleep = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 0}
+    primary_wake = {"role_name": "Rollout", "model_name": "rollout-model", "instance_id": 2}
+
+    def resolve_pre_wake(entries):
+        operations.append(("resolve_pre_wake", entries))
+        return [pre_wake]
+
+    def find_pre_sleep(task):
+        operations.append(("find_pre_sleep", task["decision_id"]))
+        return [pre_sleep]
+
+    async def sleep_instances(instances):
+        operations.append(("sleep", instances))
+
+    def find_primary_wake(task):
+        operations.append(("find_primary_wake", task["decision_id"]))
+        return [primary_wake]
+
+    async def wake_instances(instances):
+        operations.append(("wake", instances))
+        executor.stop_scale_up = True
+
+    async def interrupt_waiting(**kwargs):
+        operations.append(("interrupt", kwargs))
+
+    executor._resolve_preferred_instances_to_scaled_up = resolve_pre_wake
+    executor._find_instances_to_scaled_down_for_other_roles = find_pre_sleep
+    executor._scale_down_instances = sleep_instances
+    executor._find_instances_to_scaled_up = find_primary_wake
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = (
+        lambda sleep_elapsed_s, wake_elapsed_s: operations.append(("record", sleep_elapsed_s, wake_elapsed_s))
+    )
+    executor._interrupt_waiting_after_scale_up = interrupt_waiting
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(("finished", decision_id))
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert [operation[0] for operation in operations] == [
+        "resolve_pre_wake",
+        "find_pre_sleep",
+        "sleep",
+        "find_primary_wake",
+        "wake",
+        "record",
+        "interrupt",
+        "finished",
+    ]
+    assert operations[4][1] == [pre_wake, primary_wake]
+    assert operations[6][1]["wake_instance_ids"] == {2}
+
+
+def test_resolve_preferred_instances_to_scaled_up_returns_empty_list():
+    mod = _load_module()
+    executor = _make_executor(mod)
+
+    assert executor._resolve_preferred_instances_to_scaled_up([]) == []
+
+    executor.instances_status_flags["RewardModel"] = {"rm-model": {4: mod.InstanceStatus.AWAKEN}}
+    assert executor._resolve_preferred_instances_to_scaled_up(
+        [{"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 4}]
+    ) == []
+
+
+def test_scale_up_handler_treats_none_pre_wake_as_empty_and_wakes_primary():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {"decision_id": 18, "role_name": "RewardModel", "model_name": "rm-model"}
+    )
+    primary_wake = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 7}
+    operations = []
+
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: None
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+    executor._find_instances_to_scaled_up = lambda task: [primary_wake]
+
+    async def wake_instances(instances):
+        operations.append(("wake", instances))
+        executor.stop_scale_up = True
+
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._interrupt_waiting_after_scale_up = lambda **kwargs: asyncio.sleep(0)
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(("finished", decision_id))
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert operations == [("wake", [primary_wake]), ("finished", 18)]
+
+
+def test_request_level_scale_up_uses_planned_migrations_and_skips_legacy_rebalance():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.scaling_policy = types.SimpleNamespace(
+        enable_request_level_candidate_evaluation=True
+    )
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    planned = [
+        {
+            "request_id": "r0",
+            "source_instance_id": 0,
+            "destination_instance_id": 2,
+        }
+    ]
+    executor.scale_up_task_queue.put_nowait(
+        {
+            "decision_id": 19,
+            "role_name": "Rollout",
+            "model_name": "model",
+            "planned_request_migrations": planned,
+        }
+    )
+    primary_wake = {"role_name": "Rollout", "model_name": "model", "instance_id": 2}
+    executor.instances_status_flags["Rollout"]["model"] = {
+        2: mod.InstanceStatus.ASLEEP
+    }
+    operations = []
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+    executor._find_instances_to_scaled_up = lambda task: [primary_wake]
+
+    async def wake_instances(instances):
+        operations.append(("wake", instances))
+        executor.instances_status_flags["Rollout"]["model"][2] = mod.InstanceStatus.AWAKEN
+        executor.stop_scale_up = True
+
+    async def execute_planned(**kwargs):
+        operations.append(("planned", kwargs))
+        return 1
+
+    async def legacy(**kwargs):
+        operations.append(("legacy", kwargs))
+
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._execute_planned_request_migrations = execute_planned
+    executor._interrupt_waiting_after_scale_up = legacy
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(
+        ("finished", decision_id)
+    )
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert [operation[0] for operation in operations] == ["wake", "planned", "finished"]
+    assert operations[1][1]["request_migrations"] == planned
+
+
+def test_request_level_scale_up_does_not_migrate_after_wake_failure():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.scaling_policy = types.SimpleNamespace(
+        enable_request_level_candidate_evaluation=True
+    )
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {
+            "decision_id": 20,
+            "role_name": "Rollout",
+            "model_name": "model",
+            "planned_request_migrations": [{"request_id": "r0"}],
+        }
+    )
+    primary_wake = {"role_name": "Rollout", "model_name": "model", "instance_id": 2}
+    executor.instances_status_flags["Rollout"]["model"] = {
+        2: mod.InstanceStatus.RECOVERING
+    }
+    operations = []
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+    executor._find_instances_to_scaled_up = lambda task: [primary_wake]
+
+    async def wake_instances(instances):
+        operations.append(("wake", instances))
+        executor.stop_scale_up = True
+
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._execute_planned_request_migrations = lambda **kwargs: operations.append(
+        ("planned", kwargs)
+    )
+    executor._interrupt_waiting_after_scale_up = lambda **kwargs: operations.append(
+        ("legacy", kwargs)
+    )
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(
+        ("finished", decision_id)
+    )
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert [operation[0] for operation in operations] == ["wake", "finished"]
+
+
+def test_scale_up_handler_continues_after_action_failure():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {"decision_id": 21, "role_name": "RewardModel", "model_name": "rm-model"}
+    )
+    executor.scale_up_task_queue.put_nowait(
+        {"decision_id": 22, "role_name": "RewardModel", "model_name": "rm-model"}
+    )
+    primary_wake = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 7}
+    operations = []
+
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+
+    def find_instances(task):
+        if task["decision_id"] == 21:
+            raise RuntimeError("injected scale-up failure")
+        return [primary_wake]
+
+    async def wake_instances(instances):
+        operations.append(("wake", instances))
+        executor.stop_scale_up = True
+
+    executor._find_instances_to_scaled_up = find_instances
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._interrupt_waiting_after_scale_up = lambda **kwargs: asyncio.sleep(0)
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(("finished", decision_id))
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert operations == [("finished", 21), ("wake", [primary_wake]), ("finished", 22)]
+
+
+def test_failed_scale_up_action_releases_real_policy_gate():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {"decision_id": 23, "role_name": "RewardModel", "model_name": "rm-model"}
+    )
+    executor._policy_scaling_idle = asyncio.Event()
+    executor._policy_scaling_holder = "policy_decision decision_id=23"
+    executor._policy_scaling_holder_since_s = None
+    executor._policy_scaling_owner_token = 7
+    executor._next_policy_scaling_owner_token = 8
+    executor._policy_scaling_waiters = []
+    executor._decision_pending_action_counts = {23: 1}
+    executor._decision_gate_tokens = {23: 7}
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+
+    def fail_action(task):
+        executor.stop_scale_up = True
+        raise RuntimeError("injected failure before wake")
+
+    executor._find_instances_to_scaled_up = fail_action
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert executor._decision_pending_action_counts == {}
+    assert executor._decision_gate_tokens == {}
+    assert executor._policy_scaling_owner_token is None
+    assert executor._policy_scaling_idle.is_set()
+
+
+def test_scale_down_handler_continues_after_action_failure():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_down = False
+    executor.scale_down_task_queue = asyncio.Queue()
+    executor.scale_down_task_queue.put_nowait(
+        {"decision_id": 31, "role_name": "Rollout", "model_name": "model"}
+    )
+    executor.scale_down_task_queue.put_nowait(
+        {"decision_id": 32, "role_name": "Rollout", "model_name": "model"}
+    )
+    sleep_target = {"role_name": "Rollout", "model_name": "model", "instance_id": 3}
+    operations = []
+
+    def find_instances(task):
+        if task["decision_id"] == 31:
+            raise RuntimeError("injected scale-down failure")
+        return [sleep_target]
+
+    async def sleep_instances(instances):
+        operations.append(("sleep", instances))
+        executor.stop_scale_down = True
+
+    executor._find_instances_to_scaled_down_in_role = find_instances
+    executor._scale_down_instances = sleep_instances
+    executor._mark_decision_action_finished = lambda decision_id: operations.append(("finished", decision_id))
+
+    asyncio.run(executor._scale_down_handler_loop())
+
+    assert operations == [("finished", 31), ("sleep", [sleep_target]), ("finished", 32)]

@@ -16,17 +16,18 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=colocated
-export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated_rollout_ds_7b_rm8b
+export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated_test_weight_arena
 export PSRL_DEPLOY_STALENESS=0
 export PSRL_DEPLOY_RM_ASYNC=True
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=4
+export PSRL_DEPLOY_NNODES=8
+export PSRL_DEPLOY_TRAIN_NNODES=8
 export PSRL_DEPLOY_TRAIN_NGPUS=8
 # No separate shared pool in mode 2; all replicas ride on train_pool. These are
 # unused by main_ppo's colocated branch but kept for the common arg builder.
 export PSRL_DEPLOY_SHARED_NNODES=0
 export PSRL_DEPLOY_SHARED_NGPUS=0
 export PSRL_DEPLOY_RM_NUM_REPLICAS=0
+export PSRL_DEPLOY_EXTRA="${PSRL_DEPLOY_EXTRA:-} ++psrl.nixl.weight_arena.reward_enabled=true ++psrl.nixl.weight_arena.reward_cpu_cache_pin_memory=true"
 export PSRL_DEPLOY_SMOKE=${1:-0}
 shift || true
 

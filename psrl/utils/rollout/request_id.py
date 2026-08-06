@@ -46,6 +46,11 @@ def parse_psrl_uid_from_request_id(request_id: int | str) -> int | str:
         return req_id_str
 
 
+def canonical_psrl_request_id(request_id: int | str) -> str:
+    """Return the router key for a logical or vLLM-internal request ID."""
+    return str(parse_psrl_uid_from_request_id(request_id))
+
+
 def normalize_request_ids_for_vllm_abort(request_ids) -> list[str]:
     """Normalize ids for ``vLLM.abort`` (must be the internal engine request id string)."""
     if request_ids is None:

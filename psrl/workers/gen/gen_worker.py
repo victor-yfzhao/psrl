@@ -66,6 +66,116 @@ class GenInterface:
 
 
 class PSRL_GenWorker(Worker):
+    def _log_sleep_wake_timing(self, operation: str, stage: str, started_at: float, **details: Any) -> None:
+        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        psrl_logger.warning(
+            "[VLLM_SLEEP_WAKE_TIMING] scope=gen_worker operation=%s stage=%s "
+            "instance=%s role=%s elapsed_s=%.6f%s%s",
+            operation,
+            stage,
+            self.get_instance_id(),
+            self.role,
+            time.perf_counter() - started_at,
+            " " if detail_text else "",
+            detail_text,
+        )
+
+    async def _log_tp_worker_tms_timing(self, operation: str) -> None:
+        """Pull TP-local TMS stages into the GenWorker log."""
+        if not os.environ.get("PSRL_VLLM_PATCHES", "").startswith("TMS"):
+            return
+        started_at = time.perf_counter()
+        try:
+            snapshots = await self._collective_rpc("get_last_tms_sleep_wake_timing", args=(operation,))
+            for snapshot in snapshots:
+                timing = snapshot.get("timing")
+                if timing is None:
+                    psrl_logger.warning(
+                        "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker_summary operation=%s "
+                        "stage=missing instance=%s role=%s host=%s rank=%s tp_rank=%s pid=%s",
+                        operation,
+                        self.get_instance_id(),
+                        self.role,
+                        snapshot["hostname"],
+                        snapshot["rank"],
+                        snapshot["tp_rank"],
+                        snapshot["pid"],
+                    )
+                    continue
+                for stage in timing["stages"]:
+                    psrl_logger.warning(
+                        "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker_summary operation=%s "
+                        "stage=%s tag=%s instance=%s role=%s host=%s rank=%s tp_rank=%s "
+                        "pid=%s elapsed_s=%.6f",
+                        operation,
+                        stage["stage"],
+                        stage["tag"],
+                        self.get_instance_id(),
+                        self.role,
+                        snapshot["hostname"],
+                        snapshot["rank"],
+                        snapshot["tp_rank"],
+                        snapshot["pid"],
+                        stage["elapsed_s"],
+                    )
+        except Exception:
+            psrl_logger.exception(
+                "[VLLM_SLEEP_WAKE_TIMING] failed to collect TP timing operation=%s instance=%s role=%s",
+                operation,
+                self.get_instance_id(),
+                self.role,
+            )
+        finally:
+            self._log_sleep_wake_timing(operation, "tp_timing_collection", started_at)
+
+    async def _log_tp_worker_stage_timing(self, operation: str, stage: str) -> None:
+        """Pull worker-extension timing details into the GenWorker log."""
+        started_at = time.perf_counter()
+        try:
+            snapshots = await self._collective_rpc("get_last_worker_stage_timing", args=(stage,))
+            for snapshot in snapshots:
+                timing = snapshot.get("timing")
+                if timing is None:
+                    psrl_logger.warning(
+                        "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker_summary operation=%s "
+                        "stage=%s status=missing instance=%s role=%s host=%s rank=%s tp_rank=%s pid=%s",
+                        operation,
+                        stage,
+                        self.get_instance_id(),
+                        self.role,
+                        snapshot["hostname"],
+                        snapshot["rank"],
+                        snapshot["tp_rank"],
+                        snapshot["pid"],
+                    )
+                    continue
+                detail_text = " ".join(
+                    f"{key}={value:.6f}" if isinstance(value, (int, float)) else f"{key}={value}"
+                    for key, value in timing.items()
+                )
+                psrl_logger.warning(
+                    "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker_summary operation=%s "
+                    "stage=%s instance=%s role=%s host=%s rank=%s tp_rank=%s pid=%s %s",
+                    operation,
+                    stage,
+                    self.get_instance_id(),
+                    self.role,
+                    snapshot["hostname"],
+                    snapshot["rank"],
+                    snapshot["tp_rank"],
+                    snapshot["pid"],
+                    detail_text,
+                )
+        except Exception:
+            psrl_logger.exception(
+                "[VLLM_SLEEP_WAKE_TIMING] failed to collect TP stage=%s instance=%s role=%s",
+                stage,
+                self.get_instance_id(),
+                self.role,
+            )
+        finally:
+            self._log_sleep_wake_timing(operation, "tp_stage_timing_collection", started_at, worker_stage=stage)
+
     @staticmethod
     def configure_worker(
         config,
@@ -150,6 +260,25 @@ class PSRL_GenWorker(Worker):
                 env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
             elif psrl_config.tms.range == "all":
                 env_vars["PSRL_VLLM_PATCHES"] = "TMS"
+
+        arena_config = psrl_config.nixl.get("weight_arena", None)
+        rollout_arena_enabled = arena_config is not None and arena_config.get("rollout_enabled", False)
+        reward_arena_enabled = arena_config is not None and arena_config.get("reward_enabled", False)
+        role_arena_enabled = (role in ["rollout", "validate"] and rollout_arena_enabled) or (
+            role == "reward" and reward_arena_enabled
+        )
+        if role_arena_enabled:
+            if role != "reward" and psrl_config.ps_mode not in ("nixl_cpu", "nixl_gpu"):
+                raise RuntimeError(
+                    f"psrl.nixl.weight_arena for role={role} requires psrl.ps_mode to be nixl_cpu or nixl_gpu."
+                )
+            if psrl_config.tms.range != "all":
+                raise RuntimeError(f"psrl.nixl.weight_arena for role={role} requires psrl.tms.range=all.")
+            env_vars["PSRL_VLLM_WEIGHT_ARENA"] = "1"
+            # vLLM's Ray executor forwards VLLM_* variables to its inner GPU
+            # workers. Keep the PSRL name for the outer worker and mirror it
+            # so the patch is applied in the process that owns GPUModelRunner.
+            env_vars["VLLM_PSRL_WEIGHT_ARENA"] = "1"
 
         if config.rollout.disable_attn:
             warnings.warn(
@@ -330,6 +459,16 @@ class PSRL_GenWorker(Worker):
         max_model_len = await self._collective_rpc("estimate_max_model_len", args=())
         return max_model_len
 
+    async def get_weight_arena_info(self) -> list[dict[str, Any]]:
+        """Return arena state from every vLLM GPU worker."""
+        await self._is_init_model.wait()
+        return await self._collective_rpc("get_weight_arena_info", args=())
+
+    async def get_worker_stage_timing(self, stage: str) -> list[dict[str, Any]]:
+        """Return a worker-extension timing snapshot from every TP rank."""
+        await self._is_init_model.wait()
+        return await self._collective_rpc("get_worker_stage_timing", args=(stage,))
+
     async def init_nixl_client(self):
         """
         Initialize the NIXL client.
@@ -378,59 +517,153 @@ class PSRL_GenWorker(Worker):
         """Wake up model weights and register for NIXL."""
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_wake_up."
+        total_start = time.perf_counter()
 
         # init empty model
+        stage_start = time.perf_counter()
         await self.wake_up()
+        self._log_sleep_wake_timing("wake", "nixl_engine_wake", stage_start)
         # register local tensors
+        stage_start = time.perf_counter()
         await self._collective_rpc("nixl_register_after_wake_up", args=())
+        self._log_sleep_wake_timing("wake", "nixl_register_after_wake_up", stage_start)
+        await self._log_tp_worker_stage_timing("wake", "nixl_register_after_wake_up")
+        self._log_sleep_wake_timing("wake", "nixl_wake_total", total_start)
 
     async def nixl_sleep(self):
         """Deregister local tensors and put model weights to sleep state (free up GPU memory)."""
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_sleep."
+        total_start = time.perf_counter()
 
-        # put model weights to sleep
-        await self.sleep()
-        # deregister local tensors
+        # Deregister while the current physical pages are still mapped.
+        stage_start = time.perf_counter()
         await self._collective_rpc("nixl_deregister", args=())
+        self._log_sleep_wake_timing("sleep", "nixl_deregister", stage_start)
+        await self._log_tp_worker_stage_timing("sleep", "nixl_deregister")
+        # Put model weights to sleep only after NIXL has released its registrations.
+        stage_start = time.perf_counter()
+        await self.sleep(log_gpu_memory=False)
+        self._log_sleep_wake_timing("sleep", "nixl_engine_sleep", stage_start)
+        stage_start = time.perf_counter()
+        await self._log_sleep_gpu_memory("after_nixl_deregister")
+        self._log_sleep_wake_timing("sleep", "memory_snapshot", stage_start, snapshot_stage="after_nixl_deregister")
+        self._log_sleep_wake_timing("sleep", "nixl_sleep_total", total_start)
 
     async def _nixl_log_shard_info(self, stage: str, max_elements: int = 8):
         """Log NIXL shard info via vLLM extension for sleep/wake_up debugging."""
         label = f"I{self.get_instance_id()}_{stage}"
         await self._collective_rpc("nixl_log_shard_info", args=(label, max_elements))
 
-    async def sleep(self):
+    async def _log_sleep_gpu_memory(self, stage: str) -> None:
+        """Log per-vLLM-worker CUDA memory without making sleep depend on diagnostics."""
+        assert self.rollout, "Rollout must be initialized before logging GPU memory."
+        try:
+            snapshots = await self.rollout.inference_engine.collective_rpc(
+                "get_gpu_memory_snapshot",
+                timeout=30,
+                args=(),
+            )
+            gib = 1024**3
+            for snapshot in snapshots:
+                psrl_logger.info(
+                    "[VLLM_SLEEP_MEMORY] stage=%s instance=%s host=%s node_id=%s "
+                    "rank=%s tp_rank=%s pid=%s device=cuda:%s gpu_uuid=%s gpu_name=%s "
+                    "torch_allocated=%.2f GB torch_reserved=%.2f GB "
+                    "device_used=%.2f GB device_free=%.2f GB device_total=%.2f GB",
+                    stage,
+                    self.get_instance_id(),
+                    snapshot["hostname"],
+                    snapshot["node_id"],
+                    snapshot["rank"],
+                    snapshot["tp_rank"],
+                    snapshot["pid"],
+                    snapshot["device"],
+                    snapshot["device_uuid"],
+                    snapshot["device_name"],
+                    snapshot["torch_allocated_bytes"] / gib,
+                    snapshot["torch_reserved_bytes"] / gib,
+                    snapshot["device_used_bytes"] / gib,
+                    snapshot["device_free_bytes"] / gib,
+                    snapshot["device_total_bytes"] / gib,
+                )
+        except Exception:
+            psrl_logger.exception(
+                "[VLLM_SLEEP_MEMORY] failed to collect memory after stage=%s instance=%s",
+                stage,
+                self.get_instance_id(),
+            )
+
+    async def sleep(self, log_gpu_memory: bool = True):
         """Put model weights to sleep state (free up GPU memory)."""
+        total_start = time.perf_counter()
         if self._is_transformers_rollout_backend():
             psrl_logger.info("Transformers rollout sleep is a no-op on instance %s.", self.get_instance_id())
             return
         psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()} (Double check)")
+        stage_start = time.perf_counter()
         interrupted_request_num = await self.interrupt_generation()
+        self._log_sleep_wake_timing(
+            "sleep", "interrupt_generation", stage_start, interrupted_requests=interrupted_request_num
+        )
         psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
 
+        stage_start = time.perf_counter()
         await self.rollout.inference_engine.sleep(level=2)
+        self._log_sleep_wake_timing("sleep", "engine_sleep", stage_start)
+        await self._log_tp_worker_tms_timing("sleep")
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.
+            stage_start = time.perf_counter()
             aggressive_empty_cache(force_sync=True)
+            self._log_sleep_wake_timing("sleep", "aggressive_empty_cache", stage_start)
+        if log_gpu_memory:
+            stage_start = time.perf_counter()
+            await self._log_sleep_gpu_memory("after_sleep")
+            self._log_sleep_wake_timing("sleep", "memory_snapshot", stage_start, snapshot_stage="after_sleep")
+        self._log_sleep_wake_timing("sleep", "total", total_start)
 
     async def wake_up(self):
         """Wake up model weights."""
+        total_start = time.perf_counter()
         if self._is_transformers_rollout_backend():
             self.resume_generation()
             psrl_logger.info("Transformers rollout wake_up is a no-op on instance %s.", self.get_instance_id())
             return
         if self.role == "reward":
+            stage_start = time.perf_counter()
             await self.rollout.inference_engine.wake_up(tags=["weights"])
+            self._log_sleep_wake_timing("wake", "engine_wake", stage_start, tags="weights")
+            await self._log_tp_worker_tms_timing("wake")
+            stage_start = time.perf_counter()
             await self._load_reward_weights_from_cpu_cache()
+            self._log_sleep_wake_timing("wake", "load_reward_weights_from_cpu_cache", stage_start)
+            await self._log_tp_worker_stage_timing("wake", "load_weights_from_cpu_cache")
+            stage_start = time.perf_counter()
             await self.rollout.inference_engine.wake_up(tags=["kv_cache"])
+            self._log_sleep_wake_timing("wake", "engine_wake", stage_start, tags="kv_cache")
+            await self._log_tp_worker_tms_timing("wake")
             self.resume_generation()
             psrl_logger.info(f"Generation resumed on instance {self.get_instance_id()}")
+            self._log_sleep_wake_timing("wake", "total", total_start)
             return
         wake_up_tags = ["weights", "kv_cache"]
         if self.psrl_config.tms.enable_cuda_graph:
             wake_up_tags.append("graph")
+        stage_start = time.perf_counter()
         await self.rollout.inference_engine.wake_up(tags=wake_up_tags)
+        self._log_sleep_wake_timing("wake", "engine_wake", stage_start, tags=",".join(wake_up_tags))
+        await self._log_tp_worker_tms_timing("wake")
+        self._log_sleep_wake_timing("wake", "total", total_start)
+
+    async def shutdown_rollout_engine(self, timeout_s: float = 120) -> None:
+        """Gracefully stop vLLM and its child workers before terminating this actor."""
+        rollout = getattr(self, "rollout", None)
+        inference_engine = getattr(rollout, "inference_engine", None)
+        if inference_engine is not None:
+            inference_engine.shutdown(timeout=timeout_s)
+        self.rollout = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def is_rollout_engine_sleeping(self) -> bool:
@@ -673,7 +906,12 @@ class PSRL_GenWorker(Worker):
             )
             if self.role == "reward" and self.rollout.inference_engine is not None:
                 await self._preload_reward_weights_to_cpu_cache()
-                if not self.psrl_config.deployment.elastic_rm.enable:
+                arena_config = self.psrl_config.nixl.get("weight_arena", {})
+                reward_arena_enabled = arena_config.get("reward_enabled", False)
+                if reward_arena_enabled or not self.psrl_config.deployment.elastic_rm.enable:
+                    # Arena-backed reward workers build their final CPU mirror
+                    # during initialization so even the first elastic wake uses
+                    # a few contiguous H2D copies rather than checkpoint loaders.
                     await self._load_reward_weights_from_cpu_cache()
         self._is_init_model.set()
 
@@ -878,14 +1116,18 @@ class PSRL_GenWorker(Worker):
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
             "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         )
+        total_start = time.perf_counter()
         ps_manager_handle = self.gen_interface.ps_manager_handle
+        metadata_start = time.perf_counter()
         if self._cached_ps_nixl_agent_names is None:
             self._cached_ps_nixl_agent_names = await ps_manager_handle.get_ps_nixl_agent_names.remote()
         if self._cached_ps_nixl_gen_storage_client_names is None:
             self._cached_ps_nixl_gen_storage_client_names = (
                 await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
             )
+        self._log_sleep_wake_timing("pull", "fetch_ps_metadata", metadata_start)
         if not self.psrl_config.profile.fix_weight:
+            transfer_start = time.perf_counter()
             await self.rollout.inference_engine.collective_rpc(
                 "nixl_pull_model_core",
                 args=(
@@ -893,14 +1135,20 @@ class PSRL_GenWorker(Worker):
                     self._cached_ps_nixl_gen_storage_client_names,
                 ),
             )
+            self._log_sleep_wake_timing("pull", "nixl_pull_model_core", transfer_start)
+            await self._log_tp_worker_stage_timing("pull", "nixl_pull_model_core")
+        version_start = time.perf_counter()
         await ps_manager_handle.pull_model_state_dict_nixl.remote(
             self.get_instance_id()
         )  # This only updates the model version
+        self._log_sleep_wake_timing("pull", "update_ps_version", version_start)
+        self._log_sleep_wake_timing("pull", "nixl_pull_total", total_start)
         psrl_logger.info("NIXL pull model done.")
 
     async def pull_model_async(self) -> None:
         assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks"
 
+        total_start = time.perf_counter()
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model_async()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
@@ -908,7 +1156,10 @@ class PSRL_GenWorker(Worker):
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Important: the prefix cache needs to be cleared after pulling the model
+        reset_start = time.perf_counter()
         await self.rollout.inference_engine.reset_prefix_cache()
+        self._log_sleep_wake_timing("pull", "reset_prefix_cache", reset_start)
+        self._log_sleep_wake_timing("pull", "pull_model_total", total_start)
 
     async def _async_interrupt_requests(self, request_ids=None):
         """Interrupt requests in the engine queue (waiting and running).

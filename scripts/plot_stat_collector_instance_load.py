@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_DIR = (
     REPO_ROOT
     / "logs/verl_deployment_modes/"
-    "dapo_mode5_bs_128_share_16_elastic_rl_rollout7_ds_7b_rm8b"
+    "mixed_test_none_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl_Qwen2.5-32B_Qwen3-30B-A3B-Thinking-2507"
 )
 
 ROLE_ORDER = ("Rollout", "RewardModel")

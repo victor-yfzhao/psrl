@@ -119,10 +119,12 @@ class ScalingAction:
     # When scale_up must evict another role first: preferred SLEEP targets (same dict shape
     # as executor pre_sleep). Only force_wake colocated path sets this today.
     pre_sleep_other_preferred: list[dict[str, Any]] | None = None
-    # Optional same-role migration targets to wake before sleeping pre_sleep_other_preferred.
-    # Used when a larger-parallelism instance can be opened by moving smaller instances
-    # onto completely free devices first.
+    # Optional same-role migration targets to wake together with the primary scale-up,
+    # after pre_sleep_other_preferred has released the primary target's devices.
     pre_wake_other_preferred: list[dict[str, Any]] | None = None
+    # Request-level rebalance plan generated for the primary scale-up role.
+    # Entries contain request_id/source_instance_id/destination_instance_id.
+    planned_request_migrations: list[dict[str, Any]] | None = None
 
 
 @dataclass

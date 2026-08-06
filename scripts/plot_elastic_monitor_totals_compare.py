@@ -26,9 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # --- Parse / plot tuning (edit here) ---
 # Inclusive plot range in minutes from the first aggregated timestamp in each log.
 PLOT_WINDOW_START_MIN = 0.0
-PLOT_WINDOW_END_MIN = 300.0
+PLOT_WINDOW_END_MIN = 100.0
 # If True, only plot elastic (min_0); skip non-elastic overlay.
-PLOT_ELASTIC_ONLY = True
+PLOT_ELASTIC_ONLY = False
 # Optional y-axis ranges for the five subplots. None = auto-scale.
 PLOT_YLIM_THROUGHPUT: tuple[float, float] | None = None
 PLOT_YLIM_RUNNING: tuple[float, float] | None = None
@@ -68,17 +68,17 @@ COLOR_MIN0_ROLLOUT = "#1a5276"
 
 NON_ELASTIC_LOG_PATH = (
     REPO_ROOT
-    / f"logs/verl_deployment_modes/mode1_bs_256_roll_6_rm_18_disaggregated_rollout7b_rm8b/ElasticMonitor.log"
+    / f"logs/verl_deployment_modes/mixed_test_none_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl_Qwen2.5-32B_Qwen3-30B-A3B-Thinking-2507/ElasticMonitor.log"
 )
 ELASTIC_LOG_PATH = (
     REPO_ROOT
-    / f"logs/verl_deployment_modes/mode5_bs_128_share_16_elastic_rl_rollout7_ds_7b_rm8b/ElasticMonitor.log"
+    / f"logs/verl_deployment_modes/mixed_test_new_request_level_candidate_evaluation_mode5_bs_128_share_32_elastic_rl_Qwen2.5-32B_Qwen3-30B-A3B-Thinking-2507/ElasticMonitor.log"
 )
-_OUT_TAG = "elastic_only" if PLOT_ELASTIC_ONLY else "compare_min0_vs_min4"
+_OUT_TAG = "elastic_only" if PLOT_ELASTIC_ONLY else "compare_none_vs_new"
 OUT_PATH = (
     REPO_ROOT
-    / f"logs/verl_deployment_modes/{_OUT_TAG}_rollout7b_rm8b/"
-    f"rm_rollout_ds_7b_totals_merged_"
+    / f"logs/verl_deployment_modes/{_OUT_TAG}_none_new/"
+    f"none_new_share_32_totals_merged_"
     f"{PLOT_WINDOW_START_MIN}-{PLOT_WINDOW_END_MIN}_min.png"
 )
 

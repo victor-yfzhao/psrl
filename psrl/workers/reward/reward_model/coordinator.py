@@ -229,8 +229,26 @@ class RewardModelCoordinator(CommandExtension):
                 if command_type == CommandType.ABORT:
                     instance_to_uids = command_args.get("instance_to_uids", None)
                     instance_ids = command_args.get("instance_ids", None)
-                    if instance_to_uids is None and instance_ids is None:
-                        raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
+                    request_migrations = command_args.get("request_migrations", None)
+                    migration_context = command_args.get("migration_context")
+                    if instance_to_uids is None and instance_ids is None and request_migrations is None:
+                        raise ValueError(
+                            "ABORT command must contain 'instance_to_uids', 'instance_ids', "
+                            "or 'request_migrations' in args."
+                        )
+
+                    if request_migrations is not None:
+                        if self.reward_model_router is None:
+                            instance_to_uids = {}
+                        else:
+                            prepared = await self.reward_model_router.prepare_request_migrations.remote(
+                                request_migrations
+                            )
+                            instance_to_uids = prepared.get("instance_to_uids", {})
+                            psrl_logger.info(
+                                "Prepared RM request migrations before ABORT: %s",
+                                prepared,
+                            )
 
                     psrl_logger.info(
                         "Received ABORT command with instance_to_uids (count=%s) and instance_ids=%s; "
@@ -239,6 +257,12 @@ class RewardModelCoordinator(CommandExtension):
                         instance_ids,
                     )
                     futures = []
+
+                    if migration_context and instance_to_uids is not None and self.reward_model_router is not None:
+                        await self.reward_model_router.mark_migration_requests.remote(
+                            instance_to_uids,
+                            migration_context,
+                        )
 
                     if instance_to_uids is not None:
                         for instance_id, uids in instance_to_uids.items():
@@ -293,9 +317,17 @@ class RewardModelCoordinator(CommandExtension):
                     if -1 in instance_ids:
                         instance_ids = list(range(self.reward_model_wg_size))
 
+                    overhead_started_s = time.monotonic()
+                    pause_s = 0.0
+                    interrupt_s = 0.0
+                    engine_sleep_s = 0.0
+                    success = False
                     try:
                         if self.reward_model_router is not None:
+                            stage_started_s = time.monotonic()
                             await self.reward_model_router.pause_instances.remote(instance_ids)
+                            pause_s = time.monotonic() - stage_started_s
+                        stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
                                 self.reward_model_wg_list[instance_id].execute_rank_zero_async(
@@ -304,20 +336,35 @@ class RewardModelCoordinator(CommandExtension):
                                 for instance_id in instance_ids
                             ]
                         )
+                        interrupt_s = time.monotonic() - stage_started_s
+                        stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
                                 self.reward_model_wg_list[instance_id].execute_rank_zero_async("sleep")
                                 for instance_id in instance_ids
                             ]
                         )
+                        engine_sleep_s = time.monotonic() - stage_started_s
                     except Exception:
                         psrl_logger.exception("SLEEP command failed for RM instances %s", instance_ids)
                         if self.reward_model_router is not None:
                             await self.reward_model_router.resume_instances.remote(instance_ids)
                         self._complete_command(command_id, False)
                     else:
+                        success = True
                         psrl_logger.info("SLEEP command for instances %s completed.", instance_ids)
                         self._complete_command(command_id, True)
+                    finally:
+                        psrl_logger.info(
+                            "[ELASTIC_OVERHEAD] operation=sleep role=RewardModel instances=%s success=%s "
+                            "router_pause_s=%.6f interrupt_s=%.6f engine_sleep_s=%.6f total_s=%.6f",
+                            instance_ids,
+                            success,
+                            pause_s,
+                            interrupt_s,
+                            engine_sleep_s,
+                            time.monotonic() - overhead_started_s,
+                        )
                 
                 elif command_type == CommandType.WAKE_UP:
                     instance_ids = command_args.get("instance_ids", None)
@@ -329,21 +376,40 @@ class RewardModelCoordinator(CommandExtension):
                     if -1 in instance_ids:
                         instance_ids = list(range(self.reward_model_wg_size))
 
+                    overhead_started_s = time.monotonic()
+                    engine_wakeup_s = 0.0
+                    router_resume_s = 0.0
+                    success = False
                     try:
+                        stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
                                 self.reward_model_wg_list[instance_id].execute_rank_zero_async("wake_up")
                                 for instance_id in instance_ids
                             ]
                         )
+                        engine_wakeup_s = time.monotonic() - stage_started_s
                         if self.reward_model_router is not None:
+                            stage_started_s = time.monotonic()
                             await self.reward_model_router.resume_instances.remote(instance_ids)
+                            router_resume_s = time.monotonic() - stage_started_s
                     except Exception:
                         psrl_logger.exception("WAKE_UP command failed for RM instances %s", instance_ids)
                         self._complete_command(command_id, False)
                     else:
+                        success = True
                         psrl_logger.info("WAKE_UP command for instances %s completed.", instance_ids)
                         self._complete_command(command_id, True)
+                    finally:
+                        psrl_logger.info(
+                            "[ELASTIC_OVERHEAD] operation=wakeup role=RewardModel instances=%s success=%s "
+                            "engine_wakeup_s=%.6f router_resume_s=%.6f total_s=%.6f",
+                            instance_ids,
+                            success,
+                            engine_wakeup_s,
+                            router_resume_s,
+                            time.monotonic() - overhead_started_s,
+                        )
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 
@@ -479,6 +545,12 @@ class RewardModelCoordinator(CommandExtension):
             time.monotonic() - t_enter,
         )
         return summary
+
+    async def get_candidate_evaluation_snapshot(self, top_t: int | None = None) -> dict:
+        """Proxy the compact request-level snapshot from the RM router."""
+        if self.reward_model_router is None:
+            raise RuntimeError("reward-model router is not initialized")
+        return await self.reward_model_router.get_candidate_evaluation_snapshot.remote(top_t)
 
     async def init_route_strategy(self):
         # TODO(zyf): need to decide whether to use the route strategy for rm

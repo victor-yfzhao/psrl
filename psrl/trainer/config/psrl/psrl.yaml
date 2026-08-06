@@ -132,6 +132,13 @@ deployment:
       migrate_time_s_initial: 5.0
       migrate_time_ewma_alpha: 0.2
       min_gain: ${psrl.deployment.elastic_rm.hysteresis}
+      # Experimental request-snapshot evaluator. False preserves candidate
+      # scoring and the existing post-scale-up rebalance path byte-for-byte.
+      enable_request_level_candidate_evaluation: false
+      candidate_evaluation_max_workers: 64
+      # For itl_harmonic only: false uses the standard sum denominator;
+      # true uses max(w_rollout / rollout_tp, w_rm / rm_tp).
+      harmonic_denominator_use_max: false
       # Objective mode:
       # - balanced_min: keep the historical balanced-load bottleneck estimate.
       # - sum: use min(sum(instance throughput for Rollout), sum(instance throughput for RM)).
@@ -143,6 +150,10 @@ deployment:
       # Max number of same-role instances a single ITL decision may wake or sleep.
       # 1 keeps the original one-step candidate search.
       max_scale_instances_per_action: 32
+      # Enable GPU-bundle-aware wake plans when rollout and RM replicas use
+      # different power-of-two parallel sizes. Equal-size roles retain the
+      # established count-prefix candidate path even when this is true.
+      enable_heterogeneous_parallelism_candidates: false
       # Number of leading router waiting sequences to include in ITL F/F' estimates.
       # -1 includes all router waiting requests; 0 disables router-waiting load in the objective.
       router_waiting_top_t: -1
@@ -512,6 +523,21 @@ nixl:
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+  # Pack model weight storages into a small number of real CUDA allocations.
+  # NIXL still transfers one logical descriptor per model tensor.
+  weight_arena:
+    actor_enabled: true
+    rollout_enabled: true
+    reward_enabled: true
+    reward_cpu_cache_pin_memory: false
+    # direct writes the initial weights into their final arena allocation;
+    # repack retains the previous load-then-copy implementation for rollback.
+    actor_materialization: direct
+    rollout_materialization: direct
+    reward_materialization: direct
+    max_chunk_bytes: 4294967296
+    alignment_bytes: 256
 
 # Post processor for group requests in streaming mode
 group_post_process:

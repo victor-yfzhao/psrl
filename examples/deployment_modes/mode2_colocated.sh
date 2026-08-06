@@ -16,11 +16,11 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=colocated
-export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated_rollout_ds_7b_rm8b
+export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated_16
 export PSRL_DEPLOY_STALENESS=0
 export PSRL_DEPLOY_RM_ASYNC=True
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=4
+export PSRL_DEPLOY_NNODES=2
+export PSRL_DEPLOY_TRAIN_NNODES=2
 export PSRL_DEPLOY_TRAIN_NGPUS=8
 # No separate shared pool in mode 2; all replicas ride on train_pool. These are
 # unused by main_ppo's colocated branch but kept for the common arg builder.
