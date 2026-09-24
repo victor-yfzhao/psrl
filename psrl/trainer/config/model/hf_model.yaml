@@ -9,8 +9,9 @@ hf_config_path: null
 # path to the huggingface tokenizer. In case it is not the same as path
 tokenizer_path: null
 
-# whether to use shared memory for model loading
-use_shm: True
+# Keep model files off /dev/shm by default. Ray Plasma and NCCL also use that
+# finite tmpfs, and a large implicit model copy can make the raylet SIGBUS.
+use_shm: False
 
 # whether to trust remote code.
 trust_remote_code: False

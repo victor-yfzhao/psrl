@@ -141,16 +141,22 @@ class BaseConverter(ABC):
                 f"FSDP world size ({ws}) is not divisible by G_global={G_global} for {param_name}."
             )
             steps = ws // G_global
-            reshaped = make_slice_parameter(param.data.reshape(1, rows, H), param)
+            if attn_output_gate and is_q_weight(param_name):
+                assert rows % (2 * head_size) == 0, (
+                    f"rows={rows} must be divisible by 2*head_size={2 * head_size} "
+                    f"for attn_output_gate Case C reshape of {param_name}."
+                )
+                q_heads_per_group_local = rows // (2 * head_size)
+                reshaped = make_slice_parameter(
+                    param.data.reshape(1, q_heads_per_group_local, 2, head_size, H),
+                    param,
+                )
+            else:
+                reshaped = make_slice_parameter(param.data.reshape(1, rows, H), param)
             new_sharding = NIXLSharding(
                 shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
                 shard_indices=[(rank // steps, rank % steps)],
             )
-            if attn_output_gate and is_q_weight(param_name):
-                raise NotImplementedError(
-                    "attn_output_gate is not supported for fine-grained sharding (Case C)"
-                )
-
 
         return reshaped, new_sharding
 

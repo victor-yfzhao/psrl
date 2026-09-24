@@ -126,6 +126,10 @@ class RouteStrategyBase(ABC):
         """
         self.instance_to_time_record[instance_id] = datetime.now()
 
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        """Record a simulation-selected route without applying admission rules."""
+        return int(instance_id)
+
     def pop_request(self, request: DataProto, instance_id: int):
         """Pop a request from a specific worker instance.
 
@@ -274,6 +278,11 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
         self.instance_request_counts[candidates[idx]] += 1
         return candidates[idx]
 
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        instance_id = int(instance_id)
+        self.instance_request_counts[instance_id] += 1
+        return instance_id
+
     def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
         super().update_instance_to_engine_status(instance_to_engine_status)
         # instance_request_counts is router-authoritative (route/pop maintained).
@@ -388,6 +397,13 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
                 f"{response_token_num} response tokens"
             )
         return prompt_token_num + response_token_num
+
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        instance_id = int(instance_id)
+        self.instance_to_request_num[instance_id] += 1
+        self.instance_to_running_request_num[instance_id] += 1
+        self.instance_to_token_num[instance_id] += self._get_request_token_num(request)
+        return instance_id
 
     def _can_run_directly(self, request: DataProto, instance_id: int) -> bool:
         if self.instance_to_waiting_request_num[instance_id] > 0:
@@ -566,10 +582,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
             return None
         if self.instance_to_request_num[instance_id] >= self.max_concurrent_seqs_per_instance:
             return None
-        self.instance_to_request_num[instance_id] += 1
-        self.instance_to_running_request_num[instance_id] += 1
-        self.instance_to_token_num[instance_id] += self._get_request_token_num(request)
-        return instance_id
+        return self.force_route_unchecked(request, instance_id)
 
     def route(
         self,

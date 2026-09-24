@@ -65,6 +65,9 @@ def main() -> None:
 
     model.to_empty(device="meta")
     fully_shard(model, mesh=mesh, reshard_after_forward=False)
+    # FSDP2 may materialize module buffers on the target device while parameter
+    # shards remain meta. This mirrors rotary_emb.inv_freq in production models.
+    model.scale = initial_state["scale"].to(device)
     fsdp_params = _fsdp_parameters(model)
     parameter_ids = tuple(id(fsdp_param.sharded_param) for fsdp_param in fsdp_params)
     cuda_allocated_before = torch.cuda.memory_allocated(device)

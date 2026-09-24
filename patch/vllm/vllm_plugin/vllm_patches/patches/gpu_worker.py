@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 import socket
@@ -20,6 +21,24 @@ _ORIGINAL_WORKER_LOAD_MODEL = Worker.load_model
 
 def _should_restore_sleep_buffers(tags: list[str] | None) -> bool:
     return tags is None or "kv_cache" in tags
+
+
+def _release_inactive_cuda_cache() -> dict[str, int]:
+    """Release inactive blocks owned by this vLLM GPU worker process."""
+    reserved_before = torch.cuda.memory_reserved()
+    allocated_before = torch.cuda.memory_allocated()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    reserved_after = torch.cuda.memory_reserved()
+    allocated_after = torch.cuda.memory_allocated()
+    return {
+        "reserved_before": reserved_before,
+        "reserved_after": reserved_after,
+        "reserved_freed": reserved_before - reserved_after,
+        "allocated_before": allocated_before,
+        "allocated_after": allocated_after,
+    }
 
 
 @min_vllm_version("0.18.1")
@@ -93,6 +112,18 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                 torch_memory_saver.pause("graph")
                 self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="graph")
 
+        # TMS only releases allocations in its tagged pools. Inference
+        # temporaries use the worker's default caching allocator, so clear its
+        # inactive blocks in this process before another colocated role wakes.
+        stage_start = time.perf_counter()
+        cache_stats = _release_inactive_cuda_cache()
+        self.log_tms_timing(
+            "sleep",
+            "empty_cache",
+            time.perf_counter() - stage_start,
+            tag="default_allocator",
+        )
+
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -100,9 +131,11 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         device = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device)
         gib = 1024**3
-        psrl_logger.info(
+        psrl_logger.warning(
             "[VLLM_SLEEP_MEMORY] stage=worker_after_sleep host=%s rank=%s local_rank=%s "
             "pid=%s device=cuda:%s gpu_uuid=%s gpu_name=%s freed=%.2f GB "
+            "cache_reserved_before=%.2f GB cache_reserved_after=%.2f GB cache_reserved_freed=%.2f GB "
+            "cache_allocated_before=%.2f GB cache_allocated_after=%.2f GB "
             "torch_allocated=%.2f GB torch_reserved=%.2f GB "
             "device_used=%.2f GB device_free=%.2f GB device_total=%.2f GB",
             socket.gethostname(),
@@ -113,6 +146,11 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             str(getattr(properties, "uuid", "unknown")),
             properties.name,
             freed_bytes / gib,
+            cache_stats["reserved_before"] / gib,
+            cache_stats["reserved_after"] / gib,
+            cache_stats["reserved_freed"] / gib,
+            cache_stats["allocated_before"] / gib,
+            cache_stats["allocated_after"] / gib,
             torch.cuda.memory_allocated(device) / gib,
             torch.cuda.memory_reserved(device) / gib,
             used_bytes / gib,

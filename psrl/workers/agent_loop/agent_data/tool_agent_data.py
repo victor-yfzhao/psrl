@@ -123,7 +123,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Returns a list of OpenAI-function-call style dicts:
         [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
         """
-        _, tool_calls = self.tool_parser.extract_tool_calls(token_ids)
+        _, tool_calls = self.tool_parser.extract_tool_calls(token_ids, tools=self.tool_schemas)
         tool_calls_dict = [
             {
                 "type": "function",
@@ -255,7 +255,10 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         self.set_step_action(tool_calls_dict)
 
         # Compute step reward if using step-level reward mode
-        if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
+        if (
+            self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step"
+            and not output.meta_info.get("validate", False)
+        ):
             output.non_tensor_batch["__num_turns__"] = np.array(
                 [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
             )

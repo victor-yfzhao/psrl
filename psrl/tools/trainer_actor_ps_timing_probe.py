@@ -54,10 +54,10 @@ def _parse_args() -> argparse.Namespace:
         help="Pack actor FSDP2 weight storages into arenas before NIXL registration.",
     )
     parser.add_argument(
-        "--weight-arena-max-chunk-bytes",
-        type=int,
-        default=4 * 1024**3,
-        help="Maximum arena allocation size; oversized individual storages remain standalone.",
+        "--weight-arena-max-chunk-gb",
+        type=float,
+        default=4,
+        help="Maximum arena allocation size in GB; oversized individual storages remain standalone.",
     )
     parser.add_argument(
         "--reuse-existing-registration",
@@ -78,8 +78,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--world-size must be divisible by --gpus-per-node")
     if args.cycles < 1:
         parser.error("--cycles must be positive")
-    if args.weight_arena_max_chunk_bytes <= 0:
-        parser.error("--weight-arena-max-chunk-bytes must be positive")
+    if args.weight_arena_max_chunk_gb <= 0:
+        parser.error("--weight-arena-max-chunk-gb must be positive")
     if args.fingerprint_chunk_bytes <= 0:
         parser.error("--fingerprint-chunk-bytes must be positive")
     if args.local_node_only and args.world_size > args.gpus_per_node:
@@ -100,7 +100,8 @@ def _compose_config(args: argparse.Namespace, server_ip: str, server_port: int):
         "train_actor_rollout_ref.actor.use_dynamic_bsz=True",
         f"train_actor_rollout_ref.actor.fsdp_config.fsdp_size={args.world_size}",
         "train_actor_rollout_ref.actor.fsdp_config.param_offload=False",
-        "train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
+        # Full TMS sleep requires optimizer state to be offloaded before pausing.
+        "train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
         "train_actor_rollout_ref.actor.fsdp_config.use_torch_compile=False",
         "train_actor_rollout_ref.actor.optim.total_training_steps=1",
         "trainer.device=cuda",
@@ -117,7 +118,7 @@ def _compose_config(args: argparse.Namespace, server_ip: str, server_port: int):
         f"psrl.nixl.weight_arena.actor_enabled={args.weight_arena}",
     ]
     if args.weight_arena:
-        defaults.append(f"psrl.nixl.weight_arena.max_chunk_bytes={args.weight_arena_max_chunk_bytes}")
+        defaults.append(f"psrl.nixl.weight_arena.max_chunk_gb={args.weight_arena_max_chunk_gb}")
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
         config = compose(config_name="ppo_trainer", overrides=[*defaults, *args.overrides])
     OmegaConf.resolve(config)
@@ -335,7 +336,7 @@ def main() -> None:
         "cycles": args.cycles,
         "reuse_existing_registration": args.reuse_existing_registration,
         "weight_arena": args.weight_arena,
-        "weight_arena_max_chunk_bytes": args.weight_arena_max_chunk_bytes,
+        "weight_arena_max_chunk_gb": args.weight_arena_max_chunk_gb,
         "local_node_only": args.local_node_only,
         "verify_exact_weights": args.verify_exact_weights,
         "model_path": str(args.model_path),

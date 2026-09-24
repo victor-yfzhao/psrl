@@ -17,6 +17,7 @@ from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.common.utils import lazy_import_to_globals
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
+from psrl.utils.nixl.fingerprint import fingerprint_tensor_mapping, tensor_mapping_signature
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
@@ -81,6 +82,9 @@ class NIXLStorageClient:
         self.client_type = client_type
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
+        self.metadata_server_info_timeout_s = float(nixl_config.get("metadata_server_info_timeout_s", 1200.0))
+        if self.metadata_server_info_timeout_s <= 0:
+            raise ValueError("nixl.metadata_server_info_timeout_s must be positive")
         self.max_pinned_temp_memory_slots = (
             nixl_config.max_pinned_temp_memory_slots
         )  # None means no pinned temp memory
@@ -205,6 +209,25 @@ class NIXLStorageClient:
     ) -> dict[tuple[str, tuple[int, ...]], torch.Tensor]:
         """Get temp tensor mapping"""
         return self._temp_tensor_mapping
+
+    def get_weight_fingerprint(
+        self,
+        *,
+        mode: str = "sampled",
+        sample_count: int = 16,
+        chunk_bytes: int = 64 * 1024**2,
+    ) -> dict[str, Any]:
+        """Fingerprint the logical tensor contents currently exposed through NIXL."""
+        return fingerprint_tensor_mapping(
+            self._original_tensor_mapping,
+            mode=mode,
+            sample_count=sample_count,
+            chunk_bytes=chunk_bytes,
+        )
+
+    def get_tensor_mapping_signature(self) -> dict[str, Any]:
+        """Fingerprint registration metadata without reading tensor contents."""
+        return tensor_mapping_signature(self._original_tensor_mapping)
 
     def _track_registered_desc(self, desc) -> bytes:
         """Cache registered desc object and return serialized bytes."""
@@ -899,23 +922,44 @@ class NIXLStorageClient:
         Connect to the storage/meta server.
         """
         assert not self._is_connected, "Already connected to server"
+        local_port = getattr(self, "client_port", "binded")
+        psrl_logger.info(
+            f"[nixl-handshake] {self.client_name} connect start: "
+            f"server={self.server_name} {self.server_ip}:{self.server_port} "
+            f"local_ip={get_local_ip()} client_port={local_port}."
+        )
+        t0 = time.time()
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
+        t_fetch = time.time()
         self.agent.send_local_metadata(self.server_ip, self.server_port)
-        start = time.time()
+        t_send = time.time()
         ready = False
         while not ready:
             ready = self.agent.check_remote_metadata(self.server_name)
-            if time.time() - start > timeout:
+            if time.time() - t_send > timeout:
                 raise TimeoutError("Timeout waiting for server metadata to be fetched and connected.")
             time.sleep(0.1)
         self._is_connected = True
+        # NOTE(yfzhao): Client only waits until it can see the server, not until
+        # the server has loaded this client's metadata for reverse notify
+        psrl_logger.info(
+            f"[nixl-handshake] {self.client_name} connect done: "
+            f"fetch_md={t_fetch - t0:.3f}s send_local_md={t_send - t_fetch:.3f}s "
+            f"wait_server_md={time.time() - t_send:.3f}s "
+            f"server_md_ready={ready}."
+        )
 
     def send_local_sharding(self, sharding_dict: dict[str, NIXLSharding]):
         """
         Send local sharding to the server.
         """
         assert self._is_connected, "Not connected to server"
-        self.agent.send_notif(self.server_name, pickle.dumps({self.client_name: sharding_dict}))
+        payload = pickle.dumps({self.client_name: sharding_dict})
+        psrl_logger.info(
+            f"[nixl-handshake] {self.client_name} send_local_sharding: "
+            f"payload_bytes={len(payload)} n_keys={len(sharding_dict)}."
+        )
+        self.agent.send_notif(self.server_name, payload)
 
     def send_local_info(self):
         """
@@ -953,6 +997,10 @@ class NIXLStorageClient:
                     f"Expected a dict with one client sharding dict, but got {client_sharding_dicts}"
                 )
                 self._unified_sharding_dict = next(iter(client_sharding_dicts.values()))
+                psrl_logger.info(
+                    f"[nixl-handshake] {self.client_name} received server sharding: "
+                    f"clients={list(client_sharding_dicts)} wait={time.time() - start:.3f}s."
+                )
                 break
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for server sharding notification.")
@@ -960,11 +1008,12 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float | None = None):
         """
         Wait for the server info to be fetched.
         """
         assert self._is_connected, "Not connected to server"
+        timeout = self.metadata_server_info_timeout_s if timeout is None else timeout
         # Wait for all client infos (stored in the server) to be fetched
         if self._all_client_infos_fetched:
             return
@@ -1120,20 +1169,26 @@ class NIXLStorageClient:
     ) -> list[tuple[int, ...]]:
         """Read from another client, supports shard alignment and communication plan."""
         plan = comm_plan or self._comm_plan
+        planned_shards: list[tuple[int, ...]] | None = None
+        if plan and self.client_type == NIXLClientType.PULL_SIDE:
+            pull_plan = plan.get_rollout_pull_plan(self.client_name, key)
+            if target_client not in pull_plan:
+                return []
+            planned_shards = pull_plan[target_client]
+        elif plan and self.client_type == NIXLClientType.PUSH_SIDE:
+            pull_plan = plan.get_train_pull_plan(self.client_name, key)
+            if target_client not in pull_plan:
+                return []
+            planned_shards = pull_plan[target_client]
+
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
-        shards_to_transfer = []
-        if plan and self.client_type == NIXLClientType.PULL_SIDE:
-            pull_plan = plan.get_rollout_pull_plan(self.client_name, key)
-            if target_client in pull_plan:
-                shards_to_transfer = pull_plan[target_client]
-        elif plan and self.client_type == NIXLClientType.PUSH_SIDE:
-            push_plan = plan.get_train_pull_plan(self.client_name, key)
-            if target_client in push_plan:
-                shards_to_transfer = push_plan[target_client]
+        if planned_shards is not None:
+            shards_to_transfer = planned_shards
         else:
             # Default behavior: align shards
+            shards_to_transfer = []
             for shard_idx in local_info.sharding.shard_indices:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
@@ -1281,16 +1336,21 @@ class NIXLStorageClient:
     ) -> list[tuple[int, ...]]:
         """Write to another client, supports shard alignment and communication plan."""
         plan = comm_plan or self._comm_plan
+        planned_shards: list[tuple[int, ...]] | None = None
+        if plan and self.client_type == NIXLClientType.PUSH_SIDE:
+            push_plan = plan.get_push_plan(self.client_name, key)
+            if target_client not in push_plan:
+                return []
+            planned_shards = push_plan[target_client]
+
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
-        shards_to_transfer = []
-        if plan and self.client_type == NIXLClientType.PUSH_SIDE:
-            push_plan = plan.get_push_plan(self.client_name, key)
-            if target_client in push_plan:
-                shards_to_transfer = push_plan[target_client]
+        if planned_shards is not None:
+            shards_to_transfer = planned_shards
         else:
             # Default behavior: align shards
+            shards_to_transfer = []
             for shard_idx in local_info.sharding.shard_indices:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
@@ -1910,23 +1970,43 @@ class NIXLMultiStorageClients:
 
     def connect_to_server(self, timeout: float = 600.0):
         assert not self._is_connected, "Already connected to server"
+        psrl_logger.info(
+            f"[nixl-handshake] {self.agent_name} connect start: "
+            f"clients={self.multi_client_names} "
+            f"server={self.server_name} {self.server_ip}:{self.server_port} "
+            f"local_ip={get_local_ip()} client_port={self.client_port}."
+        )
+        t0 = time.time()
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
+        t_fetch = time.time()
         self.agent.send_local_metadata(self.server_ip, self.server_port)
-        start = time.time()
+        t_send = time.time()
         ready = False
         while not ready:
             ready = self.agent.check_remote_metadata(self.server_name)
-            if time.time() - start > timeout:
+            if time.time() - t_send > timeout:
                 raise TimeoutError("Timeout waiting for server metadata to be fetched and connected.")
             time.sleep(0.1)
         self._is_connected = True
         for client in self.multi_clients:
             client._is_connected = True
+        # NOTE(yfzhao): Same one-way readiness as NIXLStorageClient.connect_to_server
+        psrl_logger.info(
+            f"[nixl-handshake] {self.agent_name} connect done: "
+            f"fetch_md={t_fetch - t0:.3f}s send_local_md={t_send - t_fetch:.3f}s "
+            f"wait_server_md={time.time() - t_send:.3f}s "
+            f"server_md_ready={ready}."
+        )
 
     def send_local_sharding(self, multi_sharding_dicts: dict[str, dict[str, NIXLSharding]]):
         assert self._is_connected, "Not connected to server"
         # multi_sharding_dicts: {client_name: {key: NIXLSharding}}
-        self.agent.send_notif(self.server_name, pickle.dumps(multi_sharding_dicts))
+        payload = pickle.dumps(multi_sharding_dicts)
+        psrl_logger.info(
+            f"[nixl-handshake] {self.agent_name} send_local_sharding: "
+            f"clients={list(multi_sharding_dicts)} payload_bytes={len(payload)}."
+        )
+        self.agent.send_notif(self.server_name, payload)
 
     def send_local_info(self):
         assert self._is_connected, "Not connected to server"
@@ -1965,6 +2045,10 @@ class NIXLMultiStorageClients:
                     self.multi_clients[
                         self.multi_client_names.index(client_name)
                     ]._unified_sharding_dict = sharding_dict
+                psrl_logger.info(
+                    f"[nixl-handshake] {self.agent_name} received server sharding: "
+                    f"clients={list(client_sharding_dicts)} wait={time.time() - start:.3f}s."
+                )
                 break
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for server sharding notification.")
@@ -1972,7 +2056,7 @@ class NIXLMultiStorageClients:
         self._multi_unified_sharding_dicts_fetched = True
         return {client.client_name: client._unified_sharding_dict for client in self.multi_clients}
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_info(timeout)
         if len(self.multi_clients) > 1:

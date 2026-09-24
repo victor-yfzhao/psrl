@@ -20,6 +20,7 @@
 #   PSRL_DEPLOY_RM_NUM_REPLICAS  gen-RM num_replicas (non-elastic modes 1/4)
 #                                set to 0 to leave default
 #   PSRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
+#   PSRL_NEED_VALIDATION      0|1 (default: 0; 1 enables periodic validation)
 #   PSRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
 #   PSRL_DEPLOY_MODEL_NAME    rollout model directory name (default: Qwen2.5-7B)
 #   PSRL_DEPLOY_RM_MODEL_NAME reward model directory name (default: DeepSeek-R1-Distill-Qwen-7B)
@@ -27,6 +28,10 @@
 #   PSRL_DEPLOY_RM_MODEL_PATH optional absolute reward model path
 #   PSRL_DEPLOY_ROLLOUT_TP    rollout tensor parallelism (default: 1)
 #   PSRL_DEPLOY_RM_TP         reward-model tensor parallelism (default: 1)
+#   PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN  True|False (default: False)
+#   PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE   True|False (default: True)
+#   PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION    validation vLLM memory fraction (default: 0.6)
+#   PSRL_DEPLOY_VAL_BEFORE_TRAIN               True|False (default: False)
 #   PSRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
 #
 # Optional positional args to launch_deployment_mode are forwarded to main_ppo.
@@ -65,6 +70,52 @@ _psrl_total_gpus_from_node_spec() {
     return 1
 }
 
+_psrl_vllm_ep_size_for_model() {
+    local model_path=$1
+    local tp_size=$2
+
+    python - "${model_path}" "${tp_size}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1]) / "config.json"
+tp_size = int(sys.argv[2])
+
+with config_path.open(encoding="utf-8") as config_file:
+    config = json.load(config_file)
+
+expert_count_keys = {
+    "moe_num_experts",
+    "n_experts",
+    "n_routed_experts",
+    "num_experts",
+    "num_local_experts",
+    "num_routed_experts",
+}
+
+
+def is_moe(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized_key = key.lower()
+            if normalized_key in expert_count_keys and isinstance(child, (int, float)) and child > 1:
+                return True
+            if normalized_key == "moe_intermediate_size" and isinstance(child, (int, float)) and child > 0:
+                return True
+            if normalized_key in {"architectures", "model_type"} and "moe" in str(child).lower():
+                return True
+            if is_moe(child):
+                return True
+    elif isinstance(value, list):
+        return any(is_moe(child) for child in value)
+    return False
+
+
+print(tp_size if is_moe(config) else 1)
+PY
+}
+
 launch_deployment_mode() {
     set -xeuo pipefail
 
@@ -78,36 +129,56 @@ launch_deployment_mode() {
     : "${PSRL_DEPLOY_SHARED_NNODES:?PSRL_DEPLOY_SHARED_NNODES must be set}"
     : "${PSRL_DEPLOY_SHARED_NGPUS:?PSRL_DEPLOY_SHARED_NGPUS must be set}"
     PSRL_DEPLOY_SMOKE=${PSRL_DEPLOY_SMOKE:-0}
+    PSRL_NEED_VALIDATION=${PSRL_NEED_VALIDATION:-0}
     # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-gsm8k}
     # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-dapo}
     PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-mixed}
     PSRL_DEPLOY_RM_NUM_REPLICAS=${PSRL_DEPLOY_RM_NUM_REPLICAS:-0}
     PSRL_DEPLOY_TRAINER_READY_GRACE_S=${PSRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
+    PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN:-False}
+    PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE=${PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE:-True}
+    PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION=${PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION:-0.6}
+    PSRL_DEPLOY_VAL_BEFORE_TRAIN=${PSRL_DEPLOY_VAL_BEFORE_TRAIN:-False}
     PSRL_DEPLOY_EXTRA=${PSRL_DEPLOY_EXTRA:-}
+    if [[ -z "${PSRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
+        case "${PSRL_DEPLOY_MODE}" in
+            colocated|trainer_pool_only)
+                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=True
+                ;;
+            *)
+                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN}
+                ;;
+        esac
+    fi
 
     PSRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl
 
     if [[ "${PSRL_DEPLOY_SMOKE}" == "1" ]]; then
         experiment_suffix="_smoke"
-        total_training_steps=2
-        test_freq=9999
-        save_freq=9999
+        total_training_steps=10
+        test_freq=-1
+        save_freq=-1
         train_prompt_bsz=32
         train_prompt_mini_bsz=8
         n_resp_per_prompt=8
     else
         experiment_suffix=""
-        total_training_steps=200
-        test_freq=200
-        save_freq=200
+        total_training_steps=20
+        test_freq=-1
+        save_freq=-1
         train_prompt_bsz=128
         train_prompt_mini_bsz=32
         n_resp_per_prompt=16
     fi
 
+    if [[ "${PSRL_NEED_VALIDATION}" == "1" ]]; then
+        experiment_suffix="${experiment_suffix}_val"
+        test_freq=5
+    fi
+
     project_name='verl_deployment_modes'
-    MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-Qwen2.5-7B}
-    RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
+    MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-Qwen2.5-1.5B}
+    RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-GLM-Z1-9B-0414}
     # MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
     # RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-Qwen3-8B}
     experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
@@ -128,7 +199,7 @@ launch_deployment_mode() {
 
     _DS_NAIVE="reward_fn_key:data_source,reward_loop_type:naive,reward_fn:default,reward_model_name:null,reward_coef:1.0"
     _DS_DAPO="reward_fn_key:data_source,reward_loop_type:dapo,reward_fn:default,reward_model_name:null,reward_coef:1.0"
-    _DS_GEN="reward_fn_key:data_source,reward_loop_type:gen,reward_fn:default,reward_model_name:${RM_MODEL_NAME},reward_coef:0.001"
+    _DS_GEN="reward_fn_key:data_source,reward_loop_type:gen,reward_fn:default,reward_model_name:${RM_MODEL_NAME},reward_coef:1.0"
 
     _ROW_TRAIN_GSM8K="{file:${GSM8K_TRAIN},data_source_name:openai/gsm8k,prompt_key:prompt,reward_model_dicts:[{${_DS_NAIVE}},{${_DS_GEN}}]}"
     _ROW_TRAIN_DAPO="{file:${DAPO_TRAIN},data_source_name:dapo/dapo-math-17k,prompt_key:prompt,reward_model_dicts:[{${_DS_DAPO}},{${_DS_GEN}}]}"
@@ -161,16 +232,19 @@ launch_deployment_mode() {
     # rollout settings
     GEN_TP=${PSRL_DEPLOY_ROLLOUT_TP:-1}
     GEN_PP=1
+    GEN_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
     GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
     # reward-model rollout settings
     RM_TP=${PSRL_DEPLOY_RM_TP:-1}
     RM_PP=1
+    RM_EP=$(_psrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
     RM_NGPUS_PER_NODE_PER_INSTANCE=$(( ${RM_TP} * ${RM_PP} ))
 
     # validation settings (on train_pool; does not use elastic path)
-    VAL_TP=4
+    VAL_TP=1
     VAL_PP=1
+    VAL_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
     VAL_INSTANCES=$(( (${PSRL_DEPLOY_TRAIN_NNODES} * ${PSRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
     VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
@@ -186,11 +260,11 @@ launch_deployment_mode() {
     clip_ratio_low=0.2
     clip_ratio_high=0.28
     max_prompt_length=$((1024 * 1))
-    max_response_length=$((1024 * 20))
-    max_num_batched_tokens=$((1024 * 21))
+    max_response_length=$((1024 * 15))
+    max_num_batched_tokens=$((1024 * 16))
     packing_length=$(((max_prompt_length + max_response_length) * 2))
     enable_overlong_buffer=True
-    overlong_buffer_len=$((1024 * 8))
+    overlong_buffer_len=$((1024 * 5))
     overlong_penalty_factor=1.0
     loss_agg_mode="token-mean"
 
@@ -204,7 +278,7 @@ launch_deployment_mode() {
     rollout_is="token"
     rollout_is_threshold=2.0
 
-    offload=False
+    offload=${PSRL_DEPLOY_OPTIMIZER_OFFLOAD}
 
     REWARD_MODELS=(
         reward_models_config.reward_normalization=none
@@ -225,6 +299,7 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.rollout_nnodes_per_instance=1
         reward_models_config.reward_models.2.max_concurrent_requests_per_instance=128
         reward_models_config.reward_models.2.model.path=${RM_MODEL_PATH}
+        reward_models_config.reward_models.2.model.use_shm=False
         reward_models_config.reward_models.2.model.trust_remote_code=False
         reward_models_config.reward_models.2.rollout._target_=psrl.workers.config.RolloutConfig
         reward_models_config.reward_models.2.rollout.name=vllm
@@ -235,19 +310,25 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.rollout.enforce_eager=true
         reward_models_config.reward_models.2.rollout.free_cache_engine=true
         reward_models_config.reward_models.2.rollout.data_parallel_size=1
-        reward_models_config.reward_models.2.rollout.expert_parallel_size=1
+        reward_models_config.reward_models.2.rollout.expert_parallel_size=${RM_EP}
         reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=${RM_TP}
         reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=${RM_PP}
-        reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 21 + 1024 * 15))
+        reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 40))
         reward_models_config.reward_models.2.rollout.max_num_seqs=1024
         reward_models_config.reward_models.2.rollout.enable_chunked_prefill=false
         reward_models_config.reward_models.2.rollout.enable_prefix_caching=false
         +reward_models_config.reward_models.2.rollout.engine_kwargs.vllm.async_scheduling=false
+        # GLM-Z1 native context is 32k; YaRN factor 1.25 extrapolates to 40k without editing config.json.
+        # vLLM Transformers 5 reads rope_type; keep type for the official GLM docs field name.
+        +reward_models_config.reward_models.2.rollout.engine_kwargs.vllm.hf_overrides.rope_scaling.type=yarn
+        +reward_models_config.reward_models.2.rollout.engine_kwargs.vllm.hf_overrides.rope_scaling.rope_type=yarn
+        +reward_models_config.reward_models.2.rollout.engine_kwargs.vllm.hf_overrides.rope_scaling.factor=1.25
+        +reward_models_config.reward_models.2.rollout.engine_kwargs.vllm.hf_overrides.rope_scaling.original_max_position_embeddings=32768
         reward_models_config.reward_models.2.rollout.disable_log_stats=false
         reward_models_config.reward_models.2.rollout.skip_tokenizer_init=false
-        reward_models_config.reward_models.2.rollout.prompt_length=$((1024 * 21))
-        reward_models_config.reward_models.2.rollout.response_length=$((1024 * 15))
-        reward_models_config.reward_models.2.rollout.max_model_len=$((1024 * 21 + 1024 * 15))
+        reward_models_config.reward_models.2.rollout.prompt_length=$((1024 * 16))
+        reward_models_config.reward_models.2.rollout.response_length=$((1024 * 20))
+        reward_models_config.reward_models.2.rollout.max_model_len=$((1024 * 40))
         reward_models_config.reward_models.2.rollout.runner=generate
         reward_models_config.reward_models.2.rollout.task=generate
         reward_models_config.reward_models.2.sampling_config.temperature=1.0
@@ -308,7 +389,7 @@ launch_deployment_mode() {
                 psrl.routing_strategy.candidate_sort_indicator=reserve_capability
                 psrl.routing_strategy.enable_multi_priority_queue=True
                 psrl.routing_strategy.enable_group_sampling_on_multi_instances=True
-                psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json
+                psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen2.5_1.5b.json
                 psrl.routing_strategy.delta_throughput_threshold=0.2
                 psrl.routing_strategy.request_budget=1024
                 psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3
@@ -345,8 +426,8 @@ launch_deployment_mode() {
         "${DEPLOY_ARGS[@]}" \
         \
         psrl.log_prob.enable_rollout_engine_log_prob=True \
-        psrl.colocate_validate_and_train=False \
-        psrl.fuse_rollout_with_validate=True \
+        psrl.colocate_validate_and_train=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN} \
+        psrl.fuse_rollout_with_validate=${PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE} \
         \
         psrl.nixl.server_port=23456 \
         psrl.group_post_process.enable=False \
@@ -358,6 +439,7 @@ launch_deployment_mode() {
         \
         gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
         gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+        gen_actor_rollout_ref.rollout.expert_parallel_size=${GEN_EP} \
         gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
         gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
         gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -379,8 +461,9 @@ launch_deployment_mode() {
         train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
         train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
         train_actor_rollout_ref.rollout.val_kwargs.n=1 \
+        train_actor_rollout_ref.rollout.expert_parallel_size=${VAL_EP} \
         train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-        train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+        train_actor_rollout_ref.rollout.gpu_memory_utilization=${PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION} \
         train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
         train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
         train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -421,7 +504,7 @@ launch_deployment_mode() {
         +trainer.wandb_proxy=http://star-proxy.oa.com:3128 \
         trainer.project_name="${project_name}" \
         trainer.experiment_name="${experiment_name}" \
-        trainer.val_before_train=False \
+        trainer.val_before_train=${PSRL_DEPLOY_VAL_BEFORE_TRAIN} \
         trainer.test_freq=${test_freq} \
         trainer.save_freq=${save_freq} \
         trainer.total_epochs=1 \

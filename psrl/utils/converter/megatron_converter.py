@@ -11,12 +11,17 @@ from torch.nn import Parameter
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
-    slice_qwen3_5_in_proj,
-    slice_qwen3_5_in_proj_qkv,
+    reshape_visual_block_qkv,
+    slice_attn_conv1d,
     slice_gate_up_proj,
     slice_qkv_proj_megatron,
-    slice_attn_conv1d,
-    reshape_visual_block_qkv,
+    slice_qwen3_5_in_proj,
+    slice_qwen3_5_in_proj_qkv,
+    visual_qkv_tp_shard_spec,
+)
+from psrl.utils.converter.param_sync import (
+    ParamSyncPlan,
+    register_megatron_param_sync_actions,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -27,6 +32,7 @@ class MegatronConverter(BaseConverter):
     def __init__(self, parameter_mapping: ParameterMapping, mpu: ParallelStates | None = None):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
+        self.sync_plan = ParamSyncPlan()
 
         self.parameter_mapping.disable_tie_word_embeddings()
         self.bridge = AutoBridge.from_config(self.parameter_mapping.config)  # mbridge will maintain its own mpu
@@ -93,6 +99,12 @@ class MegatronConverter(BaseConverter):
                     sharding_dict["lm_head.weight"] = sharding_dict[new_name]
                     break
 
+        register_megatron_param_sync_actions(
+            self.sync_plan,
+            converted_state_dict,
+            self.parameter_mapping.get_external_fp32_param_patterns(),
+        )
+
         return converted_state_dict, sharding_dict
 
     def convert_parameter(self, full_name: str, param: Parameter) -> dict:
@@ -136,7 +148,8 @@ class MegatronConverter(BaseConverter):
             if key_dim is None or value_dim is None or num_v_heads is None:
                 raise ValueError(
                     "Qwen3.5 linear attention dims are missing in model_info for in_proj split; "
-                    f"got linear_key_dim={key_dim}, linear_value_dim={value_dim}, linear_num_value_heads={num_v_heads}."
+                    f"got linear_key_dim={key_dim}, linear_value_dim={value_dim}, "
+                    f"linear_num_value_heads={num_v_heads}."
                 )
             try:
                 sliced_params = slice_qwen3_5_in_proj(
@@ -224,8 +237,7 @@ class MegatronConverter(BaseConverter):
                 )
                 return dict(zip(new_param_names, new_params))
             if "visual.blocks" in hf_name and "qkv" in hf_name:
-                param = reshape_visual_block_qkv(param)
-                param.partition_dim = 1
+                param = reshape_visual_block_qkv(param, vision_head_size=self.model_info.get("vision_head_size"))
             if "mlp.experts.linear_fc1.weight" in full_name:
                 name_prefix = hf_name.rsplit('.', 1)[0]
                 expert_id = full_name.split("weight")[1]
@@ -266,17 +278,25 @@ class MegatronConverter(BaseConverter):
             shard_indices = [(self.mpu.etp_rank,)]
             shard_dim = 0 if "fc1" in full_name else 1
         elif is_tp_param:
-            shard_size = self.mpu.tp_size
-            assert hasattr(param, "partition_dim"), (
-                f"Tensor parallel partition dim must be set, but got {param.partition_dim}"
+            hf_names = self.bridge._weight_name_mapping_mcore_to_hf(full_name)
+            is_visual_qkv = any(
+                "visual.blocks" in hf_name and "qkv" in hf_name for hf_name in hf_names
             )
-            shard_indices = [(self.mpu.tp_rank,)]
-            shard_dim = param.partition_dim
-
-            if shard_dim == -1:
-                # For dt_bias, A_log, and conv1d.weight, shard_dim should be 0,
-                # but their partition_dim is -1
+            if is_visual_qkv:
+                shard_size, shard_indices = visual_qkv_tp_shard_spec(self.mpu.tp_size, self.mpu.tp_rank)
                 shard_dim = 0
+            else:
+                shard_size = self.mpu.tp_size
+                assert hasattr(param, "partition_dim"), (
+                    f"Tensor parallel partition dim must be set, but got {param.partition_dim}"
+                )
+                shard_indices = [(self.mpu.tp_rank,)]
+                shard_dim = param.partition_dim
+
+                if shard_dim == -1:
+                    # For dt_bias, A_log, and conv1d.weight, shard_dim should be 0,
+                    # but their partition_dim is -1
+                    shard_dim = 0
         else:
             shard_size = 1
             shard_indices = [(0,)]
@@ -292,6 +312,7 @@ def convert_megatron_inplace(
     parameter_mapping: ParameterMapping,
     model,
     mpu: ParallelStates | None = None,
+    return_sync_plan: bool = False,
 ):
     """
     Convenience function to convert Megatron model to unified state dict and sharding info.
@@ -303,4 +324,7 @@ def convert_megatron_inplace(
         (converted_state_dict, sharding_dict)
     """
     converter = MegatronConverter(parameter_mapping, mpu=mpu)
-    return converter.convert_state_and_sharding_dict(model)
+    state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
+    if return_sync_plan:
+        return state_dict, sharding_dict, converter.sync_plan
+    return state_dict, sharding_dict

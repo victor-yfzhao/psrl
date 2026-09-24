@@ -52,9 +52,9 @@ class GenerateAgentLoop(AgentLoopBase):
             # Indicate that the request is aborted
             return None, TerminateReason.UNKNOWN
 
-        reward_input = output
-        reward_result = await self.reward_manager.compute_score.remote(reward_input)
-        if not self.config.reward_models_config.launch_reward_fn_async:
-            output = self._post_process_and_merge_reward(reward_result, output)
+        if not output.meta_info.get("validate", False):
+            reward_result = await self.reward_manager.compute_score.remote(output)
+            if not self.config.reward_models_config.launch_reward_fn_async:
+                output = self._post_process_and_merge_reward(reward_result, output)
 
         return output, TerminateReason.FINISHED

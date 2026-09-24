@@ -13,11 +13,16 @@ from verl.trainer.ppo.reward import load_reward_manager
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.deployment_mode import expand_ngpus_per_node, resolve_deployment_mode
+from psrl.utils.deployment_mode import (
+    expand_ngpus_per_node,
+    resolve_deployment_mode,
+    validate_trainer_sleep_optimizer_offload,
+)
 from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
 )
+from psrl.utils.ray_storage import inspect_local_plasma_backing, plasma_backing_error
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -55,6 +60,46 @@ class _GpuSlotReserver:
 
     def ping(self) -> str:
         return "ok"
+
+
+@ray.remote(num_cpus=0)
+def _inspect_plasma_backing_on_node() -> dict:
+    node_id = ray.get_runtime_context().get_node_id()
+    return inspect_local_plasma_backing(node_id)
+
+
+def _validate_cluster_plasma_backing(config) -> None:
+    """Fail before model startup when Plasma's mmap filesystem is overcommitted."""
+    alive_gpu_nodes = sorted(
+        [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("GPU", 0) > 0],
+        key=lambda node: node["NodeID"],
+    )
+    total_nnodes = config.psrl.deployment.get("total_nnodes", None)
+    if total_nnodes is not None:
+        alive_gpu_nodes = alive_gpu_nodes[: int(total_nnodes)]
+    refs = [
+        _inspect_plasma_backing_on_node.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node["NodeID"], soft=False)
+        ).remote()
+        for node in alive_gpu_nodes
+    ]
+    snapshots = ray.get(refs, timeout=60)
+    reserve_bytes = int(os.environ.get("PSRL_PLASMA_BACKING_RESERVE_BYTES", 16 * 1024**3))
+    if reserve_bytes < 0:
+        raise ValueError("PSRL_PLASMA_BACKING_RESERVE_BYTES must be non-negative.")
+    errors = [
+        error
+        for snapshot in snapshots
+        if (error := plasma_backing_error(snapshot, reserve_bytes)) is not None
+    ]
+    if errors:
+        details = "\n".join(f"  - {error}" for error in errors)
+        raise RuntimeError(
+            "Unsafe Ray Plasma backing configuration detected before model startup:\n"
+            f"{details}\n"
+            "Reduce Ray object-store size or clear stale files from its backing filesystem "
+            "until the reported reserve is available."
+        )
 
 
 def _reserve_excess_nodes(config) -> list:
@@ -127,6 +172,8 @@ def run_ppo(config) -> None:
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    _validate_cluster_plasma_backing(config)
 
     # NOTE(claude): keep the handle list alive for the entire job lifetime so Ray
     # does not garbage-collect the reservation actors before the job finishes.
@@ -485,6 +532,7 @@ class TaskRunner:
         # the trainer both observe a consistent flag set (modes 2/3 force
         # elastic_rm.enable=True even though the user only set deployment.mode).
         resolved_mode = resolve_deployment_mode(config)
+        validate_trainer_sleep_optimizer_offload(config, resolved_mode)
         print(f"[Deployment] resolved mode = {resolved_mode}")
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)

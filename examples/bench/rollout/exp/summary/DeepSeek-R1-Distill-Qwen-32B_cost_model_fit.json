@@ -12,7 +12,7 @@
     "other_fit_points": [
       {
         "batch": 16,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.012658035554813369,
           "median_latency": 0.012658171355724335,
@@ -23,7 +23,7 @@
       },
       {
         "batch": 1,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.011865012219428143,
           "median_latency": 0.011865304782986641,
@@ -34,7 +34,7 @@
       },
       {
         "batch": 2,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.011894520992124328,
           "median_latency": 0.011893125250935555,
@@ -45,7 +45,7 @@
       },
       {
         "batch": 32,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.0139375143785905,
           "median_latency": 0.01393304392695427,
@@ -56,7 +56,7 @@
       },
       {
         "batch": 4,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.011950003520986425,
           "median_latency": 0.011948689818382263,
@@ -67,7 +67,7 @@
       },
       {
         "batch": 8,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/DeepSeek-R1-Distill-Qwen-32B_Syn_TP2_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.012215771197337287,
           "median_latency": 0.012214237824082375,

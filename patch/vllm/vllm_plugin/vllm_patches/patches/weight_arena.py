@@ -30,6 +30,12 @@ def _role_materialization(arena_config: dict[str, Any], role: str) -> str:
     return str(arena_config.get(key, "direct"))
 
 
+def _max_chunk_bytes(arena_config: dict[str, Any]) -> int:
+    from psrl.utils.weight_arena import gb_to_bytes
+
+    return gb_to_bytes(arena_config["max_chunk_gb"], field_name="max_chunk_gb")
+
+
 def _assert_direct_model_supported(vllm_config: Any, model_config: Any) -> None:
     if vllm_config.quant_config is not None or model_config.quantization is not None:
         raise RuntimeError("Direct weight arena currently supports unquantized models only.")
@@ -105,6 +111,45 @@ def _assert_direct_moe_modules_supported(
         raise RuntimeError("vLLM marked the model as MoE but no FusedMoE modules were found.")
 
 
+@torch.no_grad()
+def _initialize_direct_runtime_buffers(model: torch.nn.Module) -> tuple[str, ...]:
+    """Initialize model-created non-persistent buffers without changing storage.
+
+    Direct mode constructs the model on meta, so computed runtime buffers do not
+    contain their constructor values after arena materialization. They are also
+    absent from state_dict and NIXL transfers. Recompute supported buffers and
+    copy into their existing arena views so CUDA graph and arena addresses stay
+    stable.
+    """
+    initialized: list[str] = []
+    unsupported: list[str] = []
+    for module_prefix, module in model.named_modules():
+        for buffer_name in sorted(module._non_persistent_buffers_set):
+            buffer = module._buffers.get(buffer_name)
+            if buffer is None:
+                continue
+            full_name = f"{module_prefix}.{buffer_name}" if module_prefix else buffer_name
+            if buffer_name != "cos_sin_cache" or not hasattr(module, "_compute_cos_sin_cache"):
+                unsupported.append(f"{full_name} ({type(module).__name__})")
+                continue
+
+            expected = module._compute_cos_sin_cache()
+            if expected.shape != buffer.shape:
+                raise RuntimeError(
+                    f"Direct weight arena runtime buffer shape changed for {full_name}: "
+                    f"expected {tuple(buffer.shape)}, got {tuple(expected.shape)}."
+                )
+            buffer.copy_(expected.to(device=buffer.device, dtype=buffer.dtype))
+            initialized.append(full_name)
+
+    if unsupported:
+        raise RuntimeError(
+            "Direct weight arena found non-persistent buffers without an initializer: "
+            f"count={len(unsupported)} first_buffers={unsupported[:8]}."
+        )
+    return tuple(initialized)
+
+
 class DirectWeightArenaDummyLoader(DummyModelLoader):
     """Construct supported vLLM weights on meta and materialize them in arenas."""
 
@@ -146,13 +191,20 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
             handle = materialize_module_weights_in_arena(
                 model,
                 device=target_device,
-                max_chunk_bytes=int(arena_config["max_chunk_bytes"]),
+                max_chunk_bytes=_max_chunk_bytes(arena_config),
                 alignment_bytes=int(arena_config["alignment_bytes"]),
             )
             initialize_dummy_weights(model, model_config)
             process_weights_after_loading(model, model_config, target_device)
+            initialized_runtime_buffers = _initialize_direct_runtime_buffers(model)
             handle.assert_module_weights_in_arena(model)
             model._psrl_weight_arena_handle = handle
+            model._psrl_weight_arena_runtime_buffers = initialized_runtime_buffers
+            psrl_logger.warning(
+                "[NIXL_WEIGHT_ARENA] role=%s stage=initialize_runtime_buffers count=%d",
+                role,
+                len(initialized_runtime_buffers),
+            )
             if model_config.is_moe:
                 model_kind = "moe_ep" if vllm_config.parallel_config.enable_expert_parallel else "moe_tp"
             else:
@@ -246,7 +298,7 @@ def _pack_loaded_model(
     packer = pack_module_weights_in_fresh_tms_pool if replace_tms_pool else pack_module_weights
     model_runner._psrl_weight_arena_handle = packer(
         model,
-        max_chunk_bytes=int(arena_config["max_chunk_bytes"]),
+        max_chunk_bytes=_max_chunk_bytes(arena_config),
         alignment_bytes=int(arena_config["alignment_bytes"]),
     )
     stats = model_runner._psrl_weight_arena_handle.stats

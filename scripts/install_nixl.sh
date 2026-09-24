@@ -6,41 +6,42 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 CUDA_PATH=${CUDA_PATH:-"/usr/local/cuda"}
 MAX_JOBS=${MAX_JOBS:-32}
 REQUIRED_UCX_VERSION="1.20.0"
-UCX_PREFIX="/usr"
-INSTALL_UCX=true
+UCX_GIT_REF="${UCX_GIT_REF:-v1.20.0}"
+NIXL_VERSION="0.10.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSRL_PATH="$(dirname "$SCRIPT_DIR")"
 THIRD_PARTY_PATH="$PSRL_PATH/third_party"
-mkdir -p $THIRD_PARTY_PATH
+UCX_PREFIX="${UCX_PREFIX:-$THIRD_PARTY_PATH/ucx_1_20_rkey65535}"
+NIXL_PREFIX="${NIXL_PREFIX:-$THIRD_PARTY_PATH/nixl_ucx_1_20_rkey65535_backlog4096}"
+UCX_SOURCE_DIR="${UCX_SOURCE_DIR:-$THIRD_PARTY_PATH/ucx_1_20_rkey65535_src}"
+NIXL_SOURCE_DIR="${NIXL_SOURCE_DIR:-$THIRD_PARTY_PATH/nixl_0_10_1_ucx_1_20_rkey65535_backlog4096_src}"
+NIXL_SUBPROJECT_CACHE_DIR="${NIXL_SUBPROJECT_CACHE_DIR:-}"
+UCX_PATCH_FILE="$PSRL_PATH/patch/ucx/ucx-1.20.0-rkey-config-uint16-dynamic.patch"
+NIXL_PATCH_FILE="$PSRL_PATH/patch/nixl/nixl.patch"
+UCX_INSTALL_MARKER="$UCX_PREFIX/.psrl-ucx-1.20-worker-config-uint16-complete"
+mkdir -p "$THIRD_PARTY_PATH"
 
-if command -v ucx_info >/dev/null 2>&1; then
-    echo "Detected existing UCX installation via ucx_info"
-    UCX_INFO_OUTPUT=$(ucx_info -v 2>/dev/null || true)
-    DETECTED_VERSION=$(echo "$UCX_INFO_OUTPUT" | grep -Eo '([0-9]+\.){2}[0-9]+' | head -n1)
-    DETECTED_PREFIX=$(echo "$UCX_INFO_OUTPUT" | grep -i -- '--prefix=' | sed -E 's/.*--prefix=([^ ]+).*/\1/' | head -n1)
-
-    if [ -n "$DETECTED_PREFIX" ]; then
-        UCX_PREFIX="$DETECTED_PREFIX"
-    fi
-
-    if [ -n "$DETECTED_VERSION" ] && [ "$(printf '%s\n%s\n' "$DETECTED_VERSION" "$REQUIRED_UCX_VERSION" | sort -V | head -n1)" = "$REQUIRED_UCX_VERSION" ]; then
-        echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (>= $REQUIRED_UCX_VERSION), skipping UCX build."
-        INSTALL_UCX=false
-    else
-        echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (< $REQUIRED_UCX_VERSION), will build UCX $REQUIRED_UCX_VERSION."
-    fi
+if [[ -x "$UCX_PREFIX/bin/ucx_info" ]] && \
+   [[ -f "$UCX_INSTALL_MARKER" ]] && \
+   LD_LIBRARY_PATH="$UCX_PREFIX/lib:$UCX_PREFIX/lib/ucx" \
+       "$UCX_PREFIX/bin/ucx_info" -v 2>/dev/null | grep -q "Library version: $REQUIRED_UCX_VERSION"; then
+    echo "1. Patched UCX $REQUIRED_UCX_VERSION is already installed at $UCX_PREFIX"
 else
-    echo "ucx_info not found; will build UCX $REQUIRED_UCX_VERSION."
-fi
+    echo "1. Install patched UCX"
+    rm -rf "$UCX_SOURCE_DIR"
+    rm -rf "$UCX_PREFIX"
+    git clone --depth 1 --branch "$UCX_GIT_REF" https://github.com/openucx/ucx.git "$UCX_SOURCE_DIR"
+    pushd "$UCX_SOURCE_DIR"
 
-if $INSTALL_UCX; then
-    echo "1. Install ucx"
-    UCX_PREFIX="$THIRD_PARTY_PATH/ucx"
-    mkdir -p $THIRD_PARTY_PATH/ucx_src
-    pushd $THIRD_PARTY_PATH/ucx_src
-    git clone -b $REQUIRED_UCX_VERSION https://github.com/openucx/ucx.git
-    cd ucx
+    echo "Applying UCX dynamic worker-config patch..."
+    git apply --check "$UCX_PATCH_FILE"
+    git apply "$UCX_PATCH_FILE"
+    grep -Eq '^typedef uint16_t[[:space:]]+ucp_worker_cfg_index_t;$' src/ucp/core/ucp_types.h
+    grep -Eq '^#define[[:space:]]+UCP_WORKER_MAX_EP_CONFIG[[:space:]]+UINT16_MAX$' src/ucp/core/ucp_types.h
+    grep -Eq '^#define[[:space:]]+UCP_WORKER_MAX_RKEY_CONFIG[[:space:]]+UINT16_MAX$' src/ucp/core/ucp_types.h
+    grep -Eq '^#define[[:space:]]+UCP_WORKER_CFG_INDEX_NULL[[:space:]]+UINT16_MAX$' src/ucp/core/ucp_types.h
+    grep -q 'ucs_array_length(&worker->rkey_config)' src/ucp/core/ucp_worker.c
 
     # Checking Mellanox NICs
     MLX_OPTS=""
@@ -65,24 +66,35 @@ if $INSTALL_UCX; then
         --with-dm                   \
         --enable-mt                 \
         $MLX_OPTS &&                \
-    make -j $MAX_JOBS &&            \
-    make -j $MAX_JOBS install-strip &&  \
-    ldconfig
+    make -j "$MAX_JOBS" &&         \
+    make -j "$MAX_JOBS" install-strip
     popd
-    rm -rf $THIRD_PARTY_PATH/ucx_src
-else
-    echo "1. Skip UCX installation"
+    rm -rf "$UCX_SOURCE_DIR"
 fi
 
+touch "$UCX_INSTALL_MARKER"
+export PATH="$UCX_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$UCX_PREFIX/lib:$UCX_PREFIX/lib/ucx:${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="$UCX_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
 # Recommend to use gcc 11.x.x, gcc-toolset-13 may have error with nixl
-echo "2. Install nixl"
-# mkdir -p $THIRD_PARTY_PATH/nixl_src
-pushd $THIRD_PARTY_PATH/nixl_src
-# git clone -b 0.10.1 https://github.com/ai-dynamo/nixl.git
-cd nixl
+echo "2. Install patched nixl"
+rm -rf "$NIXL_SOURCE_DIR"
+rm -rf "$NIXL_PREFIX"
+git clone --depth 1 --branch "$NIXL_VERSION" https://github.com/ai-dynamo/nixl.git "$NIXL_SOURCE_DIR"
+pushd "$NIXL_SOURCE_DIR"
 mkdir -p build
+MESON_WRAP_ARGS=()
+if [[ -n "$NIXL_SUBPROJECT_CACHE_DIR" ]]; then
+    if [[ ! -d "$NIXL_SUBPROJECT_CACHE_DIR" ]]; then
+        echo "NIXL subproject cache not found: $NIXL_SUBPROJECT_CACHE_DIR" >&2
+        exit 1
+    fi
+    cp -a "$NIXL_SUBPROJECT_CACHE_DIR/." subprojects/
+    MESON_WRAP_ARGS+=(--wrap-mode=nodownload)
+fi
 # Disable obj backend
-sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/plugins/meson.build"
+sed -i "s/subdir('obj')/# subdir('obj')/" src/plugins/meson.build
 
 # Fix metadata_stream: acceptClient() and acceptClientsAsync() both spam ERROR
 # logs ("Cannot accept client connection: Bad file descriptor / Socket operation
@@ -93,25 +105,32 @@ sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/p
 # larger refactoring. The pragmatic fix is to demote both NIXL_PERROR log lines
 # to NIXL_DEBUG: the noise disappears at the default log level (WARN), and the
 # messages remain visible when NIXL_LOG_LEVEL=DEBUG is set for debugging.
-STREAM_CPP="$THIRD_PARTY_PATH/nixl_src/nixl/src/utils/stream/metadata_stream.cpp"
+STREAM_CPP="$NIXL_SOURCE_DIR/src/utils/stream/metadata_stream.cpp"
 sed -i 's/NIXL_PERROR << "Cannot accept client connection"/NIXL_DEBUG << "Cannot accept client connection"/g' "$STREAM_CPP"
-echo "metadata_stream.cpp patched: demoted 'Cannot accept' log lines to DEBUG."
+echo "metadata_stream.cpp patched: demoted 'Cannot accept' logs to DEBUG."
 
 # Disable err handling for ucp (will make NIXL READ slower 10x!)
 echo "Applying nixl patch..."
+git apply --whitespace=nowarn "$NIXL_PATCH_FILE"
+grep -q 'listen(socketFd, 4096)' "$STREAM_CPP"
+grep -q 'NIXL_THREAD_SYNC_RW' src/bindings/python/nixl_bindings.cpp
+grep -q 'init\["num_workers"\] = str(nixl_conf.num_workers)' src/api/python/_api.py
 meson setup build \
-    --prefix=$THIRD_PARTY_PATH/nixl \
+    "${MESON_WRAP_ARGS[@]}" \
+    --prefix="$NIXL_PREFIX" \
     -Dbuild_docs=false \
-    -Ducx_path=$UCX_PREFIX \
+    -Ducx_path="$UCX_PREFIX" \
     -Dinstall_headers=true \
     -Ddisable_gds_backend=false
 cd build
-ninja -j $MAX_JOBS
-ninja install -j $MAX_JOBS
+ninja -j "$MAX_JOBS"
+ninja install -j "$MAX_JOBS"
 cd ..
-python -m pip install .
-python -m pip install build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl
+python -m pip install --force-reinstall --no-deps \
+    build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl
 popd
-rm -rf $THIRD_PARTY_PATH/nixl_src
+rm -rf "$NIXL_SOURCE_DIR"
 
-echo "Successfully installed all packages for nixl"
+touch "$NIXL_PREFIX/.psrl-nixl-0.10.1-ucx-1.20-rkey65535-backlog4096-complete"
+
+echo "Successfully installed UCX $REQUIRED_UCX_VERSION (ep/rkey configs=UINT16_MAX) and NIXL $NIXL_VERSION (backlog=4096)"

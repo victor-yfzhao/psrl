@@ -15,6 +15,7 @@ def _install_stubs():
         "psrl.utils.elastic_rm.dummy_scaling_policy",
         "psrl.utils.elastic_rm.itl_scaling_policy",
         "psrl.utils.elastic_rm.itl_harmonic_scaling_policy",
+        "psrl.utils.elastic_rm.rule_based_scaling_policy",
         "psrl.utils.elastic_rm.scaling_policy",
         "psrl.utils.logger",
         "psrl.utils.server.command",
@@ -50,6 +51,10 @@ def _install_stubs():
     harmonic_mod = types.ModuleType("psrl.utils.elastic_rm.itl_harmonic_scaling_policy")
     harmonic_mod.ITLHarmonicScalingPolicy = object
     sys.modules["psrl.utils.elastic_rm.itl_harmonic_scaling_policy"] = harmonic_mod
+
+    rule_based_mod = types.ModuleType("psrl.utils.elastic_rm.rule_based_scaling_policy")
+    rule_based_mod.RuleBasedScalingPolicy = object
+    sys.modules["psrl.utils.elastic_rm.rule_based_scaling_policy"] = rule_based_mod
 
     scaling_mod = types.ModuleType("psrl.utils.elastic_rm.scaling_policy")
     scaling_mod.InstanceSignal = type("InstanceSignal", (), {})
@@ -98,6 +103,66 @@ def _make_executor(mod):
     executor.instances_status_flags = {"Rollout": {"model": {}}}
     executor.instances_engine_stats = {"Rollout": {"model": {}}}
     return executor
+
+
+def test_planner_breakdown_closes_to_outer_wall_time():
+    mod = _load_module()
+    policy = types.SimpleNamespace(
+        last_planner_breakdown={
+            "state_analysis_s": 0.0625,
+            "candidate_ordering_s": 0.0625,
+            "candidate_set_construction_s": 0.0625,
+            "simulation_input_preparation_s": 0.0625,
+            "candidate_evaluation_wall_s": 0.0625,
+            "rebalance_simulation_s": 0.0625,
+            "router_simulation_s": 0.0625,
+            "simulation_wall_s": 0.09375,
+            "rebalance_router_overlap_s": 0.03125,
+            "candidate_scoring_s": 0.0625,
+            "best_candidate_selection_s": 0.0625,
+        }
+    )
+
+    breakdown = mod._normalized_planner_breakdown(policy, 1.0)
+
+    assert breakdown["other_s"] == 0.5625
+    additive_keys = mod._PLANNER_PHASE_KEYS + ("other_s",)
+    assert sum(breakdown[key] for key in additive_keys) == 1.0
+    assert breakdown["simulation_wall_s"] == 0.09375
+    assert breakdown["rebalance_router_overlap_s"] == 0.03125
+
+
+def test_step_scaling_counts_track_actions_and_instance_transitions():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor._step_scaling_action_counts = {}
+
+    executor._record_step_scaling_action(
+        step=7,
+        decision_id=1,
+        action_type="scale_up",
+        succeeded=True,
+        sleep_instances=1,
+        wakeup_instances=2,
+    )
+    executor._record_step_scaling_action(
+        step=7,
+        decision_id=2,
+        action_type="scale_down",
+        succeeded=False,
+        sleep_instances=0,
+        wakeup_instances=0,
+    )
+
+    assert executor.get_step_scaling_action_counts(7) == {
+        "step": 7,
+        "actual_actions": 1,
+        "scale_up_actions": 1,
+        "scale_down_actions": 0,
+        "sleep_instances": 1,
+        "wakeup_instances": 2,
+        "instance_transitions": 3,
+    }
 
 
 def test_post_scale_up_candidate_builder_excludes_wake_targets_and_prefers_waiting():
@@ -268,6 +333,9 @@ def test_scale_up_handler_sleeps_then_combines_migration_and_primary_wakes():
     pre_wake = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 4}
     pre_sleep = {"role_name": "RewardModel", "model_name": "rm-model", "instance_id": 0}
     primary_wake = {"role_name": "Rollout", "model_name": "rollout-model", "instance_id": 2}
+    executor.instances_status_flags["Rollout"]["rollout-model"] = {
+        2: mod.InstanceStatus.ASLEEP
+    }
 
     def resolve_pre_wake(entries):
         operations.append(("resolve_pre_wake", entries))
@@ -286,6 +354,7 @@ def test_scale_up_handler_sleeps_then_combines_migration_and_primary_wakes():
 
     async def wake_instances(instances):
         operations.append(("wake", instances))
+        executor.instances_status_flags["Rollout"]["rollout-model"][2] = mod.InstanceStatus.AWAKEN
         executor.stop_scale_up = True
 
     async def interrupt_waiting(**kwargs):
@@ -380,6 +449,8 @@ def test_request_level_scale_up_uses_planned_migrations_and_skips_legacy_rebalan
             "role_name": "Rollout",
             "model_name": "model",
             "planned_request_migrations": planned,
+            "planner_elapsed_s": 0.5,
+            "planner_breakdown": {"router_simulation_s": 0.2, "other_s": 0.3},
         }
     )
     primary_wake = {"role_name": "Rollout", "model_name": "model", "instance_id": 2}
@@ -415,6 +486,8 @@ def test_request_level_scale_up_uses_planned_migrations_and_skips_legacy_rebalan
 
     assert [operation[0] for operation in operations] == ["wake", "planned", "finished"]
     assert operations[1][1]["request_migrations"] == planned
+    assert "planner_s" not in operations[1][1]
+    assert "planner_breakdown" not in operations[1][1]
 
 
 def test_request_level_scale_up_does_not_migrate_after_wake_failure():
@@ -461,6 +534,92 @@ def test_request_level_scale_up_does_not_migrate_after_wake_failure():
     asyncio.run(executor._scale_up_handler_loop())
 
     assert [operation[0] for operation in operations] == ["wake", "finished"]
+
+
+def test_request_level_scale_up_filters_migrations_to_actual_wake_transitions():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.scaling_policy = types.SimpleNamespace(
+        enable_request_level_candidate_evaluation=True
+    )
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    planned = [
+        {"request_id": "r0", "source_instance_id": 0, "destination_instance_id": 2},
+        {"request_id": "r1", "source_instance_id": 1, "destination_instance_id": 3},
+    ]
+    executor.scale_up_task_queue.put_nowait(
+        {
+            "decision_id": 24,
+            "role_name": "Rollout",
+            "model_name": "model",
+            "planned_request_migrations": planned,
+        }
+    )
+    wake_targets = [
+        {"role_name": "Rollout", "model_name": "model", "instance_id": 2},
+        {"role_name": "Rollout", "model_name": "model", "instance_id": 3},
+    ]
+    executor.instances_status_flags["Rollout"]["model"] = {
+        2: mod.InstanceStatus.ASLEEP,
+        3: mod.InstanceStatus.ASLEEP,
+    }
+    executed = []
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+    executor._find_instances_to_scaled_up = lambda task: wake_targets
+
+    async def wake_instances(instances):
+        executor.instances_status_flags["Rollout"]["model"][2] = mod.InstanceStatus.AWAKEN
+        executor.instances_status_flags["Rollout"]["model"][3] = mod.InstanceStatus.RECOVERING
+        executor.stop_scale_up = True
+
+    async def execute_planned(**kwargs):
+        executed.extend(kwargs["request_migrations"])
+        return len(kwargs["request_migrations"])
+
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._execute_planned_request_migrations = execute_planned
+    executor._mark_decision_action_finished = lambda decision_id: None
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert executed == [planned[0]]
+
+
+def test_legacy_rebalance_receives_only_actual_wake_transitions():
+    mod = _load_module()
+    executor = _make_executor(mod)
+    executor.stop_scale_up = False
+    executor.scale_up_task_queue = asyncio.Queue()
+    executor.scale_up_task_queue.put_nowait(
+        {"decision_id": 25, "role_name": "Rollout", "model_name": "model"}
+    )
+    wake_target = {"role_name": "Rollout", "model_name": "model", "instance_id": 2}
+    executor.instances_status_flags["Rollout"]["model"] = {
+        2: mod.InstanceStatus.ASLEEP
+    }
+    rebalance_wake_ids = []
+    executor._resolve_preferred_instances_to_scaled_up = lambda entries: []
+    executor._find_instances_to_scaled_down_for_other_roles = lambda task: []
+    executor._find_instances_to_scaled_up = lambda task: [wake_target]
+
+    async def wake_instances(instances):
+        executor.instances_status_flags["Rollout"]["model"][2] = mod.InstanceStatus.RECOVERING
+        executor.stop_scale_up = True
+
+    async def legacy_rebalance(**kwargs):
+        rebalance_wake_ids.append(kwargs["wake_instance_ids"])
+
+    executor._scale_up_instances = wake_instances
+    executor._record_policy_migration_observation = lambda *args: None
+    executor._interrupt_waiting_after_scale_up = legacy_rebalance
+    executor._mark_decision_action_finished = lambda decision_id: None
+
+    asyncio.run(executor._scale_up_handler_loop())
+
+    assert rebalance_wake_ids == [set()]
 
 
 def test_scale_up_handler_continues_after_action_failure():

@@ -48,7 +48,7 @@ def extract_vllm_reprefill_s(result: Any) -> float | None:
 
 
 class RequestMigrationOverheadTracker:
-    """Track abort-to-redispatch and re-prefill overhead for migrated requests."""
+    """Track non-overlapping interrupt, redispatch, and re-prefill overhead."""
 
     def __init__(self) -> None:
         self._requests: dict[str, dict[str, Any]] = {}
@@ -57,23 +57,23 @@ class RequestMigrationOverheadTracker:
         if not context:
             return
         selected_count = max(1, int(context.get("selected_count", 1)))
-        planner_s = max(0.0, float(context.get("planner_s", 0.0)))
         started_s = time.monotonic()
         for source_instance_id, uids in instance_to_uids.items():
             normalized_uids = uids if isinstance(uids, (list, tuple, set)) else [uids]
             for uid in normalized_uids:
                 if uid is None:
                     continue
-                self._requests[str(uid)] = {
+                request_context = {
                     **context,
                     "source_instance_id": int(source_instance_id),
                     "selected_count": selected_count,
-                    "planner_s": planner_s,
-                    "planner_share_s": planner_s / float(selected_count),
-                    "network_started_s": started_s,
+                    "abort_started_s": started_s,
+                    "interrupt_completed_s": None,
+                    "interrupt_s": None,
                     "requeued": False,
                     "network_s": None,
                 }
+                self._requests[str(uid)] = request_context
 
     def _lookup_key(self, request_id: Any) -> str | None:
         """Resolve a router logical ID to its unique scheduler request ID.
@@ -93,14 +93,22 @@ class RequestMigrationOverheadTracker:
         # sample when more than one historical suffix is present.
         return max(
             matches,
-            key=lambda key: float(self._requests[key].get("network_started_s", 0.0)),
+            key=lambda key: float(self._requests[key].get("abort_started_s", 0.0)),
         )
 
-    def mark_requeued(self, request_id: Any) -> None:
+    def mark_requeued(self, request_id: Any) -> dict[str, Any] | None:
         key = self._lookup_key(request_id)
         context = self._requests.get(key) if key is not None else None
-        if context is not None:
-            context["requeued"] = True
+        if context is None or context["requeued"]:
+            return None
+        interrupted_s = time.monotonic()
+        context["requeued"] = True
+        context["interrupt_completed_s"] = interrupted_s
+        context["interrupt_s"] = max(
+            0.0,
+            interrupted_s - context["abort_started_s"],
+        )
+        return dict(context)
 
     def mark_dispatched(
         self,
@@ -111,8 +119,16 @@ class RequestMigrationOverheadTracker:
         context = self._requests.get(key) if key is not None else None
         if context is None or not context["requeued"] or context["network_s"] is not None:
             return None
+        dispatched_s = time.monotonic()
         context["destination_instance_id"] = int(destination_instance_id)
-        context["network_s"] = max(0.0, time.monotonic() - context["network_started_s"])
+        context["network_s"] = max(
+            0.0,
+            dispatched_s - context["interrupt_completed_s"],
+        )
+        context["abort_to_redispatch_s"] = max(
+            0.0,
+            dispatched_s - context["abort_started_s"],
+        )
         return dict(context)
 
     def complete_with_status(
@@ -132,7 +148,7 @@ class RequestMigrationOverheadTracker:
             return dict(context), "missing_vllm_prefill"
         self.discard(request_id)
         context["reprefill_s"] = reprefill_s
-        context["migration_s"] = context["planner_share_s"] + context["network_s"] + reprefill_s
+        context["migration_s"] = context["interrupt_s"] + context["network_s"] + reprefill_s
         return context, "completed"
 
     def complete(self, request_id: Any, result: Any) -> dict[str, Any] | None:

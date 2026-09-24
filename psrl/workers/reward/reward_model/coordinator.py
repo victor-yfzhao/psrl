@@ -142,7 +142,7 @@ class RewardModelCoordinator(CommandExtension):
                     self.running_loop.create_task(self._process_status_queue(instance_id))
                 )
                 self.process_status_queue_tasks[instance_id].add_done_callback(
-                    lambda f: f.result()
+                    self._consume_background_task_result
                 )  # To avoid silent error in async tasks
 
             # Broadcast collected engine status to the RM router so cost-model
@@ -152,7 +152,7 @@ class RewardModelCoordinator(CommandExtension):
             self.broadcast_status_to_router_task = self.running_loop.create_task(
                 self._broadcast_status_to_router()
             )
-            self.broadcast_status_to_router_task.add_done_callback(lambda f: f.result())
+            self.broadcast_status_to_router_task.add_done_callback(self._consume_background_task_result)
 
         # # Start the model synchronization and rollout migration loop
         # if self.config.psrl.sync_and_mig_strategy.method == "greedy":
@@ -177,22 +177,43 @@ class RewardModelCoordinator(CommandExtension):
         - Command handler task
         - Engine status sync task
         """
-        if self.command_handler_task is None or self.command_handler_task.done():
-            return
-
-        # Stop the background tasks
         self.stop_command_handler = True
         self.stop_process_status_queue = [True] * self.rm_config.num_replicas
         self.stop_broadcast_status_to_router = True
 
-        tasks_to_wait = [self.command_handler_task]
+        tasks_to_wait = []
+        if self.command_handler_task is not None and not self.command_handler_task.done():
+            tasks_to_wait.append(self.command_handler_task)
         if self.process_status_queue_tasks:
-            tasks_to_wait.extend(self.process_status_queue_tasks)
-        if self.broadcast_status_to_router_task is not None:
+            tasks_to_wait.extend(task for task in self.process_status_queue_tasks if not task.done())
+        if self.broadcast_status_to_router_task is not None and not self.broadcast_status_to_router_task.done():
             tasks_to_wait.append(self.broadcast_status_to_router_task)
 
-        # Wait for tasks to finish with timeout
-        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        for task in tasks_to_wait:
+            task.cancel()
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+
+    async def shutdown_reward_engines(self) -> None:
+        """Stop coordinator tasks and gracefully close every reward vLLM engine."""
+        await self.stop_busy_loop()
+        shutdown_futures = [
+            reward_model_wg.execute_rank_zero_async("shutdown_rollout_engine")
+            for reward_model_wg in self.reward_model_wg_list
+        ]
+        results = await asyncio.gather(*shutdown_futures, return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"Failed to shut down {len(failures)} reward model engines: "
+                f"{[repr(failure) for failure in failures]}."
+            )
+
+    @staticmethod
+    def _consume_background_task_result(task: asyncio.Task) -> None:
+        """Surface background failures while allowing intentional cancellation."""
+        if not task.cancelled():
+            task.result()
 
     async def _command_handler_loop(self):
         """
@@ -242,7 +263,8 @@ class RewardModelCoordinator(CommandExtension):
                             instance_to_uids = {}
                         else:
                             prepared = await self.reward_model_router.prepare_request_migrations.remote(
-                                request_migrations
+                                request_migrations,
+                                migration_context,
                             )
                             instance_to_uids = prepared.get("instance_to_uids", {})
                             psrl_logger.info(
@@ -251,14 +273,18 @@ class RewardModelCoordinator(CommandExtension):
                             )
 
                     psrl_logger.info(
-                        "Received ABORT command with instance_to_uids (count=%s) and instance_ids=%s; "
-                        "completing immediately (fire-and-forget) to avoid blocking WAKE_UP/SLEEP commands.",
+                        "Received ABORT command with instance_to_uids (count=%s) and instance_ids=%s.",
                         sum(len(v) for v in (instance_to_uids or {}).values()),
                         instance_ids,
                     )
                     futures = []
 
-                    if migration_context and instance_to_uids is not None and self.reward_model_router is not None:
+                    if (
+                        migration_context
+                        and request_migrations is None
+                        and instance_to_uids is not None
+                        and self.reward_model_router is not None
+                    ):
                         await self.reward_model_router.mark_migration_requests.remote(
                             instance_to_uids,
                             migration_context,
@@ -302,6 +328,9 @@ class RewardModelCoordinator(CommandExtension):
                     else:
                         interrupted_request_nums = await asyncio.gather(*futures)
                         interrupted_request_num = np.sum(interrupted_request_nums)
+
+                    if migration_context and self.reward_model_router is not None:
+                        await self.reward_model_router.wait_for_exclusive_rebalance.remote()
 
                     result = interrupted_request_num
                     psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")

@@ -535,6 +535,8 @@ class StalenessInventory:
         Check whether an entry can be reserved for a given model version without a new reserve entry.
         """
         if entry_info.prompt_id in self.data_tracker:
+            if self.is_validate:
+                return True
             buffer_id, _ = self.data_tracker[entry_info.prompt_id]
             if model_version + self.staleness >= buffer_id:
                 return True
@@ -554,15 +556,24 @@ class StalenessInventory:
             # Indicate it is already RESERVED (other requests in the same prompt group have been reserved)
             # We need to check if the model version can allow
             # the new request to be reserved at the same place as before
+            if self.is_validate:
+                return True
             buffer_id, _ = self.data_tracker[entry_info.prompt_id]
             if model_version + self.staleness >= buffer_id:
                 return True
             else:
                 return False
-        # Ensure buffer IDs up to max_staleness_buffer_id exist
-        self.ensure_buffer_exists(model_version + self.staleness)
-        # Get all PENDING buffers within the staleness limit
+        if not self.is_validate:
+            self.ensure_buffer_exists(model_version + self.staleness)
+
         pending_buffers = self.get_buffers_with_capacity()
+        if self.is_validate:
+            return any(
+                buffer_id not in self._ready_for_delete_buffer_ids
+                for buffer_id in pending_buffers
+            )
+
+        # Get all PENDING buffers within the staleness limit.
         candidate_ids = [
             bid
             for bid in pending_buffers

@@ -149,3 +149,21 @@ class PSRL_RewardModelManager:
         Return the reward model tokenizer.
         """
         return self.reward_model_tokenizer
+
+    def shutdown(self) -> None:
+        """Gracefully close reward engines and terminate coordinator/router actors."""
+        shutdown_error = None
+        if self.router_process is not None:
+            ray.kill(self.router_process, no_restart=True)
+            self.router_process = None
+        try:
+            ray.get(self.reward_model_coordinator.shutdown_reward_engines.remote())
+        except Exception as exc:
+            shutdown_error = exc
+        finally:
+            ray.kill(self.reward_model_coordinator, no_restart=True)
+
+        if shutdown_error is not None:
+            raise RuntimeError(
+                f"Failed to shut down reward model manager {self.reward_model_name!r}."
+            ) from shutdown_error

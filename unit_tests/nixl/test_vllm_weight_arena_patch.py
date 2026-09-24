@@ -10,11 +10,22 @@ from vllm_patches.patches.gpu_worker import _should_restore_sleep_buffers
 from vllm_patches.patches.weight_arena import (
     _assert_direct_model_supported,
     _assert_weight_offload_disabled,
+    _initialize_direct_runtime_buffers,
     _materialize_ep_metadata_on_cpu,
     _role_materialization,
     _weight_arena_enabled,
     finalize_pending_weight_arena,
 )
+
+
+class _RuntimeBufferProbe(torch.nn.Module):
+    def __init__(self, *, supported: bool = True) -> None:
+        super().__init__()
+        name = "cos_sin_cache" if supported else "unknown_cache"
+        self.register_buffer(name, torch.empty(4, 3, device="meta"), persistent=False)
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        return torch.arange(12, dtype=torch.float32).view(4, 3)
 
 
 def _model_runner(*, uva_gb=0, prefetch_group_size=0, cache_config=None):
@@ -141,6 +152,48 @@ def test_ep_metadata_uses_cpu_inside_meta_model_construction() -> None:
     assert expert_map[96:].eq(-1).all()
 
 
+def test_direct_runtime_buffer_is_initialized_in_place() -> None:
+    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+
+    model = _RuntimeBufferProbe()
+    handle = materialize_module_weights_in_arena(
+        model,
+        device="cpu",
+        max_chunk_bytes=1024,
+        alignment_bytes=256,
+    )
+    original_storage = model.cos_sin_cache.untyped_storage()
+    original_address = model.cos_sin_cache.data_ptr()
+
+    initialized = _initialize_direct_runtime_buffers(model)
+
+    assert initialized == ("cos_sin_cache",)
+    assert model.cos_sin_cache.untyped_storage().data_ptr() == original_storage.data_ptr()
+    assert model.cos_sin_cache.data_ptr() == original_address
+    torch.testing.assert_close(
+        model.cos_sin_cache,
+        torch.arange(12, dtype=torch.float32).view(4, 3),
+        rtol=0,
+        atol=0,
+    )
+    handle.assert_module_weights_in_arena(model)
+
+
+def test_direct_runtime_buffer_rejects_unknown_non_persistent_buffer() -> None:
+    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+
+    model = _RuntimeBufferProbe(supported=False)
+    materialize_module_weights_in_arena(
+        model,
+        device="cpu",
+        max_chunk_bytes=1024,
+        alignment_bytes=256,
+    )
+
+    with pytest.raises(RuntimeError, match="without an initializer.*unknown_cache"):
+        _initialize_direct_runtime_buffers(model)
+
+
 def test_materialization_is_role_specific() -> None:
     config = {
         "rollout_materialization": "direct",
@@ -151,7 +204,7 @@ def test_materialization_is_role_specific() -> None:
 
 
 def test_finalize_pending_weight_arena_replaces_tms_pool(monkeypatch) -> None:
-    arena_config = {"max_chunk_bytes": 1024, "alignment_bytes": 256}
+    arena_config = {"max_chunk_gb": 1, "alignment_bytes": 256}
     runner = SimpleNamespace(_psrl_weight_arena_pending_config=arena_config)
     calls = []
     monkeypatch.setattr(

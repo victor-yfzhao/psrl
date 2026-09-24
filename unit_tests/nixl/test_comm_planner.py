@@ -20,9 +20,13 @@ if "ray" not in sys.modules:
     class _ActorHandle:
         pass
 
+    class _ObjectRef:
+        pass
+
     _ray_actor.ActorHandle = _ActorHandle
     sys.modules["ray.actor"] = _ray_actor
     _ray.actor = _ray_actor
+    _ray.ObjectRef = _ObjectRef
 
     def _remote_decorator(_cls=None, **_kwargs):
         def _decorate(cls):
@@ -39,6 +43,7 @@ if "ray" not in sys.modules:
     _ray.remote = _remote_decorator
     sys.modules["ray"] = _ray
 
+import pytest
 import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -48,10 +53,11 @@ from psrl.utils.nixl.network_topology import NetworkTopology
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
-    NIXLShardMetaInfo,
     NIXLSharding,
+    NIXLShardMetaInfo,
     NIXLTensorInfo,
 )
+from psrl.utils.nixl.server import NIXLMetaServer
 
 
 def _make_weight_tensor_info(global_shard_indices: list[int], total_global_shards: int = 4) -> NIXLTensorInfo:
@@ -201,6 +207,100 @@ def test_communication_planner():
     print("\nCommunication planner test completed!")
 
 
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_pull_planner_supports_replicated_kv_shard_indices(tp_size):
+    num_kv_heads = 2
+    replicas = tp_size // num_kv_heads
+    ps_client = f"replicated_kv_ps_tp{tp_size}"
+    clients = {
+        ps_client: NIXLClientInfo(
+            name=ps_client,
+            node_ip="192.168.20.1",
+            node_gpu_id=0,
+            type=NIXLClientType.PS_FOR_PULL,
+            tensor_infos={"k_proj.weight": _make_weight_tensor_info([0, 1], total_global_shards=2)},
+            meta=b"ps_meta",
+        )
+    }
+
+    for rank in range(tp_size):
+        shard_index = rank // replicas
+        client_name = f"replicated_kv_pull_tp{tp_size}_rank{rank}"
+        clients[client_name] = NIXLClientInfo(
+            name=client_name,
+            node_ip=f"192.168.21.{rank + 1}",
+            node_gpu_id=rank,
+            type=NIXLClientType.PULL_SIDE,
+            tensor_infos={
+                "k_proj.weight": _make_weight_tensor_info([shard_index], total_global_shards=2)
+            },
+            meta=f"pull_meta_{rank}".encode(),
+        )
+
+    comm_plan = global_comm_planner.make_comm_plan(clients)
+
+    for rank in range(tp_size):
+        client_name = f"replicated_kv_pull_tp{tp_size}_rank{rank}"
+        expected_shard = (rank // replicas,)
+        assert comm_plan.rollout_pull_from_ps_plan[client_name]["k_proj.weight"] == {
+            ps_client: [expected_shard]
+        }
+
+
+def test_push_planner_supports_sparse_per_expert_source_ownership():
+    num_experts = 8
+    world_size = 4
+    ps_client = "expert_ps_push"
+    expert_keys = {
+        expert_id: [
+            f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+            for projection in ("gate", "up", "down")
+        ]
+        for expert_id in range(num_experts)
+    }
+    clients = {
+        ps_client: NIXLClientInfo(
+            name=ps_client,
+            node_ip="192.168.30.1",
+            node_gpu_id=0,
+            type=NIXLClientType.PS_FOR_PUSH,
+            tensor_infos={
+                key: _make_weight_tensor_info([0], total_global_shards=1)
+                for keys in expert_keys.values()
+                for key in keys
+            },
+            meta=b"ps_meta",
+        )
+    }
+
+    experts_per_rank = num_experts // world_size
+    for rank in range(world_size):
+        client_name = f"expert_push_rank{rank}"
+        first_expert = rank * experts_per_rank
+        local_keys = [
+            key
+            for expert_id in range(first_expert, first_expert + experts_per_rank)
+            for key in expert_keys[expert_id]
+        ]
+        clients[client_name] = NIXLClientInfo(
+            name=client_name,
+            node_ip=f"192.168.31.{rank + 1}",
+            node_gpu_id=rank,
+            type=NIXLClientType.PUSH_SIDE,
+            tensor_infos={
+                key: _make_weight_tensor_info([0], total_global_shards=1) for key in local_keys
+            },
+            meta=f"push_meta_{rank}".encode(),
+        )
+
+    comm_plan = global_comm_planner.make_comm_plan(clients)
+
+    for expert_id, keys in expert_keys.items():
+        owner = f"expert_push_rank{expert_id // experts_per_rank}"
+        for key in keys:
+            assert comm_plan.push_to_ps_plan[owner][key] == {ps_client: [(0,)]}
+
+
 def test_network_topology_integration():
     """Test network topology integration with communication planner"""
     print("\nTesting network topology integration...")
@@ -225,6 +325,100 @@ def test_network_topology_integration():
     print(f"  IB: {topology.get_bandwidth_gbps('client_A', 'client_D')} Gbps")
 
     print("\nNetwork topology integration test completed!")
+
+
+def test_missing_source_key_reports_planner_context():
+    clients = {
+        "push": NIXLClientInfo(
+            name="push",
+            node_ip="192.168.1.1",
+            node_gpu_id=0,
+            type=NIXLClientType.PUSH_SIDE,
+            tensor_infos={"source.weight": _make_weight_tensor_info([0])},
+            meta=b"push_meta",
+        ),
+        "ps_push": NIXLClientInfo(
+            name="ps_push",
+            node_ip="192.168.1.2",
+            node_gpu_id=0,
+            type=NIXLClientType.PS_FOR_PUSH,
+            tensor_infos={"target.weight": _make_weight_tensor_info([0])},
+            meta=b"ps_meta",
+        ),
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        global_comm_planner.make_comm_plan(clients)
+
+    error = str(exc_info.value)
+    assert "phase=push_to_ps" in error
+    assert "target=ps_push" in error
+    assert "key='target.weight'" in error
+    assert "eligible_source_clients=['push']" in error
+    assert "source_key_counts={'push': 1}" in error
+
+
+def test_incomplete_source_shards_report_missing_coverage():
+    clients = {
+        "push": NIXLClientInfo(
+            name="push",
+            node_ip="192.168.1.1",
+            node_gpu_id=0,
+            type=NIXLClientType.PUSH_SIDE,
+            tensor_infos={"weight": _make_weight_tensor_info([0])},
+            meta=b"push_meta",
+        ),
+        "ps_push": NIXLClientInfo(
+            name="ps_push",
+            node_ip="192.168.1.2",
+            node_gpu_id=0,
+            type=NIXLClientType.PS_FOR_PUSH,
+            tensor_infos={"weight": _make_weight_tensor_info([0, 1])},
+            meta=b"ps_meta",
+        ),
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        global_comm_planner.make_comm_plan(clients)
+
+    error = str(exc_info.value)
+    assert "phase=push_to_ps" in error
+    assert "target=ps_push" in error
+    assert "key='weight'" in error
+    assert "missing_shards={'count': 1, 'sample': [(1,)]" in error
+    assert "source_shards={'push':" in error
+
+
+def test_unified_sharding_refinement_does_not_alias_split_keys():
+    shared_ps_sharding = NIXLSharding.default()
+    server = object.__new__(NIXLMetaServer)
+    server._is_all_client_shardings_recved = True
+    server.client_unified_sharding_dicts = {}
+    server.client_sharding_dicts = {
+        "ps": {
+            "weight_q": shared_ps_sharding,
+            "weight_v": shared_ps_sharding,
+        },
+        "train": {
+            "weight_q": NIXLSharding(
+                shard_mesh=OrderedDict([(0, 2)]),
+                shard_indices=[(0,)],
+            ),
+            "weight_v": NIXLSharding(
+                shard_mesh=OrderedDict([(0, 4)]),
+                shard_indices=[(0,)],
+            ),
+        },
+    }
+
+    server.make_unified_sharding()
+
+    ps_q = server.client_unified_sharding_dicts["ps"]["weight_q"]
+    ps_v = server.client_unified_sharding_dicts["ps"]["weight_v"]
+    assert ps_q.shard_mesh == OrderedDict([(0, 2)])
+    assert ps_v.shard_mesh == OrderedDict([(0, 4)])
+    assert ps_q is not ps_v
+    assert shared_ps_sharding.shard_mesh == OrderedDict([(0, 1)])
 
 
 if __name__ == "__main__":

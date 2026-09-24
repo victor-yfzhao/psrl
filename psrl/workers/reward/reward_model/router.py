@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from math import ceil
 from typing import Any
 
@@ -137,6 +138,10 @@ class RewardModelRouteStrategyBase(ABC):
     def pop_request(self, request: DataProto, instance_id: int) -> None:
         """Record a finished request."""
 
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        """Record a simulation-selected route without applying admission rules."""
+        return int(instance_id)
+
     def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
         return 1.0
 
@@ -213,6 +218,11 @@ class RequestNumBalanceRewardModelRouteStrategy(RewardModelRouteStrategyBase):
             return None
         self.instance_request_counts[int(selected)] += 1
         return int(selected)
+
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        instance_id = int(instance_id)
+        self.instance_request_counts[instance_id] += 1
+        return instance_id
 
     def update_instance_loads(self, instance_to_load: dict[int, int]) -> None:
         for instance_id, load in instance_to_load.items():
@@ -460,6 +470,11 @@ class CostModelBasedRewardModelRouteStrategy(RewardModelRouteStrategyBase):
         if not self._has_engine_status:
             self.instance_to_token_num[instance_id] += self._get_request_token_num(request)
 
+    def force_route_unchecked(self, request: DataProto, instance_id: int) -> int:
+        instance_id = int(instance_id)
+        self.push_request(request, instance_id)
+        return instance_id
+
     def pop_request(self, request: DataProto, instance_id: int) -> None:
         instance_id = int(instance_id)
         self.instance_to_request_num[instance_id] = max(0, self.instance_to_request_num[instance_id] - 1)
@@ -696,7 +711,11 @@ class PSRL_RewardModelRouter:
 
         elastic_rm_cfg = self._get_elastic_rm_config()
         itl_cfg = elastic_rm_cfg.get("itl_policy", {}) if isinstance(elastic_rm_cfg, dict) else {}
-        if not isinstance(itl_cfg, dict):
+        # OmegaConf keeps nested sections as DictConfig after the shallow
+        # conversion in _get_elastic_rm_config(). Treat mapping-like sections
+        # as valid so RM-side ITL options, including the migration queue switch,
+        # are not silently discarded.
+        if not hasattr(itl_cfg, "get"):
             itl_cfg = {}
         variant = str(elastic_rm_cfg.get("scaling_policy_variant", "normal")).lower()
         self._itl_router_enable = bool(itl_cfg.get("rm_router_enable", variant == "itl"))
@@ -751,6 +770,13 @@ class PSRL_RewardModelRouter:
             "forced": 0,
             "fallback": 0,
         }
+        self._exclusive_rebalance_migration_queue_enabled = bool(
+            itl_cfg.get("exclusive_rebalance_migration_queue", False)
+        )
+        self._rebalance_requests_to_route: deque[tuple[str, DataProto]] = deque()
+        self._rebalance_pending_request_ids: set[str] = set()
+        self._rebalance_queued_request_keys: set[str] = set()
+        self._rebalance_dispatching_request_keys: set[str] = set()
 
         # Logger.
         self.log_prefix = "RewardModelRouter"
@@ -897,6 +923,15 @@ class PSRL_RewardModelRouter:
                 await self._wait_for_routing_update()
                 continue
 
+            if self._exclusive_rebalance_active():
+                dispatched_any = await self._dispatch_exclusive_rebalance_requests()
+                if not dispatched_any:
+                    self._is_routing = False
+                    await self._wait_for_routing_update(timeout_s=self.worker_probe_backoff_s)
+                else:
+                    await asyncio.sleep(0)
+                continue
+
             if not self.requests_to_route:
                 self._is_routing = False
                 await self._wait_for_routing_update()
@@ -912,7 +947,11 @@ class PSRL_RewardModelRouter:
             self.route_strategy.update_instance_loads(active_loads)
 
             dispatched_any = False
-            while self.requests_to_route and not self._interrupt_routing:
+            while (
+                self.requests_to_route
+                and not self._interrupt_routing
+                and not self._exclusive_rebalance_active()
+            ):
                 peeked_key, peeked_request = self._peek_request()
                 worker_idx = self._select_worker_for_request(peeked_request, active_loads)
                 if worker_idx is None:
@@ -955,13 +994,29 @@ class PSRL_RewardModelRouter:
         if request_key not in self.request_futures:
             self._release_strategy_worker(request_key, request, worker_idx)
             for request_uid in self._request_uid_values(request):
+                self._migration_overhead.discard(request_uid)
                 self._planned_migration_destinations.pop(request_uid, None)
+                self._finish_exclusive_rebalance_request(request_uid, reason="request_missing")
+            getattr(self, "_rebalance_dispatching_request_keys", set()).discard(request_key)
             return
 
         request_uids = self._format_request_uids(request)
         if self._interrupt_routing:
             self._release_strategy_worker(request_key, request, worker_idx)
-            self._enqueue_request(request_key, request)
+            getattr(self, "_rebalance_dispatching_request_keys", set()).discard(request_key)
+            request_uid_values = self._request_uid_values(request)
+            exclusive_pending_uids = {
+                canonical_psrl_request_id(request_uid)
+                for request_uid in request_uid_values
+                if canonical_psrl_request_id(request_uid)
+                in getattr(self, "_rebalance_pending_request_ids", set())
+            }
+            exclusive_enqueued = self._enqueue_exclusive_rebalance_request(request_key, request)
+            if not exclusive_enqueued:
+                for request_uid in request_uid_values:
+                    if canonical_psrl_request_id(request_uid) in exclusive_pending_uids:
+                        self._migration_overhead.discard(request_uid)
+                self._enqueue_request(request_key, request)
             psrl_logger.debug(
                 "[router] Routing is interrupted, Request %s, requeueing original request.",
                 request_uids,
@@ -970,35 +1025,55 @@ class PSRL_RewardModelRouter:
 
         worker_handle = self.worker_handles[worker_idx]
         request_uid_values = self._request_uid_values(request)
+        is_exclusive_redispatch = request_key in getattr(self, "_rebalance_dispatching_request_keys", set())
         for request_uid in request_uid_values:
             dispatch_overhead = self._migration_overhead.mark_dispatched(request_uid, worker_idx)
             if dispatch_overhead is not None:
+                if is_exclusive_redispatch:
+                    self._log_migration_interrupt(request_uid, dispatch_overhead)
                 psrl_logger.info(
                     "[ELASTIC_OVERHEAD] operation=request_migration_dispatch "
                     "scope=post_scale_up_rebalance role=RewardModel migration_id=%s decision_id=%s "
                     "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
-                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f "
-                    "network_scope=abort_to_redispatch",
+                    "interrupt_s=%.6f network_s=%.6f abort_to_redispatch_s=%.6f "
+                    "interrupt_scope=abort_to_requeue network_scope=requeue_to_redispatch",
                     dispatch_overhead.get("migration_id"),
                     dispatch_overhead.get("decision_id"),
                     request_uid,
                     dispatch_overhead.get("source_instance_id"),
                     dispatch_overhead.get("destination_instance_id"),
                     dispatch_overhead.get("selected_count"),
-                    dispatch_overhead["planner_s"],
-                    dispatch_overhead["planner_share_s"],
+                    dispatch_overhead["interrupt_s"],
                     dispatch_overhead["network_s"],
+                    dispatch_overhead["abort_to_redispatch_s"],
                 )
+        if request_key in getattr(self, "_rebalance_dispatching_request_keys", set()):
+            for request_uid in request_uid_values:
+                self._finish_exclusive_rebalance_request(request_uid, reason="redispatched")
+            self._rebalance_dispatching_request_keys.discard(request_key)
         try:
             result = await self._generate_with_worker(worker_idx, worker_handle, request)
         finally:
             self._release_strategy_worker(request_key, request, worker_idx)
 
         if result is None:
-            for request_uid in request_uid_values:
-                self._migration_overhead.mark_requeued(request_uid)
             psrl_logger.debug("Request %s interrupted or unavailable, requeueing original request.", request_uids)
-            self._enqueue_request(request_key, request)
+            exclusive_pending_uids = {
+                canonical_psrl_request_id(request_uid)
+                for request_uid in request_uid_values
+                if canonical_psrl_request_id(request_uid)
+                in getattr(self, "_rebalance_pending_request_ids", set())
+            }
+            exclusive_enqueued = self._enqueue_exclusive_rebalance_request(request_key, request)
+            for request_uid in request_uid_values:
+                if exclusive_enqueued:
+                    self._mark_migration_requeued(request_uid, defer_log=True)
+                elif canonical_psrl_request_id(request_uid) in exclusive_pending_uids:
+                    self._migration_overhead.discard(request_uid)
+                else:
+                    self._mark_migration_requeued(request_uid)
+            if not exclusive_enqueued:
+                self._enqueue_request(request_key, request)
             await asyncio.sleep(self.retry_delay)
             return
 
@@ -1008,10 +1083,23 @@ class PSRL_RewardModelRouter:
         except Exception:
             interrupted = False
         if interrupted:
-            for request_uid in request_uid_values:
-                self._migration_overhead.mark_requeued(request_uid)
             psrl_logger.debug("Request %s interrupted, requeueing partial output for continuation.", request_uids)
-            self._enqueue_request(request_key, result)
+            exclusive_pending_uids = {
+                canonical_psrl_request_id(request_uid)
+                for request_uid in request_uid_values
+                if canonical_psrl_request_id(request_uid)
+                in getattr(self, "_rebalance_pending_request_ids", set())
+            }
+            exclusive_enqueued = self._enqueue_exclusive_rebalance_request(request_key, result)
+            for request_uid in request_uid_values:
+                if exclusive_enqueued:
+                    self._mark_migration_requeued(request_uid, defer_log=True)
+                elif canonical_psrl_request_id(request_uid) in exclusive_pending_uids:
+                    self._migration_overhead.discard(request_uid)
+                else:
+                    self._mark_migration_requeued(request_uid)
+            if not exclusive_enqueued:
+                self._enqueue_request(request_key, result)
             await asyncio.sleep(self.retry_delay)
             return
 
@@ -1025,8 +1113,9 @@ class PSRL_RewardModelRouter:
                     "[ELASTIC_OVERHEAD] operation=post_scale_up_rebalance "
                     "scope=post_scale_up_rebalance role=RewardModel migration_id=%s decision_id=%s "
                     "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
-                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f reprefill_s=%.6f "
-                    "migration_s=%.6f network_scope=abort_to_redispatch "
+                    "interrupt_s=%.6f network_s=%.6f abort_to_redispatch_s=%.6f "
+                    "reprefill_s=%.6f migration_s=%.6f "
+                    "interrupt_scope=abort_to_requeue network_scope=requeue_to_redispatch "
                     "reprefill_scope=vllm_scheduled_to_first_token",
                     migration_overhead.get("migration_id"),
                     migration_overhead.get("decision_id"),
@@ -1034,9 +1123,9 @@ class PSRL_RewardModelRouter:
                     migration_overhead.get("source_instance_id"),
                     migration_overhead.get("destination_instance_id"),
                     migration_overhead.get("selected_count"),
-                    migration_overhead["planner_s"],
-                    migration_overhead["planner_share_s"],
+                    migration_overhead["interrupt_s"],
                     migration_overhead["network_s"],
+                    migration_overhead["abort_to_redispatch_s"],
                     migration_overhead["reprefill_s"],
                     migration_overhead["migration_s"],
                 )
@@ -1054,6 +1143,7 @@ class PSRL_RewardModelRouter:
             psrl_logger.debug("[router] Reward request %s finished on worker %d", request_uids, worker_idx)
         for request_uid in request_uid_values:
             self._planned_migration_destinations.pop(request_uid, None)
+            self._finish_exclusive_rebalance_request(request_uid, reason="terminal")
         self._set_result(request_key, result)
         return
 
@@ -1179,7 +1269,7 @@ class PSRL_RewardModelRouter:
             for request_uid in request_uids:
                 self._planned_migration_destinations.pop(request_uid, None)
             if destination is not None and destination in candidates_loads:
-                self.request_counts[destination] += 1
+                self._record_forced_route(request, destination)
                 self._planned_migration_counters["forced"] += len(request_uids)
                 psrl_logger.info(
                     "Forced planned RM migration: request=%s destination=%s",
@@ -1273,6 +1363,212 @@ class PSRL_RewardModelRouter:
         self._pending_count += 1
         self._signal_routing_update()
 
+    def _exclusive_rebalance_active(self) -> bool:
+        return bool(
+            getattr(self, "_exclusive_rebalance_migration_queue_enabled", False)
+            and getattr(self, "_rebalance_pending_request_ids", set())
+        )
+
+    def _start_exclusive_rebalance(self, instance_to_uids: dict, migration_context: dict) -> None:
+        if not getattr(self, "_exclusive_rebalance_migration_queue_enabled", False):
+            return
+        request_ids = {
+            canonical_psrl_request_id(uid)
+            for uids in (instance_to_uids or {}).values()
+            for uid in (uids if isinstance(uids, (list, tuple, set)) else [uids])
+            if uid is not None
+        }
+        # Legacy ratio-based rebalance has no simulated destination. Keep its
+        # existing routing behavior even when the exclusive queue is enabled.
+        request_ids.intersection_update(self._planned_migration_destinations)
+        if not request_ids:
+            return
+        self._rebalance_pending_request_ids.update(request_ids)
+        psrl_logger.info(
+            "Exclusive RM rebalance started: migration_id=%s pending=%d normal_pending=%d",
+            migration_context.get("migration_id"),
+            len(self._rebalance_pending_request_ids),
+            self._pending_count,
+        )
+        self._signal_routing_update()
+
+    def _finish_exclusive_rebalance_request(self, request_uid: Any, *, reason: str) -> None:
+        request_uid = canonical_psrl_request_id(request_uid)
+        if request_uid not in getattr(self, "_rebalance_pending_request_ids", set()):
+            return
+        self._rebalance_pending_request_ids.discard(request_uid)
+        self._planned_migration_destinations.pop(request_uid, None)
+        psrl_logger.info(
+            "Exclusive RM rebalance request settled: request=%s reason=%s remaining=%d",
+            request_uid,
+            reason,
+            len(self._rebalance_pending_request_ids),
+        )
+        if not self._rebalance_pending_request_ids:
+            psrl_logger.info("Exclusive RM rebalance completed; resuming normal routing.")
+        self._signal_routing_update()
+
+    def _enqueue_exclusive_rebalance_request(self, request_key: str, request: DataProto) -> bool:
+        if not self._exclusive_rebalance_active():
+            return False
+        pending_uids = [
+            canonical_psrl_request_id(uid)
+            for uid in self._request_uid_values(request)
+            if canonical_psrl_request_id(uid) in self._rebalance_pending_request_ids
+        ]
+        if not pending_uids:
+            return False
+        destinations = {
+            self._planned_migration_destinations[uid]
+            for uid in pending_uids
+            if uid in self._planned_migration_destinations
+        }
+        if len(destinations) != 1 or any(
+            uid not in self._planned_migration_destinations for uid in pending_uids
+        ):
+            psrl_logger.error(
+                "Exclusive RM rebalance cannot resolve one simulated destination for request=%s; "
+                "returning it to normal routing. destinations=%s",
+                self._format_request_uids(request),
+                sorted(destinations),
+            )
+            for uid in pending_uids:
+                self._finish_exclusive_rebalance_request(uid, reason="missing_or_conflicting_destination")
+            return False
+        if request_key in self._rebalance_queued_request_keys:
+            return True
+        self._rebalance_requests_to_route.append((request_key, request))
+        self._rebalance_queued_request_keys.add(request_key)
+        psrl_logger.info(
+            "Queued interrupted RM request for exclusive rebalance: request=%s destination=%s fifo_depth=%d",
+            self._format_request_uids(request),
+            next(iter(destinations)),
+            len(self._rebalance_requests_to_route),
+        )
+        self._signal_routing_update()
+        return True
+
+    def _exclusive_rebalance_destination(self, request: DataProto) -> int | None:
+        pending_uids = [
+            canonical_psrl_request_id(uid)
+            for uid in self._request_uid_values(request)
+            if canonical_psrl_request_id(uid) in self._rebalance_pending_request_ids
+        ]
+        destinations = {
+            self._planned_migration_destinations[uid]
+            for uid in pending_uids
+            if uid in self._planned_migration_destinations
+        }
+        if len(destinations) != 1:
+            return None
+        destination = int(next(iter(destinations)))
+        if destination not in self.request_counts or destination in self.paused_worker_indices:
+            return None
+        return destination
+
+    def _record_forced_route(self, request: DataProto, destination: int) -> None:
+        destination = int(destination)
+        self.request_counts[destination] += 1
+        force_route = getattr(self.route_strategy, "force_route_unchecked", None)
+        if force_route is not None:
+            force_route(request, destination)
+
+    async def _dispatch_exclusive_rebalance_requests(self) -> bool:
+        if self._rebalance_dispatching_request_keys:
+            return False
+        dispatched_any = False
+        while self._rebalance_requests_to_route and not self._interrupt_routing:
+            request_key, request = self._rebalance_requests_to_route[0]
+            if request_key not in self.request_futures:
+                self._rebalance_requests_to_route.popleft()
+                self._rebalance_queued_request_keys.discard(request_key)
+                for request_uid in self._request_uid_values(request):
+                    self._migration_overhead.discard(request_uid)
+                    self._finish_exclusive_rebalance_request(request_uid, reason="request_missing")
+                continue
+            destination = self._exclusive_rebalance_destination(request)
+            if destination is None:
+                request_uid_values = self._request_uid_values(request)
+                planned_destinations = {
+                    self._planned_migration_destinations[request_uid]
+                    for request_uid in request_uid_values
+                    if request_uid in self._planned_migration_destinations
+                }
+                self._rebalance_requests_to_route.popleft()
+                self._rebalance_queued_request_keys.discard(request_key)
+                self._planned_migration_counters["fallback"] += len(request_uid_values)
+                for request_uid in request_uid_values:
+                    self._migration_overhead.discard(request_uid)
+                    self._finish_exclusive_rebalance_request(request_uid, reason="fallback_normal_routing")
+
+                try:
+                    active_loads = await self._get_cached_active_loads()
+                    fallback_destination = self._select_worker_for_request(request, active_loads)
+                except Exception:
+                    self._enqueue_request(request_key, request)
+                    psrl_logger.exception(
+                        "Exclusive RM rebalance normal fallback failed; request=%s destinations=%s "
+                        "requeued to normal routing; migration timing discarded.",
+                        self._format_request_uids(request),
+                        sorted(planned_destinations),
+                    )
+                    dispatched_any = True
+                    continue
+                if fallback_destination is None:
+                    self._enqueue_request(request_key, request)
+                    psrl_logger.warning(
+                        "Exclusive RM rebalance destination unreachable; request=%s destinations=%s "
+                        "normal strategy found no route, requeued to normal routing.",
+                        self._format_request_uids(request),
+                        sorted(planned_destinations),
+                    )
+                    dispatched_any = True
+                    continue
+
+                self._request_to_strategy_instance[request_key] = int(fallback_destination)
+                self._candidate_evaluation_inflight_requests[request_key] = request
+                for request_uid in request_uid_values:
+                    self._uid_to_inflight_instance[request_uid] = int(fallback_destination)
+                inflight_at_dispatch = active_loads.get(int(fallback_destination), 0)
+                task = asyncio.create_task(
+                    self._route_single_request(
+                        request_key,
+                        request,
+                        int(fallback_destination),
+                        inflight_at_dispatch,
+                    )
+                )
+                task.add_done_callback(lambda future: future.result())
+                self._is_routing = True
+                psrl_logger.warning(
+                    "Exclusive RM rebalance destination unreachable; request=%s destinations=%s "
+                    "fell back to normal destination=%s; migration timing discarded.",
+                    self._format_request_uids(request),
+                    sorted(planned_destinations),
+                    fallback_destination,
+                )
+                return True
+            self._rebalance_requests_to_route.popleft()
+            self._rebalance_queued_request_keys.discard(request_key)
+            self._rebalance_dispatching_request_keys.add(request_key)
+            inflight_at_dispatch = self.request_counts.get(destination, 0)
+            self._record_forced_route(request, destination)
+            self._planned_migration_counters["forced"] += len(self._request_uid_values(request))
+            self._request_to_strategy_instance[request_key] = destination
+            self._candidate_evaluation_inflight_requests[request_key] = request
+            for request_uid in self._request_uid_values(request):
+                self._uid_to_inflight_instance[request_uid] = destination
+            task = asyncio.create_task(
+                self._route_single_request(request_key, request, destination, inflight_at_dispatch)
+            )
+            task.add_done_callback(lambda future: future.result())
+            self._is_routing = True
+            dispatched_any = True
+            # Preserve FIFO dispatch order through the asynchronous worker
+            # handoff; the next item is released after redispatch settles.
+            break
+        return dispatched_any
+
     def _dequeue_request(self) -> tuple[str, DataProto] | None:
         if not self.requests_to_route:
             return None
@@ -1306,10 +1602,42 @@ class PSRL_RewardModelRouter:
     def mark_migration_requests(self, instance_to_uids: dict, migration_context: dict) -> None:
         """Start distributed overhead tracking before selected requests are aborted."""
         self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+        self._start_exclusive_rebalance(instance_to_uids, migration_context)
 
     @ray.method(concurrency_group="control")
-    def prepare_request_migrations(self, request_migrations: list[dict]) -> dict:
-        """Validate sources and register destination intent without changing counts."""
+    async def wait_for_exclusive_rebalance(self) -> None:
+        """Wait until all accepted exclusive-rebalance requests are redispatched."""
+        while self._exclusive_rebalance_active():
+            await asyncio.sleep(max(0.01, min(self.retry_delay, 0.1)))
+
+    @staticmethod
+    def _log_migration_interrupt(request_uid: Any, overhead: dict[str, Any]) -> None:
+        psrl_logger.info(
+            "[ELASTIC_OVERHEAD] operation=request_migration_interrupt "
+            "scope=post_scale_up_rebalance role=RewardModel migration_id=%s decision_id=%s "
+            "request_id=%s source_instance=%s selected_count=%s interrupt_s=%.6f "
+            "interrupt_scope=abort_to_requeue",
+            overhead.get("migration_id"),
+            overhead.get("decision_id"),
+            request_uid,
+            overhead.get("source_instance_id"),
+            overhead.get("selected_count"),
+            overhead["interrupt_s"],
+        )
+
+    def _mark_migration_requeued(self, request_uid: Any, *, defer_log: bool = False) -> None:
+        overhead = self._migration_overhead.mark_requeued(request_uid)
+        if overhead is None or defer_log:
+            return
+        self._log_migration_interrupt(request_uid, overhead)
+
+    @ray.method(concurrency_group="control")
+    def prepare_request_migrations(
+        self,
+        request_migrations: list[dict],
+        migration_context: dict | None = None,
+    ) -> dict:
+        """Validate a plan and atomically arm migration tracking before abort."""
         instance_to_uids: dict[int, list[str]] = {}
         accepted = 0
         skipped = 0
@@ -1343,6 +1671,9 @@ class PSRL_RewardModelRouter:
             if current_source != source:
                 record_skip("source_changed", engine_request_id)
                 continue
+            if destination not in self.request_counts:
+                record_skip("invalid_destination", engine_request_id)
+                continue
             self._planned_migration_destinations[logical_request_uid] = destination
             # Preserve the scheduler/vLLM ID for worker abort. The destination
             # intent is consumed by logical UID when the partial request returns.
@@ -1351,6 +1682,9 @@ class PSRL_RewardModelRouter:
         self._planned_migration_counters["accepted"] += accepted
         self._planned_migration_counters["skipped"] += skipped
         self._planned_migration_counters["planned"] += len(request_migrations or [])
+        if migration_context is not None:
+            self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+            self._start_exclusive_rebalance(instance_to_uids, migration_context)
         psrl_logger.info(
             "Prepared RM request migrations: planned=%d accepted=%d skipped=%d "
             "skip_reasons=%s skip_samples=%s sources=%s",
@@ -1378,7 +1712,7 @@ class PSRL_RewardModelRouter:
         """Return waiting-queue depth for reward routing (elastic_rm backlog signal)."""
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RewardModelRouter_enter")
-        n = int(self._pending_count)
+        n = int(self._pending_count) + len(self._rebalance_requests_to_route)
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RewardModelRouter_exit pending=%d body_s=%.6f",
@@ -1392,13 +1726,21 @@ class PSRL_RewardModelRouter:
         """Return count and token load for the leading reward waiting requests."""
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RewardModelRouter_summary_enter")
-        total_pending = int(self._pending_count)
+        exclusive_requests = [request for _, request in self._rebalance_requests_to_route]
+        total_pending = int(self._pending_count) + len(exclusive_requests)
         limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
         if limit == 0:
             requests: list[DataProto] = []
         else:
-            leading = heapq.nsmallest(limit, self.requests_to_route, key=lambda item: item[:3])
-            requests = [item[4] for item in leading]
+            requests = exclusive_requests[:limit]
+            normal_limit = limit - len(requests)
+            if normal_limit > 0:
+                leading = heapq.nsmallest(
+                    normal_limit,
+                    self.requests_to_route,
+                    key=lambda item: item[:3],
+                )
+                requests.extend(item[4] for item in leading)
         summary = {
             "pending": total_pending,
             "count": len(requests),
@@ -1418,13 +1760,22 @@ class PSRL_RewardModelRouter:
     async def get_candidate_evaluation_snapshot(self, top_t: int | None = None) -> dict:
         """Return a compact, immutable-by-convention request/router snapshot."""
         active_loads = await self._get_cached_active_loads()
-        total_pending = int(self._pending_count)
+        exclusive_items = [
+            (-1, 0, route_order, request_key, request)
+            for route_order, (request_key, request) in enumerate(self._rebalance_requests_to_route)
+        ]
+        total_pending = int(self._pending_count) + len(exclusive_items)
         limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
-        leading = (
-            []
-            if limit == 0
-            else heapq.nsmallest(limit, self.requests_to_route, key=lambda item: item[:3])
-        )
+        leading = exclusive_items[:limit]
+        normal_limit = limit - len(leading)
+        if normal_limit > 0:
+            leading.extend(
+                heapq.nsmallest(
+                    normal_limit,
+                    self.requests_to_route,
+                    key=lambda item: item[:3],
+                )
+            )
         pending_rows = [
             {
                 "request_id": self._format_request_uids(item[4]),

@@ -9,8 +9,9 @@ mode5 request-level policy: rollout ``throughput_optimal`` and reward-model
 from __future__ import annotations
 
 import heapq
+import time
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from psrl.utils.elastic_rm.candidate_routing import (
@@ -181,6 +182,13 @@ class RoleEvaluationResult:
     unrouted_count: int
     rebalance_moves: tuple[RequestMigration, ...]
     instance_throughputs: tuple[tuple[int, float], ...]
+    rebalance_simulation_s: float = field(default=0.0, compare=False)
+    router_simulation_s: float = field(default=0.0, compare=False)
+    other_simulation_s: float = field(default=0.0, compare=False)
+    rebalance_started_s: float | None = field(default=None, compare=False)
+    rebalance_finished_s: float | None = field(default=None, compare=False)
+    router_started_s: float | None = field(default=None, compare=False)
+    router_finished_s: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -783,6 +791,7 @@ def evaluate_role_candidate(
     plan: RoleCandidatePlan,
 ) -> RoleEvaluationResult:
     """Evaluate one role for one candidate using candidate-local load state."""
+    evaluation_started_s = time.monotonic()
     context = (
         snapshot
         if isinstance(snapshot, RoleEvaluationContext)
@@ -814,20 +823,45 @@ def evaluate_role_candidate(
         )
 
     moves: tuple[RequestMigration, ...] = ()
+    rebalance_started_s: float | None = None
+    rebalance_finished_s: float | None = None
     if plan.primary_scale_up:
+        rebalance_started_s = time.monotonic()
         moves = _rebalance(context, states, set(before_awake & active_ids))
+        rebalance_finished_s = time.monotonic()
+    rebalance_simulation_s = (
+        rebalance_finished_s - rebalance_started_s
+        if rebalance_started_s is not None and rebalance_finished_s is not None
+        else 0.0
+    )
 
+    router_started_s = time.monotonic()
     requests_to_route, total_to_route = _iter_requests_to_route(
         context,
         plan.sleep_instance_ids,
     )
     if not active_ids:
+        router_finished_s = time.monotonic()
+        router_simulation_s = router_finished_s - router_started_s
         return RoleEvaluationResult(
             throughput=0.0,
             routed_count=0,
             unrouted_count=total_to_route,
             rebalance_moves=moves,
             instance_throughputs=(),
+            rebalance_simulation_s=rebalance_simulation_s,
+            router_simulation_s=router_simulation_s,
+            other_simulation_s=max(
+                0.0,
+                time.monotonic()
+                - evaluation_started_s
+                - rebalance_simulation_s
+                - router_simulation_s,
+            ),
+            rebalance_started_s=rebalance_started_s,
+            rebalance_finished_s=rebalance_finished_s,
+            router_started_s=router_started_s,
+            router_finished_s=router_finished_s,
         )
     rm_selector = (
         _RMSelectorHeap(context.snapshot, states)
@@ -843,10 +877,25 @@ def evaluate_role_candidate(
         (instance_id, _instance_throughput(states[instance_id]))
         for instance_id in sorted(states)
     )
+    router_finished_s = time.monotonic()
+    router_simulation_s = router_finished_s - router_started_s
     return RoleEvaluationResult(
         throughput=sum(value for _, value in instance_throughputs),
         routed_count=routed,
         unrouted_count=total_to_route - routed,
         rebalance_moves=moves,
         instance_throughputs=instance_throughputs,
+        rebalance_simulation_s=rebalance_simulation_s,
+        router_simulation_s=router_simulation_s,
+        other_simulation_s=max(
+            0.0,
+            time.monotonic()
+            - evaluation_started_s
+            - rebalance_simulation_s
+            - router_simulation_s,
+        ),
+        rebalance_started_s=rebalance_started_s,
+        rebalance_finished_s=rebalance_finished_s,
+        router_started_s=router_started_s,
+        router_finished_s=router_finished_s,
     )

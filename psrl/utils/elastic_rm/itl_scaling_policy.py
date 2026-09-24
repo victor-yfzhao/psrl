@@ -34,6 +34,10 @@ from typing import Any
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.cost_model_path import load_cost_model_json
 from psrl.utils.deployment_mode import expand_ngpus_per_node
+from psrl.utils.elastic_rm.cpp_candidate_evaluator import (
+    CppCandidateEvaluator,
+    CppCandidateEvaluatorError,
+)
 from psrl.utils.elastic_rm.request_level_candidate_evaluator import (
     RoleCandidatePlan,
     RoleEvaluationResult,
@@ -79,6 +83,22 @@ class _RequestLevelCandidateEvaluationError(RuntimeError):
     """Abort one policy cycle when a snapshot or candidate task is invalid."""
 
 
+def _interval_union_s(intervals: list[tuple[float, float]]) -> float:
+    """Return wall time covered by at least one monotonic-clock interval."""
+    valid = sorted((start, end) for start, end in intervals if end > start)
+    if not valid:
+        return 0.0
+    current_start, current_end = valid[0]
+    total = 0.0
+    for start, end in valid[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = start, end
+    return total + current_end - current_start
+
+
 @dataclass(frozen=True)
 class _RouterWaitingLoad:
     """Router waiting queue prefix load used by the ITL objective."""
@@ -104,6 +124,30 @@ class _WakePrefixPlan:
     pre_sleep: tuple[InstanceSignal, ...]
     pre_wake: tuple[InstanceSignal, ...] = ()
     migration_pairs: tuple[tuple[InstanceSignal, InstanceSignal], ...] = ()
+
+
+@dataclass(frozen=True)
+class _WakeConflictGroup:
+    """Ordered wake group with one deterministic opposite-role conflict set."""
+
+    members: tuple[InstanceSignal, ...]
+    conflicts: tuple[InstanceSignal, ...]
+    conflict_mask: int
+    conflict_phi: float
+    conflict_requests: float
+    scaling_impact: float
+    train_prefix_counts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _WakePlanDPState:
+    """Count-DP state; masks and scalar scores avoid copying signal tuples."""
+
+    conflict_mask: int = 0
+    conflict_phi: float = 0.0
+    conflict_requests: float = 0.0
+    train_count: int = 0
+    path_code: int = 0
 
 
 def compute_itl(params: ITLModelParams, total_token_num: float, running_queue_num: float) -> float:
@@ -237,6 +281,7 @@ def _lookup_params_entry(
 
 def _coerce_params(entry: dict[str, Any]) -> ITLModelParams | None:
     """Parse A/B/C/D or legacy latency field names from a config dict."""
+
     def _get(primary: str, legacy: str | None = None, default: float = 0.0) -> float:
         if primary in entry:
             return float(entry[primary])
@@ -317,7 +362,10 @@ class ITLScalingPolicy(ScalingPolicy):
         self.migrate_time_ewma_alpha = float(itl_cfg.get("migrate_time_ewma_alpha", 0.2))
         self.min_gain = float(itl_cfg.get("min_gain", self.hysteresis))
         self.router_waiting_top_t = int(itl_cfg.get("router_waiting_top_t", 0))
-        self.max_scale_instances_per_action = max(1, int(itl_cfg.get("max_scale_instances_per_action", 1)))
+        raw_max_scale = int(itl_cfg.get("max_scale_instances_per_action", 1))
+        # -1 disables the per-action instance cap; other non-positive values still
+        # clamp to 1 so a misconfigured 0 does not skip candidate enumeration.
+        self.max_scale_instances_per_action = raw_max_scale if raw_max_scale == -1 else max(1, raw_max_scale)
         # Keep the established count-prefix behavior unless heterogeneous placement
         # planning is explicitly enabled. Even when enabled, equal-size roles stay
         # on the legacy path so current deployments preserve candidate ordering.
@@ -333,9 +381,7 @@ class ITLScalingPolicy(ScalingPolicy):
         self.current_state_include_router_waiting = self._normalize_bool(
             itl_cfg.get("current_state_include_router_waiting", True)
         )
-        self.role_throughput_weight_enable = self._normalize_bool(
-            itl_cfg.get("role_throughput_weight_enable", False)
-        )
+        self.role_throughput_weight_enable = self._normalize_bool(itl_cfg.get("role_throughput_weight_enable", False))
         self.role_throughput_weight_basis = self._normalize_role_throughput_weight_basis(
             itl_cfg.get("role_throughput_weight_basis", "request_count")
         )
@@ -348,36 +394,91 @@ class ITLScalingPolicy(ScalingPolicy):
         # degrades the objective to the loaded side's bottleneck throughput and
         # re-flags the loaded role as the capacity bottleneck so the policy can
         # still reallocate capacity toward the side that actually has work.
-        self.starvation_fallback = self._normalize_bool(
-            itl_cfg.get("starvation_fallback", True)
-        )
+        self.starvation_fallback = self._normalize_bool(itl_cfg.get("starvation_fallback", True))
         # The harmonic policy may combine its two reciprocal-throughput terms
         # with max rather than sum. Keep this knob here because both ITL policy
         # variants share the same ``itl_policy`` config block.
-        self.harmonic_denominator_use_max = self._normalize_bool(
-            itl_cfg.get("harmonic_denominator_use_max", False)
-        )
+        self.harmonic_denominator_use_max = self._normalize_bool(itl_cfg.get("harmonic_denominator_use_max", False))
         self.enable_request_level_candidate_evaluation = self._normalize_bool(
             itl_cfg.get("enable_request_level_candidate_evaluation", False)
         )
+        # Executor skips all post-scale-up ABORT when this is false, including the
+        # older ratio-based waiting-queue interrupt used when request-level
+        # evaluation is off.
+        self.rebalance_after_scale_up = self._normalize_bool(itl_cfg.get("rebalance_after_scale_up", True))
         self.candidate_evaluation_max_workers = max(
             1,
             int(itl_cfg.get("candidate_evaluation_max_workers", 8)),
         )
+        self.candidate_evaluation_backend = (
+            str(itl_cfg.get("candidate_evaluation_backend", "python") or "python").strip().lower()
+        )
+        if self.candidate_evaluation_backend not in {"python", "cpp"}:
+            raise ValueError(
+                "itl_policy.candidate_evaluation_backend must be 'python' or 'cpp', "
+                f"got {self.candidate_evaluation_backend!r}"
+            )
+        self.candidate_evaluation_cpp_binary = itl_cfg.get(
+            "candidate_evaluation_cpp_binary",
+            None,
+        )
+        self.candidate_evaluation_cpp_timeout_s = float(itl_cfg.get("candidate_evaluation_cpp_timeout_s", 30.0))
+        if self.candidate_evaluation_cpp_timeout_s <= 0.0:
+            raise ValueError("itl_policy.candidate_evaluation_cpp_timeout_s must be positive")
         self._candidate_evaluation_executor: ThreadPoolExecutor | None = None
+        self._cpp_candidate_evaluator: CppCandidateEvaluator | None = None
+        self.last_planner_breakdown: dict[str, float] = {
+            "state_analysis_s": 0.0,
+            "candidate_ordering_s": 0.0,
+            "candidate_set_construction_s": 0.0,
+            "simulation_input_preparation_s": 0.0,
+            "candidate_evaluation_wall_s": 0.0,
+            "rebalance_simulation_s": 0.0,
+            "router_simulation_s": 0.0,
+            "simulation_wall_s": 0.0,
+            "rebalance_router_overlap_s": 0.0,
+            "candidate_scoring_s": 0.0,
+            "best_candidate_selection_s": 0.0,
+        }
+        self._last_request_level_simulation_timing: dict[str, float] = {
+            "simulation_input_preparation_s": 0.0,
+            "candidate_evaluation_wall_s": 0.0,
+            "rebalance_simulation_s": 0.0,
+            "router_simulation_s": 0.0,
+            "simulation_wall_s": 0.0,
+            "rebalance_router_overlap_s": 0.0,
+            "candidate_scoring_s": 0.0,
+        }
+        self._last_candidate_ordering_s = 0.0
         if self.enable_request_level_candidate_evaluation:
             self._validate_request_level_candidate_evaluation_config()
-            self._candidate_evaluation_executor = ThreadPoolExecutor(
-                max_workers=self.candidate_evaluation_max_workers,
-                thread_name_prefix="itl-candidate-eval",
-            )
+            if self.candidate_evaluation_backend == "python":
+                self._candidate_evaluation_executor = ThreadPoolExecutor(
+                    max_workers=self.candidate_evaluation_max_workers,
+                    thread_name_prefix="itl-candidate-eval",
+                )
+            else:
+                self._cpp_candidate_evaluator = CppCandidateEvaluator(
+                    binary_path=self.candidate_evaluation_cpp_binary,
+                    max_workers=self.candidate_evaluation_max_workers,
+                    timeout_s=self.candidate_evaluation_cpp_timeout_s,
+                )
+
+    def close(self) -> None:
+        """Release candidate-evaluation workers owned by this policy."""
+        executor = self._candidate_evaluation_executor
+        self._candidate_evaluation_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        cpp_evaluator = self._cpp_candidate_evaluator
+        self._cpp_candidate_evaluator = None
+        if cpp_evaluator is not None:
+            cpp_evaluator.close()
 
     def _validate_request_level_candidate_evaluation_config(self) -> None:
         """Reject unsupported mode/strategy combinations at actor startup."""
         if self.router_waiting_top_t == 0:
-            raise ValueError(
-                "request-level candidate evaluation requires itl_policy.router_waiting_top_t != 0"
-            )
+            raise ValueError("request-level candidate evaluation requires itl_policy.router_waiting_top_t != 0")
         rollout_method = _read_nested_config_value(
             self.config,
             "psrl",
@@ -387,8 +488,7 @@ class ITLScalingPolicy(ScalingPolicy):
         )
         if str(rollout_method or "").lower() != "throughput_optimal":
             raise ValueError(
-                "request-level candidate evaluation currently requires rollout routing strategy "
-                "'throughput_optimal'"
+                "request-level candidate evaluation currently requires rollout routing strategy 'throughput_optimal'"
             )
 
         reward_models = _read_nested_config_value(
@@ -754,12 +854,8 @@ class ITLScalingPolicy(ScalingPolicy):
         if not self.role_throughput_weight_enable:
             return min(rollout_tp, rm_tp)
         backlog_map = router_backlog_by_role or {}
-        rollout_waiting = self._normalize_router_waiting_load(
-            backlog_map.get(PSRL_Role.Rollout)
-        )
-        rm_waiting = self._normalize_router_waiting_load(
-            backlog_map.get(PSRL_Role.RewardModel)
-        )
+        rollout_waiting = self._normalize_router_waiting_load(backlog_map.get(PSRL_Role.Rollout))
+        rm_waiting = self._normalize_router_waiting_load(backlog_map.get(PSRL_Role.RewardModel))
         w_rollout, w_rm = self._role_throughput_weights(
             grouped.get(PSRL_Role.Rollout, []),
             grouped.get(PSRL_Role.RewardModel, []),
@@ -825,7 +921,9 @@ class ITLScalingPolicy(ScalingPolicy):
         return [
             s
             for s in other_awake
-            if any(wake.bundle_keys and s.bundle_keys and wake.bundle_keys.intersection(s.bundle_keys) for wake in wakes)
+            if any(
+                wake.bundle_keys and s.bundle_keys and wake.bundle_keys.intersection(s.bundle_keys) for wake in wakes
+            )
         ]
 
     @staticmethod
@@ -967,10 +1065,9 @@ class ITLScalingPolicy(ScalingPolicy):
         rm_n: int,
     ) -> int:
         """Estimate devices occupied by a candidate role-count pair."""
-        return (
-            max(0, int(rollout_n)) * self._role_device_size(rollout_signals)
-            + max(0, int(rm_n)) * self._role_device_size(rm_signals)
-        )
+        return max(0, int(rollout_n)) * self._role_device_size(rollout_signals) + max(
+            0, int(rm_n)
+        ) * self._role_device_size(rm_signals)
 
     def _estimated_instance_throughput(self, signal: InstanceSignal) -> float:
         """Estimate current per-instance throughput for shrink victim ordering."""
@@ -1035,16 +1132,12 @@ class ITLScalingPolicy(ScalingPolicy):
         """Pick same-model wake targets that fit after planned sleeps."""
         if num_instances <= 0:
             return []
-        excluded = {
-            (victim.role_name, victim.model_name, int(victim.instance_id))
-            for victim in sleep_victims
-        }
+        excluded = {(victim.role_name, victim.model_name, int(victim.instance_id)) for victim in sleep_victims}
         awake_after_sleep = [
             signal
             for signals in grouped.values()
             for signal in signals
-            if signal.is_awaken
-            and (signal.role_name, signal.model_name, int(signal.instance_id)) not in excluded
+            if signal.is_awaken and (signal.role_name, signal.model_name, int(signal.instance_id)) not in excluded
         ]
         by_model = ordered_wakeable_by_model
         if by_model is None:
@@ -1071,13 +1164,12 @@ class ITLScalingPolicy(ScalingPolicy):
                 batches.append(batch)
         if not batches:
             return None
+
         # Prefer batches with the fewest train-pool instances (share pool first),
         # then by pool priority and instance id for a stable tie-break.
         def _batch_key(items: list[InstanceSignal]) -> tuple[Any, ...]:
             train_count = sum(1 for it in items if self._pool_wake_priority(it.pool_id))
-            pool_id_keys = [
-                (self._pool_wake_priority(it.pool_id), int(it.instance_id)) for it in items
-            ]
+            pool_id_keys = [(self._pool_wake_priority(it.pool_id), int(it.instance_id)) for it in items]
             return (train_count, *pool_id_keys)
 
         return min(batches, key=_batch_key)
@@ -1114,18 +1206,15 @@ class ITLScalingPolicy(ScalingPolicy):
 
         if num_instances <= 0:
             return [], []
-        excluded = {
-            (victim.role_name, victim.model_name, int(victim.instance_id))
-            for victim in sleep_victims
-        }
+        excluded = {(victim.role_name, victim.model_name, int(victim.instance_id)) for victim in sleep_victims}
         other_awake_after_sleep = [
-            s for s in other_signals
-            if s.is_awaken and (s.role_name, s.model_name, int(s.instance_id)) not in excluded
+            s for s in other_signals if s.is_awaken and (s.role_name, s.model_name, int(s.instance_id)) not in excluded
         ]
         by_model = ordered_wakeable_by_model
         if by_model is None:
             wakeable = [
-                s for s in target_signals
+                s
+                for s in target_signals
                 if self._is_scale_up_available(s) and self._signal_pool_available(s, trainer_waiting_hint)
             ]
             by_model = {}
@@ -1152,9 +1241,7 @@ class ITLScalingPolicy(ScalingPolicy):
                 continue
             batch, conflicts = pick
             train_count = sum(1 for it in batch if self._pool_wake_priority(it.pool_id))
-            pool_id_keys = [
-                (self._pool_wake_priority(it.pool_id), int(it.instance_id)) for it in batch
-            ]
+            pool_id_keys = [(self._pool_wake_priority(it.pool_id), int(it.instance_id)) for it in batch]
             key = (len(conflicts), train_count, pool_id_keys)
             if best_key is None or key < best_key:
                 best = (batch, conflicts)
@@ -1239,6 +1326,8 @@ class ITLScalingPolicy(ScalingPolicy):
         target_signals: list[InstanceSignal],
         other_signals: list[InstanceSignal],
         trainer_waiting_hint: dict[str, Any] | None,
+        ordered_sources: tuple[InstanceSignal, ...] | None = None,
+        ordered_targets_by_shape: dict[tuple[str, int], tuple[InstanceSignal, ...]] | None = None,
     ) -> tuple[tuple[InstanceSignal, InstanceSignal], ...]:
         """Move conflicting opposite-role instances onto currently free equal-size placements."""
         if not wakes or not conflicts:
@@ -1252,38 +1341,66 @@ class ITLScalingPolicy(ScalingPolicy):
         pairs: list[tuple[InstanceSignal, InstanceSignal]] = []
         used_targets: set[tuple[str, str, int]] = set()
 
-        for source in sorted(
-            conflicts,
-            key=lambda item: (
-                item.model_name,
-                len(item.bundle_keys or ()),
-                self._bundle_sort_key(item),
-                int(item.instance_id),
-            ),
-        ):
-            source_size = len(source.bundle_keys or ())
-            candidates = [
-                signal
-                for signal in other_signals
-                if self._is_scale_up_available(signal)
-                and signal.model_name == source.model_name
-                and len(signal.bundle_keys or ()) == source_size
-                and signal.bundle_keys
-                and self._signal_pool_available(signal, trainer_waiting_hint)
-                and self._signal_key(signal) not in used_targets
-                and not signal.bundle_keys.intersection(occupied)
-                and not signal.bundle_keys.intersection(reserved)
-            ]
-            if not candidates:
-                continue
-            target = min(
-                candidates,
+        if ordered_targets_by_shape is None:
+            mutable_targets_by_shape: dict[tuple[str, int], list[InstanceSignal]] = {}
+            for signal in other_signals:
+                if (
+                    self._is_scale_up_available(signal)
+                    and signal.bundle_keys
+                    and self._signal_pool_available(signal, trainer_waiting_hint)
+                ):
+                    mutable_targets_by_shape.setdefault(
+                        (signal.model_name, len(signal.bundle_keys)),
+                        [],
+                    ).append(signal)
+            ordered_targets_by_shape = {
+                shape: tuple(
+                    sorted(
+                        candidates,
+                        key=lambda item: (
+                            self._pool_wake_priority(item.pool_id),
+                            self._bundle_sort_key(item),
+                            int(item.instance_id),
+                        ),
+                    )
+                )
+                for shape, candidates in mutable_targets_by_shape.items()
+            }
+
+        if ordered_sources is None:
+            sources = sorted(
+                conflicts,
                 key=lambda item: (
-                    self._pool_wake_priority(item.pool_id),
+                    item.model_name,
+                    len(item.bundle_keys or ()),
                     self._bundle_sort_key(item),
                     int(item.instance_id),
                 ),
             )
+        else:
+            conflict_keys = {self._signal_key(signal) for signal in conflicts}
+            sources = [signal for signal in ordered_sources if self._signal_key(signal) in conflict_keys]
+
+        target_cursors: dict[tuple[str, int], int] = {}
+        for source in sources:
+            source_size = len(source.bundle_keys or ())
+            shape = (source.model_name, source_size)
+            candidates = ordered_targets_by_shape.get(shape, ())
+            cursor = target_cursors.get(shape, 0)
+            while cursor < len(candidates):
+                target = candidates[cursor]
+                cursor += 1
+                if (
+                    self._signal_key(target) in used_targets
+                    or target.bundle_keys.intersection(occupied)
+                    or target.bundle_keys.intersection(reserved)
+                ):
+                    continue
+                break
+            else:
+                target_cursors[shape] = cursor
+                continue
+            target_cursors[shape] = cursor
             pairs.append((source, target))
             used_targets.add(self._signal_key(target))
             reserved.update(target.bundle_keys or ())
@@ -1300,38 +1417,37 @@ class ITLScalingPolicy(ScalingPolicy):
     ) -> dict[int, _WakePrefixPlan]:
         """Build minimum-Phi plans for each wake count using concrete GPU conflicts.
 
-        Multiple small target instances can share one large opposite-role victim.
-        The dynamic program charges that victim once for the whole selected set,
-        so taking more children from an opened large region has zero marginal Phi.
+        The ordering pass is ``O(N log N)``. For different-size bundles the
+        count DP has one state per reachable wake count and performs bounded
+        group transitions, ``O(N^2)`` in the worst case. Conflict unions are
+        represented by integer masks, so transitions do not copy or sort signal
+        tuples. Plans are materialized once per reachable count, which keeps
+        candidate construction ``O(N^2)`` (and ``O(N)`` for a single count).
         """
         other_awake = [signal for signal in other_signals if signal.is_awaken and not signal.is_training]
+        other_awake.sort(key=lambda item: (self._bundle_sort_key(item), int(item.instance_id)))
         other_by_bundle: dict[tuple[str, int], list[InstanceSignal]] = {}
         for signal in other_awake:
             for bundle_key in signal.bundle_keys or ():
                 other_by_bundle.setdefault(bundle_key, []).append(signal)
 
-        def conflicts_for(signal: InstanceSignal) -> tuple[InstanceSignal, ...]:
-            conflicts: dict[tuple[str, str, int], InstanceSignal] = {}
-            for bundle_key in signal.bundle_keys or ():
-                for other in other_by_bundle.get(bundle_key, ()):
-                    conflicts[self._signal_key(other)] = other
-            return tuple(
-                sorted(
-                    conflicts.values(),
-                    key=lambda item: (self._bundle_sort_key(item), int(item.instance_id)),
-                )
-            )
+        victim_index = {self._signal_key(signal): index for index, signal in enumerate(other_awake)}
+        victim_phi = tuple(self._instance_phi(signal, float(signal.running_queue_num)) for signal in other_awake)
+        victim_requests = tuple(float(signal.running_queue_num) for signal in other_awake)
 
-        def selection_key(
-            wakes: tuple[InstanceSignal, ...],
-            conflicts: tuple[InstanceSignal, ...],
-        ) -> tuple[Any, ...]:
-            return (
-                self._sleep_phi(list(conflicts)),
-                sum(float(item.running_queue_num) for item in conflicts),
-                len(conflicts),
-                sum(1 for item in wakes if self._pool_wake_priority(item.pool_id)),
-                tuple(int(item.instance_id) for item in wakes),
+        def conflicts_for(signal: InstanceSignal) -> tuple[InstanceSignal, ...]:
+            conflict_keys: set[tuple[str, str, int]] = set()
+            for bundle_key in signal.bundle_keys or ():
+                conflict_keys.update(self._signal_key(other) for other in other_by_bundle.get(bundle_key, ()))
+            return tuple(
+                other_awake[victim_index[key]]
+                for key in sorted(
+                    conflict_keys,
+                    key=lambda item: (
+                        self._bundle_sort_key(other_awake[victim_index[item]]),
+                        int(item[2]),
+                    ),
+                )
             )
 
         wakeable_by_model: dict[str, list[InstanceSignal]] = {}
@@ -1341,6 +1457,101 @@ class ITLScalingPolicy(ScalingPolicy):
 
         best_plans: dict[int, _WakePrefixPlan] = {}
         best_plan_keys: dict[int, tuple[Any, ...]] = {}
+        # One extra digit is reserved for the skipped-group choice. Smaller
+        # path codes prefer taking from earlier groups, matching the sorted
+        # wake-up order without copying a wake tuple on every DP transition.
+        max_group_size = max(
+            (len(signals) for signals in wakeable_by_model.values()),
+            default=0,
+        )
+        path_base = max_group_size + 2
+
+        def state_key(state: _WakePlanDPState) -> tuple[Any, ...]:
+            return (
+                state.conflict_phi,
+                state.conflict_requests,
+                state.conflict_mask.bit_count(),
+                state.train_count,
+                state.path_code,
+            )
+
+        def add_conflicts(state: _WakePlanDPState, group: _WakeConflictGroup) -> _WakePlanDPState:
+            new_mask = group.conflict_mask & ~state.conflict_mask
+            added_phi = 0.0
+            added_requests = 0.0
+            while new_mask:
+                bit = new_mask & -new_mask
+                index = bit.bit_length() - 1
+                added_phi += victim_phi[index]
+                added_requests += victim_requests[index]
+                new_mask ^= bit
+            return _WakePlanDPState(
+                conflict_mask=state.conflict_mask | group.conflict_mask,
+                conflict_phi=state.conflict_phi + added_phi,
+                conflict_requests=state.conflict_requests + added_requests,
+                train_count=state.train_count,
+                path_code=state.path_code,
+            )
+
+        def decode_group_takes(path_code: int, group_count: int) -> list[int]:
+            takes = [0] * group_count
+            for index in range(group_count - 1, -1, -1):
+                digit = path_code % path_base
+                takes[index] = path_base - 1 - digit
+                path_code //= path_base
+            return takes
+
+        wake_impact_by_shape: dict[tuple[str, str, int], float] = {}
+
+        def estimated_wake_impact(signal: InstanceSignal) -> float:
+            shape_key = (
+                str(signal.role_name),
+                signal.model_name,
+                len(signal.bundle_keys or ()),
+            )
+            impact = wake_impact_by_shape.get(shape_key)
+            if impact is None:
+                params = self._params_for_signal(signal)
+                impact = 1.0 / compute_itl(params, 0.0, 1.0)
+                wake_impact_by_shape[shape_key] = impact
+            return impact
+
+        ordered_migration_sources = tuple(
+            sorted(
+                other_awake,
+                key=lambda item: (
+                    item.model_name,
+                    len(item.bundle_keys or ()),
+                    self._bundle_sort_key(item),
+                    int(item.instance_id),
+                ),
+            )
+        )
+        mutable_migration_targets: dict[tuple[str, int], list[InstanceSignal]] = {}
+        for signal in other_signals:
+            if (
+                self._is_scale_up_available(signal)
+                and signal.bundle_keys
+                and self._signal_pool_available(signal, trainer_waiting_hint)
+            ):
+                mutable_migration_targets.setdefault(
+                    (signal.model_name, len(signal.bundle_keys)),
+                    [],
+                ).append(signal)
+        ordered_migration_targets = {
+            shape: tuple(
+                sorted(
+                    candidates,
+                    key=lambda item: (
+                        self._pool_wake_priority(item.pool_id),
+                        self._bundle_sort_key(item),
+                        int(item.instance_id),
+                    ),
+                )
+            )
+            for shape, candidates in mutable_migration_targets.items()
+        }
+
         for model_signals in wakeable_by_model.values():
             grouped_members: dict[tuple[tuple[str, str, int], ...], list[InstanceSignal]] = {}
             conflicts_by_group: dict[tuple[tuple[str, str, int], ...], tuple[InstanceSignal, ...]] = {}
@@ -1350,7 +1561,7 @@ class ITLScalingPolicy(ScalingPolicy):
                 grouped_members.setdefault(group_key, []).append(signal)
                 conflicts_by_group[group_key] = conflicts
 
-            groups: list[tuple[tuple[InstanceSignal, ...], tuple[InstanceSignal, ...]]] = []
+            groups: list[_WakeConflictGroup] = []
             for group_key, members in grouped_members.items():
                 ordered_members = tuple(
                     sorted(
@@ -1362,48 +1573,87 @@ class ITLScalingPolicy(ScalingPolicy):
                         ),
                     )
                 )
-                groups.append((ordered_members, conflicts_by_group[group_key]))
+                conflicts = conflicts_by_group[group_key]
+                conflict_mask = 0
+                conflict_phi = 0.0
+                conflict_requests = 0.0
+                for victim in conflicts:
+                    index = victim_index[self._signal_key(victim)]
+                    conflict_mask |= 1 << index
+                    conflict_phi += victim_phi[index]
+                    conflict_requests += victim_requests[index]
+                train_prefix_counts = [0]
+                for member in ordered_members:
+                    train_prefix_counts.append(train_prefix_counts[-1] + self._pool_wake_priority(member.pool_id))
+                groups.append(
+                    _WakeConflictGroup(
+                        members=ordered_members,
+                        conflicts=conflicts,
+                        conflict_mask=conflict_mask,
+                        conflict_phi=conflict_phi,
+                        conflict_requests=conflict_requests,
+                        scaling_impact=sum(estimated_wake_impact(member) for member in ordered_members),
+                        train_prefix_counts=tuple(train_prefix_counts),
+                    )
+                )
+
             groups.sort(
-                key=lambda row: (
-                    self._sleep_phi(list(row[1])),
-                    sum(float(item.running_queue_num) for item in row[1]),
-                    len(row[1]),
-                    self._pool_wake_priority(row[0][0].pool_id),
-                    self._bundle_sort_key(row[0][0]),
+                key=lambda group: (
+                    group.conflict_phi,
+                    group.conflict_requests,
+                    -group.scaling_impact,
+                    len(group.conflicts),
+                    self._pool_wake_priority(group.members[0].pool_id),
+                    self._bundle_sort_key(group.members[0]),
+                    int(group.members[0].instance_id),
                 )
             )
 
-            # count -> (selected wakes, union of opposite-role conflicts)
-            states: dict[int, tuple[tuple[InstanceSignal, ...], tuple[InstanceSignal, ...]]] = {0: ((), ())}
-            for members, group_conflicts in groups:
-                next_states = dict(states)
-                for current_count, (current_wakes, current_conflicts) in states.items():
-                    max_take = min(len(members), max_batch - current_count)
-                    for take in range(1, max_take + 1):
+            # Count -> best state. Each group contributes a prefix of members;
+            # the conflict mask charges a shared victim only once.
+            states: dict[int, _WakePlanDPState] = {0: _WakePlanDPState()}
+            for group in groups:
+                next_states: dict[int, _WakePlanDPState] = {}
+                for current_count, state in states.items():
+                    max_take = min(len(group.members), max_batch - current_count)
+                    opened_state = add_conflicts(state, group)
+                    for take in range(max_take + 1):
                         next_count = current_count + take
-                        next_wakes = current_wakes + members[:take]
-                        conflict_map = {self._signal_key(item): item for item in current_conflicts}
-                        conflict_map.update({self._signal_key(item): item for item in group_conflicts})
-                        next_conflicts = tuple(
-                            sorted(
-                                conflict_map.values(),
-                                key=lambda item: (self._bundle_sort_key(item), int(item.instance_id)),
-                            )
+                        candidate_state = opened_state if take else state
+                        candidate_state = _WakePlanDPState(
+                            conflict_mask=candidate_state.conflict_mask,
+                            conflict_phi=candidate_state.conflict_phi,
+                            conflict_requests=candidate_state.conflict_requests,
+                            train_count=state.train_count + group.train_prefix_counts[take],
+                            path_code=state.path_code * path_base + (path_base - 1 - take),
                         )
                         existing = next_states.get(next_count)
-                        if existing is None or selection_key(next_wakes, next_conflicts) < selection_key(*existing):
-                            next_states[next_count] = (next_wakes, next_conflicts)
+                        if existing is None or state_key(candidate_state) < state_key(existing):
+                            next_states[next_count] = candidate_state
                 states = next_states
 
-            for batch_size, (wakes, conflicts) in states.items():
+            for batch_size, state in states.items():
                 if batch_size <= 0:
                     continue
+                takes = decode_group_takes(state.path_code, len(groups))
+                wakes = tuple(
+                    member for group, take in zip(groups, takes, strict=True) for member in group.members[:take]
+                )
+                # A candidate must be physically feasible for the target role as
+                # well as for the opposite-role eviction set.
+                if not self._bundle_conflict_free(list(wakes)):
+                    continue
+                conflicts = tuple(
+                    other_awake[index] for index in range(len(other_awake)) if state.conflict_mask & (1 << index)
+                )
                 migration_pairs = self._pick_heterogeneous_migration_pairs(
                     wakes=wakes,
                     conflicts=conflicts,
                     target_signals=target_signals,
                     other_signals=other_signals,
                     trainer_waiting_hint=trainer_waiting_hint,
+                    ordered_sources=ordered_migration_sources,
+                    ordered_targets_by_shape=ordered_migration_targets,
                 )
                 if current_other_n - len(conflicts) + len(migration_pairs) < self.min_awake_per_role:
                     continue
@@ -1414,11 +1664,11 @@ class ITLScalingPolicy(ScalingPolicy):
                     migration_pairs=migration_pairs,
                 )
                 key = (
-                    self._sleep_phi(list(plan.pre_sleep)),
+                    state.conflict_phi,
                     -len(plan.pre_wake),
-                    sum(float(item.running_queue_num) for item in plan.pre_sleep),
-                    len(plan.pre_sleep),
-                    sum(1 for item in plan.wakes if self._pool_wake_priority(item.pool_id)),
+                    state.conflict_requests,
+                    state.conflict_mask.bit_count(),
+                    state.train_count,
                     tuple(int(item.instance_id) for item in plan.wakes),
                 )
                 if batch_size not in best_plan_keys or key < best_plan_keys[batch_size]:
@@ -1744,6 +1994,30 @@ class ITLScalingPolicy(ScalingPolicy):
         _ = grouped, router_backlog_by_role
         return {}
 
+    def _effective_max_scale_instances_per_action(
+        self,
+        grouped: dict[PSRL_Role, list[InstanceSignal]],
+    ) -> int:
+        """
+        Return the per-action instance cap used by candidate enumeration.
+
+        ``max_scale_instances_per_action=-1`` disables the cap: the returned
+        value is the largest role instance count so wake/sleep prefixes are
+        bounded only by available instances.
+
+        Args:
+            grouped (dict[PSRL_Role, list[InstanceSignal]]): Current instances
+                keyed by role.
+
+        Returns:
+            int: Positive instance cap to pass into count enumeration and wake
+                prefix planning.
+        """
+        configured = int(self.max_scale_instances_per_action)
+        if configured == -1:
+            return max(1, max((len(signals) for signals in grouped.values()), default=0))
+        return max(1, configured)
+
     def _enumerate_candidates(
         self,
         grouped: dict[PSRL_Role, list[InstanceSignal]],
@@ -1755,6 +2029,7 @@ class ITLScalingPolicy(ScalingPolicy):
         rm_signals = grouped.get(PSRL_Role.RewardModel, [])
         current_rollout_n = sum(1 for s in rollout_signals if s.is_awaken)
         current_rm_n = sum(1 for s in rm_signals if s.is_awaken)
+        candidate_ordering_started_s = time.monotonic()
         _, rollout_victim_order = self._selection_orders_for_role(
             rollout_signals,
             trainer_waiting_hint,
@@ -1763,6 +2038,7 @@ class ITLScalingPolicy(ScalingPolicy):
             rm_signals,
             trainer_waiting_hint,
         )
+        self._last_candidate_ordering_s = time.monotonic() - candidate_ordering_started_s
         victim_orders_by_role = {
             PSRL_Role.Rollout: rollout_victim_order,
             PSRL_Role.RewardModel: rm_victim_order,
@@ -1786,7 +2062,7 @@ class ITLScalingPolicy(ScalingPolicy):
             router_backlog_by_role,
         )
         candidates: list[_ITLCandidate] = []
-        max_batch = max(1, int(self.max_scale_instances_per_action))
+        max_batch = self._effective_max_scale_instances_per_action(grouped)
         # Pressure-weighted per-role bottleneck metric: tp / w. The side carrying
         # more router/instance pressure gets a larger divisor, shrinking its
         # throughput so it is more likely to be flagged as the bottleneck. When
@@ -1795,14 +2071,12 @@ class ITLScalingPolicy(ScalingPolicy):
         # Bottleneck weights always reflect the full per-role pressure
         # (in-instance load + router backlog), independent of
         # ``current_state_include_router_waiting``. That keeps the divisor
-        #口径 consistent with ``_system_throughput``'s weight, so the side
+        # 口径 consistent with ``_system_throughput``'s weight, so the side
         # carrying more router backlog is still flagged as the bottleneck even
         # when current-state throughput estimates exclude router waiting.
         rollout_waiting = self._normalize_router_waiting_load(backlog_map.get(PSRL_Role.Rollout))
         rm_waiting = self._normalize_router_waiting_load(backlog_map.get(PSRL_Role.RewardModel))
-        w_rollout, w_rm = self._role_throughput_weights(
-            rollout_signals, rm_signals, rollout_waiting, rm_waiting
-        )
+        w_rollout, w_rm = self._role_throughput_weights(rollout_signals, rm_signals, rollout_waiting, rm_waiting)
         rollout_bottleneck = (
             role_throughputs[PSRL_Role.Rollout] / w_rollout if w_rollout > 0.0 else role_throughputs[PSRL_Role.Rollout]
         )
@@ -1944,29 +2218,20 @@ class ITLScalingPolicy(ScalingPolicy):
         role_signals: list[InstanceSignal],
     ) -> RoleSnapshot:
         if raw_snapshot is None or isinstance(raw_snapshot, Exception):
-            raise _RequestLevelCandidateEvaluationError(
-                f"missing request-level snapshot for {role_name.name}"
-            )
+            raise _RequestLevelCandidateEvaluationError(f"missing request-level snapshot for {role_name.name}")
         try:
             snapshot = (
-                raw_snapshot
-                if isinstance(raw_snapshot, RoleSnapshot)
-                else RoleSnapshot.from_mapping(raw_snapshot)
+                raw_snapshot if isinstance(raw_snapshot, RoleSnapshot) else RoleSnapshot.from_mapping(raw_snapshot)
             )
         except Exception as exc:
             raise _RequestLevelCandidateEvaluationError(
                 f"invalid request-level snapshot for {role_name.name}: {exc}"
             ) from exc
 
-        expected_strategy = (
-            "throughput_optimal"
-            if role_name == PSRL_Role.Rollout
-            else "itl"
-        )
+        expected_strategy = "throughput_optimal" if role_name == PSRL_Role.Rollout else "itl"
         if snapshot.strategy != expected_strategy:
             raise _RequestLevelCandidateEvaluationError(
-                f"snapshot strategy for {role_name.name} is {snapshot.strategy!r}, "
-                f"expected {expected_strategy!r}"
+                f"snapshot strategy for {role_name.name} is {snapshot.strategy!r}, expected {expected_strategy!r}"
             )
         signal_by_id = {int(signal.instance_id): signal for signal in role_signals}
         prepared_instances = []
@@ -1985,9 +2250,7 @@ class ITLScalingPolicy(ScalingPolicy):
                 )
             )
         if set(signal_by_id) != {instance.instance_id for instance in prepared_instances}:
-            missing = sorted(
-                set(signal_by_id) - {instance.instance_id for instance in prepared_instances}
-            )
+            missing = sorted(set(signal_by_id) - {instance.instance_id for instance in prepared_instances})
             raise _RequestLevelCandidateEvaluationError(
                 f"request-level snapshot for {role_name.name} is missing instances {missing}"
             )
@@ -2008,11 +2271,15 @@ class ITLScalingPolicy(ScalingPolicy):
     ) -> float:
         """Replace legacy candidate scores using one immutable snapshot baseline."""
         evaluation_started_s = time.monotonic()
-        executor = self._candidate_evaluation_executor
-        if executor is None:
-            raise _RequestLevelCandidateEvaluationError(
-                "request-level candidate executor was not initialized"
-            )
+        self._last_request_level_simulation_timing = {
+            "simulation_input_preparation_s": 0.0,
+            "candidate_evaluation_wall_s": 0.0,
+            "rebalance_simulation_s": 0.0,
+            "router_simulation_s": 0.0,
+            "simulation_wall_s": 0.0,
+            "rebalance_router_overlap_s": 0.0,
+            "candidate_scoring_s": 0.0,
+        }
         snapshots = {
             role_name: self._prepare_request_level_snapshot(
                 role_name=role_name,
@@ -2024,127 +2291,193 @@ class ITLScalingPolicy(ScalingPolicy):
             )
             for role_name in (PSRL_Role.Rollout, PSRL_Role.RewardModel)
         }
-
-        try:
-            contexts = {
-                role_name: prepare_role_evaluation_context(snapshot)
-                for role_name, snapshot in snapshots.items()
-            }
-        except Exception as exc:
-            raise _RequestLevelCandidateEvaluationError(
-                f"failed to prepare request-level evaluation context: {exc}"
-            ) from exc
-
-        plan_futures: dict[
-            tuple[PSRL_Role, RoleCandidatePlan],
-            Future,
-        ] = {}
-        plan_labels: dict[
-            tuple[PSRL_Role, RoleCandidatePlan],
-            tuple[str, int | None],
-        ] = {}
-
-        def submit_once(
-            role_name: PSRL_Role,
-            plan: RoleCandidatePlan,
-            *,
-            kind: str,
-            index: int | None,
-        ) -> tuple[PSRL_Role, RoleCandidatePlan]:
-            key = (role_name, plan)
-            if key not in plan_futures:
-                plan_futures[key] = executor.submit(
-                    evaluate_role_candidate,
-                    contexts[role_name],
-                    plan,
-                )
-                plan_labels[key] = (kind, index)
-            return key
-
-        baseline_plan = RoleCandidatePlan()
-        baseline_keys = {
-            role_name: submit_once(
-                role_name,
-                baseline_plan,
-                kind="baseline",
-                index=None,
-            )
-            for role_name in contexts
-        }
-
-        candidate_plan_keys: list[
-            dict[PSRL_Role, tuple[PSRL_Role, RoleCandidatePlan]]
-        ] = []
+        candidate_plans: list[dict[PSRL_Role, RoleCandidatePlan]] = []
         for index, candidate in enumerate(candidates):
             wake_by_role, sleep_by_role = self._candidate_wake_sleep_by_role(candidate)
-            role_keys: dict[PSRL_Role, tuple[PSRL_Role, RoleCandidatePlan]] = {}
-            for role_name in contexts:
-                plan = RoleCandidatePlan(
-                    wake_instance_ids=frozenset(wake_by_role.get(role_name, set())),
-                    sleep_instance_ids=frozenset(sleep_by_role.get(role_name, set())),
-                    primary_scale_up=(
-                        candidate.action.action_type == "scale_up"
-                        and candidate.action.role_name == role_name
+            candidate_plans.append(
+                {
+                    role_name: RoleCandidatePlan(
+                        wake_instance_ids=frozenset(wake_by_role.get(role_name, set())),
+                        sleep_instance_ids=frozenset(sleep_by_role.get(role_name, set())),
+                        primary_scale_up=(
+                            candidate.action.action_type == "scale_up" and candidate.action.role_name == role_name
+                        ),
+                    )
+                    for role_name in snapshots
+                }
+            )
+
+        logical_task_count = 2 * (len(candidates) + 1)
+        task_count = logical_task_count
+        deduplicated_task_count = 0
+        timing_semantics = "direct_stage_wall_union"
+        candidate_scoring_started_s: float | None = None
+
+        if self.candidate_evaluation_backend == "cpp":
+            cpp_evaluator = self._cpp_candidate_evaluator
+            if cpp_evaluator is None:
+                raise CppCandidateEvaluatorError(
+                    "C++ request-level candidate evaluator was not initialized"
+                )
+            cpp_started_s = time.monotonic()
+            batch = cpp_evaluator.evaluate(
+                snapshots={role_name.name: snapshot for role_name, snapshot in snapshots.items()},
+                candidate_plans=[
+                    {role_name.name: plan for role_name, plan in plans.items()} for plans in candidate_plans
+                ],
+            )
+            cpp_backend_wall_s = time.monotonic() - cpp_started_s
+            self._last_request_level_simulation_timing.update(
+                {
+                    "simulation_input_preparation_s": (
+                        cpp_started_s
+                        - evaluation_started_s
+                        + max(0.0, cpp_backend_wall_s - batch.evaluation_wall_s)
                     ),
+                    "candidate_evaluation_wall_s": batch.evaluation_wall_s,
+                    "rebalance_simulation_s": batch.rebalance_simulation_s,
+                    "router_simulation_s": batch.router_simulation_s,
+                    "simulation_wall_s": batch.simulation_wall_s,
+                    "rebalance_router_overlap_s": batch.rebalance_router_overlap_s,
+                }
+            )
+            candidate_scoring_started_s = time.monotonic()
+            baseline_results = {PSRL_Role[role_name]: result for role_name, result in batch.baseline_results.items()}
+            candidate_results = [
+                {PSRL_Role[role_name]: result for role_name, result in results.items()}
+                for results in batch.candidate_results
+            ]
+            logical_task_count = batch.logical_task_count
+            task_count = batch.unique_task_count
+            deduplicated_task_count = batch.deduplicated_task_count
+        else:
+            executor = self._candidate_evaluation_executor
+            if executor is None:
+                raise _RequestLevelCandidateEvaluationError(
+                    "Python request-level candidate executor was not initialized"
                 )
-                role_keys[role_name] = submit_once(
+            try:
+                contexts = {
+                    role_name: prepare_role_evaluation_context(snapshot) for role_name, snapshot in snapshots.items()
+                }
+            except Exception as exc:
+                raise _RequestLevelCandidateEvaluationError(
+                    f"failed to prepare request-level evaluation context: {exc}"
+                ) from exc
+
+            simulation_started_s = time.monotonic()
+            self._last_request_level_simulation_timing.update(
+                {"simulation_input_preparation_s": simulation_started_s - evaluation_started_s}
+            )
+            plan_futures: dict[
+                tuple[PSRL_Role, RoleCandidatePlan],
+                Future,
+            ] = {}
+            plan_labels: dict[
+                tuple[PSRL_Role, RoleCandidatePlan],
+                tuple[str, int | None],
+            ] = {}
+
+            def submit_once(
+                role_name: PSRL_Role,
+                plan: RoleCandidatePlan,
+                *,
+                kind: str,
+                index: int | None,
+            ) -> tuple[PSRL_Role, RoleCandidatePlan]:
+                key = (role_name, plan)
+                if key not in plan_futures:
+                    plan_futures[key] = executor.submit(
+                        evaluate_role_candidate,
+                        contexts[role_name],
+                        plan,
+                    )
+                    plan_labels[key] = (kind, index)
+                return key
+
+            baseline_plan = RoleCandidatePlan()
+            baseline_keys = {
+                role_name: submit_once(
                     role_name,
-                    plan,
-                    kind="candidate",
-                    index=index,
+                    baseline_plan,
+                    kind="baseline",
+                    index=None,
                 )
-            candidate_plan_keys.append(role_keys)
-
-        results_by_plan: dict[
-            tuple[PSRL_Role, RoleCandidatePlan],
-            RoleEvaluationResult,
-        ] = {}
-        try:
-            for key, future in plan_futures.items():
-                role_name, _ = key
-                kind, index = plan_labels[key]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"kind={kind} candidate={index} role={role_name.name}: {exc}"
-                    ) from exc
-                results_by_plan[key] = result
-        except Exception as exc:
-            for future in plan_futures.values():
-                future.cancel()
-            raise _RequestLevelCandidateEvaluationError(
-                f"candidate-role evaluation failed: {exc}"
-            ) from exc
-
-        baseline_results = {
-            role_name: results_by_plan[key]
-            for role_name, key in baseline_keys.items()
-        }
-        candidate_results = [
-            {
-                role_name: results_by_plan[key]
-                for role_name, key in role_keys.items()
+                for role_name in contexts
             }
-            for role_keys in candidate_plan_keys
-        ]
+            candidate_plan_keys = [
+                {
+                    role_name: submit_once(
+                        role_name,
+                        plans[role_name],
+                        kind="candidate",
+                        index=index,
+                    )
+                    for role_name in contexts
+                }
+                for index, plans in enumerate(candidate_plans)
+            ]
+
+            results_by_plan: dict[
+                tuple[PSRL_Role, RoleCandidatePlan],
+                RoleEvaluationResult,
+            ] = {}
+            try:
+                for key, future in plan_futures.items():
+                    role_name, _ = key
+                    kind, index = plan_labels[key]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        raise RuntimeError(f"kind={kind} candidate={index} role={role_name.name}: {exc}") from exc
+                    results_by_plan[key] = result
+            except Exception as exc:
+                for future in plan_futures.values():
+                    future.cancel()
+                raise _RequestLevelCandidateEvaluationError(f"candidate-role evaluation failed: {exc}") from exc
+            simulation_elapsed_s = time.monotonic() - simulation_started_s
+            rebalance_intervals = [
+                (result.rebalance_started_s, result.rebalance_finished_s)
+                for result in results_by_plan.values()
+                if result.rebalance_started_s is not None and result.rebalance_finished_s is not None
+            ]
+            router_intervals = [
+                (result.router_started_s, result.router_finished_s)
+                for result in results_by_plan.values()
+                if result.router_started_s is not None and result.router_finished_s is not None
+            ]
+            rebalance_wall_s = _interval_union_s(rebalance_intervals)
+            router_wall_s = _interval_union_s(router_intervals)
+            simulation_wall_s = _interval_union_s(rebalance_intervals + router_intervals)
+            self._last_request_level_simulation_timing.update(
+                {
+                    "candidate_evaluation_wall_s": simulation_elapsed_s,
+                    "rebalance_simulation_s": rebalance_wall_s,
+                    "router_simulation_s": router_wall_s,
+                    "simulation_wall_s": simulation_wall_s,
+                    "rebalance_router_overlap_s": max(
+                        0.0,
+                        rebalance_wall_s + router_wall_s - simulation_wall_s,
+                    ),
+                }
+            )
+
+            candidate_scoring_started_s = time.monotonic()
+            baseline_results = {role_name: results_by_plan[key] for role_name, key in baseline_keys.items()}
+            candidate_results = [
+                {role_name: results_by_plan[key] for role_name, key in role_keys.items()}
+                for role_keys in candidate_plan_keys
+            ]
+            task_count = len(plan_futures)
+            deduplicated_task_count = logical_task_count - task_count
+
+        if candidate_scoring_started_s is None:
+            candidate_scoring_started_s = time.monotonic()
         expected_roles = {PSRL_Role.Rollout, PSRL_Role.RewardModel}
         if set(baseline_results) != expected_roles or any(
             set(results) != expected_roles for results in candidate_results
         ):
-            raise _RequestLevelCandidateEvaluationError(
-                "candidate-role evaluation returned an incomplete result set"
-            )
-
-        self._policy_log(
-            "request_level_candidate_evaluation",
-            candidates=len(candidates),
-            logical_tasks=2 * (len(candidates) + 1),
-            tasks=len(plan_futures),
-            deduplicated_tasks=2 * (len(candidates) + 1) - len(plan_futures),
-            max_workers=self.candidate_evaluation_max_workers,
-            elapsed_s=f"{time.monotonic() - evaluation_started_s:.6f}",
-        )
+            raise _RequestLevelCandidateEvaluationError("candidate-role evaluation returned an incomplete result set")
 
         baseline_throughput = self._combine_request_level_role_throughputs(
             grouped,
@@ -2178,6 +2511,33 @@ class ITLScalingPolicy(ScalingPolicy):
                 candidate.action.planned_request_migrations = [
                     move.as_dict() for move in primary_result.rebalance_moves
                 ]
+        self._last_request_level_simulation_timing["candidate_scoring_s"] = (
+            time.monotonic() - candidate_scoring_started_s
+        )
+        self._policy_log(
+            "request_level_candidate_evaluation",
+            backend=self.candidate_evaluation_backend,
+            candidates=len(candidates),
+            logical_tasks=logical_task_count,
+            tasks=task_count,
+            deduplicated_tasks=deduplicated_task_count,
+            max_workers=self.candidate_evaluation_max_workers,
+            elapsed_s=f"{time.monotonic() - evaluation_started_s:.6f}",
+            simulation_input_preparation_s=(
+                f"{self._last_request_level_simulation_timing['simulation_input_preparation_s']:.6f}"
+            ),
+            candidate_evaluation_wall_s=(
+                f"{self._last_request_level_simulation_timing['candidate_evaluation_wall_s']:.6f}"
+            ),
+            rebalance_simulation_s=f"{self._last_request_level_simulation_timing['rebalance_simulation_s']:.6f}",
+            router_simulation_s=f"{self._last_request_level_simulation_timing['router_simulation_s']:.6f}",
+            simulation_wall_s=f"{self._last_request_level_simulation_timing['simulation_wall_s']:.6f}",
+            rebalance_router_overlap_s=(
+                f"{self._last_request_level_simulation_timing['rebalance_router_overlap_s']:.6f}"
+            ),
+            candidate_scoring_s=f"{self._last_request_level_simulation_timing['candidate_scoring_s']:.6f}",
+            timing_semantics=timing_semantics,
+        )
         return baseline_throughput
 
     @staticmethod
@@ -2187,9 +2547,7 @@ class ITLScalingPolicy(ScalingPolicy):
             return "inf"
         return f"{value:.6f}"
 
-    def _instance_throughput_from_load(
-        self, signal: InstanceSignal, request_load: float, token_load: float
-    ) -> float:
+    def _instance_throughput_from_load(self, signal: InstanceSignal, request_load: float, token_load: float) -> float:
         """Estimate one instance's throughput from a hypothetical request/token load."""
         if request_load <= 0.0:
             return self._idle_instance_throughput()
@@ -2385,9 +2743,7 @@ class ITLScalingPolicy(ScalingPolicy):
                 label = "rollout" if role_name == PSRL_Role.Rollout else "rm"
                 cycle_log.kv(
                     **{
-                        f"{label}_request_level_tp": self._format_throughput_value(
-                            result.throughput
-                        ),
+                        f"{label}_request_level_tp": self._format_throughput_value(result.throughput),
                         f"{label}_routed": result.routed_count,
                         f"{label}_unrouted": result.unrouted_count,
                         f"{label}_rebalance_planned": len(result.rebalance_moves),
@@ -2431,6 +2787,21 @@ class ITLScalingPolicy(ScalingPolicy):
     ) -> ScalingDecision:
         """Pick the scale action with highest ``gain_l`` if it exceeds ``min_gain``."""
         _ = pending_scale_up_by_role
+        self.last_planner_breakdown = {
+            "state_analysis_s": 0.0,
+            "candidate_ordering_s": 0.0,
+            "candidate_set_construction_s": 0.0,
+            "simulation_input_preparation_s": 0.0,
+            "candidate_evaluation_wall_s": 0.0,
+            "rebalance_simulation_s": 0.0,
+            "router_simulation_s": 0.0,
+            "simulation_wall_s": 0.0,
+            "rebalance_router_overlap_s": 0.0,
+            "candidate_scoring_s": 0.0,
+            "best_candidate_selection_s": 0.0,
+        }
+        self._last_candidate_ordering_s = 0.0
+        state_analysis_started_s = time.monotonic()
         cy = self._cycle_log
         cy.start()
         cy.section("inputs")
@@ -2443,7 +2814,9 @@ class ITLScalingPolicy(ScalingPolicy):
             return ScalingDecision(actions=[], reason="empty_signals", estimated_lambda=0.0, role_to_total_mu={})
         if execution_in_progress:
             self._finish_cycle("skipped", "decision_execution_in_progress")
-            return ScalingDecision(actions=[], reason="decision_execution_in_progress", estimated_lambda=0.0, role_to_total_mu={})
+            return ScalingDecision(
+                actions=[], reason="decision_execution_in_progress", estimated_lambda=0.0, role_to_total_mu={}
+            )
         grouped = self._group_by_role(signals)
         _, role_total_mu, _ = self._build_mu_maps(signals)
         estimated_lambda = self._estimate_lambda(signals, role_total_mu)
@@ -2456,11 +2829,26 @@ class ITLScalingPolicy(ScalingPolicy):
         backlog_positive = self._router_backlog_positive(router_backlog_by_role)
         if all_stale and not backlog_positive:
             self._finish_cycle("skipped", "all_signals_stale", stale_count=stale_count)
-            return ScalingDecision(actions=[], reason="all_signals_stale", estimated_lambda=estimated_lambda, role_to_total_mu=role_total_mu)
+            return ScalingDecision(
+                actions=[],
+                reason="all_signals_stale",
+                estimated_lambda=estimated_lambda,
+                role_to_total_mu=role_total_mu,
+            )
         if all_stale and backlog_positive:
-            cy.note("all instance snapshots are stale, but router backlog is positive; continuing for backlog-driven wake")
+            cy.note(
+                "all instance snapshots are stale, but router backlog is positive; continuing for backlog-driven wake"
+            )
 
+        self.last_planner_breakdown["state_analysis_s"] = time.monotonic() - state_analysis_started_s
+        candidate_construction_started_s = time.monotonic()
         candidates = self._enumerate_candidates(grouped, router_backlog_by_role, trainer_waiting_hint)
+        candidate_construction_elapsed_s = time.monotonic() - candidate_construction_started_s
+        self.last_planner_breakdown["candidate_ordering_s"] = self._last_candidate_ordering_s
+        self.last_planner_breakdown["candidate_set_construction_s"] = max(
+            0.0,
+            candidate_construction_elapsed_s - self._last_candidate_ordering_s,
+        )
         request_level_current_throughput: float | None = None
         if self.enable_request_level_candidate_evaluation:
             try:
@@ -2470,6 +2858,20 @@ class ITLScalingPolicy(ScalingPolicy):
                     router_backlog_by_role=router_backlog_by_role,
                     request_level_snapshots_by_role=request_level_snapshots_by_role,
                 )
+                self.last_planner_breakdown.update(self._last_request_level_simulation_timing)
+            except CppCandidateEvaluatorError as exc:
+                cy.section("request_level_candidate_evaluation")
+                cy.kv(
+                    enabled=True,
+                    status="fatal",
+                    error=str(exc),
+                )
+                self._finish_cycle(
+                    "error",
+                    "cpp_candidate_evaluator_failed",
+                    error=str(exc),
+                )
+                raise
             except _RequestLevelCandidateEvaluationError as exc:
                 cy.section("request_level_candidate_evaluation")
                 cy.kv(
@@ -2488,8 +2890,12 @@ class ITLScalingPolicy(ScalingPolicy):
                     estimated_lambda=estimated_lambda,
                     role_to_total_mu=role_total_mu,
                 )
+        best_candidate_selection_started_s = time.monotonic()
         candidates.sort(key=lambda item: item.gain_l, reverse=True)
         best = candidates[0] if candidates else None
+        self.last_planner_breakdown["best_candidate_selection_s"] = (
+            time.monotonic() - best_candidate_selection_started_s
+        )
         current_rollout_n = sum(1 for s in grouped.get(PSRL_Role.Rollout, []) if s.is_awaken)
         current_rm_n = sum(1 for s in grouped.get(PSRL_Role.RewardModel, []) if s.is_awaken)
         # Same objective-aware path used inside ``_enumerate_candidates`` so the
@@ -2542,14 +2948,19 @@ class ITLScalingPolicy(ScalingPolicy):
         cy.kv(system_throughput=self._format_throughput_value(current_throughput))
         cy.section("candidates")
         for index, candidate in enumerate(candidates):
-            self._log_candidate_state(
-                cy, index, candidate, rollout_signals, rm_signals, rollout_backlog, rm_backlog
-            )
+            self._log_candidate_state(cy, index, candidate, rollout_signals, rm_signals, rollout_backlog, rm_backlog)
 
         cy.section("itl_decision")
         if best is None:
-            self._finish_cycle("no_action", "itl_no_feasible_candidate", current_throughput=f"{current_throughput:.8f}")
-            return ScalingDecision(actions=[], reason="itl_no_feasible_candidate", estimated_lambda=estimated_lambda, role_to_total_mu=role_total_mu)
+            self._finish_cycle(
+                "no_action", "itl_no_feasible_candidate", current_throughput=f"{current_throughput:.8f}"
+            )
+            return ScalingDecision(
+                actions=[],
+                reason="itl_no_feasible_candidate",
+                estimated_lambda=estimated_lambda,
+                role_to_total_mu=role_total_mu,
+            )
         cy.kv(
             best_action=best.action.action_type,
             best_role=best.action.role_name.name,
@@ -2573,7 +2984,12 @@ class ITLScalingPolicy(ScalingPolicy):
                 best_L=f"{best.gain_l:.8f}",
                 min_gain=f"{self.min_gain:.8f}",
             )
-            return ScalingDecision(actions=[], reason="itl_gain_below_min_gain", estimated_lambda=estimated_lambda, role_to_total_mu=role_total_mu)
+            return ScalingDecision(
+                actions=[],
+                reason="itl_gain_below_min_gain",
+                estimated_lambda=estimated_lambda,
+                role_to_total_mu=role_total_mu,
+            )
         self.last_action_time_ms = now_ms
         reason = f"itl_best_{best.action.action_type}_{best.action.role_name.name}"
         best.action.reason = reason

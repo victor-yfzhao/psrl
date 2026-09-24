@@ -52,6 +52,11 @@ log_prob:
   # Whether to return logprobs from rollout engines
   enable_rollout_engine_log_prob: True
 
+  # On a partial-rollout continuation, replace the saved response logprobs
+  # with the values recomputed by the reprefill instead of appending a second
+  # copy of the prefix. Disabled by default for backward compatibility.
+  update_reprefill_log_probs: False
+
 # Worker deployment and resource allocation
 deployment:
 
@@ -71,6 +76,14 @@ deployment:
   # null (default) preserves backward compatibility: mode is inferred from
   # elastic_rm.enable / colocate.
   mode: null
+
+  # Experimental disaggregated-rollout interruption. When enabled together
+  # with mode=disaggregated, all in-flight rollout requests are interrupted at
+  # this interval and sent through the normal partial-rollout router again.
+  # Validation requests are excluded by the router.
+  disaggregated_rollout_interrupt:
+    enable: False
+    interval_s: 0.0
 
   # ---- Launch presets (override on the command line, e.g. psrl.deployment.mode=colocated) ----
   # Mode 1 (disaggregated):  psrl.deployment.mode=disaggregated
@@ -121,7 +134,15 @@ deployment:
     # - itl: use ITLScalingPolicy (optimizes ITL/F/L objective, bottleneck throughput)
     # - itl_harmonic: use ITLHarmonicScalingPolicy (same as itl but optimizes the
     #   weighted harmonic mean of Rollout/RM throughput instead of the bottleneck min)
+    # - rule_based: use KV-cache high/low thresholds; expand only onto idle devices,
+    #   route requests back through the router on shrink, and do no post-expand rebalance
     scaling_policy_variant: normal
+
+    # Non-preemptive KV-cache rule-based policy parameters. These default to the
+    # common thresholds below but can be tuned independently for this policy.
+    rule_based_policy:
+      scale_up_threshold: ${psrl.deployment.elastic_rm.theta_max}
+      scale_down_threshold: ${psrl.deployment.elastic_rm.theta_low}
 
     # ITL/F/L policy parameters. A/B/C/D follow:
     #   ITL = A * total_token_num + max(B, C * running_queue_num) + D
@@ -134,8 +155,23 @@ deployment:
       min_gain: ${psrl.deployment.elastic_rm.hysteresis}
       # Experimental request-snapshot evaluator. False preserves candidate
       # scoring and the existing post-scale-up rebalance path byte-for-byte.
-      enable_request_level_candidate_evaluation: false
+      enable_request_level_candidate_evaluation: true
+      # Skip all post-scale-up ABORT when false, including the older ratio-based
+      # waiting-queue interrupt used when request-level evaluation is off.
+      rebalance_after_scale_up: true
+      # When enabled, pause normal router dispatch while a request-level
+      # rebalance is active. Interrupted requests are redispatched FIFO to the
+      # destinations chosen by candidate simulation, bypassing normal routing
+      # admission and ranking rules.
+      exclusive_rebalance_migration_queue: false
       candidate_evaluation_max_workers: 64
+      # Candidate simulation implementation: python or cpp. The C++ backend
+      # keeps one JSONL evaluator process alive for the policy lifetime.
+      candidate_evaluation_backend: python
+      # null resolves to build/elastic_simulator/elastic_simulator under the
+      # repository root. An explicit path may be used for packaged binaries.
+      candidate_evaluation_cpp_binary: null
+      candidate_evaluation_cpp_timeout_s: 30.0
       # For itl_harmonic only: false uses the standard sum denominator;
       # true uses max(w_rollout / rollout_tp, w_rm / rm_tp).
       harmonic_denominator_use_max: false
@@ -149,7 +185,8 @@ deployment:
       vllm_current_queue_scope: running
       # Max number of same-role instances a single ITL decision may wake or sleep.
       # 1 keeps the original one-step candidate search.
-      max_scale_instances_per_action: 32
+      # -1 disables the per-action cap (still bounded by available instances).
+      max_scale_instances_per_action: -1
       # Enable GPU-bundle-aware wake plans when rollout and RM replicas use
       # different power-of-two parallel sizes. Equal-size roles retain the
       # established count-prefix candidate path even when this is true.
@@ -254,10 +291,8 @@ deployment:
     post_scale_up_rebalance_request_weight: 0.6
     post_scale_up_rebalance_length_weight: 0.4
 
-    # When ITL uses only vLLM running for current throughput estimates, optionally
-    # keep vLLM waiting queues visible to the router by periodically ABORTing
-    # waiting-only uids from coordinators. The router will requeue interrupted
-    # requests through its existing retry/partial-rollout path.
+    # Periodically ABORT waiting-only uids so the router can see them. Independent
+    # of scaling_policy_variant. False keeps the vLLM-scheduler-only path.
     interrupt_vllm_waiting_when_running_only: true
     interrupt_vllm_waiting_interval_s: 2.0
     interrupt_vllm_waiting_ratio: 1.0
@@ -389,6 +424,11 @@ partial_rollout:
   # Whether view interrupted trajectories as new prompts
   interrupt_as_prompt: False
 
+  # Emit request-level version and sequence-boundary audit events.  This is
+  # intended for elastic partial-rollout diagnosis and is disabled by default.
+  trace:
+    enable: true
+
 # Rollout routing strategy config
 routing_strategy:
 
@@ -518,11 +558,32 @@ nixl:
   # Server port
   server_port: 23456
 
+  # Bound concurrent metadata/communication-plan notifications because each payload can be large.
+  metadata_broadcast_max_workers: 8
+
+  # Covers server-side info collection, communication planning, and metadata distribution.
+  metadata_server_info_timeout_s: 1200
+
   # Pinned temp memory slots num for non-contiguous transfer
   max_pinned_temp_memory_slots: 64
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+  # Versioned diagnostics for locating model-content divergence across NIXL
+  # transfers and trainer sleep/wake restoration. Sampled fingerprints read a
+  # fixed set of positions from every logical tensor; full fingerprints hash
+  # every byte and should be enabled only at a low frequency for large models.
+  weight_verification:
+    enable: false
+    transfer_chain: true
+    trainer_sleep_wake: true
+    sample_every_n_versions: 1
+    full_every_n_versions: 0
+    sample_count_per_tensor: 16
+    full_hash_chunk_bytes: 67108864
+    include_tensor_digests: true
+    fail_on_mismatch: false
 
   # Pack model weight storages into a small number of real CUDA allocations.
   # NIXL still transfers one logical descriptor per model tensor.
@@ -530,13 +591,27 @@ nixl:
     actor_enabled: true
     rollout_enabled: true
     reward_enabled: true
+    # node_shared builds distinct topology ranks concurrently from lazy
+    # safetensors mappings, then stores one final arena shard per topology rank
+    # in node-local memory; duplicate instances map the same physical pages.
+    # process_local retains the anonymous CPU mirror as a rollback option.
+    reward_cpu_cache_mode: node_shared
+    reward_node_cache_dir: /dev/shm/psrl-rm-weight-cache
+    # auto uses one tmpfs arena when the whole node has room, otherwise one
+    # sealed DRAM-backed memfd arena shared through the node-local broker.
+    reward_node_cache_backend: auto
+    # Keep enough tmpfs headroom for the 128 GiB Plasma cap plus 64 GiB of
+    # runtime communication buffers; otherwise auto selects memfd before writing.
+    reward_node_cache_shm_reserve_gb: 192
+    reward_node_cache_memfd_reserve_gb: 256
+    reward_node_cache_wait_timeout_s: 1800
     reward_cpu_cache_pin_memory: false
     # direct writes the initial weights into their final arena allocation;
     # repack retains the previous load-then-copy implementation for rollback.
     actor_materialization: direct
     rollout_materialization: direct
-    reward_materialization: direct
-    max_chunk_bytes: 4294967296
+    reward_materialization: repack
+    max_chunk_gb: 16
     alignment_bytes: 256
 
 # Post processor for group requests in streaming mode

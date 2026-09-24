@@ -39,6 +39,71 @@ def _extract_problem(extra_info: dict, raw_prompt, fallback: str) -> str:
     return fallback
 
 
+def tokenize_rm_chat_prompt(
+    tokenizer,
+    messages: list[dict],
+    *,
+    add_generation_prompt: bool,
+    max_length: int,
+):
+    """
+    Tokenize a gen-RM chat prompt and left-truncate to ``max_length``.
+
+    HuggingFace ``truncation=True`` without ``max_length`` uses
+    ``tokenizer.model_max_length`` (128000 for GLM-Z1), so it does not enforce
+    ``reward_models_config.*.rollout.prompt_length``. Default truncation is
+    right-sided and would drop the trailing ``\\boxed{True/False}`` instruction.
+
+    Args:
+        tokenizer: Reward-model tokenizer.
+        messages (list[dict]): Chat messages from ``prompt_constructor``.
+        add_generation_prompt (bool): Whether to append the assistant prefix.
+        max_length (int): Maximum RM prompt tokens (``rollout.prompt_length``).
+
+    Returns:
+        Tokenized RM prompt in the tokenizer's usual return type (tensor, list,
+        or BatchEncoding).
+    """
+    assert max_length > 0, f"RM prompt max_length must be positive, got: {max_length}."
+    original_side = getattr(tokenizer, "truncation_side", "right")
+    tokenizer.truncation_side = "left"
+    try:
+        # NOTE(claude): padding=False so short prompts are not padded to prompt_length
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            padding=False,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+    finally:
+        tokenizer.truncation_side = original_side
+
+
+def _count_rm_input_tokens(rm_inputs) -> int:
+    if isinstance(rm_inputs, torch.Tensor):
+        input_ids_tensor = rm_inputs
+        attention_mask_tensor = None
+    else:
+        input_ids_tensor = rm_inputs.get("input_ids")
+        attention_mask_tensor = rm_inputs.get("attention_mask", None)
+    if isinstance(attention_mask_tensor, torch.Tensor):
+        if attention_mask_tensor.dim() == 2:
+            return int(attention_mask_tensor[0].sum().item())
+        return int(attention_mask_tensor.sum().item())
+    if isinstance(input_ids_tensor, torch.Tensor):
+        if input_ids_tensor.dim() == 2:
+            return int(input_ids_tensor[0].numel())
+        return int(input_ids_tensor.numel())
+    if isinstance(input_ids_tensor, list):
+        if input_ids_tensor and isinstance(input_ids_tensor[0], list):
+            return len(input_ids_tensor[0])
+        return len(input_ids_tensor)
+    raise TypeError(f"Unsupported RM tokenizer output type: {type(rm_inputs)!r}.")
+
+
 @register("gen")
 class GenRewardLoopManager(RewardLoopManagerBase):
     """
@@ -82,11 +147,15 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         self.reward_model_tokenizer = self.reward_model_manager.get_reward_model_tokenizer()
         self.router_process = self.reward_model_manager.get_router_process()
         self.replica_handles = self.reward_model_manager.get_replica_handles()
+        self.rm_prompt_length = int(self.reward_model_manager.reward_model_config.rollout.prompt_length)
         self._replica_rr_index = 0
         self._reward_model_tokenizer_lock = self._get_tokenizer_lock(self.reward_model_tokenizer)
         self.reward_kwargs = reward_kwargs
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, "gen_reward_loop"))
-        psrl_logger.info("Initialized GenRewardLoopManager.")
+        psrl_logger.info(
+            f"[gen_reward_loop] Initialized GenRewardLoopManager with "
+            f"rm_prompt_length={self.rm_prompt_length}."
+        )
 
     @classmethod
     def _get_tokenizer_lock(cls, tokenizer) -> threading.RLock:
@@ -162,15 +231,26 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         rm_prompt = self.reward_function.prompt_constructor(prompt_str=problem_str, response_str=response_str)
         using_sys_prompt = self.reward_function.using_sys_prompt
 
-        # Tokenize RM prompt
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            policy_prompt_len = int(prompt_ids.numel())
+        else:
+            policy_prompt_len = int((prompt_ids != pad_id).sum().item())
+        policy_response_len = (
+            int(valid_response_length.item())
+            if torch.is_tensor(valid_response_length)
+            else int(valid_response_length)
+        )
+
+        # Tokenize RM prompt, left-truncated to rollout.prompt_length.
         rm_inputs = await self._run_reward_model_tokenizer_call(
-            lambda: self.reward_model_tokenizer.apply_chat_template(
+            lambda: tokenize_rm_chat_prompt(
+                self.reward_model_tokenizer,
                 rm_prompt,
-                tokenize=True,
                 add_generation_prompt=using_sys_prompt,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
+                max_length=self.rm_prompt_length,
             ),
         )
 
@@ -179,20 +259,14 @@ class GenRewardLoopManager(RewardLoopManagerBase):
         if isinstance(rm_inputs, torch.Tensor):
             rm_inputs = {"input_ids": rm_inputs}
 
-        # Compute RM input length in tokens (non-padding tokens if attention_mask is available)
-        rm_input_len = None
-        input_ids_tensor = rm_inputs.get("input_ids")
-        attention_mask_tensor = rm_inputs.get("attention_mask", None)
-        if isinstance(attention_mask_tensor, torch.Tensor):
-            if attention_mask_tensor.dim() == 2:
-                rm_input_len = int(attention_mask_tensor[0].sum().item())
-            else:
-                rm_input_len = int(attention_mask_tensor.sum().item())
-        elif isinstance(input_ids_tensor, torch.Tensor):
-            if input_ids_tensor.dim() == 2:
-                rm_input_len = int(input_ids_tensor[0].numel())
-            else:
-                rm_input_len = int(input_ids_tensor.numel())
+        rm_input_len = _count_rm_input_tokens(rm_inputs)
+        if rm_input_len >= self.rm_prompt_length:
+            psrl_logger.warning(
+                f"[gen_reward_loop] RM prompt hit max_length={self.rm_prompt_length} for uid={request_uid}: "
+                f"policy_prompt_tokens={policy_prompt_len} policy_response_tokens={policy_response_len} "
+                f"problem_chars={len(problem_str)} solution_chars={len(response_str)} "
+                f"rm_input_tokens={rm_input_len}."
+            )
 
         # Build DataProto for RM inference
         rm_data_proto = self._build_rm_data_proto(rm_inputs, request_uid)

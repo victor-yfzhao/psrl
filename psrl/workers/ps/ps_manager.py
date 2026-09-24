@@ -394,7 +394,7 @@ class PSManager(RequestStatusTracker):
                 "Model version should not be -1 when getting the indicator of reserving a request"
             )
             assert request_id not in self._abort_request_ids, f"Checking a aborted request {request_id} is not allowed"
-            if model_version <= self.max_aborted_version:
+            if not is_validate and model_version <= self.max_aborted_version:
                 indicators.append(float("inf"))
                 continue
             entry_info = EntryInfo(
@@ -407,10 +407,13 @@ class PSManager(RequestStatusTracker):
             if staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
                 indicators.append(float("-inf"))
             elif staleness_inventory.can_reserve_data(entry_info, model_version):
-                max_pending_buffer_id = staleness_inventory.get_max_pending_buffer_id(
-                    model_version + self.psrl_config.staleness
-                )
-                indicators.append(-max_pending_buffer_id)
+                if is_validate:
+                    indicators.append(0.0)
+                else:
+                    max_pending_buffer_id = staleness_inventory.get_max_pending_buffer_id(
+                        model_version + self.psrl_config.staleness
+                    )
+                    indicators.append(-max_pending_buffer_id)
             else:
                 indicators.append(float("inf"))
         return indicators

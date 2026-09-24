@@ -44,6 +44,7 @@ from psrl.utils.nixl import (
     NIXLInterface,
     NIXLStorageClient,
 )
+from psrl.utils.optimizer_state import assert_optimizer_state_offloaded
 from psrl.utils.ray import exclusive_push_model_context
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
 
@@ -200,12 +201,12 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 f"got {materialization!r}."
             )
 
-        from psrl.utils.weight_arena import materialize_fsdp2_model_weights_in_arena
+        from psrl.utils.weight_arena import gb_to_bytes, materialize_fsdp2_model_weights_in_arena
 
         self._nixl_weight_arena_handle = materialize_fsdp2_model_weights_in_arena(
             actor_module_fsdp,
             device=torch.device("cuda", get_device_id()),
-            max_chunk_bytes=int(arena_config.max_chunk_bytes),
+            max_chunk_bytes=gb_to_bytes(arena_config.max_chunk_gb, field_name="max_chunk_gb"),
             alignment_bytes=int(arena_config.alignment_bytes),
         )
         self._nixl_weight_arena_materialization = materialization
@@ -225,19 +226,15 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 "psrl.nixl.weight_arena.actor_materialization must be 'direct' or 'repack', "
                 f"got {materialization!r}."
             )
-        non_cpu_state = [name for name, tensor in full_state.items() if tensor.device.type != "cpu"]
-        if non_cpu_state:
-            raise RuntimeError(
-                "Actor direct weight arena requires the pre-FSDP full state on CPU so it does not retain an "
-                f"old CUDA weight allocation; first_tensors={non_cpu_state[:8]}."
-            )
-        actor_module.to_empty(device="meta")
-        non_meta = [name for name, tensor in actor_module.state_dict().items() if tensor.device.type != "meta"]
-        if non_meta:
-            raise RuntimeError(
-                "Actor direct weight arena failed to dematerialize the model before fully_shard: "
-                f"first_tensors={non_meta[:8]}."
-            )
+        from psrl.utils.weight_arena import prepare_module_for_direct_fsdp2_weight_arena
+
+        state_device_counts = prepare_module_for_direct_fsdp2_weight_arena(actor_module, full_state)
+        psrl_logger.info(
+            "[NIXL_WEIGHT_ARENA] role=actor rank=%d stage=prepare_direct_fsdp2 "
+            "state_device_counts=%s",
+            self.rank,
+            state_device_counts,
+        )
 
     def _post_fsdp2_model_load(self, actor_module_fsdp: torch.nn.Module, role: str) -> None:
         arena_config = self._actor_weight_arena_config(role)
@@ -257,11 +254,11 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 f"got {materialization!r}."
             )
 
-        from psrl.utils.weight_arena import pack_fsdp2_model_weights_in_fresh_tms_pool
+        from psrl.utils.weight_arena import gb_to_bytes, pack_fsdp2_model_weights_in_fresh_tms_pool
 
         self._nixl_weight_arena_handle = pack_fsdp2_model_weights_in_fresh_tms_pool(
             actor_module_fsdp,
-            max_chunk_bytes=int(arena_config.max_chunk_bytes),
+            max_chunk_bytes=gb_to_bytes(arena_config.max_chunk_gb, field_name="max_chunk_gb"),
             alignment_bytes=int(arena_config.alignment_bytes),
         )
         self._nixl_weight_arena_materialization = materialization
@@ -317,45 +314,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             fsdp_strategy=self.config.actor.strategy,
         )
 
-    def get_nixl_weight_fingerprint(self, chunk_bytes: int = 64 * 1024**2) -> dict:
-        """Hash every logical tensor registered for NIXL without sampling."""
-        import hashlib
-
-        if chunk_bytes <= 0:
-            raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}.")
-        tensor_mapping = self.nixl_storage_client.get_original_tensor_mapping()
-        if not tensor_mapping:
-            raise RuntimeError("NIXL tensor mapping is empty; run nixl_protocol before fingerprinting weights.")
-
-        global_hasher = hashlib.sha256()
-        tensor_digests: dict[str, str] = {}
-        total_bytes = 0
-        for (key, shard_idx), tensor in sorted(tensor_mapping.items(), key=lambda item: item[0]):
-            tensor_bytes = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
-            metadata = (
-                f"{key}\0{shard_idx}\0{tensor.dtype}\0{tuple(tensor.shape)}\0"
-                f"{tuple(tensor.stride())}\0{tensor_bytes.numel()}"
-            ).encode()
-            tensor_hasher = hashlib.sha256(metadata)
-            for offset in range(0, tensor_bytes.numel(), chunk_bytes):
-                length = min(chunk_bytes, tensor_bytes.numel() - offset)
-                cpu_chunk = tensor_bytes.narrow(0, offset, length).cpu()
-                tensor_hasher.update(cpu_chunk.numpy().tobytes())
-            digest = tensor_hasher.hexdigest()
-            logical_name = f"{key}|{shard_idx}"
-            tensor_digests[logical_name] = digest
-            global_hasher.update(metadata)
-            global_hasher.update(bytes.fromhex(digest))
-            total_bytes += tensor_bytes.numel()
-
-        return {
-            "rank": self.rank,
-            "digest": global_hasher.hexdigest(),
-            "logical_tensor_count": len(tensor_digests),
-            "total_bytes": total_bytes,
-            "tensor_digests": tensor_digests,
-        }
-
     def nixl_protocol(self, mode: str = "full"):
         """Run the NIXL server protocol.
 
@@ -395,15 +353,18 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """Clear all FSDP2 gradient state after wake_up/pull_model.
 
         optimizer.zero_grad() only clears sharded_param.grad, but FSDP2 internally
-        maintains unsharded_accumulated_grad on each FSDPParam object. If a val phase
-        interrupts the training loop before post_backward() has a chance to consume and
-        reset this field, the stale unsharded grad will be accumulated on top of the
-        next backward pass, causing grad_norm to explode.
+        maintains unsharded_accumulated_grad on each FSDPParam object. A trainer
+        sleep boundary must not carry any of these gradient views into the next
+        update, regardless of whether sleep was entered for elastic rollout or
+        colocated validation.
 
-        This method clears all three grad locations:
+        This method clears all available grad locations:
           1. sharded_param.grad        - what the optimizer sees
           2. unsharded_accumulated_grad - FSDP2 internal accumulation buffer
-          3. _unsharded_param.grad     - transient grad on the all-gathered parameter
+          3. _unsharded_param.grad     - transient grad on an all-gathered parameter
+
+        ``_unsharded_param`` is created lazily by FSDP2 and is absent while a
+        parameter remains sharded, so it must be accessed conditionally.
         """
         from torch.distributed._composable.fsdp import FSDPModule
 
@@ -421,12 +382,13 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                             )
                             fp.unsharded_accumulated_grad = None
                             dirty_count += 1
-                        if fp._unsharded_param.grad is not None:
+                        unsharded_param = getattr(fp, "_unsharded_param", None)
+                        if unsharded_param is not None and unsharded_param.grad is not None:
                             psrl_logger.debug(
                                 f"[clear_fsdp2_grads] {fp._param_fqn}: "
-                                f"_unsharded_param.grad norm = {fp._unsharded_param.grad.norm():.4f}"
+                                f"_unsharded_param.grad norm = {unsharded_param.grad.norm():.4f}"
                             )
-                            fp._unsharded_param.grad = None
+                            unsharded_param.grad = None
                             dirty_count += 1
 
         # Also clear sharded_param.grad (what optimizer.zero_grad() would clear)
@@ -443,9 +405,29 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             )
         else:
             psrl_logger.debug(f"[clear_fsdp2_grads] No stale grads found on rank {self.rank}.")
+        return dirty_count
 
     def nixl_sleep(self, mode: str = "full"):
         """Deregister the model weights for NIXL and free up GPU memory."""
+        full_sleep = mode != "meta"
+        if full_sleep:
+            if not self._is_offload_optimizer:
+                raise RuntimeError(
+                    "Full trainer sleep requires train_actor_rollout_ref.actor.fsdp_config."
+                    "optimizer_offload=True so optimizer state survives TMS pause/resume."
+                )
+            torch.cuda.synchronize()
+            optimizer_summary = assert_optimizer_state_offloaded(
+                self.actor_optimizer,
+                stage="before_sleep",
+                rank=self.rank,
+            )
+            psrl_logger.info(
+                "[TRAINER_OPTIMIZER_OFFLOAD_CHECK] stage=before_sleep rank=%d summary=%s",
+                self.rank,
+                optimizer_summary,
+            )
+        self._psrl_full_sleep_active = full_sleep
         if mode != "meta":
             if self.nixl_storage_client.local_client_info is None:
                 psrl_logger.warning("Skip NIXL deregistration because local tensors are not registered.")
@@ -515,6 +497,18 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         stage_start = time.perf_counter()
         self.wake_up_fsdp_model()
         resume_s = time.perf_counter() - stage_start
+        optimizer_summary = None
+        if getattr(self, "_psrl_full_sleep_active", False):
+            optimizer_summary = assert_optimizer_state_offloaded(
+                self.actor_optimizer,
+                stage="after_wake",
+                rank=self.rank,
+            )
+            psrl_logger.info(
+                "[TRAINER_OPTIMIZER_OFFLOAD_CHECK] stage=after_wake rank=%d summary=%s",
+                self.rank,
+                optimizer_summary,
+            )
         arena_handle = getattr(self, "_nixl_weight_arena_handle", None)
         arena_addresses = arena_handle.assert_virtual_addresses_unchanged() if arena_handle is not None else None
         # Reset nixl agent and reregister to handle physical memory changes
@@ -533,6 +527,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             "total_s": total_s,
             "nixl_client": dict(client_timing) if client_timing is not None else None,
             "arena_virtual_addresses": arena_addresses,
+            "optimizer_state": optimizer_summary,
         }
         psrl_logger.warning(
             "[TRAINER_WAKE_TIMING] scope=train_worker rank=%d node_id=%s "
@@ -545,6 +540,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             "passed" if arena_addresses is not None else "disabled",
             len(arena_addresses or ()),
         )
+        self._psrl_full_sleep_active = False
         return result
 
     def wake_up_fsdp_model(self):
@@ -672,7 +668,12 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             skip_load_weight = init_mode == "empty"
             skip_random_init = skip_load_weight and os.getenv("PSRL_EMPTY_INIT_NO_RANDOM_WEIGHTS", "0") == "1"
             if skip_random_init:
-                from transformers.modeling_utils import no_init_weights
+                try:
+                    # Transformers 5.x moved this context manager out of modeling_utils.
+                    from transformers.initialization import no_init_weights
+                except ImportError:
+                    # Keep compatibility with the older Transformers API used by some workers.
+                    from transformers.modeling_utils import no_init_weights
 
                 psrl_logger.info("Skipping random weight initialization for empty FSDP model initialization.")
                 init_context = no_init_weights()

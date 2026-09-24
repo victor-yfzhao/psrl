@@ -35,9 +35,9 @@ def test_extract_transformers_prefill_metric():
     assert mod.extract_vllm_reprefill_s(result) == pytest.approx(0.75)
 
 
-def test_migration_tracker_breakdown_sums_planner_share_network_and_reprefill(monkeypatch):
+def test_migration_tracker_breakdown_sums_interrupt_network_and_reprefill(monkeypatch):
     mod = _load_module()
-    monotonic_values = iter([100.0, 100.3])
+    monotonic_values = iter([100.0, 100.2, 100.3])
     monkeypatch.setattr(mod.time, "monotonic", lambda: next(monotonic_values))
     tracker = mod.RequestMigrationOverheadTracker()
     tracker.mark_batch(
@@ -47,10 +47,17 @@ def test_migration_tracker_breakdown_sums_planner_share_network_and_reprefill(mo
             "decision_id": 7,
             "planner_s": 0.2,
             "selected_count": 2,
+            "planner_breakdown": {
+                "candidate_set_construction_s": 0.04,
+                "rebalance_simulation_s": 0.06,
+                "router_simulation_s": 0.08,
+                "best_candidate_selection_s": 0.01,
+                "other_s": 0.01,
+            },
         },
     )
 
-    tracker.mark_requeued("request-1")
+    interrupted = tracker.mark_requeued("request-1")
     tracker.mark_dispatched("request-1", 5)
     result = tracker.complete(
         "request-1",
@@ -58,12 +65,31 @@ def test_migration_tracker_breakdown_sums_planner_share_network_and_reprefill(mo
     )
 
     assert result is not None
-    assert result["planner_share_s"] == pytest.approx(0.1)
-    assert result["network_s"] == pytest.approx(0.3)
+    assert interrupted is not None
+    assert interrupted["interrupt_s"] == pytest.approx(0.2)
+    assert "planner_share_s" not in result
+    assert result["interrupt_s"] == pytest.approx(0.2)
+    assert result["network_s"] == pytest.approx(0.1)
+    assert result["abort_to_redispatch_s"] == pytest.approx(0.3)
     assert result["reprefill_s"] == pytest.approx(0.4)
-    assert result["migration_s"] == pytest.approx(0.8)
+    assert result["migration_s"] == pytest.approx(0.7)
     assert result["source_instance_id"] == 2
     assert result["destination_instance_id"] == 5
+
+
+def test_migration_tracker_records_only_the_first_requeue_as_interrupt_completion():
+    mod = _load_module()
+    tracker = mod.RequestMigrationOverheadTracker()
+    tracker.mark_batch(
+        {0: ["request-1"]},
+        {"selected_count": 1},
+    )
+
+    first = tracker.mark_requeued("request-1")
+    second = tracker.mark_requeued("request-1")
+
+    assert first is not None
+    assert second is None
 
 
 def test_migration_tracker_waits_for_requeue_and_valid_prefill():
@@ -81,7 +107,7 @@ def test_migration_tracker_waits_for_requeue_and_valid_prefill():
 
 def test_migration_tracker_resolves_router_logical_id_to_scheduler_id(monkeypatch):
     mod = _load_module()
-    monotonic_values = iter([10.0, 10.4])
+    monotonic_values = iter([10.0, 10.15, 10.4])
     monkeypatch.setattr(mod.time, "monotonic", lambda: next(monotonic_values))
     tracker = mod.RequestMigrationOverheadTracker()
     tracker.mark_batch({0: ["12345-abc"]}, {"planner_s": 0.1, "selected_count": 1})
@@ -91,13 +117,15 @@ def test_migration_tracker_resolves_router_logical_id_to_scheduler_id(monkeypatc
     result = tracker.complete("12345", _result_with_metrics(scheduled_ts=2.0, first_token_ts=2.2))
 
     assert result is not None
-    assert result["network_s"] == pytest.approx(0.4)
+    assert result["interrupt_s"] == pytest.approx(0.15)
+    assert result["network_s"] == pytest.approx(0.25)
+    assert result["abort_to_redispatch_s"] == pytest.approx(0.4)
     assert result["destination_instance_id"] == 3
 
 
 def test_mark_dispatched_returns_network_sample_before_completion(monkeypatch):
     mod = _load_module()
-    monotonic_values = iter([10.0, 10.25])
+    monotonic_values = iter([10.0, 10.1, 10.25])
     monkeypatch.setattr(mod.time, "monotonic", lambda: next(monotonic_values))
     tracker = mod.RequestMigrationOverheadTracker()
     tracker.mark_batch({1: ["42-deadbeef"]}, {"planner_s": 0.2, "selected_count": 2})
@@ -106,14 +134,16 @@ def test_mark_dispatched_returns_network_sample_before_completion(monkeypatch):
     dispatch = tracker.mark_dispatched("42", 3)
 
     assert dispatch is not None
-    assert dispatch["network_s"] == pytest.approx(0.25)
+    assert dispatch["interrupt_s"] == pytest.approx(0.1)
+    assert dispatch["network_s"] == pytest.approx(0.15)
+    assert dispatch["abort_to_redispatch_s"] == pytest.approx(0.25)
     assert dispatch["source_instance_id"] == 1
     assert dispatch["destination_instance_id"] == 3
 
 
 def test_completion_status_reports_missing_prefill_and_can_be_discarded(monkeypatch):
     mod = _load_module()
-    monotonic_values = iter([20.0, 20.5])
+    monotonic_values = iter([20.0, 20.2, 20.5])
     monkeypatch.setattr(mod.time, "monotonic", lambda: next(monotonic_values))
     tracker = mod.RequestMigrationOverheadTracker()
     tracker.mark_batch({0: ["7-deadbeef"]}, {"planner_s": 0.0, "selected_count": 1})
@@ -124,14 +154,15 @@ def test_completion_status_reports_missing_prefill_and_can_be_discarded(monkeypa
 
     assert status == "missing_vllm_prefill"
     assert context is not None
-    assert context["network_s"] == pytest.approx(0.5)
+    assert context["interrupt_s"] == pytest.approx(0.2)
+    assert context["network_s"] == pytest.approx(0.3)
     tracker.discard("7")
     assert tracker.complete_with_status("7", SimpleNamespace(meta_info={}))[1] == "not_tracked"
 
 
 def test_tracker_prefers_latest_internal_id_for_replanned_logical_request(monkeypatch):
     mod = _load_module()
-    monotonic_values = iter([30.0, 31.0, 31.4])
+    monotonic_values = iter([30.0, 31.0, 31.2, 31.4])
     monkeypatch.setattr(mod.time, "monotonic", lambda: next(monotonic_values))
     tracker = mod.RequestMigrationOverheadTracker()
     tracker.mark_batch({0: ["9-aaaaaaaa"]}, {"planner_s": 0.0, "selected_count": 1})
@@ -142,6 +173,8 @@ def test_tracker_prefers_latest_internal_id_for_replanned_logical_request(monkey
 
     assert dispatch is not None
     assert dispatch["source_instance_id"] == 1
-    assert dispatch["network_s"] == pytest.approx(0.4)
+    assert dispatch["interrupt_s"] == pytest.approx(0.2)
+    assert dispatch["network_s"] == pytest.approx(0.2)
+    assert dispatch["abort_to_redispatch_s"] == pytest.approx(0.4)
     tracker.discard("9")
     assert tracker._requests == {}

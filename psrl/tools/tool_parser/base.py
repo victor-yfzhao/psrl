@@ -10,11 +10,16 @@ class ToolParser(ABC):
         self.tokenizer = tokenizer
 
     @abstractmethod
-    def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[ToolCall]]:
+    def extract_tool_calls(
+        self,
+        responses_ids: list[int],
+        tools: list[dict] | None = None,
+    ) -> tuple[str, list[ToolCall]]:
         """Extract tool calls from the responses.
 
         Args:
             responses_ids (List[int]): The ids of the responses.
+            tools: Optional OpenAI function schemas for schema-aware parsing.
 
         Returns:
             List[ToolCall]: Extracted tool calls.

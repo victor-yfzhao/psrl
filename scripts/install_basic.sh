@@ -62,7 +62,7 @@ python -m uv pip install -r requirements/build.txt
 python -m uv pip install --no-build-isolation -e .
 popd
 
-# Reinstall transformers because vllm v0.18.1 uses transformers==4.57.3
+# Qwen3.5 model configs require Transformers 5.x; reinstall after vLLM dependencies.
 python -m uv pip install "transformers[hf_xet]==5.5.0"
 
 if [ -z "$VERL_PATH" ]; then

@@ -47,18 +47,22 @@ class ResourcePoolManager:
 
         Initializes resource pools based on the resource pool specification,
         with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
+        For FSDP backend, uses max_colocate_count=4 so three colocated roles
+        plus one spare CPU for WorkerGroup init helpers can share a bundle.
         For Megatron backend, uses max_colocate_count>1 for different models.
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
+            # max_colocate_count is the CPU quota per bundle and also the GPU fraction
+            # denominator (num_gpus = resource_num_per_bundle / max_colocate_count).
+            # Three colocated roles (actor, rollout, reward) need 3 CPUs; keep +1 spare
+            # so WorkerGroup init helper tasks (get_master_addr_port) can still schedule
+            # when all three roles already occupy a bundle.
+            # NOTE(claude): without the spare CPU, SubRayResourcePool init can deadlock
+            # because every helper task is pinned to pgs[0] bundle 0
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes,
                 use_gpu=True,
-                max_colocate_count=3,
+                max_colocate_count=4,
                 name_prefix=resource_pool_name,
                 resource_num_per_bundle=self.resource_num_per_bundle.get(resource_pool_name, 1),
             )

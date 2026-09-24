@@ -63,6 +63,8 @@ def model_name_to_cost_model_stems(model_name: str) -> list[str]:
     model_basename = lower.rstrip("/").rsplit("/", 1)[-1]
     if model_basename == "qwen2.5-32b":
         stems.append("qwen_32b")
+    elif model_basename == "qwen3.5-122b-a10b":
+        stems.append("qwen3.5_122b_a10b")
     else:
         family = _extract_qwen_family(lower, parts)
         size = _extract_model_size(parts)

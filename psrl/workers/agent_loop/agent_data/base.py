@@ -537,9 +537,10 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             reward_result = {non_tensor_batch["uid"][0]: {"reward_score": self.trajectory.reward}}
             output = self._post_process_and_merge_reward(reward_result, data)
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
-            reward_result = await self.reward_manager.compute_score.remote(data)
-            if not self.config.reward_models_config.launch_reward_fn_async:
-                output = self._post_process_and_merge_reward(reward_result, data)
+            if not data.meta_info.get("validate", False):
+                reward_result = await self.reward_manager.compute_score.remote(data)
+                if not self.config.reward_models_config.launch_reward_fn_async:
+                    output = self._post_process_and_merge_reward(reward_result, data)
         else:
             raise ValueError(
                 f"Unknown traj_reward_mode: {self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode}"

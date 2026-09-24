@@ -71,9 +71,7 @@ def resolve_deployment_mode(config) -> str:
             mode = "disaggregated"
     mode = str(mode)
     if mode not in VALID_DEPLOYMENT_MODES:
-        raise ValueError(
-            f"Invalid psrl.deployment.mode={mode!r}; expected one of {VALID_DEPLOYMENT_MODES}."
-        )
+        raise ValueError(f"Invalid psrl.deployment.mode={mode!r}; expected one of {VALID_DEPLOYMENT_MODES}.")
 
     with open_dict(config):
         config.psrl.deployment.mode = mode
@@ -107,3 +105,44 @@ def resolve_deployment_mode(config) -> str:
             elastic_rm.enable_trainer_pool = False
             elastic_rm.enable_policy = False
     return mode
+
+
+def validate_trainer_sleep_optimizer_offload(config, mode: str | None = None) -> None:
+    """Require optimizer offload whenever a deployment can sleep the trainer.
+
+    Trainer sleep releases process-wide TMS allocations. Model weights are
+    restored from the parameter server after wake-up, but optimizer state is
+    not. Keeping optimizer tensors on CPU while the trainer is idle is therefore
+    a correctness requirement, not only a memory optimization.
+    """
+    deployment = config.psrl.deployment
+    resolved_mode = str(mode if mode is not None else deployment.get("mode", "disaggregated"))
+    sleep_reasons = []
+    if bool(deployment.elastic_rm.get("enable_trainer_pool", False)):
+        sleep_reasons.append("psrl.deployment.elastic_rm.enable_trainer_pool=True")
+    if resolved_mode == "trainer_pool_only":
+        sleep_reasons.append("psrl.deployment.mode=trainer_pool_only")
+    if bool(config.psrl.get("colocate_validate_and_train", False)):
+        sleep_reasons.append("psrl.colocate_validate_and_train=True")
+    if not sleep_reasons:
+        return
+
+    actor = config.train_actor_rollout_ref.actor
+    strategy = str(actor.strategy)
+    if strategy in ("fsdp", "fsdp2"):
+        config_path = "train_actor_rollout_ref.actor.fsdp_config.optimizer_offload"
+        optimizer_offload = bool(actor.fsdp_config.get("optimizer_offload", False))
+    elif strategy == "megatron":
+        config_path = "train_actor_rollout_ref.actor.megatron.optimizer_offload"
+        optimizer_offload = bool(actor.megatron.get("optimizer_offload", False))
+    else:
+        raise ValueError(
+            f"Trainer sleep is enabled by {', '.join(sleep_reasons)}, but actor strategy {strategy!r} "
+            "does not define a supported optimizer-offload path."
+        )
+
+    if not optimizer_offload:
+        raise ValueError(
+            f"Trainer sleep is enabled by {', '.join(sleep_reasons)}; set {config_path}=True. "
+            "Without optimizer offload, TMS sleep can discard optimizer state that is not restored by pull_model()."
+        )

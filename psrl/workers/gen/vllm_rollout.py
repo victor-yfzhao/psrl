@@ -40,11 +40,124 @@ except ImportError:
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import deprecated
+from psrl.utils.rollout.reprefill import (
+    collect_reprefill_log_probs,
+    collect_token_log_probs,
+    merge_reprefill_log_probs,
+    should_update_reprefill_log_probs,
+)
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import StatCollector
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _to_plain_container(value):
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _extending_rope_scaling(rope_scaling) -> dict | None:
+    """
+    Return a RoPE-scaling dict only when it actually extends the native window.
+
+    Transformers 5.x GLM configs expose a default ``rope_scaling`` /
+    ``rope_parameters`` with ``rope_type=default`` and no factor. That object is
+    truthy but must not hide launch-time ``hf_overrides``.
+    """
+    rope_scaling = _to_plain_container(rope_scaling)
+    if not isinstance(rope_scaling, dict) or not rope_scaling:
+        return None
+    factor = rope_scaling.get("factor")
+    if factor is not None and float(factor) > 1.0:
+        return rope_scaling
+    rope_type = str(rope_scaling.get("type") or rope_scaling.get("rope_type") or "default").lower()
+    if rope_type in ("", "default", "none"):
+        return None
+    return rope_scaling
+
+
+def _normalize_rope_override_dict(rope_scaling: dict) -> dict:
+    """Copy a RoPE override and make Transformers 5 / vLLM keys explicit."""
+    rope_scaling = dict(rope_scaling)
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type is not None:
+        rope_scaling["rope_type"] = rope_type
+    return rope_scaling
+
+
+_ROPE_LEAF_KEYS = frozenset(
+    {"rope_type", "type", "factor", "rope_theta", "original_max_position_embeddings"}
+)
+
+
+def _merge_rope_parameters(base, override: dict) -> dict:
+    """
+    Overlay a YaRN override onto the checkpoint ``rope_parameters``.
+
+    Keep existing fields such as ``rope_theta``. Nested-by-layer-type dicts
+    get the same overlay on every layer.
+    """
+    override = _normalize_rope_override_dict(override)
+    base = _to_plain_container(base)
+    if not isinstance(base, dict) or not base:
+        return override
+    is_nested = all(isinstance(value, dict) for value in base.values()) and not (
+        set(base) & _ROPE_LEAF_KEYS
+    )
+    if is_nested:
+        return {layer: {**layer_rp, **override} for layer, layer_rp in base.items()}
+    return {**base, **override}
+
+
+def _ensure_vllm_hf_rope_overrides(engine_kwargs: dict, model_hf_config) -> None:
+    """
+    Rewrite ``hf_overrides`` so vLLM actually applies launch-time YaRN.
+
+    vLLM ``ModelConfig`` applies dict-valued ``hf_overrides`` after
+    ``patch_rope_parameters``, and ``_get_and_verify_max_len`` reads
+    ``rope_parameters["rope_type"]``. GLM docs still use ``rope_scaling.type``.
+    """
+    hf_overrides = _to_plain_container(engine_kwargs.get("hf_overrides")) or {}
+    if not isinstance(hf_overrides, dict):
+        return
+    scaling = _extending_rope_scaling(hf_overrides.get("rope_scaling"))
+    if scaling is None:
+        scaling = _extending_rope_scaling(hf_overrides.get("rope_parameters"))
+    if scaling is None:
+        return
+    scaling = _normalize_rope_override_dict(scaling)
+    hf_overrides = dict(hf_overrides)
+    hf_overrides["rope_scaling"] = scaling
+    hf_overrides["rope_parameters"] = _merge_rope_parameters(
+        getattr(model_hf_config, "rope_parameters", None),
+        scaling,
+    )
+    engine_kwargs["hf_overrides"] = hf_overrides
+
+
+def _resolve_rope_scaling(model_hf_config, engine_kwargs: dict) -> dict | None:
+    """
+    Resolve RoPE scaling from vLLM ``hf_overrides`` first, then the HF config.
+
+    Disk ``config.json`` is the official GLM switch. Launch scripts can instead
+    pass ``engine_kwargs.vllm.hf_overrides.rope_scaling`` so a shared checkpoint
+    is not mutated.
+    """
+    hf_overrides = _to_plain_container(engine_kwargs.get("hf_overrides")) or {}
+    override_scaling = None
+    if isinstance(hf_overrides, dict):
+        override_scaling = _extending_rope_scaling(hf_overrides.get("rope_scaling"))
+        if override_scaling is None:
+            override_scaling = _extending_rope_scaling(hf_overrides.get("rope_parameters"))
+    if override_scaling is not None:
+        return override_scaling
+    return _extending_rope_scaling(
+        getattr(model_hf_config, "rope_scaling", None)
+        or getattr(model_hf_config, "rope_parameters", None)
+    )
 
 
 class PSRL_vLLMRollout:
@@ -126,7 +239,14 @@ class PSRL_vLLMRollout:
 
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
-        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = _to_plain_container(config.get("engine_kwargs", {}).get("vllm", {}) or {}) or {}
+        if not isinstance(engine_kwargs, dict):
+            engine_kwargs = {}
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        _ensure_vllm_hf_rope_overrides(engine_kwargs, model_hf_config)
+
+        rope_scaling_config = _resolve_rope_scaling(model_hf_config, engine_kwargs)
         if not rope_scaling_config:
             max_position_embeddings = None
             if hasattr(model_hf_config, "max_position_embeddings"):
@@ -149,14 +269,20 @@ class PSRL_vLLMRollout:
             # see https://qwen.readthedocs.io/en/latest/deployment/vllm.html#extended-context-support
             # for using yarn as an example
             rope_scaling_factor = rope_scaling_config.get("factor", 1.0)
-
+            original_max_position_embeddings = rope_scaling_config.get(
+                "original_max_position_embeddings",
+                getattr(model_hf_config, "max_position_embeddings", None),
+            )
+            assert original_max_position_embeddings is not None, (
+                "original_max_position_embeddings is required when rope_scaling is set."
+            )
             assert (
-                model_hf_config.max_position_embeddings * rope_scaling_factor
+                original_max_position_embeddings * rope_scaling_factor
                 >= config.prompt_length + config.response_length
             ), (
                 "model context length should be greater than total sequence length, "
                 + f"got rope_scaling_factor={rope_scaling_factor} and "
-                + f"max_position_embeddings={model_hf_config.max_position_embeddings}"
+                + f"original_max_position_embeddings={original_max_position_embeddings}"
             )
 
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
@@ -184,14 +310,10 @@ class PSRL_vLLMRollout:
             if model_config.lora_rank > 0
             else {}
         )
-        # copy it to avoid secretly modifying the engine config
-        engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}
-
         # For each vLLM engine parameter,
         # - `None` means not setting it, so we pop it, and leave it to vLLM default value
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         weight_arena_config = psrl_config.nixl.get("weight_arena", {})
         if OmegaConf.is_config(weight_arena_config):
             weight_arena_config = OmegaConf.to_container(weight_arena_config, resolve=True)
@@ -200,6 +322,10 @@ class PSRL_vLLMRollout:
         arena_role = "reward" if self.is_reward_model else "rollout"
         arena_enabled_key = f"{arena_role}_enabled"
         arena_materialization_key = f"{arena_role}_materialization"
+        if self.is_reward_model:
+            from psrl.utils.node_shared_weight_cache import validate_reward_cache_config
+
+            validate_reward_cache_config(weight_arena_config)
         direct_arena = weight_arena_config.get(
             arena_enabled_key, False
         ) and weight_arena_config.get(arena_materialization_key, "direct") == "direct"
@@ -307,6 +433,7 @@ class PSRL_vLLMRollout:
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
             "psrl_nixl_weight_arena": weight_arena_config,
             "psrl_role": "reward" if self.is_reward_model else "rollout",
+            "instance_id": kwargs.get("instance_id", 0),
         }
         psrl_logger.info(
             "vLLM scheduler config: role=%s use_psrl_scheduler=%s scheduler_cls=%s "
@@ -515,7 +642,8 @@ class PSRL_vLLMRollout:
             self.scheduler_abort_events[request_ids_tuple] = asyncio.Event()
 
             # Process the abort request
-            await self.inference_engine.abort(request_ids)
+            # SchedulerStats carries vLLM's internal request IDs.
+            await self.inference_engine.abort(request_ids, internal=True)
 
             # Signal that this abort request is done and clean up
             self.scheduler_abort_events[request_ids_tuple].set()
@@ -642,6 +770,22 @@ class PSRL_vLLMRollout:
         uid_list = non_tensor_batch["uid"].tolist()
 
         meta_info = prompts.meta_info
+        update_reprefill_log_probs = should_update_reprefill_log_probs(
+            self.psrl_config.log_prob.get("update_reprefill_log_probs", False),
+            is_reward_model=self.is_reward_model,
+            is_teacher_model=self.is_teacher_model,
+        )
+
+        # Keep the response ids that were present before this continuation. They
+        # are used to verify that prompt logprobs really correspond to the
+        # prefix we are about to replace.
+        prior_raw_response_ids = non_tensor_batch.get("raw_response_ids")
+        if prior_raw_response_ids is None:
+            prior_raw_response_ids = [[] for _ in range(batch_size)]
+        elif isinstance(prior_raw_response_ids, np.ndarray):
+            prior_raw_response_ids = prior_raw_response_ids.tolist()
+        else:
+            prior_raw_response_ids = list(prior_raw_response_ids)
 
         response_ids_list = []
         response_len_list = []
@@ -649,12 +793,14 @@ class PSRL_vLLMRollout:
         interrupted_by_scheduler_list = []
         pooling_output_list = []
         all_log_prob_list = []
+        replace_reprefill_log_prob_list = [False] * batch_size
         all_teacher_id_list = []
         routed_experts_list = []
 
         metrics_list = []
 
         for i, uid in enumerate(uid_list):
+            sample_idx = i
             vllm_output = outputs[i]
             try:
                 metrics_list.append(vllm_output.metrics)
@@ -707,24 +853,44 @@ class PSRL_vLLMRollout:
                 and hasattr(vllm_output.outputs[0], "logprobs")
                 and vllm_output.outputs[0].logprobs is not None
             ):
-                if self.psrl_config.partial_rollout.interrupt_as_prompt:
-                    curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
-                    # Collect log probs only when the request finished normally
-                    # The response log probs are collected in two parts:
-                    # 1. The log probs of the accumulated response tokens (in current prompt tokens)
-                    # 2. The log probs of the current response tokens
-                    if not interrupted and curr_response_len > 0:
-                        # partial response log probs from prompt log probs
+                if update_reprefill_log_probs:
+                    response_lengths = non_tensor_batch.get("response_unpadded_len", [0] * batch_size)
+                    if np.isscalar(response_lengths):
+                        curr_response_len = int(response_lengths)
+                    else:
+                        curr_response_len = int(response_lengths[sample_idx])
+                    log_prob_list, replace_reprefill_log_prob_list[sample_idx] = collect_reprefill_log_probs(
+                        prior_raw_response_ids[sample_idx],
+                        vllm_output.prompt_token_ids,
+                        vllm_output.prompt_logprobs,
+                        response_ids,
+                        vllm_output.outputs[0].logprobs,
+                        curr_response_len,
+                    )
+                elif self.psrl_config.partial_rollout.interrupt_as_prompt:
+                    response_lengths = non_tensor_batch.get("response_unpadded_len", [0] * batch_size)
+                    if np.isscalar(response_lengths):
+                        curr_response_len = int(response_lengths)
+                    else:
+                        curr_response_len = int(response_lengths[sample_idx])
+                    # Preserve the legacy interrupt-as-prompt behavior: only a
+                    # completed continuation carries the full response logprobs.
+                    if not interrupted and curr_response_len > 0 and vllm_output.prompt_logprobs is not None:
                         prompt_token_ids = vllm_output.prompt_token_ids
-                        for i, logprob in enumerate(vllm_output.prompt_logprobs[-curr_response_len:]):
-                            log_prob_list.append(logprob[prompt_token_ids[i - curr_response_len]].logprob)
-                        # new response log probs from decode log probs
-                        for i, logprob in enumerate(vllm_output.outputs[0].logprobs):
-                            log_prob_list.append(logprob[response_ids[i]].logprob)
+                        prefix_token_ids = prompt_token_ids[-curr_response_len:]
+                        prefix_logprobs = vllm_output.prompt_logprobs[-curr_response_len:]
+                        for token_id, logprob in zip(prefix_token_ids, prefix_logprobs, strict=False):
+                            if logprob is None:
+                                break
+                            try:
+                                log_prob_list.append(logprob[token_id].logprob)
+                            except (KeyError, TypeError):
+                                log_prob_list.append(logprob[str(token_id)].logprob)
+                        log_prob_list.extend(
+                            collect_token_log_probs(response_ids, vllm_output.outputs[0].logprobs)
+                        )
                 else:
-                    # Response log probs from decode log probs
-                    for i, logprob in enumerate(vllm_output.outputs[0].logprobs):
-                        log_prob_list.append(logprob[response_ids[i]].logprob)
+                    log_prob_list.extend(collect_token_log_probs(response_ids, vllm_output.outputs[0].logprobs))
             elif (
                 not self.is_pooling_model
                 and self.is_teacher_model
@@ -788,6 +954,11 @@ class PSRL_vLLMRollout:
         non_tensor_batch["interrupted_by_scheduler"] = np.array(interrupted_by_scheduler_list, dtype=bool)
 
         meta_info["vllm_metrics"] = np.array(metrics_list, dtype=object)
+        if update_reprefill_log_probs:
+            non_tensor_batch["reprefill_log_prob_updated"] = np.array(
+                replace_reprefill_log_prob_list,
+                dtype=bool,
+            )
         # meta_info["metrics"] = metrics_list
 
         # Update rollout_log_probs
@@ -798,7 +969,21 @@ class PSRL_vLLMRollout:
                     curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
                 else:
                     curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-                curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+                for i in range(batch_size):
+                    curr_rollout_log_probs[i] = merge_reprefill_log_probs(
+                        curr_rollout_log_probs[i],
+                        all_log_prob_list[i],
+                        replace_previous=replace_reprefill_log_prob_list[i],
+                    )
+                    if (
+                        update_reprefill_log_probs
+                        and len(curr_rollout_log_probs[i]) != response_unpadded_len[i]
+                    ):
+                        raise ValueError(
+                            "Rollout logprob length mismatch after reprefill for request "
+                            f"{uid_list[i]}: got {len(curr_rollout_log_probs[i])} logprobs for "
+                            f"{response_unpadded_len[i]} response tokens"
+                        )
                 non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
             elif self.is_teacher_model:
                 if "teacher_log_probs" in non_tensor_batch:
@@ -1063,7 +1248,7 @@ class PSRL_vLLMRollout:
             psrl_logger.debug("No requests to interrupt via abort_all().")
         return interrupted_request_num
 
-    async def interrupt_requests_async(self, request_ids):
+    async def interrupt_requests_async(self, request_ids) -> int:
         """
         Interrupt specific requests by their IDs asynchronously.
 
@@ -1072,7 +1257,13 @@ class PSRL_vLLMRollout:
 
         Args:
             request_ids: List of request IDs to interrupt
+
+        Returns:
+            Number of requests removed from the vLLM output processor.
         """
         if len(request_ids) > 0:
             request_ids = [str(request_id) for request_id in request_ids]
-            await self.inference_engine.abort(request_ids)
+            # GenWorker passes vLLM scheduler IDs (the internal IDs).  Using
+            # the default external-ID lookup silently misses randomized IDs.
+            return int(await self.inference_engine.abort(request_ids, internal=True) or 0)
+        return 0

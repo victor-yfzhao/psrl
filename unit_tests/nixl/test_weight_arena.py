@@ -1,13 +1,33 @@
 import pytest
 import torch
 from psrl.utils.weight_arena import (
+    gb_to_bytes,
     get_fsdp_param_groups,
     materialize_module_weights_in_arena,
     pack_module_weights,
+    prepare_module_for_direct_fsdp2_weight_arena,
     restore_weight_arena_from_cpu,
     snapshot_weight_arena_to_cpu,
 )
 from torch import nn
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(4, 4 * 1024**3), ("256", 256 * 1024**3), (0.0625, 64 * 1024**2)],
+)
+def test_gb_to_bytes(value, expected: int) -> None:
+    assert gb_to_bytes(value, field_name="size_gb") == expected
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), "invalid"])
+def test_gb_to_bytes_rejects_invalid_values(value) -> None:
+    with pytest.raises(ValueError, match="size_gb must be"):
+        gb_to_bytes(value, field_name="size_gb")
+
+
+def test_gb_to_bytes_can_allow_zero() -> None:
+    assert gb_to_bytes(0, field_name="reserve_gb", allow_zero=True) == 0
 
 
 class _SharedStorageModule(nn.Module):
@@ -264,3 +284,54 @@ def test_get_fsdp_param_groups_supports_current_and_legacy_state_layouts() -> No
 def test_get_fsdp_param_groups_rejects_unknown_layout() -> None:
     with pytest.raises(RuntimeError, match="missing _fsdp_param_group"):
         get_fsdp_param_groups(object())
+
+
+def test_prepare_direct_fsdp2_arena_retains_cpu_state_and_dematerializes_module() -> None:
+    module = nn.Linear(4, 3)
+    full_state = module.state_dict()
+    expected = {name: tensor.clone() for name, tensor in full_state.items()}
+
+    device_counts = prepare_module_for_direct_fsdp2_weight_arena(module, full_state)
+
+    assert device_counts == {"cpu": 2}
+    assert all(tensor.device.type == "meta" for tensor in module.state_dict().values())
+    for name, tensor in full_state.items():
+        assert tensor.device.type == "cpu"
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+
+def test_prepare_direct_fsdp2_arena_accepts_receiving_rank_meta_state() -> None:
+    with torch.device("meta"):
+        module = nn.Linear(4, 3)
+    parameter_ids = {name: id(parameter) for name, parameter in module.named_parameters()}
+    full_state = module.state_dict()
+
+    device_counts = prepare_module_for_direct_fsdp2_weight_arena(module, full_state)
+
+    assert device_counts == {"meta": 2}
+    assert {name: id(parameter) for name, parameter in module.named_parameters()} == parameter_ids
+    assert all(tensor.device.type == "meta" for tensor in module.state_dict().values())
+
+
+def test_prepare_direct_fsdp2_arena_rejects_accelerator_state() -> None:
+    class _FakeCudaTensor:
+        device = torch.device("cuda:0")
+
+    module = nn.Linear(4, 3)
+    with pytest.raises(RuntimeError, match=r"device_counts=\{'cuda': 1\}.*model.weight.*cuda:0"):
+        prepare_module_for_direct_fsdp2_weight_arena(
+            module,
+            {"model.weight": _FakeCudaTensor()},  # type: ignore[dict-item]
+        )
+
+
+def test_prepare_direct_fsdp2_arena_rejects_mixed_cpu_meta_state() -> None:
+    module = nn.Linear(4, 3)
+    with pytest.raises(RuntimeError, match=r"uniform.*device_counts=\{'cpu': 1, 'meta': 1\}"):
+        prepare_module_for_direct_fsdp2_weight_arena(
+            module,
+            {
+                "model.weight": torch.empty(1),
+                "model.bias": torch.empty(1, device="meta"),
+            },
+        )

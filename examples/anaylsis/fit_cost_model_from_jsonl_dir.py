@@ -10,7 +10,7 @@ from scipy.optimize import curve_fit
 
 
 FILE_RE = re.compile(
-    r"^(?P<model>.+)_Syn_TP(?P<tp>\d+)_PP(?P<pp>\d+)_B(?P<batch>\d+)_P(?P<prompt>\d+)_R(?P<response>\d+)_disable_attn_(?P<disable>true|false)\.jsonl$"
+    r"^(?P<model>.+)_Syn_TP(?P<tp>\d+)_PP(?P<pp>\d+)(?:_EP(?P<ep>\d+))?_B(?P<batch>\d+)_P(?P<prompt>\d+)_R(?P<response>\d+)_disable_attn_(?P<disable>true|false)\.jsonl$"
 )
 
 
@@ -21,6 +21,7 @@ def parse_file_name(path: Path) -> dict | None:
     info = match.groupdict()
     info["tp"] = int(info["tp"])
     info["pp"] = int(info["pp"])
+    info["ep"] = int(info["ep"]) if info.get("ep") is not None else 1
     info["batch"] = int(info["batch"])
     info["prompt"] = int(info["prompt"])
     info["response"] = int(info["response"])

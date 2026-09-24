@@ -45,7 +45,7 @@ def main() -> None:
     arena_config = {
         "rollout_enabled": direct,
         "rollout_materialization": "direct",
-        "max_chunk_bytes": 64 * 1024**2,
+        "max_chunk_gb": 0.0625,
         "alignment_bytes": 256,
     }
     llm = LLM(

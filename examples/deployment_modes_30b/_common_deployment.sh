@@ -21,6 +21,12 @@
 #                                set to 0 to leave default
 #   PSRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
 #   PSRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
+#   PSRL_DEPLOY_TRAIN_BACKEND fsdp2|megatron (default: fsdp2)
+#   PSRL_DEPLOY_MEGATRON_TP   Megatron tensor parallel size
+#   PSRL_DEPLOY_MEGATRON_PP   Megatron pipeline parallel size
+#   PSRL_DEPLOY_MEGATRON_CP   Megatron context parallel size
+#   PSRL_DEPLOY_MEGATRON_EP   Megatron expert parallel size
+#   PSRL_DEPLOY_MEGATRON_ETP  Megatron expert tensor parallel size
 #   PSRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
 #
 # Optional positional args to launch_deployment_mode are forwarded to main_ppo.
@@ -59,6 +65,52 @@ _psrl_total_gpus_from_node_spec() {
     return 1
 }
 
+_psrl_vllm_ep_size_for_model() {
+    local model_path=$1
+    local tp_size=$2
+
+    python - "${model_path}" "${tp_size}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1]) / "config.json"
+tp_size = int(sys.argv[2])
+
+with config_path.open(encoding="utf-8") as config_file:
+    config = json.load(config_file)
+
+expert_count_keys = {
+    "moe_num_experts",
+    "n_experts",
+    "n_routed_experts",
+    "num_experts",
+    "num_local_experts",
+    "num_routed_experts",
+}
+
+
+def is_moe(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized_key = key.lower()
+            if normalized_key in expert_count_keys and isinstance(child, (int, float)) and child > 1:
+                return True
+            if normalized_key == "moe_intermediate_size" and isinstance(child, (int, float)) and child > 0:
+                return True
+            if normalized_key in {"architectures", "model_type"} and "moe" in str(child).lower():
+                return True
+            if is_moe(child):
+                return True
+    elif isinstance(value, list):
+        return any(is_moe(child) for child in value)
+    return False
+
+
+print(tp_size if is_moe(config) else 1)
+PY
+}
+
 launch_deployment_mode() {
     set -xeuo pipefail
 
@@ -78,14 +130,38 @@ launch_deployment_mode() {
     PSRL_DEPLOY_RM_NUM_REPLICAS=${PSRL_DEPLOY_RM_NUM_REPLICAS:-0}
     PSRL_DEPLOY_TRAINER_READY_GRACE_S=${PSRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
     PSRL_DEPLOY_EXTRA=${PSRL_DEPLOY_EXTRA:-}
+    PSRL_DEPLOY_TRAIN_BACKEND=${PSRL_DEPLOY_TRAIN_BACKEND:-fsdp2}
+    PSRL_DEPLOY_MEGATRON_TP=${PSRL_DEPLOY_MEGATRON_TP:-2}
+    PSRL_DEPLOY_MEGATRON_PP=${PSRL_DEPLOY_MEGATRON_PP:-2}
+    PSRL_DEPLOY_MEGATRON_CP=${PSRL_DEPLOY_MEGATRON_CP:-1}
+    PSRL_DEPLOY_MEGATRON_EP=${PSRL_DEPLOY_MEGATRON_EP:-1}
+    PSRL_DEPLOY_MEGATRON_ETP=${PSRL_DEPLOY_MEGATRON_ETP:-1}
+    PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU=${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU:-1}
+    PSRL_DEPLOY_MEGATRON_USE_MBRIDGE=${PSRL_DEPLOY_MEGATRON_USE_MBRIDGE:-True}
+    PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD:-False}
+    PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD=${PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD:-True}
+    PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD=${PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD:-True}
+    PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS=${PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS:-1}
+    PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF=${PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF:-0.01}
+    PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF=${PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF:-0.001}
+    if [[ -z "${PSRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
+        case "${PSRL_DEPLOY_MODE}" in
+            colocated|trainer_pool_only)
+                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=True
+                ;;
+            *)
+                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=False
+                ;;
+        esac
+    fi
 
     PSRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl
 
     if [[ "${PSRL_DEPLOY_SMOKE}" == "1" ]]; then
         experiment_suffix="_smoke"
-        total_training_steps=2
-        test_freq=9999
-        save_freq=9999
+        total_training_steps=50
+        test_freq=-1
+        save_freq=-1
         train_prompt_bsz=32
         train_prompt_mini_bsz=8
         n_resp_per_prompt=8
@@ -99,11 +175,40 @@ launch_deployment_mode() {
         n_resp_per_prompt=16
     fi
 
+    case "${PSRL_DEPLOY_TRAIN_BACKEND}" in
+        fsdp|fsdp2)
+            TRAINER_CONFIG_NAME=ppo_trainer
+            train_backend_suffix=""
+            ;;
+        megatron)
+            TRAINER_CONFIG_NAME=ppo_megatron_trainer
+            train_backend_suffix="_megatron"
+            export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+            for value in \
+                "${PSRL_DEPLOY_MEGATRON_TP}" \
+                "${PSRL_DEPLOY_MEGATRON_PP}" \
+                "${PSRL_DEPLOY_MEGATRON_CP}" \
+                "${PSRL_DEPLOY_MEGATRON_EP}" \
+                "${PSRL_DEPLOY_MEGATRON_ETP}" \
+                "${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}"; do
+                if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Megatron parallel and micro-batch sizes must be positive integers, got '${value}'" >&2
+                    return 1
+                fi
+            done
+            ;;
+        *)
+            echo "Invalid PSRL_DEPLOY_TRAIN_BACKEND=${PSRL_DEPLOY_TRAIN_BACKEND}; expected fsdp2 or megatron" >&2
+            return 1
+            ;;
+    esac
+
     project_name='verl_deployment_modes'
     MODEL_NAME='Qwen2.5-32B'
     # RM_MODEL_NAME='DeepSeek-R1-Distill-Qwen-32B'
     RM_MODEL_NAME='Qwen3-30B-A3B-Thinking-2507'
-    experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
+    experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${train_backend_suffix}${experiment_suffix}"
 
     source ${PSRL_WORKSPACE}/env/env_311.sh
 
@@ -154,16 +259,19 @@ launch_deployment_mode() {
     # rollout settings
     GEN_TP=4
     GEN_PP=1
+    GEN_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
     GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
     # reward-model rollout settings
     RM_TP=4
     RM_PP=1
+    RM_EP=$(_psrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
     RM_NGPUS_PER_NODE_PER_INSTANCE=$(( ${RM_TP} * ${RM_PP} ))
 
     # validation settings (on train_pool; does not use elastic path)
     VAL_TP=8
     VAL_PP=1
+    VAL_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
     VAL_INSTANCES=$(( (${PSRL_DEPLOY_TRAIN_NNODES} * ${PSRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
     VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
@@ -197,7 +305,51 @@ launch_deployment_mode() {
     rollout_is="token"
     rollout_is_threshold=2.0
 
-    offload=False
+    offload=${PSRL_DEPLOY_OPTIMIZER_OFFLOAD}
+
+    case "${PSRL_DEPLOY_TRAIN_BACKEND}" in
+        fsdp|fsdp2)
+            TRAIN_BACKEND_ARGS=(
+                train_actor_rollout_ref.model.use_remove_padding=True
+                train_actor_rollout_ref.model.enable_gradient_checkpointing=True
+                train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz}
+                train_actor_rollout_ref.actor.fsdp_config.param_offload=False
+                train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload}
+                train_actor_rollout_ref.actor.grad_clip=1.0
+                train_actor_rollout_ref.model.use_shm=False
+            )
+            ;;
+        megatron)
+            TRAIN_BACKEND_ARGS=(
+                train_actor_rollout_ref.model.use_remove_padding=False
+                train_actor_rollout_ref.actor.use_dynamic_bsz=False
+                train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}
+                train_actor_rollout_ref.actor.megatron.param_offload=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.grad_offload=${PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.optimizer_offload=${PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${PSRL_DEPLOY_MEGATRON_TP}
+                train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${PSRL_DEPLOY_MEGATRON_PP}
+                train_actor_rollout_ref.actor.megatron.context_parallel_size=${PSRL_DEPLOY_MEGATRON_CP}
+                train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${PSRL_DEPLOY_MEGATRON_EP}
+                train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${PSRL_DEPLOY_MEGATRON_ETP}
+                train_actor_rollout_ref.actor.megatron.use_mbridge=${PSRL_DEPLOY_MEGATRON_USE_MBRIDGE}
+                train_actor_rollout_ref.actor.megatron.use_remove_padding=False
+                train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
+                train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
+                train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=${PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS}
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=${PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF}
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=${PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF}
+                train_actor_rollout_ref.ref.megatron.param_offload=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
+                train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${PSRL_DEPLOY_MEGATRON_TP}
+                train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${PSRL_DEPLOY_MEGATRON_PP}
+                train_actor_rollout_ref.ref.megatron.context_parallel_size=${PSRL_DEPLOY_MEGATRON_CP}
+                train_actor_rollout_ref.ref.megatron.expert_model_parallel_size=${PSRL_DEPLOY_MEGATRON_EP}
+                train_actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${PSRL_DEPLOY_MEGATRON_ETP}
+            )
+            ;;
+    esac
 
     REWARD_MODELS=(
         reward_models_config.reward_normalization=none
@@ -218,6 +370,7 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.rollout_nnodes_per_instance=1
         reward_models_config.reward_models.2.max_concurrent_requests_per_instance=128
         reward_models_config.reward_models.2.model.path=${RM_MODEL_PATH}
+        reward_models_config.reward_models.2.model.use_shm=False
         reward_models_config.reward_models.2.model.trust_remote_code=False
         reward_models_config.reward_models.2.rollout._target_=psrl.workers.config.RolloutConfig
         reward_models_config.reward_models.2.rollout.name=vllm
@@ -228,7 +381,7 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.rollout.enforce_eager=true
         reward_models_config.reward_models.2.rollout.free_cache_engine=true
         reward_models_config.reward_models.2.rollout.data_parallel_size=1
-        reward_models_config.reward_models.2.rollout.expert_parallel_size=1
+        reward_models_config.reward_models.2.rollout.expert_parallel_size=${RM_EP}
         reward_models_config.reward_models.2.rollout.tensor_model_parallel_size=${RM_TP}
         reward_models_config.reward_models.2.rollout.pipeline_model_parallel_size=${RM_PP}
         reward_models_config.reward_models.2.rollout.max_num_batched_tokens=$((1024 * 16 + 1024 * 20))
@@ -328,6 +481,7 @@ launch_deployment_mode() {
     fi
 
     PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
+        --config-name="${TRAINER_CONFIG_NAME}" \
         psrl.ps_manager_ip=${LOCAL_IP} \
         psrl.reward_service_ip=${LOCAL_IP} \
         psrl.rollout_n=${n_resp_per_prompt} \
@@ -351,6 +505,7 @@ launch_deployment_mode() {
         \
         gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
         gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
+        gen_actor_rollout_ref.rollout.expert_parallel_size=${GEN_EP} \
         gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
         gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
         gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -361,8 +516,7 @@ launch_deployment_mode() {
         gen_actor_rollout_ref.rollout.disable_log_stats=false \
         \
         train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-        train_actor_rollout_ref.model.use_remove_padding=True \
-        train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
+        "${TRAIN_BACKEND_ARGS[@]}" \
         train_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
         train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
         train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -372,6 +526,7 @@ launch_deployment_mode() {
         train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
         train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
         train_actor_rollout_ref.rollout.val_kwargs.n=1 \
+        train_actor_rollout_ref.rollout.expert_parallel_size=${VAL_EP} \
         train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
         train_actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
         train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -382,15 +537,10 @@ launch_deployment_mode() {
         train_actor_rollout_ref.actor.optim.lr=1e-6 \
         train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
         train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
-        train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
         train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${max_num_batched_tokens} \
         train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-        train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
-        train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
         train_actor_rollout_ref.actor.entropy_coeff=0 \
-        train_actor_rollout_ref.actor.grad_clip=1.0 \
         train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
-        train_actor_rollout_ref.model.use_shm=False \
         \
         "${REWARD_MODELS[@]}" \
         \

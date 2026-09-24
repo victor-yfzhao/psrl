@@ -18,7 +18,7 @@ if (( IDLE_GPU_DEMAND > TRAIN_POOL_GPUS )); then
 fi
 
 export PSRL_DEPLOY_MODE=trainer_pool_only
-export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_8_rm_4_trainer_pool_only_qwen7b_rm32b
+export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_8_rm_4_trainer_pool_only
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 export PSRL_DEPLOY_RM_ASYNC=False
 export PSRL_DEPLOY_NNODES=4

@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import importlib
 import inspect
+import json
 import logging
 import os
 import time
@@ -38,7 +40,11 @@ from psrl.utils.logger import (
     log_end_event,
     log_single_event,
 )
-from psrl.utils.nixl import NIXLInterface
+from psrl.utils.nixl import (
+    NIXLInterface,
+    resolve_weight_fingerprint_options,
+    weight_fingerprint_flow_enabled,
+)
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.utils.rollout.request_id import (
     normalize_request_ids_for_vllm_abort,
@@ -66,6 +72,162 @@ class GenInterface:
 
 
 class PSRL_GenWorker(Worker):
+    _PARTIAL_ROLLOUT_TRACE_CHUNK_KEY = "_psrl_partial_rollout_trace_chunk"
+
+    def _partial_rollout_trace_enabled(self) -> bool:
+        return self.role != "reward" and bool(
+            OmegaConf.select(self.psrl_config, "partial_rollout.trace.enable", default=False)
+        )
+
+    @staticmethod
+    def _partial_rollout_trace_sequence(value: Any) -> tuple[int, str]:
+        """Return a stable, non-reversible summary for a per-request token sequence."""
+        if value is None:
+            return 0, "empty"
+        if isinstance(value, np.ndarray) and value.ndim > 0 and len(value) == 1:
+            value = value[0]
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(
+            value[0], (list, tuple, np.ndarray)
+        ):
+            value = value[0]
+        try:
+            tokens = np.asarray(value, dtype=np.int64).reshape(-1)
+        except (TypeError, ValueError):
+            return 0, "unavailable"
+        if tokens.size == 0:
+            return 0, "empty"
+        return int(tokens.size), hashlib.sha256(tokens.tobytes()).hexdigest()[:16]
+
+    @staticmethod
+    def _partial_rollout_trace_length(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, np.ndarray) and value.ndim > 0 and len(value) == 1:
+            value = value[0]
+        try:
+            return int(np.asarray(value).reshape(-1).size)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _partial_rollout_trace_scalar(value: Any, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(np.asarray(value).reshape(-1)[0])
+        except (IndexError, TypeError, ValueError):
+            return default
+
+    async def _partial_rollout_trace_start(
+        self,
+        request: DataProto,
+        *,
+        request_version: int,
+        previous_instance: int | None,
+    ) -> dict[str, Any] | None:
+        if not self._partial_rollout_trace_enabled():
+            return None
+
+        non_tensor_batch = request.non_tensor_batch
+        prefix_tokens, prefix_sha256 = self._partial_rollout_trace_sequence(
+            non_tensor_batch.get("raw_response_ids")
+        )
+        chunk = self._partial_rollout_trace_scalar(
+            non_tensor_batch.get(self._PARTIAL_ROLLOUT_TRACE_CHUNK_KEY)
+        )
+        try:
+            current_ps_version = int(await self.gen_interface.ps_manager_handle.get_ps_model_version.remote())
+        except Exception:
+            # Diagnostics must not make a rollout request fail if the optional
+            # PS-version snapshot races with shutdown/recovery.
+            current_ps_version = -1
+            psrl_logger.exception(
+                "[PARTIAL_ROLLOUT_TRACE] failed to read current PS version uid=%s",
+                non_tensor_batch["uid"][0],
+            )
+        loaded_version = int(self.curr_rollout_instance_model_version)
+        context = {
+            "uid": int(non_tensor_batch["uid"][0]),
+            "chunk": chunk,
+            "partial": int("raw_response_ids" in non_tensor_batch),
+            "request_version": int(request_version),
+            "loaded_version": loaded_version,
+            "current_ps_version": current_ps_version,
+            "request_staleness": current_ps_version - int(request_version),
+            "loaded_staleness": current_ps_version - loaded_version,
+            "instance": int(self.get_instance_id()),
+            "previous_instance": previous_instance,
+            "prefix_tokens": prefix_tokens,
+            "prefix_sha256": prefix_sha256,
+            "prior_logprob_tokens": self._partial_rollout_trace_length(
+                non_tensor_batch.get("rollout_log_probs")
+            ),
+        }
+        psrl_logger.warning(
+            "[PARTIAL_ROLLOUT_TRACE] stage=generate_start uid=%s chunk=%s partial=%s "
+            "request_version=%s loaded_version=%s current_ps_version=%s "
+            "request_staleness=%s loaded_staleness=%s instance=%s previous_instance=%s "
+            "prefix_tokens=%s prefix_sha256=%s prior_logprob_tokens=%s",
+            context["uid"],
+            context["chunk"],
+            context["partial"],
+            context["request_version"],
+            context["loaded_version"],
+            context["current_ps_version"],
+            context["request_staleness"],
+            context["loaded_staleness"],
+            context["instance"],
+            context["previous_instance"] if context["previous_instance"] is not None else "none",
+            context["prefix_tokens"],
+            context["prefix_sha256"],
+            context["prior_logprob_tokens"],
+        )
+        return context
+
+    def _partial_rollout_trace_result(
+        self,
+        result: DataProto,
+        context: dict[str, Any] | None,
+    ) -> None:
+        if context is None:
+            return
+
+        non_tensor_batch = result.non_tensor_batch
+        response_tokens, response_sha256 = self._partial_rollout_trace_sequence(
+            non_tensor_batch.get("raw_response_ids")
+        )
+        interrupted = int(bool(non_tensor_batch["interrupted"][0]))
+        interrupted_by_scheduler = int(bool(non_tensor_batch["interrupted_by_scheduler"][0]))
+        generated_tokens = response_tokens - context["prefix_tokens"]
+        logprob_tokens = self._partial_rollout_trace_length(non_tensor_batch.get("rollout_log_probs"))
+        psrl_logger.warning(
+            "[PARTIAL_ROLLOUT_TRACE] stage=generate_result uid=%s chunk=%s partial=%s "
+            "request_version=%s loaded_version=%s instance=%s prefix_tokens=%s "
+            "response_tokens=%s generated_tokens=%s response_sha256=%s "
+            "rollout_logprob_tokens=%s interrupted=%s interrupted_by_scheduler=%s",
+            context["uid"],
+            context["chunk"],
+            context["partial"],
+            context["request_version"],
+            context["loaded_version"],
+            context["instance"],
+            context["prefix_tokens"],
+            response_tokens,
+            generated_tokens,
+            response_sha256,
+            logprob_tokens,
+            interrupted,
+            interrupted_by_scheduler,
+        )
+        if interrupted or interrupted_by_scheduler:
+            non_tensor_batch[self._PARTIAL_ROLLOUT_TRACE_CHUNK_KEY] = np.array(
+                [context["chunk"] + 1], dtype=np.int32
+            )
+        else:
+            non_tensor_batch.pop(self._PARTIAL_ROLLOUT_TRACE_CHUNK_KEY, None)
+
     def _log_sleep_wake_timing(self, operation: str, stage: str, started_at: float, **details: Any) -> None:
         detail_text = " ".join(f"{key}={value}" for key, value in details.items())
         psrl_logger.warning(
@@ -79,6 +241,45 @@ class PSRL_GenWorker(Worker):
             " " if detail_text else "",
             detail_text,
         )
+
+    def _log_rollout_weight_fingerprints(self, pull_results: Any, *, model_version: int) -> None:
+        """Persist EngineCore fingerprint records through the GenWorker logger."""
+        if not isinstance(pull_results, (list, tuple)) or not pull_results:
+            raise RuntimeError(
+                "Rollout weight verification expected one result per vLLM worker, "
+                f"but got {type(pull_results).__name__}: {pull_results!r}"
+            )
+
+        expected_records = (
+            ("raw_fingerprint", "rollout_after_raw_pull"),
+            ("final_fingerprint", "rollout_after_param_sync"),
+        )
+        for worker_index, worker_result in enumerate(pull_results):
+            if not isinstance(worker_result, dict):
+                raise RuntimeError(
+                    "Rollout weight verification received an invalid vLLM worker result: "
+                    f"worker_index={worker_index}, result={worker_result!r}"
+                )
+            if int(worker_result.get("model_version", -1)) != model_version:
+                raise RuntimeError(
+                    "Rollout weight verification version mismatch in vLLM worker result: "
+                    f"worker_index={worker_index}, expected={model_version}, "
+                    f"actual={worker_result.get('model_version')!r}"
+                )
+            for result_key, expected_stage in expected_records:
+                record = worker_result.get(result_key)
+                if not isinstance(record, dict):
+                    raise RuntimeError(
+                        "Rollout weight verification did not return a fingerprint record: "
+                        f"worker_index={worker_index}, result_key={result_key}, record={record!r}"
+                    )
+                if record.get("stage") != expected_stage or int(record.get("model_version", -1)) != model_version:
+                    raise RuntimeError(
+                        "Rollout weight verification returned inconsistent fingerprint metadata: "
+                        f"worker_index={worker_index}, expected_stage={expected_stage}, "
+                        f"expected_version={model_version}, record={record!r}"
+                    )
+                psrl_logger.warning("[WEIGHT_FINGERPRINT] %s", json.dumps(record, sort_keys=True))
 
     async def _log_tp_worker_tms_timing(self, operation: str) -> None:
         """Pull TP-local TMS stages into the GenWorker log."""
@@ -413,14 +614,14 @@ class PSRL_GenWorker(Worker):
         )
 
     async def _preload_reward_weights_to_cpu_cache(self) -> None:
-        """Preload reward model checkpoint weights into vLLM worker CPU memory."""
+        """Prepare the reward checkpoint's CPU weight source on vLLM workers."""
         assert self.rollout, "Rollout must be initialized before preloading reward weights."
         assert self.rollout.inference_engine is not None, "Reward vLLM engine must be initialized."
         await self.rollout.inference_engine.collective_rpc(
             "preload_weights_to_cpu_cache",
             args=(self.config.model.path, self.config.rollout.load_format),
         )
-        psrl_logger.info("Reward model weights preloaded to CPU cache on instance %s.", self.get_instance_id())
+        psrl_logger.info("Reward model CPU weight source prepared on instance %s.", self.get_instance_id())
 
     async def _load_reward_weights_from_cpu_cache(self) -> None:
         """Load reward model weights from the vLLM worker CPU cache to GPU."""
@@ -662,8 +863,13 @@ class PSRL_GenWorker(Worker):
         rollout = getattr(self, "rollout", None)
         inference_engine = getattr(rollout, "inference_engine", None)
         if inference_engine is not None:
-            inference_engine.shutdown(timeout=timeout_s)
-        self.rollout = None
+            try:
+                await inference_engine.collective_rpc("close_node_shared_weight_cache", args=())
+            finally:
+                inference_engine.shutdown(timeout=timeout_s)
+                self.rollout = None
+        else:
+            self.rollout = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def is_rollout_engine_sleeping(self) -> bool:
@@ -1126,15 +1332,31 @@ class PSRL_GenWorker(Worker):
                 await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
             )
         self._log_sleep_wake_timing("pull", "fetch_ps_metadata", metadata_start)
+        model_version = -1
+        fingerprint_options = None
+        if self.role == "rollout" and weight_fingerprint_flow_enabled(
+            self.psrl_config,
+            flow="transfer_chain",
+        ):
+            model_version = int(await ps_manager_handle.get_ps_model_version.remote("rollout_weight_fingerprint"))
+            fingerprint_options = resolve_weight_fingerprint_options(
+                self.psrl_config,
+                flow="transfer_chain",
+                model_version=model_version,
+            )
         if not self.psrl_config.profile.fix_weight:
             transfer_start = time.perf_counter()
-            await self.rollout.inference_engine.collective_rpc(
+            pull_results = await self.rollout.inference_engine.collective_rpc(
                 "nixl_pull_model_core",
                 args=(
                     self._cached_ps_nixl_agent_names,
                     self._cached_ps_nixl_gen_storage_client_names,
+                    model_version,
+                    fingerprint_options,
                 ),
             )
+            if fingerprint_options is not None:
+                self._log_rollout_weight_fingerprints(pull_results, model_version=model_version)
             self._log_sleep_wake_timing("pull", "nixl_pull_model_core", transfer_start)
             await self._log_tp_worker_stage_timing("pull", "nixl_pull_model_core")
         version_start = time.perf_counter()
@@ -1202,9 +1424,16 @@ class PSRL_GenWorker(Worker):
             )
 
         # Abort using vLLM internal request id strings (not PSRL uid integers).
-        await self.rollout.interrupt_requests_async(engine_request_ids)
-        psrl_logger.debug(f"Interrupted requests with IDs: {request_ids}")
-        interrupt_request_num = len(request_tasks)
+        # The rollout returns the count actually removed from OutputProcessor;
+        # this includes engine-queued requests that have no active Python task.
+        interrupt_request_num = await self.rollout.interrupt_requests_async(engine_request_ids)
+        psrl_logger.debug(
+            "Interrupted %d/%d requests with IDs (active_tasks=%d, ids=%s)",
+            interrupt_request_num,
+            len(engine_request_ids),
+            len(request_tasks),
+            request_ids,
+        )
         return interrupt_request_num
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1372,6 +1601,12 @@ class PSRL_GenWorker(Worker):
         request_ids = request.non_tensor_batch.get("uid", None)
         rollout_instance_id = self.get_instance_id()
 
+        previous_instance = None
+        if "rollout_instance_id" in request.non_tensor_batch:
+            previous_instance = self._partial_rollout_trace_scalar(
+                request.non_tensor_batch["rollout_instance_id"], default=-1
+            )
+
         # Only update the model version if the request is prompt-only
         if "raw_response_ids" in request.non_tensor_batch:
             # Indicate it is a partial rollout request, use the original version tag in the request
@@ -1413,6 +1648,11 @@ class PSRL_GenWorker(Worker):
             }
             request.meta_info.update(meta_info)
             request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id] * len(request.batch))
+            trace_context = await self._partial_rollout_trace_start(
+                request,
+                request_version=model_version,
+                previous_instance=previous_instance,
+            )
 
             # Start the generation
             with log_dual_events(
@@ -1429,6 +1669,7 @@ class PSRL_GenWorker(Worker):
             )
 
             result = self.rollout.post_process_outputs(request, vllm_output)
+            self._partial_rollout_trace_result(result, trace_context)
 
             interrupted = result.non_tensor_batch["interrupted"][0]
             interrupted_by_scheduler = result.non_tensor_batch["interrupted_by_scheduler"][0]

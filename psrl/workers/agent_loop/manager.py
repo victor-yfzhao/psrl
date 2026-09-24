@@ -83,9 +83,13 @@ class PSRL_AgentLoopManager:
 
         self.train_data_queue = asyncio.Queue(maxsize=data_queue_size)
         self.val_data_queue = asyncio.Queue(maxsize=data_queue_size)
-        # result_queue_size = self.entries_per_buffer * self.rollout_n * (self.staleness + 1)
-        # self.result_queue = asyncio.Queue(maxsize=result_queue_size)
-        self.result_queue = asyncio.Queue()
+        self.train_result_queue = asyncio.Queue()
+        self.val_result_queue = asyncio.Queue()
+        # Validation recovery gets priority after its first result arrives. This
+        # keeps queued training results from delaying a validation buffer.
+        self._validation_recovery_done = asyncio.Event()
+        self._validation_recovery_done.set()
+        self._active_val_buffer_ids: set[int] = set()
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
 
@@ -96,7 +100,8 @@ class PSRL_AgentLoopManager:
         self.running_loop = None
         self.train_dispatch_task = None
         self.val_dispatch_task = None
-        self.collect_task = None
+        self.train_collect_task = None
+        self.val_collect_task = None
         self.stop_train_dispatch_task = False
         self.stop_val_dispatch_task = False
         self.stop_collect_task = False
@@ -185,8 +190,10 @@ class PSRL_AgentLoopManager:
             and not self.train_dispatch_task.done()
             or self.val_dispatch_task is not None
             and not self.val_dispatch_task.done()
-            or self.collect_task is not None
-            and not self.collect_task.done()
+            or self.train_collect_task is not None
+            and not self.train_collect_task.done()
+            or self.val_collect_task is not None
+            and not self.val_collect_task.done()
         ):
             return
 
@@ -202,27 +209,33 @@ class PSRL_AgentLoopManager:
         self.train_dispatch_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
         self.val_dispatch_task = self.running_loop.create_task(self._val_dispatch_data())
         self.val_dispatch_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
-        self.collect_task = self.running_loop.create_task(self._collect_results())
-        self.collect_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        self.train_collect_task = self.running_loop.create_task(self._collect_results(is_validate=False))
+        self.train_collect_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        self.val_collect_task = self.running_loop.create_task(self._collect_results(is_validate=True))
+        self.val_collect_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
         if (
             (not self.train_dispatch_task or self.train_dispatch_task.done())
             and (not self.val_dispatch_task or self.val_dispatch_task.done())
-            and (not self.collect_task or self.collect_task.done())
+            and (not self.train_collect_task or self.train_collect_task.done())
+            and (not self.val_collect_task or self.val_collect_task.done())
         ):
             return
 
         self.stop_train_dispatch_task = True
         self.stop_val_dispatch_task = True
         self.stop_collect_task = True
+        self._validation_recovery_done.set()
         # Wait for the background task to finish
-        await asyncio.gather(
+        tasks = [
             self.train_dispatch_task,
             self.val_dispatch_task,
-            self.collect_task,
-        )
+            self.train_collect_task,
+            self.val_collect_task,
+        ]
+        await asyncio.gather(*(task for task in tasks if task is not None))
 
         # Stop the busy loop of agent loop workers
         futures = []
@@ -245,15 +258,22 @@ class PSRL_AgentLoopManager:
         Returns:
             The ID of the generated validation buffer.
         """
-        batch_size = len(data) // self.val_rollout_n
-        for i in range(batch_size):
-            await self.ps_manager_handle.add_request.remote(
-                data.non_tensor_batch["uid"][i * self.val_rollout_n : (i + 1) * self.val_rollout_n].tolist(),
-                is_validate=True,
-            )
-            await self.put_data(data[i * self.val_rollout_n : (i + 1) * self.val_rollout_n], is_validate=True)
+        buffer_id = self._val_buffer_id
         self._val_buffer_id += 1
-        return self._val_buffer_id - 1
+        self._active_val_buffer_ids.add(buffer_id)
+
+        try:
+            batch_size = len(data) // self.val_rollout_n
+            for i in range(batch_size):
+                await self.ps_manager_handle.add_request.remote(
+                    data.non_tensor_batch["uid"][i * self.val_rollout_n : (i + 1) * self.val_rollout_n].tolist(),
+                    is_validate=True,
+                )
+                await self.put_data(data[i * self.val_rollout_n : (i + 1) * self.val_rollout_n], is_validate=True)
+        except BaseException:
+            self._finish_validation_recovery(buffer_id)
+            raise
+        return buffer_id
 
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
@@ -681,26 +701,50 @@ class PSRL_AgentLoopManager:
         return dispatch_plan
 
     async def put_result(self, result: DataProto):
-        """Put result data into the manager's result queue."""
-        await self.result_queue.put(result)
-        # psrl_logger.info(f"Put result {result.non_tensor_batch['uid']} into result queue")
+        """Put result data into the corresponding collection queue."""
+        if result.meta_info.get("validate", False):
+            # Once validation starts returning results, finish that buffer before
+            # admitting more queued training results into the PS recovery path.
+            if self._validation_recovery_done.is_set():
+                psrl_logger.info(
+                    "Validation result recovery started; pausing training recovery "
+                    f"with {self.train_result_queue.qsize()} queued results."
+                )
+            self._validation_recovery_done.clear()
+            await self.val_result_queue.put(result)
+        else:
+            await self.train_result_queue.put(result)
 
-    async def _collect_results(self):
-        """Main collection loop that gathers results from workers."""
+    async def _collect_results(self, is_validate: bool):
+        """Collect training or validation results from its dedicated queue."""
+        result_queue = self.val_result_queue if is_validate else self.train_result_queue
         while not self.stop_collect_task:
-            # psrl_logger.info(f"Collecting results from result queue with size {self.result_queue.qsize()}")
-            while not self.result_queue.empty():
-                result = self.result_queue.get_nowait()
-                # psrl_logger.info(f"Got requests {result.non_tensor_batch['uid']} from result queue")
+            if result_queue.empty():
+                await asyncio.sleep(0)
+                continue
 
-                # Process the collected result
-                result = self._post_process(result)
-                # Occupy requests in PS worker
-                # psrl_logger.info(f"Post-processed requests {result.non_tensor_batch['uid']}")
-                await self.occupy_requests(result)
-                # psrl_logger.info(f"Occupied requests {result.non_tensor_batch['uid']}")
-            await asyncio.sleep(0)  # Yield control to the event loop
-        psrl_logger.info("Stop collecting results")
+            if not is_validate:
+                await self._validation_recovery_done.wait()
+                if self.stop_collect_task:
+                    break
+
+            result = result_queue.get_nowait()
+            result = self._post_process(result)
+            await self.occupy_requests(result)
+            await asyncio.sleep(0)
+        psrl_logger.info(f"Stop collecting {'validation' if is_validate else 'training'} results")
+
+    def _finish_validation_recovery(self, buffer_id: int):
+        """Release training recovery after all active validation buffers finish."""
+        recovery_was_active = not self._validation_recovery_done.is_set()
+        self._active_val_buffer_ids.discard(buffer_id)
+        if not self._active_val_buffer_ids:
+            self._validation_recovery_done.set()
+            if recovery_was_active:
+                psrl_logger.info(
+                    f"Validation buffer {buffer_id} recovery finished; resuming training recovery "
+                    f"with {self.train_result_queue.qsize()} queued results."
+                )
 
     async def occupy_requests(self, request_data: DataProto):
         """
@@ -1133,6 +1177,7 @@ class PSRL_AgentLoopManager:
                 del self._val_buffer_waiters[buffer_id]
             else:
                 psrl_logger.warning(f"No waiters found for VALIDATION buffer {buffer_id} when trying to awake.")
+            self._finish_validation_recovery(buffer_id)
             await self.ps_manager_handle.maybe_delete_buffer.remote(ready_buffer_id, is_validate)
             return
 

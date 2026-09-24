@@ -18,16 +18,19 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
-    slice_in_proj_ba,
-    slice_in_proj_qkvz,
-    slice_qwen3_5_in_proj_qkv,
+    get_qkv_tp_layout,
+    reshape_visual_block_qkv,
+    slice_attn_conv1d,
     slice_fused_moe_w2_weight,
     slice_fused_moe_w13_weight,
     slice_gate_up_proj,
+    slice_in_proj_ba,
+    slice_in_proj_qkvz,
     slice_qkv_proj,
-    slice_attn_conv1d,
-    reshape_visual_block_qkv,
+    slice_qwen3_5_in_proj_qkv,
+    visual_qkv_tp_shard_spec,
 )
+from psrl.utils.converter.param_sync import DTypeCastSync, ParamSyncPlan
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
@@ -44,6 +47,7 @@ class VllmConverter(BaseConverter):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
+        self.sync_plan = ParamSyncPlan()
         self.mappings = parameter_mapping.get_mappings()
         self.fused_mappings: dict[str, tuple[MappingType, list[tuple[str, int]]]] = {}
         for vllm_name, hf_name, mapping_type, shard_id in self.mappings:
@@ -85,15 +89,15 @@ class VllmConverter(BaseConverter):
             if module_prefix.startswith("language_model.model"):
                 module_prefix = f"model.language_model.{module_prefix[21:]}"
             if module_prefix.startswith("language_model.lm_head"):
-                module_prefix = f"lm_head"
+                module_prefix = "lm_head"
             seen_module_prefixes.add(module_prefix)
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 if full_name.startswith("."):
                     full_name = full_name[1:]
                 new_params = self.convert_parameter(full_name, param, module)
-                sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
+                    sharding = self.get_sharding_for_param(module, param_name, new_param_name)
                     new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
@@ -105,13 +109,36 @@ class VllmConverter(BaseConverter):
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 new_params = self.convert_parameter(full_name, param, module)
-                sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
+                    sharding = self.get_sharding_for_param(module, param_name, new_param_name)
                     new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
+        self._expose_external_fp32_params(
+            converted_state_dict,
+            strict="Qwen3_5" in type(model).__name__,
+        )
         return converted_state_dict, sharding_dict
+
+    def _expose_external_fp32_params(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Expose canonical FP32 copies for parameters stored in lower precision by vLLM."""
+        fp32_patterns = self.parameter_mapping.get_external_fp32_param_patterns()
+        for key, tensor in state_dict.items():
+            if tensor.dtype != torch.float32 and any(pattern in key for pattern in fp32_patterns):
+                if strict:
+                    raise TypeError(
+                        "vLLM precision invariant violated: "
+                        f"{key} must be stored as float32, got {tensor.dtype}. "
+                        "Apply the matching PSRL vLLM patch before starting Qwen3.5."
+                    )
+                self.sync_plan.add(DTypeCastSync(key=key, source_param=tensor))
+                state_dict[key] = tensor.float()
 
     def convert_parameter(self, full_name: str, param: Parameter, module) -> dict:
         """
@@ -151,7 +178,9 @@ class VllmConverter(BaseConverter):
                     intermediate_size = self.model_info["intermediate_size"]
                     if intermediate_size is None:
                         intermediate_size = self.model_info["moe_intermediate_size"]
-                    assert intermediate_size is not None, "Intermediate size must be specified in model_info for gate_up_proj split"
+                    assert intermediate_size is not None, (
+                        "Intermediate size must be specified in model_info for gate_up_proj split"
+                    )
                     try:
                         sliced_params = slice_gate_up_proj(
                             fused_param=param,
@@ -291,7 +320,7 @@ class VllmConverter(BaseConverter):
             return dict(zip(new_param_names, new_params))
 
         if "visual.blocks" in full_name and "qkv" in full_name:
-            param = reshape_visual_block_qkv(param)
+            param = reshape_visual_block_qkv(param, vision_head_size=self.model_info.get("vision_head_size"))
 
         # Default: No conversion needed
         return {full_name: param}
@@ -319,9 +348,30 @@ class VllmConverter(BaseConverter):
                 ),
             ):
                 if "visual.blocks" in full_name and "qkv" in full_name:
-                    shard_dim = 1
+                    shard_dim = 0
+                    tp_rank = self.tp_rank if self.tp_rank is not None else 0
+                    tp_size, shard_indices = visual_qkv_tp_shard_spec(tp_size, tp_rank)
                 else:
                     shard_dim = 0
+                    is_kv_projection = full_name is not None and any(
+                        full_name.endswith(suffix)
+                        for suffix in (
+                            "k_proj.weight",
+                            "k_proj.bias",
+                            "v_proj.weight",
+                            "v_proj.bias",
+                        )
+                    )
+                    if isinstance(module, QKVParallelLinear) and is_kv_projection:
+                        _, _, num_kv_head_replicas = get_qkv_tp_layout(
+                            num_heads=self.model_info["num_heads"],
+                            num_kv_heads=self.model_info["num_kv_heads"],
+                            tp_size=tp_size,
+                        )
+                        if num_kv_head_replicas > 1:
+                            tp_rank = self.tp_rank if self.tp_rank is not None else 0
+                            tp_size //= num_kv_head_replicas
+                            shard_indices = [(tp_rank // num_kv_head_replicas,)]
             elif isinstance(module, RowParallelLinear):
                 if param_name == "bias":
                     # NOTE(zym) bias doesn't need to be sharded
@@ -363,7 +413,8 @@ def convert_vllm_inplace(
     parameter_mapping: ParameterMapping,
     model,
     tp_rank: int = 0,
-) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
+    return_sync_plan: bool = False,
+):
     """
     Convenience function to convert vLLM model to unified state dict and sharding info.
     Args:
@@ -374,4 +425,7 @@ def convert_vllm_inplace(
         (converted_state_dict, sharding_dict)
     """
     converter = VllmConverter(parameter_mapping, tp_rank=tp_rank)
-    return converter.convert_state_and_sharding_dict(model)
+    state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
+    if return_sync_plan:
+        return state_dict, sharding_dict, converter.sync_plan
+    return state_dict, sharding_dict

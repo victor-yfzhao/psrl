@@ -4,6 +4,13 @@ from types import SimpleNamespace
 import psrl.utils.elastic_rm.itl_scaling_policy as itl_policy_module
 import pytest
 from psrl.trainer.ppo.utils import PSRL_Role
+from psrl.utils.elastic_rm.cpp_candidate_evaluator import (
+    CppBatchEvaluation,
+    CppCandidateEvaluatorError,
+)
+from psrl.utils.elastic_rm.itl_harmonic_scaling_policy import (
+    ITLHarmonicScalingPolicy,
+)
 from psrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy, _ITLCandidate
 from psrl.utils.elastic_rm.request_level_candidate_evaluator import RoleCandidatePlan
 from psrl.utils.elastic_rm.scaling_policy import InstanceSignal, ScalingAction
@@ -31,8 +38,11 @@ def _policy(
     router_waiting_top_t=-1,
     min_awake_per_role=1,
     config=None,
+    policy_cls=ITLScalingPolicy,
+    candidate_backend="python",
+    cpp_binary=None,
 ):
-    return ITLScalingPolicy(
+    return policy_cls(
         config=config or _config(),
         policy_config={
             "enable_policy": True,
@@ -41,15 +51,15 @@ def _policy(
             "itl_policy": {
                 "enable_request_level_candidate_evaluation": True,
                 "candidate_evaluation_max_workers": max_workers,
+                "candidate_evaluation_backend": candidate_backend,
+                "candidate_evaluation_cpp_binary": cpp_binary,
                 "router_waiting_top_t": router_waiting_top_t,
                 "rm_router_enable": True,
                 "throughput_objective": "sum",
                 "vllm_current_queue_scope": "running",
                 "decision_window_s": 30.0,
                 "min_gain": 0.0,
-                "model_params": {
-                    "default": {"A": 0.1, "B": 1.0, "C": 0.0, "D": 0.0}
-                },
+                "model_params": {"default": {"A": 0.1, "B": 1.0, "C": 0.0, "D": 0.0}},
             },
         },
     )
@@ -70,12 +80,31 @@ def _legacy_policy():
                 "vllm_current_queue_scope": "running",
                 "decision_window_s": 30.0,
                 "min_gain": 0.0,
-                "model_params": {
-                    "default": {"A": 0.1, "B": 1.0, "C": 0.0, "D": 0.0}
-                },
+                "model_params": {"default": {"A": 0.1, "B": 1.0, "C": 0.0, "D": 0.0}},
             },
         },
     )
+
+
+def test_itl_policy_rebalance_after_scale_up_defaults_true():
+    policy = _legacy_policy()
+    assert policy.rebalance_after_scale_up is True
+
+
+def test_itl_policy_can_disable_rebalance_after_scale_up():
+    policy = ITLScalingPolicy(
+        config=_config(),
+        policy_config={
+            "enable_policy": True,
+            "itl_policy": {
+                "enable_request_level_candidate_evaluation": True,
+                "rebalance_after_scale_up": False,
+                "router_waiting_top_t": -1,
+            },
+        },
+    )
+    assert policy.rebalance_after_scale_up is False
+    assert policy.enable_request_level_candidate_evaluation is True
 
 
 def _signal(role, instance_id, *, awake, running=0, tokens=0):
@@ -184,10 +213,46 @@ def test_request_level_policy_scores_candidate_and_attaches_rebalance_plan():
 
     assert baseline == candidate.current_throughput
     assert candidate.request_level_results_by_role is not None
-    assert [
-        migration["request_id"]
-        for migration in candidate.action.planned_request_migrations
-    ] == ["1", "2"]
+    assert [migration["request_id"] for migration in candidate.action.planned_request_migrations] == ["1", "2"]
+
+
+def test_harmonic_decide_records_planner_phase_breakdown():
+    policy = _policy(max_workers=2, policy_cls=ITLHarmonicScalingPolicy)
+    grouped, snapshots, _ = _fixture()
+    signals = grouped[PSRL_Role.Rollout] + grouped[PSRL_Role.RewardModel]
+    try:
+        policy.decide(
+            signals,
+            router_backlog_by_role={},
+            request_level_snapshots_by_role=snapshots,
+        )
+    finally:
+        policy._candidate_evaluation_executor.shutdown(wait=True)
+
+    assert set(policy.last_planner_breakdown) == {
+        "state_analysis_s",
+        "candidate_ordering_s",
+        "candidate_set_construction_s",
+        "simulation_input_preparation_s",
+        "candidate_evaluation_wall_s",
+        "rebalance_simulation_s",
+        "router_simulation_s",
+        "simulation_wall_s",
+        "rebalance_router_overlap_s",
+        "candidate_scoring_s",
+        "best_candidate_selection_s",
+    }
+    assert policy.last_planner_breakdown["state_analysis_s"] > 0.0
+    assert policy.last_planner_breakdown["candidate_ordering_s"] > 0.0
+    assert policy.last_planner_breakdown["candidate_set_construction_s"] > 0.0
+    assert policy.last_planner_breakdown["simulation_input_preparation_s"] > 0.0
+    assert policy.last_planner_breakdown["candidate_evaluation_wall_s"] > 0.0
+    assert policy.last_planner_breakdown["rebalance_simulation_s"] >= 0.0
+    assert policy.last_planner_breakdown["router_simulation_s"] >= 0.0
+    assert policy.last_planner_breakdown["simulation_wall_s"] >= 0.0
+    assert policy.last_planner_breakdown["rebalance_router_overlap_s"] >= 0.0
+    assert policy.last_planner_breakdown["candidate_scoring_s"] > 0.0
+    assert policy.last_planner_breakdown["best_candidate_selection_s"] > 0.0
 
 
 def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
@@ -239,9 +304,7 @@ def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
     try:
         decision = policy.decide(
             signals,
-            router_backlog_by_role={
-                PSRL_Role.RewardModel: {"request_count": 1, "token_count": 1}
-            },
+            router_backlog_by_role={PSRL_Role.RewardModel: {"request_count": 1, "token_count": 1}},
             request_level_snapshots_by_role=snapshots,
         )
     finally:
@@ -336,6 +399,119 @@ def test_request_level_policy_validates_top_t_and_exact_strategies():
         _policy(config=_config(rollout_method="round_robin"))
     with pytest.raises(ValueError, match="reward-model routing strategy 'itl'"):
         _policy(config=_config(rm_method="round_robin"))
+    with pytest.raises(ValueError, match="candidate_evaluation_backend"):
+        _policy(candidate_backend="invalid")
+
+
+def test_request_level_policy_can_use_cpp_backend(monkeypatch):
+    closed = []
+
+    class FakeCppCandidateEvaluator:
+        def __init__(self, *, binary_path, max_workers, timeout_s):
+            assert binary_path == "/fake/elastic_simulator"
+            assert max_workers == 2
+            assert timeout_s == 30.0
+
+        def evaluate(self, *, snapshots, candidate_plans):
+            contexts = {
+                role: itl_policy_module.prepare_role_evaluation_context(snapshot)
+                for role, snapshot in snapshots.items()
+            }
+            baseline = {
+                role: itl_policy_module.evaluate_role_candidate(
+                    context,
+                    RoleCandidatePlan(),
+                )
+                for role, context in contexts.items()
+            }
+            candidate_results = tuple(
+                {
+                    role: itl_policy_module.evaluate_role_candidate(
+                        contexts[role],
+                        plans[role],
+                    )
+                    for role in contexts
+                }
+                for plans in candidate_plans
+            )
+            return CppBatchEvaluation(
+                baseline_results=baseline,
+                candidate_results=candidate_results,
+                logical_task_count=2 * (len(candidate_plans) + 1),
+                unique_task_count=3,
+                deduplicated_task_count=1,
+                bridge_wall_s=0.004,
+                evaluation_wall_s=0.003,
+                rebalance_simulation_s=0.001,
+                router_simulation_s=0.002,
+                simulation_wall_s=0.0025,
+                rebalance_router_overlap_s=0.0005,
+            )
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        itl_policy_module,
+        "CppCandidateEvaluator",
+        FakeCppCandidateEvaluator,
+    )
+    policy = _policy(
+        max_workers=2,
+        candidate_backend="cpp",
+        cpp_binary="/fake/elastic_simulator",
+    )
+    grouped, snapshots, candidate = _fixture()
+    try:
+        baseline = policy._evaluate_request_level_candidates(
+            candidates=[candidate],
+            grouped=grouped,
+            router_backlog_by_role={},
+            request_level_snapshots_by_role=snapshots,
+        )
+    finally:
+        policy.close()
+
+    assert policy._candidate_evaluation_executor is None
+    assert baseline == candidate.current_throughput
+    assert candidate.request_level_results_by_role is not None
+    assert [migration["request_id"] for migration in candidate.action.planned_request_migrations] == ["1", "2"]
+    assert policy._last_request_level_simulation_timing["rebalance_simulation_s"] == 0.001
+    assert policy._last_request_level_simulation_timing["router_simulation_s"] == 0.002
+    assert policy._last_request_level_simulation_timing["candidate_evaluation_wall_s"] == 0.003
+    assert policy._last_request_level_simulation_timing["simulation_wall_s"] == 0.0025
+    assert policy._last_request_level_simulation_timing["rebalance_router_overlap_s"] == 0.0005
+    assert closed == [True]
+
+
+def test_request_level_policy_propagates_cpp_backend_failure(monkeypatch):
+    class FailedCppCandidateEvaluator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def evaluate(self, **_kwargs):
+            raise CppCandidateEvaluatorError("C++ candidate evaluator exited with code 1")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        itl_policy_module,
+        "CppCandidateEvaluator",
+        FailedCppCandidateEvaluator,
+    )
+    policy = _policy(candidate_backend="cpp", cpp_binary="/fake/elastic_simulator")
+    grouped, snapshots, _ = _fixture()
+    signals = grouped[PSRL_Role.Rollout] + grouped[PSRL_Role.RewardModel]
+    try:
+        with pytest.raises(CppCandidateEvaluatorError, match="exited with code 1"):
+            policy.decide(
+                signals,
+                router_backlog_by_role={},
+                request_level_snapshots_by_role=snapshots,
+            )
+    finally:
+        policy.close()
 
 
 def test_request_level_policy_prepares_once_and_deduplicates_unchanged_role(
@@ -379,7 +555,15 @@ def test_request_level_policy_prepares_once_and_deduplicates_unchanged_role(
 
     assert sorted(prepared_roles) == ["RewardModel", "Rollout"]
     assert len(evaluated_plans) == 3
-    assert sum(
-        role == "RewardModel" and plan == RoleCandidatePlan()
-        for role, plan in evaluated_plans
-    ) == 1
+    assert sum(role == "RewardModel" and plan == RoleCandidatePlan() for role, plan in evaluated_plans) == 1
+    timing = policy._last_request_level_simulation_timing
+    assert timing["candidate_evaluation_wall_s"] > 0.0
+    assert timing["rebalance_simulation_s"] >= 0.0
+    assert timing["router_simulation_s"] >= 0.0
+    assert timing["simulation_wall_s"] == pytest.approx(
+        timing["rebalance_simulation_s"]
+        + timing["router_simulation_s"]
+        - timing["rebalance_router_overlap_s"]
+    )
+    assert timing["simulation_wall_s"] <= timing["candidate_evaluation_wall_s"]
+    assert sum(timing.values()) > 0.0

@@ -37,6 +37,7 @@ from psrl.utils.nixl import (
     NIXLInterface,
     NIXLStorageClient,
 )
+from psrl.utils.optimizer_state import assert_optimizer_state_offloaded
 from psrl.utils.ray import exclusive_push_model_context
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
 
@@ -168,9 +169,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             trust_remote_code=self.config.model.get("trust_remote_code", False),
         )
         parameter_mapping = create_parameter_mapping("Megatron", model_config)
-        self.unified_state_dict, self.local_sharding_dict = convert_megatron_inplace(
+        self.unified_state_dict, self.local_sharding_dict, self.param_sync_plan = convert_megatron_inplace(
             parameter_mapping,
             self.actor_module,
+            return_sync_plan=True,
         )
 
     def nixl_protocol(self, mode: str = "full"):
@@ -213,6 +215,25 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     def nixl_sleep(self, mode: str = "full"):
         """Deregister local tensors and put model weights to sleep state."""
+        full_sleep = mode != "meta"
+        if full_sleep:
+            if not self._is_offload_optimizer:
+                raise RuntimeError(
+                    "Full trainer sleep requires train_actor_rollout_ref.actor.megatron."
+                    "optimizer_offload=True so optimizer state survives TMS pause/resume."
+                )
+            torch.cuda.synchronize()
+            optimizer_summary = assert_optimizer_state_offloaded(
+                self.actor_optimizer,
+                stage="before_sleep",
+                rank=self.rank,
+            )
+            psrl_logger.info(
+                "[TRAINER_OPTIMIZER_OFFLOAD_CHECK] stage=before_sleep rank=%d summary=%s",
+                self.rank,
+                optimizer_summary,
+            )
+        self._psrl_full_sleep_active = full_sleep
         self.sleep_megatron_model()
         if mode == "meta":
             return
@@ -290,8 +311,20 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         to handle memory changes after sleep/wake_up cycle.
         """
         self.wake_up_megatron_model()
+        if getattr(self, "_psrl_full_sleep_active", False):
+            optimizer_summary = assert_optimizer_state_offloaded(
+                self.actor_optimizer,
+                stage="after_wake",
+                rank=self.rank,
+            )
+            psrl_logger.info(
+                "[TRAINER_OPTIMIZER_OFFLOAD_CHECK] stage=after_wake rank=%d summary=%s",
+                self.rank,
+                optimizer_summary,
+            )
         # Re-register the state dict and sharding dict to the NIXL client
         self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
+        self._psrl_full_sleep_active = False
 
     def wake_up_megatron_model(self):
         """
@@ -406,7 +439,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
         psrl_logger.info("Gathering the full state dict on the CPU of the representative rank.")
-        
+
         if self.bridge is not None:
             if self.vanilla_bridge:
                 per_tensor_param = self.bridge.export_weights(self.actor.actor_module)

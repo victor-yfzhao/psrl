@@ -1,11 +1,14 @@
 import asyncio
+import concurrent.futures
 import logging
 import os
 import time
+from collections import deque
+from typing import Any
 
 import numpy as np
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from verl import DataProto
 from vllm.sampling_params import RequestOutputKind
@@ -15,6 +18,7 @@ from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.elastic_rm.overhead import RequestMigrationOverheadTracker
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.utils.rollout.reprefill import filter_rollout_request_ids
 from psrl.utils.rollout.request_id import canonical_psrl_request_id
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.request_queue import (
@@ -39,6 +43,43 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote(concurrency_groups={"control": 1, "transition_wait": 32, "monitor": 1})
 class RolloutRouter:
+    def _partial_rollout_trace_enabled(self) -> bool:
+        return bool(OmegaConf.select(self.config, "psrl.partial_rollout.trace.enable", default=False))
+
+    def _log_partial_rollout_route(
+        self,
+        *,
+        request_id: int,
+        is_partial: bool,
+        previous_instance: int | None,
+        requested_version: int,
+        chosen_instance: int | None,
+        route_reason: str,
+        candidates: list[int],
+    ) -> None:
+        """Emit the routing side of a partial-rollout continuation audit."""
+        if not self._partial_rollout_trace_enabled() or not is_partial:
+            return
+
+        selected_version = (
+            self.instance_to_version_after_sync.get(chosen_instance) if chosen_instance is not None else None
+        )
+        candidate_versions = ",".join(
+            f"{instance_id}:{self.instance_to_version_after_sync[instance_id]}"
+            for instance_id in sorted(candidates)
+        )
+        psrl_logger.warning(
+            "[PARTIAL_ROLLOUT_TRACE] stage=route uid=%s partial=1 previous_instance=%s "
+            "requested_version=%s selected_instance=%s selected_version=%s route_reason=%s candidates=%s",
+            request_id,
+            previous_instance if previous_instance is not None else "none",
+            requested_version,
+            chosen_instance if chosen_instance is not None else "none",
+            selected_version if selected_version is not None else "none",
+            route_reason,
+            candidate_versions or "none",
+        )
+
     def __init__(
         self,
         config: DictConfig,
@@ -113,6 +154,10 @@ class RolloutRouter:
         # {request_id: instance_id}
         self.incomplete_request_to_instance = {}
         self.request_futures = {}  # Track request futures: {request_id: Future}
+        # Keep validation state separate so experimental rollout-only
+        # interruption can never include validation requests.
+        self._request_is_validate: dict[int, bool] = {}
+        self._force_reroute_request_ids: set[int] = set()
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
         # Track the instance ids that are currently paused (not available for routing)
@@ -137,6 +182,20 @@ class RolloutRouter:
             "forced": 0,
             "fallback": 0,
         }
+        self._exclusive_rebalance_migration_queue_enabled = bool(
+            OmegaConf.select(
+                self.config,
+                "psrl.deployment.elastic_rm.itl_policy.exclusive_rebalance_migration_queue",
+                default=False,
+            )
+        )
+        self._rebalance_requests_to_route: deque[DataProto] = deque()
+        self._rebalance_pending_request_ids: set[str] = set()
+        self._rebalance_queued_request_ids: set[str] = set()
+        self._rebalance_dispatching_request_ids: set[str] = set()
+        self._routing_wakeup_event: asyncio.Event | None = None
+        self._routing_event_loop: asyncio.AbstractEventLoop | None = None
+        self._rebalance_completion_waiters: set[concurrent.futures.Future[None]] = set()
 
         # Build logger
         self.log_prefix = "RolloutRouter"
@@ -326,22 +385,295 @@ class RolloutRouter:
         for instance_id in instance_ids:
             self.currently_paused_instance_ids.discard(instance_id)
 
+    @staticmethod
+    def _log_migration_interrupt(request_id: Any, overhead: dict[str, Any]) -> None:
+        psrl_logger.info(
+            "[ELASTIC_OVERHEAD] operation=request_migration_interrupt "
+            "scope=post_scale_up_rebalance role=Rollout migration_id=%s decision_id=%s "
+            "request_id=%s source_instance=%s selected_count=%s interrupt_s=%.6f "
+            "interrupt_scope=abort_to_requeue",
+            overhead.get("migration_id"),
+            overhead.get("decision_id"),
+            request_id,
+            overhead.get("source_instance_id"),
+            overhead.get("selected_count"),
+            overhead["interrupt_s"],
+        )
+
+    def _mark_migration_requeued(self, request_id: Any, *, defer_log: bool = False) -> None:
+        overhead = self._migration_overhead.mark_requeued(request_id)
+        if overhead is None or defer_log:
+            return
+        self._log_migration_interrupt(request_id, overhead)
+
+    def _exclusive_rebalance_active(self) -> bool:
+        return bool(
+            getattr(self, "_exclusive_rebalance_migration_queue_enabled", False)
+            and getattr(self, "_rebalance_pending_request_ids", set())
+        )
+
+    def _exclusive_rebalance_ready_to_dispatch(self) -> bool:
+        return bool(
+            self._exclusive_rebalance_active()
+            and getattr(self, "_rebalance_requests_to_route", ())
+            and not getattr(self, "_rebalance_dispatching_request_ids", set())
+            and not getattr(self, "_pause_routing", False)
+        )
+
+    def _wake_routing_loop(self) -> None:
+        """Wake the routing loop without waiting for its periodic poll."""
+        event = getattr(self, "_routing_wakeup_event", None)
+        loop = getattr(self, "_routing_event_loop", None)
+        if event is None or loop is None or loop.is_closed():
+            return
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
+
+    def _notify_exclusive_rebalance_completed(self) -> None:
+        """Release waiters that may run on a different Ray concurrency-group loop."""
+        waiters = getattr(self, "_rebalance_completion_waiters", set())
+        for waiter in tuple(waiters):
+            try:
+                waiter.set_result(None)
+            except concurrent.futures.InvalidStateError:
+                pass
+        waiters.clear()
+
+    async def _wait_for_routing_iteration(self, timeout_s: float) -> None:
+        """Keep normal polling while allowing rebalance dispatch to wake immediately."""
+        event = getattr(self, "_routing_wakeup_event", None)
+        if event is None:
+            await asyncio.sleep(timeout_s)
+            return
+        event.clear()
+        # Closing the clear/check race is important: settlement may have
+        # happened just before this iteration reached the wait boundary.
+        if self._exclusive_rebalance_ready_to_dispatch():
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_s)
+        except TimeoutError:
+            pass
+
+    def _start_exclusive_rebalance(self, instance_to_uids: dict, migration_context: dict) -> None:
+        if not getattr(self, "_exclusive_rebalance_migration_queue_enabled", False):
+            return
+        request_ids = {
+            canonical_psrl_request_id(uid)
+            for uids in (instance_to_uids or {}).values()
+            for uid in (uids if isinstance(uids, (list, tuple, set)) else [uids])
+            if uid is not None
+        }
+        # Legacy ratio-based rebalance has no simulated destination. Keep its
+        # existing routing behavior even when the exclusive queue is enabled.
+        request_ids.intersection_update(self._planned_migration_destinations)
+        if not request_ids:
+            return
+        self._rebalance_pending_request_ids.update(request_ids)
+        psrl_logger.info(
+            "Exclusive rollout rebalance started: migration_id=%s pending=%d normal_pending=%d",
+            migration_context.get("migration_id"),
+            len(self._rebalance_pending_request_ids),
+            self.requests_to_route.size(),
+        )
+
+    def _finish_exclusive_rebalance_request(self, request_id: Any, *, reason: str) -> None:
+        request_key = canonical_psrl_request_id(request_id)
+        if request_key not in getattr(self, "_rebalance_pending_request_ids", set()):
+            return
+        self._rebalance_pending_request_ids.discard(request_key)
+        self._rebalance_queued_request_ids.discard(request_key)
+        self._rebalance_dispatching_request_ids.discard(request_key)
+        self._planned_migration_destinations.pop(request_key, None)
+        psrl_logger.info(
+            "Exclusive rollout rebalance request settled: request=%s reason=%s remaining=%d",
+            request_key,
+            reason,
+            len(self._rebalance_pending_request_ids),
+        )
+        if not self._rebalance_pending_request_ids:
+            psrl_logger.info("Exclusive rollout rebalance completed; resuming normal routing.")
+            self._notify_exclusive_rebalance_completed()
+            self._wake_routing_loop()
+        elif self._exclusive_rebalance_ready_to_dispatch():
+            self._wake_routing_loop()
+
+    def _enqueue_exclusive_rebalance_request(self, request: DataProto) -> bool:
+        if not self._exclusive_rebalance_active():
+            return False
+        request_id = request.non_tensor_batch["uid"][0]
+        request_key = canonical_psrl_request_id(request_id)
+        if request_key not in self._rebalance_pending_request_ids:
+            return False
+        if request_key not in self._planned_migration_destinations:
+            psrl_logger.error(
+                "Exclusive rollout rebalance lost planned destination for request %s; "
+                "returning it to normal routing.",
+                request_key,
+            )
+            self._finish_exclusive_rebalance_request(request_key, reason="missing_destination")
+            return False
+        if request_key in self._rebalance_queued_request_ids:
+            return True
+        self._rebalance_requests_to_route.append(request)
+        self._rebalance_queued_request_ids.add(request_key)
+        psrl_logger.info(
+            "Queued interrupted rollout request for exclusive rebalance: request=%s destination=%s fifo_depth=%d",
+            request_key,
+            self._planned_migration_destinations[request_key],
+            len(self._rebalance_requests_to_route),
+        )
+        self._wake_routing_loop()
+        return True
+
+    def _exclusive_rebalance_destination(self, request: DataProto) -> int | None:
+        request_key = canonical_psrl_request_id(request.non_tensor_batch["uid"][0])
+        destination = self._planned_migration_destinations.get(request_key)
+        if destination is None:
+            return None
+        destination = int(destination)
+        if not 0 <= destination < self.rollout_wg_size - self.n_validate_instances:
+            return None
+        if destination in self.currently_paused_instance_ids:
+            return None
+        return destination
+
+    async def _dispatch_exclusive_rebalance_requests(self) -> None:
+        if self._rebalance_dispatching_request_ids:
+            return
+        while self._rebalance_requests_to_route and not self._pause_routing:
+            request = self._rebalance_requests_to_route[0]
+            request_id = request.non_tensor_batch["uid"][0]
+            request_key = canonical_psrl_request_id(request_id)
+            if await self.ps_manager_handle.check_aborted_requests.remote(request_id, remove=True):
+                self._rebalance_requests_to_route.popleft()
+                self._rebalance_queued_request_ids.discard(request_key)
+                self._migration_overhead.discard(request_key)
+                self._finish_exclusive_rebalance_request(request_key, reason="request_aborted")
+                self._set_result(request_id, None)
+                continue
+            destination = self._exclusive_rebalance_destination(request)
+            if destination is None:
+                planned_destination = self._planned_migration_destinations.get(request_key)
+                self._rebalance_requests_to_route.popleft()
+                self._rebalance_queued_request_ids.discard(request_key)
+                self._migration_overhead.discard(request_key)
+                self._planned_migration_counters["fallback"] += 1
+                self._finish_exclusive_rebalance_request(request_key, reason="fallback_normal_routing")
+
+                try:
+                    fallback_destination = await self._choose_new_rollout_instance(request)
+                except Exception:
+                    self.requests_to_route.put(request)
+                    psrl_logger.exception(
+                        "Exclusive rollout rebalance normal fallback failed; request=%s destination=%s "
+                        "requeued to normal routing; migration timing discarded.",
+                        request_key,
+                        planned_destination,
+                    )
+                    continue
+                if fallback_destination is None:
+                    self.requests_to_route.put(request)
+                    psrl_logger.warning(
+                        "Exclusive rollout rebalance destination unreachable; request=%s destination=%s "
+                        "normal strategy found no route, requeued to normal routing.",
+                        request_key,
+                        planned_destination,
+                    )
+                    continue
+
+                self.incomplete_request_to_instance[request_id] = fallback_destination
+                task = asyncio.create_task(self._route_single_request(request, fallback_destination))
+                task.add_done_callback(lambda future: future.result())
+                self._is_routing = True
+                psrl_logger.warning(
+                    "Exclusive rollout rebalance destination unreachable; request=%s destination=%s "
+                    "fell back to normal destination=%s; migration timing discarded.",
+                    request_key,
+                    planned_destination,
+                    fallback_destination,
+                )
+                continue
+            self._rebalance_requests_to_route.popleft()
+            self._rebalance_queued_request_ids.discard(request_key)
+            self._rebalance_dispatching_request_ids.add(request_key)
+            self._planned_migration_counters["forced"] += 1
+            force_route = getattr(self.route_strategy, "force_route_unchecked", None)
+            if force_route is not None:
+                destination = int(force_route(request, destination))
+            self.incomplete_request_to_instance[request_id] = destination
+            task = asyncio.create_task(self._route_single_request(request, destination))
+            task.add_done_callback(lambda future: future.result())
+            self._is_routing = True
+            # Preserve FIFO dispatch order, including the asynchronous status
+            # update that marks the request as redispatched.
+            return
+
     @ray.method(concurrency_group="control")
     def mark_migration_requests(self, instance_to_uids: dict, migration_context: dict) -> None:
         """Start distributed overhead tracking before selected requests are aborted."""
         self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+        self._start_exclusive_rebalance(instance_to_uids, migration_context)
+
+    @ray.method(concurrency_group="transition_wait")
+    async def wait_for_exclusive_rebalance(self) -> None:
+        """Wait until all accepted exclusive-rebalance requests are redispatched."""
+        if not self._exclusive_rebalance_active():
+            return
+        waiter: concurrent.futures.Future[None] = concurrent.futures.Future()
+        waiters = getattr(self, "_rebalance_completion_waiters", None)
+        if waiters is None:
+            waiters = set()
+            self._rebalance_completion_waiters = waiters
+        waiters.add(waiter)
+        # Close the registration/completion race without binding an
+        # asyncio.Event to either Ray concurrency-group event loop.
+        if not self._exclusive_rebalance_active():
+            waiters.discard(waiter)
+            return
+        try:
+            await asyncio.wrap_future(waiter)
+        finally:
+            waiters.discard(waiter)
 
     @ray.method(concurrency_group="control")
-    def prepare_request_migrations(self, request_migrations: list[dict]) -> dict:
-        """Validate planned sources and register destination intent without counters."""
+    def get_inflight_rollout_request_ids(self) -> dict[int, list[int]]:
+        """Return in-flight training-rollout requests grouped by instance."""
+        return filter_rollout_request_ids(self.instance_to_inflight_request_ids, self._request_is_validate)
+
+    @ray.method(concurrency_group="control")
+    def mark_periodic_interrupt_requests(self, request_ids: list[int]) -> int:
+        """Mark requests interrupted by the disaggregated experiment for rerouting."""
+        marked = 0
+        for request_id in request_ids:
+            request_id = int(request_id)
+            if not self._request_is_validate.get(request_id, False) and request_id in self.request_futures:
+                self._force_reroute_request_ids.add(request_id)
+                marked += 1
+        return marked
+
+    @ray.method(concurrency_group="control")
+    def prepare_request_migrations(
+        self,
+        request_migrations: list[dict],
+        migration_context: dict | None = None,
+    ) -> dict:
+        """Validate a plan and atomically arm migration tracking before abort."""
         instance_to_uids: dict[int, list[str]] = {}
         accepted = 0
         skipped = 0
         skip_reasons: dict[str, int] = {}
         skip_samples: dict[str, list[str]] = {}
         source_by_uid = {
-            str(request_id): int(instance_id)
-            for request_id, instance_id in self.incomplete_request_to_instance.items()
+            canonical_psrl_request_id(request_id): int(instance_id)
+            for instance_id, request_ids in self.instance_to_inflight_request_ids.items()
+            for request_id in request_ids
         }
         future_by_uid = {
             str(request_id): request_future
@@ -382,6 +714,9 @@ class RolloutRouter:
             if current_source != source:
                 record_skip("source_changed", engine_request_id)
                 continue
+            if not 0 <= destination < self.rollout_wg_size - self.n_validate_instances:
+                record_skip("invalid_destination", engine_request_id)
+                continue
             self._planned_migration_destinations[logical_request_id] = destination
             # Workers abort by scheduler/vLLM ID, while the router consumes the
             # destination intent later by logical UID after the request returns.
@@ -390,6 +725,9 @@ class RolloutRouter:
         self._planned_migration_counters["accepted"] += accepted
         self._planned_migration_counters["skipped"] += skipped
         self._planned_migration_counters["planned"] += len(request_migrations or [])
+        if migration_context is not None:
+            self._migration_overhead.mark_batch(instance_to_uids, migration_context)
+            self._start_exclusive_rebalance(instance_to_uids, migration_context)
         psrl_logger.info(
             "Prepared rollout request migrations: planned=%d accepted=%d skipped=%d "
             "skip_reasons=%s skip_samples=%s sources=%s",
@@ -426,6 +764,11 @@ class RolloutRouter:
             "Request must have 'version_tag' for routing and it must not be None"
         )
         needed_model_version = request.non_tensor_batch["version_tag"][0]
+        requested_version = int(needed_model_version)
+        is_partial = "raw_response_ids" in request.non_tensor_batch
+        previous_instance = None
+        if "rollout_instance_id" in request.non_tensor_batch:
+            previous_instance = int(request.non_tensor_batch["rollout_instance_id"][0])
 
         # 1. Filter the rollout instances that are not paused and can tolerate the needed staleness of the request
         # This guarantees that the gen worker will have no ahead-of-time version tag when generating
@@ -454,7 +797,12 @@ class RolloutRouter:
 
         # 2. If forbidden global migration and the request is a partial rollout request,
         # only consider the specific instance for routing
-        if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.sync_and_mig_strategy.mig.enable:
+        force_reroute = bool(request.non_tensor_batch.get("_psrl_force_reroute", False))
+        if (
+            "rollout_instance_id" in request.non_tensor_batch
+            and not self.config.psrl.sync_and_mig_strategy.mig.enable
+            and not force_reroute
+        ):
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             if old_instance_id in candidates:
                 candidates = [old_instance_id]
@@ -473,7 +821,11 @@ class RolloutRouter:
                 )
 
         # 2.5. If request is in sticky session, keep the existing instance
-        if self.sticky_session_requests.get(request_id, False) and "rollout_instance_id" in request.non_tensor_batch:
+        if (
+            self.sticky_session_requests.get(request_id, False)
+            and "rollout_instance_id" in request.non_tensor_batch
+            and not force_reroute
+        ):
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             if old_instance_id in candidates:
                 candidates = [old_instance_id]
@@ -603,6 +955,7 @@ class RolloutRouter:
         migration_key = str(request_id)
         planned_destination = self._planned_migration_destinations.get(migration_key)
         chosen_rollout_instance = None
+        route_reason = "none"
         if planned_destination is not None:
             if int(planned_destination) in fallback_candidates:
                 chosen_rollout_instance = await _route_with_candidates(
@@ -610,6 +963,8 @@ class RolloutRouter:
                     "planned_migration",
                     force_destination=True,
                 )
+                if chosen_rollout_instance is not None:
+                    route_reason = "planned_migration"
             self._planned_migration_destinations.pop(migration_key, None)
             if chosen_rollout_instance is None:
                 self._planned_migration_counters["fallback"] += 1
@@ -630,6 +985,8 @@ class RolloutRouter:
 
         if chosen_rollout_instance is None:
             chosen_rollout_instance = await _route_with_candidates(candidates, "primary")
+            if chosen_rollout_instance is not None:
+                route_reason = "primary"
         if (
             chosen_rollout_instance is None
             and binding_reasons
@@ -646,9 +1003,12 @@ class RolloutRouter:
                 fallback_candidates,
             )
             chosen_rollout_instance = await _route_with_candidates(fallback_candidates, "fallback")
+            if chosen_rollout_instance is not None:
+                route_reason = "fallback"
 
         # 7. If not None, the request is routed to the chosen rollout instance
         if chosen_rollout_instance is not None:
+            request.non_tensor_batch.pop("_psrl_force_reroute", None)
             # Allocate the version tag and reserve the request for the chosen
             # rollout instance if the request is not routed before
             not_routed_before = "rollout_instance_id" not in request.non_tensor_batch
@@ -671,6 +1031,16 @@ class RolloutRouter:
                 )
         else:
             pass
+
+        self._log_partial_rollout_route(
+            request_id=int(request_id),
+            is_partial=is_partial,
+            previous_instance=previous_instance,
+            requested_version=requested_version,
+            chosen_instance=chosen_rollout_instance,
+            route_reason=route_reason,
+            candidates=fallback_candidates,
+        )
 
         return chosen_rollout_instance
 
@@ -793,6 +1163,8 @@ class RolloutRouter:
         """
         assert len(request) == 1, "RolloutRouter only supports single request generation."
         if self.scheduler_task is None:
+            self._routing_event_loop = asyncio.get_running_loop()
+            self._routing_wakeup_event = asyncio.Event()
             if self.config.psrl.routing_strategy.enable_multi_priority_queue:
                 task_coro = self._multi_priority_queue_routing_loop()
                 self.scheduler_task = asyncio.create_task(task_coro)
@@ -818,6 +1190,7 @@ class RolloutRouter:
         result_future = asyncio.Future()
         # Store the future in a way that the scheduler can access it
         self.request_futures[request_id] = result_future
+        self._request_is_validate[int(request_id)] = bool(is_validate)
         # Add request to priority queue
         self.requests_to_route.put(request)
         # psrl_logger.info(f"Adding request {request_id} to priority queue")
@@ -842,9 +1215,12 @@ class RolloutRouter:
         """
         assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
         assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
+        self._finish_exclusive_rebalance_request(request_id, reason="terminal")
         self.request_futures[request_id].set_result(result)
         self.incomplete_request_to_instance.pop(request_id, None)
         self.sticky_session_requests.pop(request_id, None)
+        self._request_is_validate.pop(int(request_id), None)
+        self._force_reroute_request_ids.discard(int(request_id))
 
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""
@@ -855,7 +1231,7 @@ class RolloutRouter:
         """Return current number of requests waiting in router queue."""
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RolloutRouter_enter")
-        n = int(self.requests_to_route.size())
+        n = int(self.requests_to_route.size()) + len(self._rebalance_requests_to_route)
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RolloutRouter_exit pending=%d body_s=%.6f",
@@ -869,7 +1245,7 @@ class RolloutRouter:
         """Return count and token load for the leading waiting requests."""
         t0 = time.monotonic()
         log_elastic_rm_backlog_diag(psrl_logger, "stage=RolloutRouter_summary_enter")
-        total_pending = int(self.requests_to_route.size())
+        total_pending = int(self.requests_to_route.size()) + len(self._rebalance_requests_to_route)
         limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
         requests = list(self._iter_pending_requests_in_route_order(limit))
         summary = {
@@ -1043,9 +1419,15 @@ class RolloutRouter:
             paused_instance_ids,
             current_ps_model_version,
         )
-        total_pending = int(self.requests_to_route.size())
+        total_queued = int(self.requests_to_route.size()) + len(self._rebalance_requests_to_route)
+        pending_requests = [
+            request
+            for request in self._iter_pending_requests_in_route_order(total_queued)
+            if not bool((getattr(request, "meta_info", {}) or {}).get("validate", False))
+        ]
+        total_pending = len(pending_requests)
         limit = total_pending if top_t is None else max(0, min(total_pending, int(top_t)))
-        pending_requests = list(self._iter_pending_requests_in_route_order(limit))
+        pending_requests = pending_requests[:limit]
         pending_rows = await asyncio.gather(
             *(
                 self._candidate_evaluation_request_row(
@@ -1061,7 +1443,9 @@ class RolloutRouter:
 
         instances: list[dict] = []
         inflight_route_order = total_pending
-        for instance_id in range(self.rollout_wg_size):
+        # Dedicated validation instances share this router but are not registered
+        # with ElasticExecutor and must not appear in elastic policy snapshots.
+        for instance_id in range(self.n_rollout_instances):
             engine_status = self.route_strategy.instance_to_engine_status.get(instance_id)
             scheduler_stats = (
                 engine_status.snapshot.get("scheduler_stats", {})
@@ -1191,6 +1575,11 @@ class RolloutRouter:
         if limit <= 0:
             return
         yielded = 0
+        for request in self._rebalance_requests_to_route:
+            yield request
+            yielded += 1
+            if yielded >= limit:
+                return
         if isinstance(self.requests_to_route, MultiPriorityRequestQueue):
             iterator = (request for _, request in self.requests_to_route.iter_all_requests())
         else:
@@ -1246,6 +1635,7 @@ class RolloutRouter:
     async def resume_routing(self):
         """Resume the routing."""
         self._pause_routing = False
+        self._wake_routing_loop()
         psrl_logger.info("Resuming routing")
 
     async def _single_priority_queue_routing_loop(self):
@@ -1259,7 +1649,13 @@ class RolloutRouter:
             async with (
                 AsyncBusyPollingRayLock(self.ps_manager_handle),
             ):
-                while not self.requests_to_route.empty() and not self._pause_routing:
+                if self._exclusive_rebalance_active():
+                    await self._dispatch_exclusive_rebalance_requests()
+                while (
+                    not self._exclusive_rebalance_active()
+                    and not self.requests_to_route.empty()
+                    and not self._pause_routing
+                ):
                     self._is_routing = True
                     request = self.requests_to_route.pop()
                     assert request is not None, "Request should not be None in priority queue"
@@ -1290,7 +1686,7 @@ class RolloutRouter:
                     task.add_done_callback(lambda f: f.result())
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
-            await asyncio.sleep(sleep_time)
+            await self._wait_for_routing_iteration(sleep_time)
 
     async def _multi_priority_queue_routing_loop(self):
         """Continuous routing loop for multiple priority queues.
@@ -1306,9 +1702,13 @@ class RolloutRouter:
             async with (
                 AsyncBusyPollingRayLock(self.ps_manager_handle),
             ):
+                if self._exclusive_rebalance_active():
+                    await self._dispatch_exclusive_rebalance_requests()
                 self.requests_to_route.remove_empty_queues()
                 remain_requests = []
                 for queue_id, request_queue in self.requests_to_route.iter_queues():
+                    if self._exclusive_rebalance_active():
+                        break
                     if len(remain_requests) != 0:
                         # Method 1: If the last queue still has requests, we will not process the other queues
                         break
@@ -1350,7 +1750,7 @@ class RolloutRouter:
                     f"Routing {route_num} requests in multi priority queue "
                     f"routing loop, time cost: {time.time() - begin_time} seconds"
                 )
-            await asyncio.sleep(sleep_time)
+            await self._wait_for_routing_iteration(sleep_time)
 
     async def _route_single_request(self, request: DataProto, new_instance_id: int):
         """Route a single request to a rollout instance.
@@ -1394,13 +1794,43 @@ class RolloutRouter:
         # )
 
         if update_status_success[0]:
-            self._migration_overhead.mark_dispatched(request_id, new_instance_id)
+            request_key = canonical_psrl_request_id(request_id)
+            is_exclusive_redispatch = request_key in getattr(
+                self,
+                "_rebalance_dispatching_request_ids",
+                set(),
+            )
+            dispatch_overhead = self._migration_overhead.mark_dispatched(
+                request_id,
+                new_instance_id,
+            )
+            if dispatch_overhead is not None:
+                if is_exclusive_redispatch:
+                    self._log_migration_interrupt(request_id, dispatch_overhead)
+                psrl_logger.info(
+                    "[ELASTIC_OVERHEAD] operation=request_migration_dispatch "
+                    "scope=post_scale_up_rebalance role=Rollout migration_id=%s decision_id=%s "
+                    "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
+                    "interrupt_s=%.6f network_s=%.6f abort_to_redispatch_s=%.6f "
+                    "interrupt_scope=abort_to_requeue network_scope=requeue_to_redispatch",
+                    dispatch_overhead.get("migration_id"),
+                    dispatch_overhead.get("decision_id"),
+                    request_id,
+                    dispatch_overhead.get("source_instance_id"),
+                    dispatch_overhead.get("destination_instance_id"),
+                    dispatch_overhead.get("selected_count"),
+                    dispatch_overhead["interrupt_s"],
+                    dispatch_overhead["network_s"],
+                    dispatch_overhead["abort_to_redispatch_s"],
+                )
             self._candidate_evaluation_inflight_requests[str(request_id)] = request
             # Change engine status
             self.route_strategy.push_request(request, new_instance_id)
             # Add request to inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
             self._track_transition_request_started(new_instance_id, request_id)
+            if request_key in self._rebalance_dispatching_request_ids:
+                self._finish_exclusive_rebalance_request(request_key, reason="redispatched")
 
             # Set sampling params
             rollout_config = self.config.gen_actor_rollout_ref.rollout
@@ -1413,6 +1843,17 @@ class RolloutRouter:
                 output_kind=RequestOutputKind.CUMULATIVE,
                 detokenize=False,
             )
+            if (
+                self.config.psrl.log_prob.enable_rollout_engine_log_prob
+                and (
+                    self.config.psrl.log_prob.get("update_reprefill_log_probs", False)
+                    or self.config.psrl.partial_rollout.interrupt_as_prompt
+                )
+                and "raw_response_ids" in request.non_tensor_batch
+            ):
+                # Prompt logprobs are needed to refresh the response prefix on
+                # a continuation; logprobs=0 alone only covers decoded tokens.
+                sampling_params["prompt_logprobs"] = 0
 
             # override sampling params for validation
             if request.meta_info.get("validate", False):
@@ -1432,8 +1873,9 @@ class RolloutRouter:
                     "[ELASTIC_OVERHEAD] operation=post_scale_up_rebalance "
                     "scope=post_scale_up_rebalance migration_id=%s decision_id=%s "
                     "request_id=%s source_instance=%s destination_instance=%s selected_count=%s "
-                    "planner_batch_s=%.6f planner_share_s=%.6f network_s=%.6f reprefill_s=%.6f "
-                    "migration_s=%.6f network_scope=abort_to_redispatch "
+                    "interrupt_s=%.6f network_s=%.6f abort_to_redispatch_s=%.6f "
+                    "reprefill_s=%.6f migration_s=%.6f "
+                    "interrupt_scope=abort_to_requeue network_scope=requeue_to_redispatch "
                     "reprefill_scope=vllm_scheduled_to_first_token",
                     migration_overhead.get("migration_id"),
                     migration_overhead.get("decision_id"),
@@ -1441,9 +1883,9 @@ class RolloutRouter:
                     migration_overhead.get("source_instance_id"),
                     migration_overhead.get("destination_instance_id"),
                     migration_overhead.get("selected_count"),
-                    migration_overhead["planner_s"],
-                    migration_overhead["planner_share_s"],
+                    migration_overhead["interrupt_s"],
                     migration_overhead["network_s"],
+                    migration_overhead["abort_to_redispatch_s"],
                     migration_overhead["reprefill_s"],
                     migration_overhead["migration_s"],
                 )
@@ -1463,8 +1905,20 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
-                self._migration_overhead.mark_requeued(request_id)
-                self.requests_to_route.put(consolidated_output)
+                if int(request_id) in self._force_reroute_request_ids:
+                    consolidated_output.non_tensor_batch["_psrl_force_reroute"] = np.array([True], dtype=bool)
+                    self._force_reroute_request_ids.discard(int(request_id))
+                request_key = canonical_psrl_request_id(request_id)
+                was_exclusive_pending = request_key in getattr(self, "_rebalance_pending_request_ids", set())
+                exclusive_enqueued = self._enqueue_exclusive_rebalance_request(consolidated_output)
+                if exclusive_enqueued:
+                    self._mark_migration_requeued(request_id, defer_log=True)
+                elif was_exclusive_pending:
+                    self._migration_overhead.discard(request_id)
+                else:
+                    self._mark_migration_requeued(request_id)
+                if not exclusive_enqueued:
+                    self.requests_to_route.put(consolidated_output)
                 self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
                 return
@@ -1476,8 +1930,20 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
-                self._migration_overhead.mark_requeued(request_id)
-                self.requests_to_route.put(consolidated_output)
+                if int(request_id) in self._force_reroute_request_ids:
+                    consolidated_output.non_tensor_batch["_psrl_force_reroute"] = np.array([True], dtype=bool)
+                    self._force_reroute_request_ids.discard(int(request_id))
+                request_key = canonical_psrl_request_id(request_id)
+                was_exclusive_pending = request_key in getattr(self, "_rebalance_pending_request_ids", set())
+                exclusive_enqueued = self._enqueue_exclusive_rebalance_request(consolidated_output)
+                if exclusive_enqueued:
+                    self._mark_migration_requeued(request_id, defer_log=True)
+                elif was_exclusive_pending:
+                    self._migration_overhead.discard(request_id)
+                else:
+                    self._mark_migration_requeued(request_id)
+                if not exclusive_enqueued:
+                    self.requests_to_route.put(consolidated_output)
                 self._track_transition_request_resolved(request_id)
                 # No result to set since the request is not completed
                 return

@@ -12,7 +12,7 @@
     "other_fit_points": [
       {
         "batch": 16,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005906730965562306,
           "median_latency": 0.005905725061893463,
@@ -23,7 +23,7 @@
       },
       {
         "batch": 1,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005680070713364834,
           "median_latency": 0.005679644411429763,
@@ -34,7 +34,7 @@
       },
       {
         "batch": 2,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005698411524925786,
           "median_latency": 0.0056976391933858395,
@@ -45,7 +45,7 @@
       },
       {
         "batch": 32,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.006451080344314394,
           "median_latency": 0.006446393206715584,
@@ -56,7 +56,7 @@
       },
       {
         "batch": 4,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005736336468674933,
           "median_latency": 0.005735768936574459,
@@ -67,7 +67,7 @@
       },
       {
         "batch": 64,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B64_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B64_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.008875315517267321,
           "median_latency": 0.008875751867890358,
@@ -78,7 +78,7 @@
       },
       {
         "batch": 8,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-8B_Syn_TP1_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005718752881415377,
           "median_latency": 0.0057159592397511005,

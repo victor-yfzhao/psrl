@@ -70,6 +70,7 @@ export PSRL_TMS_VLLM_SLEEP_OUTPUT_DIR="${OUTPUT_DIR}"
 export PSRL_LOGGING_LEVEL=${PSRL_LOGGING_LEVEL:-INFO}
 export PSRL_TMS_VLLM_MAX_TOKENS=${PSRL_TMS_VLLM_MAX_TOKENS:-1}
 export PSRL_TMS_VLLM_NUM_INSTANCES="${INSTANCE_COUNT}"
+export PSRL_TMS_VLLM_CYCLES=${PSRL_TMS_VLLM_CYCLES:-2}
 # Ray's uv hook walks the driver parent process tree even though this probe is
 # not launched with uv. Container PID namespaces can make that walk fail before
 # pytest collection, so disable only that unused environment propagation hook.
@@ -92,6 +93,7 @@ fi
 
 cd "${REPO_ROOT}"
 echo "Starting isolated TMS timing probe: role=${PROBE_ROLE} instances=${INSTANCE_COUNT} model=${MODEL_PATH} output=${OUTPUT_DIR}"
+echo "Timing cycles: ${PSRL_TMS_VLLM_CYCLES}; weight arena: ${PSRL_TMS_VLLM_WEIGHT_ARENA:-0}"
 if [[ "${PROBE_ROLE}" == "rollout" ]]; then
     echo "Rollout probe includes one CPU PSStorageWorker and real NIXL checkpoint pulls."
 fi

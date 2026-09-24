@@ -771,6 +771,36 @@ def test_itl_enumerates_batch_scale_up_candidates_when_enabled():
     assert batch[0].rollout_n == 3
 
 
+def test_itl_unlimited_max_scale_instances_enumerates_all_wakeable():
+    # Rollout is the strict bottleneck with three wakeable instances. With
+    # max_scale_instances_per_action=-1 the count enumeration must reach
+    # rollout_n=4, producing a batch wake of all three sleepers.
+    policy = _policy(max_scale_instances_per_action=-1)
+    rollout = [
+        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PSRL_Role.Rollout, 3, awake=False, running=0, tokens=0, bundle=3),
+    ]
+    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=4)]
+    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+
+    assert policy.max_scale_instances_per_action == -1
+    candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
+    batch = [
+        c
+        for c in candidates
+        if c.action.action_type == "scale_up"
+        and c.action.role_name == PSRL_Role.Rollout
+        and c.action.num_instances == 3
+    ]
+
+    assert len(batch) == 1
+    assert batch[0].action.preferred_instance_ids == [1, 2, 3]
+    assert batch[0].rollout_n == 4
+    assert {c.action.num_instances for c in candidates if c.action.role_name == PSRL_Role.Rollout} == {1, 2, 3}
+
+
 def test_itl_keeps_single_step_candidates_by_default():
     # Rollout is the strict bottleneck with two wakeable instances. With the
     # default max_scale_instances_per_action=1 the count enumeration must only

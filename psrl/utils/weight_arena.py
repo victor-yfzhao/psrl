@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import time
 from dataclasses import asdict, dataclass, replace
 
@@ -13,6 +14,24 @@ try:
     from torch.distributed.tensor import DTensor
 except ImportError:
     from torch.distributed._tensor import DTensor
+
+
+def gb_to_bytes(value: int | float | str, *, field_name: str, allow_zero: bool = False) -> int:
+    """Convert a GB config value to binary bytes."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative number, got {value!r}.")
+    try:
+        gb = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number, got {value!r}.") from exc
+    size_bytes = gb * 1024**3
+    minimum_invalid = gb < 0 if allow_zero else gb <= 0
+    if not math.isfinite(gb) or minimum_invalid or not size_bytes.is_integer():
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(
+            f"{field_name} must be a {qualifier} GB value resolving to whole bytes, got {value!r}."
+        )
+    return int(size_bytes)
 
 
 @dataclass(frozen=True)
@@ -307,6 +326,60 @@ def get_fsdp_param_groups(state: object) -> tuple[object, ...]:
     return param_groups
 
 
+def prepare_module_for_direct_fsdp2_weight_arena(
+    module: nn.Module,
+    full_state: dict[str, torch.Tensor],
+) -> dict[str, int]:
+    """Dematerialize a pre-FSDP module while retaining its load-source state.
+
+    FSDP2 constructs the load-source rank on CPU and the remaining ranks on
+    meta. Both layouts are valid for a direct arena load: CPU tensors provide
+    the state-dict payload, while meta tensors are placeholders on ranks that
+    receive the broadcast. Only an already materialized accelerator state
+    would retain the old allocation that direct materialization must avoid.
+    """
+    device_counts: dict[str, int] = {}
+    unsupported: list[tuple[str, str]] = []
+    for name, tensor in full_state.items():
+        device_type = tensor.device.type
+        device_counts[device_type] = device_counts.get(device_type, 0) + 1
+        if device_type not in {"cpu", "meta"}:
+            unsupported.append((name, str(tensor.device)))
+
+    if unsupported:
+        raise RuntimeError(
+            "Actor direct weight arena requires the pre-FSDP full state on CPU "
+            "for load-source ranks or meta for receiving ranks; "
+            f"device_counts={dict(sorted(device_counts.items()))} "
+            f"first_unsupported_tensors={unsupported[:8]}."
+        )
+    if len(device_counts) > 1:
+        raise RuntimeError(
+            "Actor direct weight arena requires a uniform pre-FSDP full state: "
+            "all CPU on a load-source rank or all meta on a receiving rank; "
+            f"device_counts={dict(sorted(device_counts.items()))}."
+        )
+
+    # CPU state_dict tensors retain their original storages after to_empty(),
+    # so they remain available to set_model_state_dict(). An all-meta receiving
+    # rank is already in the desired layout and must not be rematerialized.
+    if device_counts.get("cpu", 0):
+        module.to_empty(device="meta")
+
+    non_meta = [
+        (name, str(tensor.device))
+        for name, tensor in module.state_dict().items()
+        if tensor.device.type != "meta"
+    ]
+    if non_meta:
+        raise RuntimeError(
+            "Actor direct weight arena failed to dematerialize the model before fully_shard: "
+            f"device_counts={dict(sorted(device_counts.items()))} "
+            f"first_tensors={non_meta[:8]}."
+        )
+    return dict(sorted(device_counts.items()))
+
+
 def _collect_fsdp2_bindings(module: nn.Module) -> list[tuple[str, torch.Tensor]]:
     try:
         from torch.distributed._composable.fsdp import FSDPModule
@@ -444,12 +517,14 @@ def _plan_chunks(
 def _group_direct_bindings(
     named_tensors: list[tuple[str, torch.Tensor]],
     alignment_bytes: int,
+    *,
+    allowed_cuda_device: torch.device | None = None,
 ) -> list[_StorageGroup]:
     groups: list[_StorageGroup] = []
     by_key: dict[tuple[str, int, int], _StorageGroup] = {}
     for name, tensor in named_tensors:
         _validate_binding(name, tensor, require_cuda=False)
-        if tensor.device.type == "cuda":
+        if tensor.device.type == "cuda" and tensor.device != allowed_cuda_device:
             raise RuntimeError(
                 f"Direct weight arena requires meta or CPU source tensors, but {name} is already on {tensor.device}."
             )
@@ -636,7 +711,14 @@ def materialize_fsdp2_model_weights_in_arena(
     max_chunk_bytes: int,
     alignment_bytes: int = 256,
 ) -> FSDP2WeightArenaHandle:
-    """Materialize CPU/meta FSDP2 shards and module buffers directly into arenas."""
+    """Materialize FSDP2 shards and module buffers directly into arenas.
+
+    Parameter shards must still be CPU/meta so direct mode never retains an old
+    CUDA weight allocation. FSDP may independently move small module buffers to
+    the target CUDA device while sharding; preserve those values while rebinding
+    them into the arena. Non-persistent buffers are restored again after the
+    initial NIXL pull because they are not part of the transferred state dict.
+    """
     _validate_config(max_chunk_bytes, alignment_bytes)
     target_device = torch.device(device)
     if target_device.type != "cuda":
@@ -663,14 +745,21 @@ def materialize_fsdp2_model_weights_in_arena(
         seen_buffer_ids.add(id(buffer))
         if isinstance(buffer, DTensor):
             raise RuntimeError(f"FSDP2 direct weight arena does not support DTensor buffer {name}.")
-        if buffer.device.type not in ("cpu", "meta"):
-            raise RuntimeError(f"FSDP2 direct weight arena expected CPU/meta buffer {name}, got {buffer.device}.")
+        if buffer.device.type not in ("cpu", "meta") and buffer.device != target_device:
+            raise RuntimeError(
+                f"FSDP2 direct weight arena expected CPU/meta or target-device buffer {name}, "
+                f"got {buffer.device} for target {target_device}."
+            )
         if buffer.untyped_storage().nbytes() == 0:
             empty_buffers.append(buffer)
         else:
             named_tensors.append((f"buffer:{name}", buffer))
 
-    groups = _group_direct_bindings(named_tensors, alignment_bytes)
+    groups = _group_direct_bindings(
+        named_tensors,
+        alignment_bytes,
+        allowed_cuda_device=target_device,
+    )
     chunks = _plan_chunks(
         groups,
         max_chunk_bytes,
@@ -717,9 +806,9 @@ def materialize_fsdp2_model_weights_in_arena(
                 fsdp_param._sharding_spec = old_param._spec
                 fsdp_placements.append((fsdp_param, arena_index, offset_bytes))
             else:
-                if source_tensor.device.type == "cpu":
+                if source_tensor.device.type != "meta":
                     source_storage = source_tensor.untyped_storage()
-                    source_bytes = torch.empty(0, dtype=torch.uint8, device="cpu").set_(
+                    source_bytes = torch.empty(0, dtype=torch.uint8, device=source_tensor.device).set_(
                         source_storage,
                         storage_offset=0,
                         size=(source_storage.nbytes(),),

@@ -56,6 +56,16 @@ class DataProcessor:
         # Dataset and dataloader attributes
         self.tokenizer = tokenizer
         self.processor = processor
+        if self.processor is not None:
+            apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+            explicit_chat_template = apply_chat_template_kwargs.get("chat_template")
+            if getattr(self.processor, "chat_template", None) is None and explicit_chat_template is None:
+                model_path = self.config.train_actor_rollout_ref.model.path
+                raise ValueError(
+                    f"Processor {type(self.processor).__name__} loaded from {model_path!r} has no chat template. "
+                    "Provide data.apply_chat_template_kwargs.chat_template or ensure the processor inherits "
+                    "its tokenizer's chat_template."
+                )
 
         # self.train_dataloader_iter = None
         # self.val_dataloader_iter = None
@@ -139,7 +149,10 @@ class DataProcessor:
 
         datasets_lens = [len(dataset) for dataset in self.train_datasets]
         rough_batch_sizes = [int(self.config.data.train_batch_size * ratio) for ratio in self.train_datasets_ratios]
-        rough_num_batches = [dataset_len // rough_batch_size for dataset_len, rough_batch_size in zip(datasets_lens, rough_batch_sizes)]
+        rough_num_batches = [
+            dataset_len // rough_batch_size
+            for dataset_len, rough_batch_size in zip(datasets_lens, rough_batch_sizes)
+        ]
         max_num_batches = max(rough_num_batches)
         oversample_ratios = [max_num_batches / rough_num_batch for rough_num_batch in rough_num_batches]
         for dataset, oversample_ratio in zip(self.train_datasets, oversample_ratios):
@@ -697,7 +710,11 @@ class DataProcessor:
                     psrl_logger.debug("Reinitializing train_dataloader_iters for next epoch")
                     self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
             except Exception as e:
-                psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
+                psrl_logger.error(
+                    f"Fatal exception in data processing thread; stopping data processing: {e}",
+                    exc_info=True,
+                )
+                self.stop_data_process = True
 
         # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")

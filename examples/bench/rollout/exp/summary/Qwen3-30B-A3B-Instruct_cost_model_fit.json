@@ -12,7 +12,7 @@
     "other_fit_points": [
       {
         "batch": 128,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B128_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B128_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.010051586989704552,
           "median_latency": 0.010050427168607712,
@@ -23,7 +23,7 @@
       },
       {
         "batch": 16,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B16_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.005660751690741393,
           "median_latency": 0.005653763189911842,
@@ -34,7 +34,7 @@
       },
       {
         "batch": 1,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B1_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.0037829968191328504,
           "median_latency": 0.00378287211060524,
@@ -45,7 +45,7 @@
       },
       {
         "batch": 2,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B2_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.004074154858631971,
           "median_latency": 0.00407075509428978,
@@ -56,7 +56,7 @@
       },
       {
         "batch": 32,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B32_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.006608027539888882,
           "median_latency": 0.006616557016968727,
@@ -67,7 +67,7 @@
       },
       {
         "batch": 4,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B4_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.004782698174067748,
           "median_latency": 0.0047809407114982605,
@@ -78,7 +78,7 @@
       },
       {
         "batch": 64,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B64_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B64_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.007585289517283789,
           "median_latency": 0.007587216794490814,
@@ -89,7 +89,7 @@
       },
       {
         "batch": 8,
-        "path": "/jizhicfs/pkuhetu/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
+        "path": "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/examples/bench/rollout/exp/details/Qwen3-30B-A3B-Instruct_Syn_TP2_PP1_B8_P1024_R8192_disable_attn_true.jsonl",
         "summary": {
           "mean_latency": 0.0052162014675004986,
           "median_latency": 0.0052214860916137695,

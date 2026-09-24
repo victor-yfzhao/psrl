@@ -26,7 +26,7 @@ IDLE_ROLLOUT_INSTANCES=${IDLE_ROLLOUT_INSTANCES:-4}
 IDLE_RM_INSTANCES=${IDLE_RM_INSTANCES:-4}
 
 export PSRL_DEPLOY_MODE=trainer_pool_only
-export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_2_rm_6_trainer_pool_only
+export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_4_rm_4_trainer_pool_only
 export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
 # Mode 4 is a disaggregated concurrent pipeline (like mode 1) PLUS fixed idle
 # replicas on train_pool. 
@@ -37,8 +37,8 @@ export PSRL_DEPLOY_NNODES=2
 export PSRL_DEPLOY_TRAIN_NNODES=1
 export PSRL_DEPLOY_TRAIN_NGPUS=8
 export PSRL_DEPLOY_SHARED_NNODES=1
-export PSRL_DEPLOY_SHARED_NGPUS=2
-export PSRL_DEPLOY_RM_NUM_REPLICAS=6
+export PSRL_DEPLOY_SHARED_NGPUS=4
+export PSRL_DEPLOY_RM_NUM_REPLICAS=4
 export PSRL_DEPLOY_SMOKE=${1:-0}
 shift || true
 

@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
 export PSRL_DEPLOY_MODE=colocated
-export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated_qwen7b_rm32b
+export PSRL_DEPLOY_EXPERIMENT=mode2_bs_128_colocated
 export PSRL_DEPLOY_STALENESS=0
 export PSRL_DEPLOY_RM_ASYNC=True
 export PSRL_DEPLOY_NNODES=4

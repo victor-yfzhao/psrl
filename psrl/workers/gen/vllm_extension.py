@@ -25,21 +25,46 @@ from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.config import set_current_vllm_config
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import gen_client_name, ps_agent_name
 from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.param_sync import precision_sensitive_parameter_stats
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
+    fingerprint_log_record,
 )
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _iter_rank_local_checkpoint_weights(model_loader, model_config, model):
+    """Yield CPU checkpoint tensors after enabling the loader's rank filter."""
+    initialize_ep_filter = getattr(model_loader, "_init_ep_weight_filter", None)
+    if initialize_ep_filter is not None:
+        initialize_ep_filter(model_config)
+    for name, tensor in model_loader.get_all_weights(model_config, model):
+        if isinstance(tensor, DTensor):
+            tensor = tensor.full_tensor()
+        if tensor.device.type != "cpu":
+            raise RuntimeError(
+                "Node-shared reward checkpoint loader must yield CPU tensors, "
+                f"but {name!r} is on {tensor.device}."
+            )
+        yield name, tensor
+
+
+def _load_model_weights_with_vllm_config(model, weights, vllm_config):
+    """Keep reload-time model and EP loaders inside vLLM's config context."""
+    with set_current_vllm_config(vllm_config):
+        return model.load_weights(weights=weights)
 
 
 """
@@ -83,11 +108,10 @@ class vLLMWorkerExtension:
 
     def preload_weights_to_cpu_cache(self, weights_path: str | None = None, load_format: str | None = None) -> int:
         """
-        Preload checkpoint weights into CPU memory for reward-model wake up.
+        Prepare checkpoint-backed CPU weights for reward-model wake up.
 
-        The cache stores checkpoint-format weights, so wake up can remap GPU
-        parameter memory first and then call `model.load_weights` without
-        reading checkpoint files again.
+        Node-shared mode keeps lazy safetensors mappings so ranks share physical
+        page-cache backing. Process-local mode retains the eager CPU clone.
         """
         try:
             model = self.model_runner.model
@@ -95,6 +119,7 @@ class vLLMWorkerExtension:
                 model = model.unwrap()
 
             model_config = copy(self.model_config)
+            model_id = str(weights_path if weights_path is not None else model_config.model)
             if weights_path is not None:
                 model_config.model = copy_to_local(weights_path)
 
@@ -103,6 +128,51 @@ class vLLMWorkerExtension:
                 # Reward models are initialized with dummy weights on GPU, but
                 # the CPU cache must come from the real checkpoint.
                 load_config.load_format = "auto" if str(load_format).startswith("dummy") else load_format
+
+            arena_config = (self.model_runner.vllm_config.additional_config or {}).get(
+                "psrl_nixl_weight_arena", {}
+            )
+            from psrl.utils.node_shared_weight_cache import validate_reward_cache_config
+
+            cache_mode = validate_reward_cache_config(arena_config)
+            if cache_mode == "node_shared":
+                if not hasattr(self.model_runner, "_psrl_weight_arena_handle"):
+                    raise RuntimeError("Node-shared reward CPU cache requires an initialized reward weight arena.")
+                from psrl.utils.node_shared_weight_cache import fingerprint_safetensors_checkpoint
+
+                checkpoint_fingerprint = fingerprint_safetensors_checkpoint(model_config.model)
+                checkpoint_load_format = str(load_config.load_format).lower()
+                if checkpoint_load_format not in ("auto", "safetensors"):
+                    raise NotImplementedError(
+                        "Node-shared reward checkpoint loading requires load_format "
+                        f"'auto' or 'safetensors', got {checkpoint_load_format!r}."
+                    )
+                # All ranks map the same read-only checkpoint pages. The model's
+                # rank-local vLLM loaders then slice/filter on CPU before copying
+                # only their TP/EP shard into the final GPU arena.
+                load_config.load_format = "safetensors"
+                load_config.safetensors_load_strategy = "lazy"
+                load_config.model_loader_extra_config = {}
+                model_loader = get_model_loader(load_config)
+                if not hasattr(model_loader, "get_all_weights"):
+                    raise NotImplementedError(
+                        f"Node-shared CPU weight cache does not support load format `{load_config.load_format}`."
+                    )
+                self._psrl_streaming_weight_source = {
+                    "model_config": model_config,
+                    "load_config": load_config,
+                    "model_id": model_id,
+                    "checkpoint_fingerprint": checkpoint_fingerprint,
+                }
+                self._psrl_reward_weight_cache_state = {
+                    "ready": True,
+                    "source": "node_shared_checkpoint",
+                    "checkpoint_fingerprint": checkpoint_fingerprint,
+                }
+                psrl_logger.info(
+                    "Prepared safetensors streaming source for node-shared reward cache."
+                )
+                return 0
 
             model_loader = get_model_loader(load_config)
             if not hasattr(model_loader, "get_all_weights"):
@@ -126,6 +196,103 @@ class vLLMWorkerExtension:
             return len(cache)
         except Exception as e:
             raise ValueError(f"Error in vLLMWorkerExtension.preload_weights_to_cpu_cache: {e}") from e
+
+    def _publish_node_shared_reward_arena(
+        self,
+        arena_handle,
+        arena_config: dict,
+        model_id: str,
+        checkpoint_fingerprint: str,
+        populate_handle=None,
+    ):
+        """Publish or map this worker's topology-specific reward arena."""
+        from vllm.distributed.parallel_state import get_ep_group, get_pp_group, get_tp_group
+
+        from psrl.utils.node_shared_weight_cache import (
+            WeightCacheTopology,
+            publish_or_map_weight_arena,
+        )
+        from psrl.utils.weight_arena import gb_to_bytes
+
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        if parallel_config.enable_expert_parallel:
+            ep_group = get_ep_group()
+            ep_size = ep_group.world_size
+            ep_rank = ep_group.rank_in_group
+        else:
+            ep_size = 1
+            ep_rank = 0
+        topology = WeightCacheTopology(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            pp_size=pp_group.world_size,
+            pp_rank=pp_group.rank_in_group,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+        )
+        runtime_context = ray.get_runtime_context()
+        job_id_value = runtime_context.get_job_id()
+        job_id = job_id_value.hex() if callable(getattr(job_id_value, "hex", None)) else str(job_id_value)
+        shared_cache = publish_or_map_weight_arena(
+            arena_handle,
+            cache_root=arena_config.get("reward_node_cache_dir", "/dev/shm/psrl-rm-weight-cache"),
+            job_id=job_id,
+            node_id=self.get_node_id(),
+            model_id=model_id,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            model_dtype=str(self.model_config.dtype),
+            quantization=(
+                None
+                if getattr(self.model_config, "quantization", None) is None
+                else str(self.model_config.quantization)
+            ),
+            topology=topology,
+            timeout_s=float(arena_config.get("reward_node_cache_wait_timeout_s", 1800)),
+            populate_handle=populate_handle,
+            backend=str(arena_config.get("reward_node_cache_backend", "auto")),
+            shm_reserve_bytes=gb_to_bytes(
+                arena_config.get("reward_node_cache_shm_reserve_gb", 256),
+                field_name="reward_node_cache_shm_reserve_gb",
+                allow_zero=True,
+            ),
+            memfd_reserve_bytes=gb_to_bytes(
+                arena_config.get("reward_node_cache_memfd_reserve_gb", 256),
+                field_name="reward_node_cache_memfd_reserve_gb",
+                allow_zero=True,
+            ),
+        )
+        diagnostics = shared_cache.diagnostics()
+        psrl_logger.warning(
+            "[RM_NODE_SHARED_WEIGHT_CACHE] backend=%s node_id=%s cache_key=%s role=%s "
+            "tp_rank=%d pp_rank=%d ep_rank=%d mapped_bytes=%d unique_cache_bytes=%d "
+            "inode=%d private_bytes=%s pss_bytes=%s.",
+            diagnostics["backend"],
+            diagnostics["node_id"],
+            diagnostics["cache_key"],
+            diagnostics["role"],
+            topology.tp_rank,
+            topology.pp_rank,
+            topology.ep_rank,
+            diagnostics["mapped_bytes"],
+            diagnostics["unique_cache_bytes"],
+            diagnostics["inode"],
+            diagnostics["private_bytes"],
+            diagnostics["pss_bytes"],
+        )
+        return shared_cache
+
+    def close_node_shared_weight_cache(self) -> None:
+        """Close this worker's mmap views and release its job namespace lease."""
+        shared_cache = getattr(self, "_psrl_node_shared_arena_cache", None)
+        if shared_cache is None:
+            return
+        if hasattr(self, "_psrl_weight_arena_cpu_cache"):
+            del self._psrl_weight_arena_cpu_cache
+        gc.collect()
+        shared_cache.close()
+        del self._psrl_node_shared_arena_cache
 
     def load_weights_from_cpu_cache(self, blocking: bool = True):
         """
@@ -153,64 +320,189 @@ class vLLMWorkerExtension:
             if arena_cache is not None:
                 if arena_handle is None:
                     raise RuntimeError("Reward arena CPU cache exists without a weight arena handle.")
-                if cache_state is None or not cache_state.get("ready") or cache_state.get("source") != "arena":
+                if (
+                    cache_state is None
+                    or not cache_state.get("ready")
+                    or cache_state.get("source") not in ("arena", "node_shared_arena")
+                ):
                     raise RuntimeError(f"Reward arena CPU cache has invalid state: {cache_state!r}.")
                 from psrl.utils.weight_arena import restore_weight_arena_from_cpu
 
-                cache_source = "arena"
+                cache_source = cache_state["source"]
                 torch.cuda.synchronize()
                 gpu_copy_start = time.perf_counter()
                 arena_restore_bytes = restore_weight_arena_from_cpu(arena_handle, arena_cache)
                 gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
+                shared_cache = getattr(self, "_psrl_node_shared_arena_cache", None)
+                if shared_cache is not None:
+                    shared_cache.drop_resident_pages()
                 validation_start = time.perf_counter()
                 arena_handle.assert_module_weights_in_arena(model)
                 model_validation_elapsed_s += time.perf_counter() - validation_start
                 loaded_params = {"__psrl_weight_arena_restore__"}
             else:
-                if not hasattr(self, "_psrl_cpu_weight_cache"):
-                    raise RuntimeError("CPU weight cache is not initialized.")
-                if cache_state is None or not cache_state.get("ready") or cache_state.get("source") != "checkpoint":
+                streaming_source = getattr(self, "_psrl_streaming_weight_source", None)
+                process_local_source = hasattr(self, "_psrl_cpu_weight_cache")
+                if streaming_source is None and not process_local_source:
+                    raise RuntimeError("Reward CPU weight source is not initialized.")
+                expected_source = "node_shared_checkpoint" if streaming_source is not None else "checkpoint"
+                if (
+                    cache_state is None
+                    or not cache_state.get("ready")
+                    or cache_state.get("source") != expected_source
+                ):
                     raise RuntimeError(f"Reward checkpoint CPU cache has invalid state: {cache_state!r}.")
                 if arena_handle is not None and not blocking:
                     raise RuntimeError("Reward arena snapshot requires blocking=True.")
 
-                current_device = torch.cuda.current_device()
+                current_device = None if streaming_source is not None else torch.cuda.current_device()
 
                 def cached_weights_generator():
+                    if streaming_source is not None:
+                        model_loader = get_model_loader(streaming_source["load_config"])
+                        yield from _iter_rank_local_checkpoint_weights(
+                            model_loader,
+                            streaming_source["model_config"],
+                            model,
+                        )
+                        return
                     for name, tensor in self._psrl_cpu_weight_cache:
+                        if isinstance(tensor, DTensor):
+                            tensor = tensor.full_tensor()
                         yield (name, tensor.to(current_device, non_blocking=True))
 
-                torch.cuda.synchronize()
-                gpu_copy_start = time.perf_counter()
-                with self._maybe_tms_weights_region():
-                    loaded_params = model.load_weights(weights=cached_weights_generator())
-                if loaded_params is None:
-                    raise RuntimeError("Reward checkpoint loader returned no load result.")
-                if blocking:
-                    torch.cuda.synchronize()
-                    gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
-                    if arena_handle is not None:
+                arena_config = (self.model_runner.vllm_config.additional_config or {}).get(
+                    "psrl_nixl_weight_arena", {}
+                )
+                cache_mode = arena_config.get("reward_cpu_cache_mode", "node_shared")
+                node_shared_first_load = (
+                    arena_handle is not None
+                    and cache_mode == "node_shared"
+                    and streaming_source is not None
+                )
+                if node_shared_first_load:
+                    builder_timings: dict[str, float] = {}
+
+                    def populate_shared_arena() -> None:
+                        nonlocal loaded_params
+                        torch.cuda.synchronize()
+                        checkpoint_load_start = time.perf_counter()
+                        with self._maybe_tms_weights_region():
+                            loaded_params = _load_model_weights_with_vllm_config(
+                                model,
+                                cached_weights_generator(),
+                                self.model_runner.vllm_config,
+                            )
+                        if loaded_params is None:
+                            raise RuntimeError("Reward checkpoint loader returned no load result.")
+                        torch.cuda.synchronize()
+                        builder_timings["checkpoint_load_s"] = (
+                            time.perf_counter() - checkpoint_load_start
+                        )
+                        validation_start = time.perf_counter()
+                        arena_handle.assert_module_weights_in_arena(model)
+                        builder_timings["validation_s"] = time.perf_counter() - validation_start
+                        empty_cache_start = time.perf_counter()
+                        aggressive_empty_cache(force_sync=True)
+                        builder_timings["empty_cache_s"] = time.perf_counter() - empty_cache_start
+
+                    snapshot_start = time.perf_counter()
+                    shared_cache = self._publish_node_shared_reward_arena(
+                        arena_handle,
+                        arena_config,
+                        streaming_source["model_id"],
+                        streaming_source["checkpoint_fingerprint"],
+                        populate_handle=populate_shared_arena,
+                    )
+                    arena_snapshot_elapsed_s = time.perf_counter() - snapshot_start
+                    self._psrl_node_shared_arena_cache = shared_cache
+                    self._psrl_weight_arena_cpu_cache = shared_cache.arenas
+                    if shared_cache.builder:
+                        cache_source = "node_shared_checkpoint_builder"
+                        gpu_copy_elapsed_s = builder_timings.get("checkpoint_load_s", 0.0)
+                        empty_cache_elapsed_s = builder_timings.get("empty_cache_s", 0.0)
+                        model_validation_elapsed_s += builder_timings.get("validation_s", 0.0)
+                    else:
+                        from psrl.utils.weight_arena import restore_weight_arena_from_cpu
+
+                        cache_source = "node_shared_arena_consumer"
+                        torch.cuda.synchronize()
+                        gpu_copy_start = time.perf_counter()
+                        arena_restore_bytes = restore_weight_arena_from_cpu(
+                            arena_handle,
+                            shared_cache.arenas,
+                        )
+                        torch.cuda.synchronize()
+                        gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
+                        shared_cache.drop_resident_pages()
+                        loaded_params = {"__psrl_weight_arena_restore__"}
                         validation_start = time.perf_counter()
                         arena_handle.assert_module_weights_in_arena(model)
                         model_validation_elapsed_s += time.perf_counter() - validation_start
-                    # Release checkpoint-layout CPU-to-GPU staging tensors before
-                    # taking the persistent arena snapshot.
-                    empty_cache_start = time.perf_counter()
-                    aggressive_empty_cache(force_sync=True)
-                    empty_cache_elapsed_s = time.perf_counter() - empty_cache_start
-
-                if arena_handle is not None:
-                    from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
-
-                    arena_config = (self.model_runner.vllm_config.additional_config or {}).get(
-                        "psrl_nixl_weight_arena", {}
+                    arena_bytes = sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in self._psrl_weight_arena_cpu_cache
                     )
+                    self._psrl_reward_weight_cache_state = {
+                        "ready": True,
+                        "source": "node_shared_arena",
+                        "arena_count": len(self._psrl_weight_arena_cpu_cache),
+                        "arena_bytes": arena_bytes,
+                        "pin_memory": False,
+                        **shared_cache.diagnostics(),
+                    }
+                    cache_transitioned = True
+                    release_start = time.perf_counter()
+                    del self._psrl_streaming_weight_source
+                    gc.collect()
+                    cache_release_elapsed_s = time.perf_counter() - release_start
+                else:
+                    torch.cuda.synchronize()
+                    gpu_copy_start = time.perf_counter()
+                    with self._maybe_tms_weights_region():
+                        loaded_params = _load_model_weights_with_vllm_config(
+                            model,
+                            cached_weights_generator(),
+                            self.model_runner.vllm_config,
+                        )
+                    if loaded_params is None:
+                        raise RuntimeError("Reward checkpoint loader returned no load result.")
+                    if blocking:
+                        torch.cuda.synchronize()
+                        gpu_copy_elapsed_s = time.perf_counter() - gpu_copy_start
+                        if arena_handle is not None:
+                            validation_start = time.perf_counter()
+                            arena_handle.assert_module_weights_in_arena(model)
+                            model_validation_elapsed_s += time.perf_counter() - validation_start
+                        # Release checkpoint-layout CPU-to-GPU staging tensors before
+                        # taking the persistent arena snapshot.
+                        empty_cache_start = time.perf_counter()
+                        aggressive_empty_cache(force_sync=True)
+                        empty_cache_elapsed_s = time.perf_counter() - empty_cache_start
+
+                if arena_handle is not None and not node_shared_first_load:
                     pin_memory = bool(arena_config.get("reward_cpu_cache_pin_memory", False))
                     snapshot_start = time.perf_counter()
-                    self._psrl_weight_arena_cpu_cache = snapshot_weight_arena_to_cpu(
-                        arena_handle,
-                        pin_memory=pin_memory,
-                    )
+                    if cache_mode == "node_shared":
+                        if streaming_source is None:
+                            raise RuntimeError(
+                                "Node-shared reward arena publication requires a streaming checkpoint source."
+                            )
+                        shared_cache = self._publish_node_shared_reward_arena(
+                            arena_handle,
+                            arena_config,
+                            streaming_source["model_id"],
+                            streaming_source["checkpoint_fingerprint"],
+                        )
+                        self._psrl_node_shared_arena_cache = shared_cache
+                        self._psrl_weight_arena_cpu_cache = shared_cache.arenas
+                    else:
+                        from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
+
+                        self._psrl_weight_arena_cpu_cache = snapshot_weight_arena_to_cpu(
+                            arena_handle,
+                            pin_memory=pin_memory,
+                        )
                     arena_snapshot_elapsed_s = time.perf_counter() - snapshot_start
                     arena_bytes = sum(
                         tensor.numel() * tensor.element_size()
@@ -218,14 +510,19 @@ class vLLMWorkerExtension:
                     )
                     self._psrl_reward_weight_cache_state = {
                         "ready": True,
-                        "source": "arena",
+                        "source": "node_shared_arena" if cache_mode == "node_shared" else "arena",
                         "arena_count": len(self._psrl_weight_arena_cpu_cache),
                         "arena_bytes": arena_bytes,
                         "pin_memory": pin_memory,
                     }
+                    if cache_mode == "node_shared":
+                        self._psrl_reward_weight_cache_state.update(shared_cache.diagnostics())
                     cache_transitioned = True
                     release_start = time.perf_counter()
-                    del self._psrl_cpu_weight_cache
+                    if streaming_source is not None:
+                        del self._psrl_streaming_weight_source
+                    else:
+                        del self._psrl_cpu_weight_cache
                     gc.collect()
                     cache_release_elapsed_s = time.perf_counter() - release_start
         except Exception as e:
@@ -270,7 +567,7 @@ class vLLMWorkerExtension:
             model_validation_elapsed_s,
             elapsed_s,
         )
-        return loaded_params
+        return True
 
     def load_weights(self, weights, blocking: bool = True):
         """
@@ -393,6 +690,9 @@ class vLLMWorkerExtension:
                 "total_bytes": sum(tensor.numel() * tensor.element_size() for tensor in arena_cache),
                 "pin_memory": all(tensor.is_pinned() for tensor in arena_cache),
             }
+            shared_cache = getattr(self, "_psrl_node_shared_arena_cache", None)
+            if shared_cache is not None:
+                cache_info.update(shared_cache.diagnostics())
         registration_timing = None
         nixl_client = getattr(self, "nixl_storage_client", None)
         if nixl_client is not None:
@@ -478,6 +778,7 @@ class vLLMWorkerExtension:
         # NIXL attributes
         self.unified_state_dict = None
         self.unified_sharding_dict = None
+        self.psrl_instance_id = int(instance_id)
         # Initialize the NIXL client
         self.nixl_storage_client = NIXLStorageClient(
             client_name=gen_client_name(instance_id, self.get_instance_local_rank()),
@@ -505,9 +806,30 @@ class vLLMWorkerExtension:
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
         parameter_mapping = create_parameter_mapping(type(vllm_model), model_config)
-        self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
-            parameter_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
+        self.unified_state_dict, self.local_sharding_dict, self.param_sync_plan = convert_vllm_inplace(
+            parameter_mapping,
+            vllm_model,
+            tp_rank=self.get_instance_local_tp_rank(),
+            return_sync_plan=True,
         )
+        fp32_patterns = parameter_mapping.get_external_fp32_param_patterns()
+        fp32_keys = [
+            key
+            for key, tensor in self.unified_state_dict.items()
+            if tensor.dtype == torch.float32 and any(pattern in key for pattern in fp32_patterns)
+        ]
+        if fp32_keys:
+            psrl_logger.info(
+                "vLLM precision invariant validated: fp32_parameters=%d patterns=%s",
+                len(fp32_keys),
+                fp32_patterns,
+            )
+        if self.param_sync_plan.actions:
+            psrl_logger.info(
+                "vLLM canonical parameter sync plan created: actions=%d keys=%s",
+                len(self.param_sync_plan.actions),
+                [action.key for action in self.param_sync_plan.actions],
+            )
 
     def nixl_protocol(self, config: DictConfig, mode: str = "full"):
         """Run the NIXL server protocol.
@@ -635,7 +957,41 @@ class vLLMWorkerExtension:
         """Debug log local NIXL shard info on this vLLM worker."""
         self.nixl_storage_client.log_shard_info(label=label, max_elements=max_elements)
 
-    def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
+    def _capture_weight_fingerprint(
+        self,
+        *,
+        stage: str,
+        model_version: int,
+        options: dict | None,
+    ) -> dict | None:
+        if options is None:
+            return None
+        fingerprint = self.nixl_storage_client.get_weight_fingerprint(
+            mode=options["mode"],
+            sample_count=options["sample_count"],
+            chunk_bytes=options["chunk_bytes"],
+        )
+        record = fingerprint_log_record(
+            fingerprint,
+            flow="transfer_chain",
+            stage=stage,
+            role="rollout",
+            model_version=model_version,
+            rank=self.get_instance_local_rank(),
+            instance_id=self.psrl_instance_id,
+            tp_rank=self.get_instance_local_tp_rank(),
+            client_name=self.nixl_storage_client.client_name,
+            include_tensor_digests=options["include_tensor_digests"],
+        )
+        return record
+
+    def nixl_pull_model_core(
+        self,
+        ps_nixl_agent_names,
+        ps_nixl_gen_storage_client_names,
+        model_version: int = -1,
+        fingerprint_options: dict | None = None,
+    ):
         """Pull the model parameters from PS workers via NIXL.
 
         Args:
@@ -676,6 +1032,29 @@ class vLLMWorkerExtension:
         finish_start = time.perf_counter()
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
+        raw_fingerprint = self._capture_weight_fingerprint(
+            stage="rollout_after_raw_pull",
+            model_version=model_version,
+            options=fingerprint_options,
+        )
+        sync_plan_start = time.perf_counter()
+        self.param_sync_plan.after_pull(self.unified_state_dict)
+        self.cuda_synchronize()
+        final_fingerprint = self._capture_weight_fingerprint(
+            stage="rollout_after_param_sync",
+            model_version=model_version,
+            options=fingerprint_options,
+        )
+        sync_plan_elapsed_s = time.perf_counter() - sync_plan_start
+        precision_stats = precision_sensitive_parameter_stats(self.unified_state_dict)
+        if precision_stats:
+            psrl_logger.info(
+                "[WEIGHT_SYNC_PRECISION] role=rollout rank=%d tp_rank=%d pull=%d stats=%s",
+                self.get_instance_local_rank(),
+                self.get_instance_local_tp_rank(),
+                self.pull_times,
+                precision_stats,
+            )
         # self.nixl_log_shard_info(label=f"AFTER_GEN_PULL_{self.pull_times}")
         self.nixl_storage_client.clear_intermediate_cached_data()
         finish_elapsed_s = time.perf_counter() - finish_start
@@ -684,6 +1063,7 @@ class vLLMWorkerExtension:
         self._psrl_worker_stage_timings["nixl_pull_model_core"] = {
             "issue_reads_elapsed_s": issue_reads_elapsed_s,
             "wait_elapsed_s": wait_elapsed_s,
+            "sync_plan_elapsed_s": sync_plan_elapsed_s,
             "finish_elapsed_s": finish_elapsed_s,
             "elapsed_s": elapsed_s,
         }
@@ -691,6 +1071,14 @@ class vLLMWorkerExtension:
             f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "
             f"time: {elapsed_s}s"
         )
+        # vLLM V1 runs this extension in an EngineCore process, which does not
+        # inherit the GenWorker's file logger. Return records to the caller so
+        # the outer Ray actor can persist them in its component log.
+        return {
+            "model_version": model_version,
+            "raw_fingerprint": raw_fingerprint,
+            "final_fingerprint": final_fingerprint,
+        }
 
     def estimate_max_model_len(self):
         """Estimate the maximum model length that can fit in the available KV cache memory."""

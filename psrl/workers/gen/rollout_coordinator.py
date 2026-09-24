@@ -102,8 +102,10 @@ class RolloutCoordinator(CommandExtension):
         self.sync_task = None
         self.process_status_queue_tasks = []
         self.broadcast_status_to_router_task = None
+        self.disaggregated_interrupt_task = None
         self.stop_command_handler = False
         self.stop_sync_and_migrate = False
+        self.stop_disaggregated_interrupt = False
         self.stop_process_status_queue = [False] * self.gen_wg_size
         self.stop_broadcast_status_to_router = False
 
@@ -125,6 +127,27 @@ class RolloutCoordinator(CommandExtension):
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
 
         self.enable_elastic_rm = self.config.psrl.deployment.elastic_rm.enable
+
+        # Optional experiment for reproducing elastic-style drift in the
+        # disaggregated layout. It is deliberately validated here so an
+        # accidental enablement in another deployment mode cannot interrupt
+        # validation or reward requests.
+        interrupt_config = self.config.psrl.deployment.get("disaggregated_rollout_interrupt", {})
+        self._disaggregated_interrupt_enabled = bool(interrupt_config.get("enable", False))
+        self._disaggregated_interrupt_interval_s = float(interrupt_config.get("interval_s", 0.0))
+        deployment_mode = str(self.config.psrl.deployment.get("mode", ""))
+        if self._disaggregated_interrupt_enabled:
+            if deployment_mode != "disaggregated":
+                raise ValueError(
+                    "disaggregated_rollout_interrupt requires psrl.deployment.mode=disaggregated"
+                )
+            if self._disaggregated_interrupt_interval_s <= 0:
+                raise ValueError("disaggregated_rollout_interrupt.interval_s must be > 0 when enabled")
+            if not self.config.psrl.partial_rollout.enable:
+                raise ValueError(
+                    "disaggregated_rollout_interrupt requires psrl.partial_rollout.enable=True "
+                    "so interrupted requests can loop back"
+                )
 
         # ElasticExecutor integration for swap-based sync (set via set_elastic_executor).
         # When available, sync_with_ps will try to wake a free instance and sleep the
@@ -360,6 +383,10 @@ class RolloutCoordinator(CommandExtension):
         self.running_loop = asyncio.get_running_loop()
         self.command_handler_task = self.running_loop.create_task(self._command_handler_loop())
         self.command_handler_task.add_done_callback(self._on_command_handler_done)
+        if self._disaggregated_interrupt_enabled:
+            self.disaggregated_interrupt_task = self.running_loop.create_task(
+                self._disaggregated_rollout_interrupt_loop()
+            )
 
         # Start the status collection tasks
         if self.config.psrl.status_collection.enable:
@@ -412,17 +439,64 @@ class RolloutCoordinator(CommandExtension):
         # Stop the background tasks
         self.stop_command_handler = True
         self.stop_sync_and_migrate = True
+        self.stop_disaggregated_interrupt = True
         self.stop_process_status_queue = [True] * self.gen_wg_size
         self.stop_broadcast_status_to_router = True
+
+        if self.disaggregated_interrupt_task is not None and not self.disaggregated_interrupt_task.done():
+            self.disaggregated_interrupt_task.cancel()
 
         tasks_to_wait = [self.command_handler_task]
         tasks_to_wait.append(self.sync_task)
         if self.process_status_queue_tasks:
             tasks_to_wait.extend(self.process_status_queue_tasks)
         tasks_to_wait.append(self.broadcast_status_to_router_task)
+        if self.disaggregated_interrupt_task is not None:
+            tasks_to_wait.append(self.disaggregated_interrupt_task)
 
         # Wait for tasks to finish with timeout
         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+
+    async def _disaggregated_rollout_interrupt_loop(self):
+        """Abort training-rollout requests periodically and let the router requeue them."""
+        tick = 0
+        while not self.stop_disaggregated_interrupt:
+            await asyncio.sleep(self._disaggregated_interrupt_interval_s)
+            if self.stop_disaggregated_interrupt:
+                break
+
+            try:
+                instance_to_uids = await self.rollout_router.get_inflight_rollout_request_ids.remote()
+                instance_to_uids = {
+                    int(instance_id): [int(request_id) for request_id in request_ids]
+                    for instance_id, request_ids in (instance_to_uids or {}).items()
+                    if request_ids
+                }
+                request_ids = [request_id for ids in instance_to_uids.values() for request_id in ids]
+                if not request_ids:
+                    continue
+
+                marked = await self.rollout_router.mark_periodic_interrupt_requests.remote(request_ids)
+                interrupted = await self.exec_command(
+                    Command(type=CommandType.ABORT, instance_to_uids=instance_to_uids),
+                    blocking=True,
+                )
+                tick += 1
+                psrl_logger.info(
+                    "[DISAGG_INTERRUPT] tick=%d interval_s=%.3f requests=%d marked=%d interrupted=%s "
+                    "scope=rollout_only reroute=partial_router",
+                    tick,
+                    self._disaggregated_interrupt_interval_s,
+                    len(request_ids),
+                    marked,
+                    interrupted,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Keep the experiment alive after a transient Ray/engine error;
+                # the next interval will take a fresh request snapshot.
+                psrl_logger.exception("[DISAGG_INTERRUPT] periodic rollout interruption failed")
 
     async def _command_handler_loop(self):
         """
@@ -494,7 +568,8 @@ class RolloutCoordinator(CommandExtension):
                             instance_to_uids = {}
                         else:
                             prepared = await self.rollout_router.prepare_request_migrations.remote(
-                                request_migrations
+                                request_migrations,
+                                migration_context,
                             )
                             instance_to_uids = prepared.get("instance_to_uids", {})
                             psrl_logger.info(
@@ -508,7 +583,12 @@ class RolloutCoordinator(CommandExtension):
                     )
                     futures = []
 
-                    if migration_context and instance_to_uids is not None and self.rollout_router is not None:
+                    if (
+                        migration_context
+                        and request_migrations is None
+                        and instance_to_uids is not None
+                        and self.rollout_router is not None
+                    ):
                         await self.rollout_router.mark_migration_requests.remote(
                             instance_to_uids,
                             migration_context,
@@ -541,6 +621,9 @@ class RolloutCoordinator(CommandExtension):
                     else:
                         interrupted_request_nums = await asyncio.gather(*futures)
                         interrupted_request_num = np.sum(interrupted_request_nums)
+
+                    if migration_context and self.rollout_router is not None:
+                        await self.rollout_router.wait_for_exclusive_rebalance.remote()
 
                     result = interrupted_request_num
                     psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
@@ -660,7 +743,7 @@ class RolloutCoordinator(CommandExtension):
                         stage_started_s = time.monotonic()
                         interrupted_request_nums = await asyncio.gather(
                             *[
-                                self.rollout_wg_list[instance_id].execute_rank_zero_async(
+                                self.gen_wg_list[instance_id].execute_rank_zero_async(
                                     "interrupt_generation"
                                 )
                                 for instance_id in awake_instance_ids
@@ -676,7 +759,7 @@ class RolloutCoordinator(CommandExtension):
                         stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
-                                self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_sleep")
+                                self.gen_wg_list[instance_id].execute_rank_zero_async("nixl_sleep")
                                 for instance_id in awake_instance_ids
                             ]
                         )
@@ -740,7 +823,7 @@ class RolloutCoordinator(CommandExtension):
                         stage_started_s = time.monotonic()
                         await asyncio.gather(
                             *[
-                                self.rollout_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up")
+                                self.gen_wg_list[instance_id].execute_rank_zero_async("nixl_wake_up")
                                 for instance_id, is_sleeping in zip(instance_ids, sleeping_flags)
                                 if is_sleeping
                             ]
@@ -1138,6 +1221,57 @@ class RolloutCoordinator(CommandExtension):
         self.ready_buffers.add(ready_buffer)
         psrl_logger.info(f"Updated ready buffers to: {self.ready_buffers}")
 
+    async def _sync_instances_directly(
+        self,
+        instance_ids: list[int],
+        *,
+        wait_interrupted_partial_requests_loop_back: bool,
+    ) -> None:
+        """
+        Synchronize instances without elastic swap or scaling operations.
+
+        Dedicated validation instances are globally indexed after rollout
+        instances but are not registered with ElasticExecutor. They must use
+        this direct synchronization path.
+        """
+        with log_dual_events(
+            f"Synchronize generation instances {instance_ids} with PS "
+            "(model pull and request loopback are blocking for the coordinator)",
+            psrl_logger,
+            level=logging.INFO,
+            event_type=EventType.OTHER,
+        ):
+            for instance_id in instance_ids:
+                self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
+                    instance_id, 0
+                )
+            target_ps_version = int(self.ps_model_version)
+            transition_id = await self.rollout_router.begin_instance_transition.remote(instance_ids)
+            await self.rollout_router.pause_routing.remote()
+            psrl_logger.info("Paused routing for synchronization transition %d", transition_id)
+            try:
+                await self.rollout_router.update_currently_syncing_instances.remote(
+                    instance_ids,
+                    target_ps_version,
+                )
+                result = await self.exec_command(
+                    Command(
+                        type=CommandType.SYNC,
+                        instance_ids=instance_ids,
+                        curr_ps_model_version=target_ps_version,
+                        wait_model_sync=True,
+                    ),
+                    blocking=True,
+                )
+                if result is None or result is False:
+                    raise RuntimeError(f"SYNC command failed for instances {instance_ids}")
+                if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                    await self.rollout_router.wait_instance_transition.remote(transition_id)
+            finally:
+                await self.rollout_router.finish_instance_transition.remote(transition_id, resume=True)
+                await self.rollout_router.resume_routing.remote()
+                psrl_logger.info("Resumed routing after synchronization transition %d", transition_id)
+
     async def sync_with_ps(
         self,
         instance_ids: list[int],
@@ -1147,54 +1281,35 @@ class RolloutCoordinator(CommandExtension):
         """
         Synchronize with PS for the given instance IDs.
         """
+        invalid_instance_ids = [
+            instance_id for instance_id in instance_ids if instance_id < 0 or instance_id >= self.gen_wg_size
+        ]
+        if invalid_instance_ids:
+            raise ValueError(
+                f"Generation instance IDs must be in [0, {self.gen_wg_size}), "
+                f"got: {invalid_instance_ids!r}."
+            )
+
+        validation_sync_ids = [
+            instance_id for instance_id in instance_ids if instance_id >= self.rollout_wg_size
+        ]
+        if validation_sync_ids:
+            await self._sync_instances_directly(
+                validation_sync_ids,
+                wait_interrupted_partial_requests_loop_back=wait_interrupted_partial_requests_loop_back,
+            )
+
+        instance_ids = [
+            instance_id for instance_id in instance_ids if instance_id < self.rollout_wg_size
+        ]
+        if not instance_ids:
+            return
+
         if not self.enable_elastic_rm:
-            # Add batching SYNC command to the command queue to interrupt the instance
-            # This will stop the instance, pull the model weights from PS, and resume generation.
-            # But this will not block the current loop.
-            # NOTE(lhy): we don't need to update the instance version here because the version
-            # is updated in the `sync_with_ps` method of the GenWorker
-            # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager
-            # will update the instance version.
-            # However, we need to update the latest stale model version here to avoid stale stats
-            # being handled after the synchronization.
-            with log_dual_events(
-                f"Synchronize rollout instances {instance_ids} with PS "
-                "(model pull and request loopback are blocking for the coordinator)",
-                psrl_logger,
-                level=logging.INFO,
-                event_type=EventType.OTHER,
-            ):
-                for instance_id in instance_ids:
-                    self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
-                        instance_id, 0
-                    )
-                target_ps_version = int(self.ps_model_version)
-                transition_id = await self.rollout_router.begin_instance_transition.remote(instance_ids)
-                await self.rollout_router.pause_routing.remote()
-                psrl_logger.info("Paused routing for synchronization transition %d", transition_id)
-                try:
-                    await self.rollout_router.update_currently_syncing_instances.remote(
-                        instance_ids,
-                        target_ps_version,
-                    )
-                    result = await self.exec_command(
-                        Command(
-                            type=CommandType.SYNC,
-                            instance_ids=instance_ids,
-                            curr_ps_model_version=target_ps_version,
-                            # Routing must not resume before the pull finishes.
-                            wait_model_sync=True,
-                        ),
-                        blocking=True,
-                    )
-                    if result is None or result is False:
-                        raise RuntimeError(f"SYNC command failed for instances {instance_ids}")
-                    if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
-                        await self.rollout_router.wait_instance_transition.remote(transition_id)
-                finally:
-                    await self.rollout_router.finish_instance_transition.remote(transition_id, resume=True)
-                    await self.rollout_router.resume_routing.remote()
-                    psrl_logger.info("Resumed routing after synchronization transition %d", transition_id)
+            await self._sync_instances_directly(
+                instance_ids,
+                wait_interrupted_partial_requests_loop_back=wait_interrupted_partial_requests_loop_back,
+            )
             return
 
 

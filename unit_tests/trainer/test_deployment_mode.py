@@ -1,22 +1,34 @@
-"""Unit tests for PSRL_RayPPOTrainer._resolve_deployment_mode.
+"""Unit tests for lightweight deployment-mode resolution and validation.
 
 Verifies that each `psrl.deployment.mode` value resolves to the expected
 `elastic_rm` flag combination and that backward-compat inference (mode=null)
 preserves legacy behavior.
 """
 
+import pytest
 from omegaconf import OmegaConf
+from psrl.utils.deployment_mode import (
+    expand_ngpus_per_node,
+    resolve_deployment_mode,
+    validate_trainer_sleep_optimizer_offload,
+)
 
-from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
-from psrl.utils.deployment_mode import expand_ngpus_per_node
 
-
-def _make_config(mode, elastic_rm_enable=False, enable_trainer_pool=False,
-                 enable_policy=True, colocate=False):
+def _make_config(
+    mode,
+    elastic_rm_enable=False,
+    enable_trainer_pool=False,
+    enable_policy=True,
+    colocate=False,
+    colocate_validate_and_train=False,
+    optimizer_offload=False,
+    strategy="fsdp2",
+):
     cfg = OmegaConf.create(
         {
             "psrl": {
                 "colocate": colocate,
+                "colocate_validate_and_train": colocate_validate_and_train,
                 "deployment": {
                     "mode": mode,
                     "trainer_pool_idle_rollout_instances": 0,
@@ -30,13 +42,20 @@ def _make_config(mode, elastic_rm_enable=False, enable_trainer_pool=False,
                     },
                 },
             },
+            "train_actor_rollout_ref": {
+                "actor": {
+                    "strategy": strategy,
+                    "fsdp_config": {"optimizer_offload": optimizer_offload},
+                    "megatron": {"optimizer_offload": optimizer_offload},
+                }
+            },
         }
     )
     return cfg
 
 
 def _resolved(cfg):
-    return PSRL_RayPPOTrainer._resolve_deployment_mode(cfg), cfg.psrl.deployment.elastic_rm
+    return resolve_deployment_mode(cfg), cfg.psrl.deployment.elastic_rm
 
 
 def test_disaggregated():
@@ -98,7 +117,7 @@ def test_null_infers_disaggregated():
 def test_invalid_mode_raises():
     cfg = _make_config("bogus_mode")
     try:
-        PSRL_RayPPOTrainer._resolve_deployment_mode(cfg)
+        resolve_deployment_mode(cfg)
     except ValueError:
         return
     raise AssertionError("Expected ValueError for invalid deployment mode")
@@ -120,6 +139,65 @@ def test_expand_ngpus_per_node_rejects_wrong_length():
     except ValueError:
         return
     raise AssertionError("Expected ValueError for mismatched per-node GPU list length")
+
+
+def test_elastic_trainer_pool_requires_optimizer_offload():
+    cfg = _make_config(
+        "elastic_rl",
+        elastic_rm_enable=True,
+        enable_trainer_pool=True,
+        optimizer_offload=False,
+    )
+    mode, _ = _resolved(cfg)
+
+    with pytest.raises(ValueError, match=r"fsdp_config\.optimizer_offload=True"):
+        validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_elastic_trainer_pool_accepts_optimizer_offload():
+    cfg = _make_config(
+        "elastic_rl",
+        elastic_rm_enable=True,
+        enable_trainer_pool=True,
+        optimizer_offload=True,
+    )
+    mode, _ = _resolved(cfg)
+
+    validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_trainer_pool_only_also_requires_optimizer_offload():
+    cfg = _make_config("trainer_pool_only", optimizer_offload=False)
+    mode, _ = _resolved(cfg)
+
+    with pytest.raises(ValueError, match="trainer_pool_only"):
+        validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_colocated_validation_requires_optimizer_offload_without_elastic_pool():
+    cfg = _make_config(
+        "disaggregated",
+        colocate_validate_and_train=True,
+        optimizer_offload=False,
+    )
+    mode, _ = _resolved(cfg)
+
+    with pytest.raises(ValueError, match="colocate_validate_and_train=True"):
+        validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_megatron_sleep_uses_megatron_optimizer_offload_setting():
+    cfg = _make_config(
+        "elastic_rl",
+        elastic_rm_enable=True,
+        enable_trainer_pool=True,
+        optimizer_offload=False,
+        strategy="megatron",
+    )
+    mode, _ = _resolved(cfg)
+
+    with pytest.raises(ValueError, match=r"actor\.megatron\.optimizer_offload=True"):
+        validate_trainer_sleep_optimizer_offload(cfg, mode)
 
 
 if __name__ == "__main__":

@@ -49,10 +49,10 @@ from psrl.trainer.ppo.utils import (
     record_rollout_rm_metrics,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.tms_env import build_ray_train_worker_tms_env
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.dataset import DataProcessor, DatasetType
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
-from psrl.utils.common.tms_env import build_ray_train_worker_tms_env
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -62,6 +62,9 @@ from psrl.utils.logger import (
 from psrl.utils.nixl import (
     GLOBAL_PORT_SCANNER,
     NIXLInterface,
+    compare_weight_fingerprints,
+    resolve_weight_fingerprint_options,
+    weight_fingerprint_flow_enabled,
 )
 from psrl.utils.reward_token_metrics import extract_reward_model_token_counts
 from psrl.utils.server.command import Command, CommandType
@@ -172,6 +175,7 @@ class PSRL_RayPPOTrainer:
         self._elastic_trainer_pool_training_active = False
         self._elastic_trainer_pool_trainer_sleeping = False
         self._elastic_trainer_pool_entries: list[dict] | None = None
+        self._trainer_before_sleep_weight_fingerprints: dict | None = None
 
         # Rollout gateway handle
         self.rollout_gateway = None
@@ -408,6 +412,9 @@ class PSRL_RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        from psrl.utils.deployment_mode import validate_trainer_sleep_optimizer_offload
+
+        validate_trainer_sleep_optimizer_offload(config, self.deployment_mode)
         # number of GPUs used in training
         train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
         if config.train_actor_rollout_ref.actor.strategy == "megatron":
@@ -650,6 +657,15 @@ class PSRL_RayPPOTrainer:
             assert self.config.psrl.tms.range == "train" or self.config.psrl.tms.range == "all", (
                 "TMS range must be 'train' or 'all' when using colocate_validate_and_train"
             )
+            if self.elastic_trainer_pool_mode:
+                assert self.config.psrl.ps_mode in ("nixl_cpu", "nixl_gpu"), (
+                    "Elastic trainer-pool validation colocation requires psrl.ps_mode "
+                    f"to be 'nixl_cpu' or 'nixl_gpu', got: {self.config.psrl.ps_mode!r}."
+                )
+                assert not self.config.psrl.fuse_rollout_with_validate, (
+                    "Elastic trainer-pool validation colocation requires "
+                    "psrl.fuse_rollout_with_validate=False."
+                )
         else:
             assert self.config.psrl.fuse_rollout_with_validate, (
                 "fuse_rollout_with_validate must be enabled when not colocate_validate_and_train"
@@ -1297,6 +1313,33 @@ class PSRL_RayPPOTrainer:
         if getattr(self, "actor_wg", None) is None:
             raise RuntimeError("Actor worker group must be initialized before sleeping trainer.")
         psrl_logger.info("Elastic trainer pool: sleeping trainer actor.")
+        self._trainer_before_sleep_weight_fingerprints = None
+        if weight_fingerprint_flow_enabled(self.config.psrl, flow="trainer_sleep_wake"):
+            model_version = int(ray.get(self.ps_manager_handle.get_ps_model_version.remote("trainer_before_sleep")))
+            fingerprint_options = resolve_weight_fingerprint_options(
+                self.config.psrl,
+                flow="trainer_sleep_wake",
+                model_version=model_version,
+            )
+        else:
+            model_version = -1
+            fingerprint_options = None
+        if fingerprint_options is not None:
+            before_sleep = ray.get(
+                self.actor_wg.execute_all_async(
+                    "capture_weight_fingerprint",
+                    "trainer_before_sleep",
+                    model_version,
+                    "trainer_sleep_wake",
+                )
+            )
+            if any(record is not None for record in before_sleep):
+                self._trainer_before_sleep_weight_fingerprints = {
+                    "model_version": model_version,
+                    "records": before_sleep,
+                }
+            else:
+                self._trainer_before_sleep_weight_fingerprints = None
         sleep_started_s = time.perf_counter()
         ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full"))
         sleep_elapsed_s = time.perf_counter() - sleep_started_s
@@ -1325,6 +1368,17 @@ class PSRL_RayPPOTrainer:
             stage_start = time.perf_counter()
             ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
             wake_rpc_s = time.perf_counter() - stage_start
+            baseline = self._trainer_before_sleep_weight_fingerprints
+            mapping_records = None
+            if baseline is not None:
+                mapping_records = ray.get(
+                    self.actor_wg.execute_all_async(
+                        "capture_weight_mapping_signature",
+                        "trainer_after_wake_register",
+                        baseline["model_version"],
+                        "trainer_sleep_wake",
+                    )
+                )
             updated_client_names = [train_client_name(i) for i in range(self.actor_wg.world_size)]
             futures = []
             stage_start = time.perf_counter()
@@ -1336,8 +1390,10 @@ class PSRL_RayPPOTrainer:
             self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
             broadcast_infos_s = time.perf_counter() - stage_start
             stage_start = time.perf_counter()
-            ray.get(self.actor_wg.execute_all_async("pull_model"))
+            pull_results = ray.get(self.actor_wg.execute_all_async("pull_model"))
             pull_model_s = time.perf_counter() - stage_start
+            self._clear_fsdp2_grads_after_trainer_wake()
+            self._verify_trainer_sleep_wake_weights(mapping_records, pull_results)
             total_s = time.perf_counter() - total_start
             psrl_logger.warning(
                 "[TRAINER_WAKE_TIMING] scope=trainer_controller world_size=%d "
@@ -1362,6 +1418,89 @@ class PSRL_RayPPOTrainer:
                 total_s,
             )
         self._elastic_trainer_pool_trainer_sleeping = False
+
+    def _verify_trainer_sleep_wake_weights(self, mapping_records: list | None, pull_results: list) -> None:
+        baseline = self._trainer_before_sleep_weight_fingerprints
+        self._trainer_before_sleep_weight_fingerprints = None
+        if baseline is None:
+            return
+
+        expected_records = {
+            int(record["rank"]): record for record in baseline["records"] if record is not None
+        }
+        mapping_by_rank = {
+            int(record["rank"]): record for record in (mapping_records or []) if record is not None
+        }
+        actual_records = {
+            int(result["final_fingerprint"]["rank"]): result["final_fingerprint"]
+            for result in pull_results
+            if result is not None and result.get("final_fingerprint") is not None
+        }
+        actual_versions = sorted(
+            {
+                int(result["model_version"])
+                for result in pull_results
+                if result is not None and result.get("model_version") is not None
+            }
+        )
+        expected_version = int(baseline["model_version"])
+        rank_results = {}
+        mismatch = False
+        for rank in sorted(expected_records.keys() | actual_records.keys() | mapping_by_rank.keys()):
+            expected = expected_records.get(rank)
+            actual = actual_records.get(rank)
+            mapping = mapping_by_rank.get(rank)
+            if expected is None or actual is None:
+                mismatch = True
+                rank_results[rank] = {"match": False, "reason": "missing_fingerprint"}
+                continue
+            comparison = compare_weight_fingerprints(expected, actual)
+            mapping_match = mapping is not None and expected.get("mapping_digest") == mapping.get("mapping_digest")
+            address_match = mapping is not None and expected.get("address_digest") == mapping.get("address_digest")
+            content_match = bool(comparison["match"] and comparison["mapping_match"])
+            mismatch = mismatch or not content_match or not mapping_match
+            rank_results[rank] = {
+                "match": content_match and mapping_match,
+                "content_match": content_match,
+                "mapping_match_after_register": mapping_match,
+                "address_match_after_register": address_match,
+                "differing_tensor_count": comparison["differing_tensor_count"],
+                "differing_tensors": comparison["differing_tensors"][:20],
+            }
+
+        version_match = actual_versions == [expected_version]
+        mismatch = mismatch or not version_match
+        record = {
+            "expected_model_version": expected_version,
+            "actual_model_versions": actual_versions,
+            "version_match": version_match,
+            "status": "mismatch" if mismatch else "match",
+            "rank_results": rank_results,
+        }
+        log_method = psrl_logger.error if mismatch else psrl_logger.warning
+        log_method("[TRAINER_SLEEP_WAKE_WEIGHT_CHECK] %s", json.dumps(record, sort_keys=True))
+
+        options = resolve_weight_fingerprint_options(
+            self.config.psrl,
+            flow="trainer_sleep_wake",
+            model_version=expected_version,
+        )
+        if mismatch and options is not None and options["fail_on_mismatch"]:
+            raise RuntimeError(f"Trainer sleep/wake weight verification failed: {record}")
+
+    def _clear_fsdp2_grads_after_trainer_wake(self) -> list[int]:
+        """Reset every FSDP2 gradient representation before the next update."""
+        if self.config.train_actor_rollout_ref.actor.strategy != "fsdp2":
+            return []
+        dirty_counts = ray.get(self.actor_wg.execute_all_async("clear_fsdp2_grads")) or []
+        normalized_counts = [int(count or 0) for count in dirty_counts]
+        psrl_logger.info(
+            "[TRAINER_WAKE_GRAD_CHECK] world_size=%d dirty_counts=%s total_cleared=%d",
+            self.actor_wg.world_size,
+            normalized_counts,
+            sum(normalized_counts),
+        )
+        return normalized_counts
 
     def _trainer_pool_only_replica_entries(self) -> list[dict]:
         """Train_pool rollout/rm replica entries for mode 4 (subset of instance entries)."""
@@ -1441,6 +1580,38 @@ class PSRL_RayPPOTrainer:
         self._elastic_trainer_pool_training_active = True
         psrl_logger.info("Elastic trainer pool: entered training window with entries=%s.", entries)
 
+    def _enter_elastic_trainer_pool_validation_window(self):
+        """
+        Reserve train-pool elastic instances without waking the trainer.
+
+        Dedicated validation workers time-share the trainer GPUs. Reserving the
+        elastic entries keeps policy-driven rollout and reward-model wakeups off
+        those GPUs until validation finishes.
+        """
+        if not self.elastic_trainer_pool_mode or self._elastic_trainer_pool_training_active:
+            return
+        entries = self._elastic_trainer_pool_instance_entries()
+        if self.elastic_executor is not None and entries:
+            ray.get(self.elastic_executor.enter_training_pool.remote(entries))
+        self._elastic_trainer_pool_training_active = True
+        psrl_logger.info("Elastic trainer pool: entered validation window with entries=%s.", entries)
+
+    def _sleep_validation_workers_after_initialization(self) -> None:
+        """Sleep dedicated validation workers before initializing train-pool rollout replicas."""
+        validation_instance_ids = list(
+            range(
+                self.n_rollout_instances,
+                self.n_rollout_instances + self.n_validate_instances,
+            )
+        )
+        ray.get(
+            [
+                self.rollout_coordinator.sleep.remote("validate"),
+                self.rollout_router.pause_instances.remote(validation_instance_ids),
+            ]
+        )
+        self.is_rollout_mode_in_actor = False
+
     def _leave_elastic_trainer_pool_training_window(self):
         """Sleep the actor and release train-pool elastic instances after a training step."""
         if not (self.elastic_trainer_pool_mode or self.trainer_pool_only_mode) or not self._elastic_trainer_pool_training_active:
@@ -1455,8 +1626,24 @@ class PSRL_RayPPOTrainer:
         self._elastic_trainer_pool_training_active = False
         psrl_logger.info("Elastic trainer pool: left training window with entries=%s.", entries)
 
+    def _set_elastic_training_step(self) -> None:
+        """Tell ElasticExecutor which trainer step owns subsequently accepted actions."""
+        if self.elastic_executor is None:
+            return
+        try:
+            ray.get(
+                self.elastic_executor.set_current_training_step.remote(
+                    self.global_steps
+                )
+            )
+        except Exception:
+            psrl_logger.exception(
+                "Failed to set elastic_rm training step=%s; actions may be tagged step=-1.",
+                self.global_steps,
+            )
+
     def _collect_elastic_awake_metrics(self) -> dict[str, int]:
-        """Pull the live per-role awake-instance counts from ElasticExecutor for wandb.
+        """Pull live awake counts and completed scaling actions for this step.
 
         Returns an empty dict when elastic_rm is disabled or the snapshot cannot be
         fetched, so the failure never blocks the per-step metric logging.
@@ -1464,11 +1651,46 @@ class PSRL_RayPPOTrainer:
         if self.elastic_executor is None:
             return {}
         try:
-            awake_counts = ray.get(self.elastic_executor.get_awake_instance_counts.remote())
+            awake_counts, scaling_counts = ray.get(
+                [
+                    self.elastic_executor.get_awake_instance_counts.remote(),
+                    self.elastic_executor.get_step_scaling_action_counts.remote(
+                        self.global_steps
+                    ),
+                ]
+            )
         except Exception:
-            psrl_logger.exception("Failed to fetch elastic_rm awake instance counts; skipping this step.")
+            psrl_logger.exception(
+                "Failed to fetch elastic_rm step metrics; skipping this step."
+            )
             return {}
-        return {f"elastic_rm/awake_instances/{role_key}": int(count) for role_key, count in awake_counts.items()}
+        metrics = {
+            f"elastic_rm/awake_instances/{role_key}": int(count)
+            for role_key, count in awake_counts.items()
+        }
+        metrics.update(
+            {
+                "elastic_rm/scaling_actions/total": int(
+                    scaling_counts["actual_actions"]
+                ),
+                "elastic_rm/scaling_actions/scale_up": int(
+                    scaling_counts["scale_up_actions"]
+                ),
+                "elastic_rm/scaling_actions/scale_down": int(
+                    scaling_counts["scale_down_actions"]
+                ),
+                "elastic_rm/scaling_instance_transitions/total": int(
+                    scaling_counts["instance_transitions"]
+                ),
+                "elastic_rm/scaling_instance_transitions/sleep": int(
+                    scaling_counts["sleep_instances"]
+                ),
+                "elastic_rm/scaling_instance_transitions/wakeup": int(
+                    scaling_counts["wakeup_instances"]
+                ),
+            }
+        )
+        return metrics
 
     def init_reward_manager(self, validation: bool = False):
         """Initialize the reward manager for computing rewards during training."""
@@ -1539,6 +1761,25 @@ class PSRL_RayPPOTrainer:
             psrl_logger.debug("Reward manager stopped successfully.")
         else:
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
+
+    def shutdown_reward_model_managers(self) -> None:
+        """Gracefully close all GenRM engines and release node-shared caches."""
+        failures = []
+        for reward_model_name, manager in self.reward_model_manager_mapping.items():
+            try:
+                manager.shutdown()
+            except Exception as exc:
+                failures.append((reward_model_name, exc))
+                psrl_logger.exception(
+                    "Failed to shut down reward model manager %s.",
+                    reward_model_name,
+                )
+        self.reward_model_manager_mapping.clear()
+        if failures:
+            psrl_logger.warning(
+                "Reward model manager shutdown completed with %d failures.",
+                len(failures),
+            )
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1650,9 +1891,23 @@ class PSRL_RayPPOTrainer:
 
         Note that we use the training side to do val for overlapping with generation.
         """
-        with log_dual_events("Switch to rollout mode", psrl_logger, event_type=EventType.SWITCH):
-            self.switch_to_rollout_mode()
+        elastic_validation_colocation = (
+            self.elastic_trainer_pool_mode and self.config.psrl.colocate_validate_and_train
+        )
+        if elastic_validation_colocation:
+            self._enter_elastic_trainer_pool_validation_window()
 
+        try:
+            with log_dual_events("Switch to rollout mode", psrl_logger, event_type=EventType.SWITCH):
+                self.switch_to_rollout_mode()
+            return self._run_validation()
+        finally:
+            if self.is_rollout_mode_in_actor:
+                with log_dual_events("Switch validation workers out", psrl_logger, event_type=EventType.SWITCH):
+                    self.switch_to_trainer_mode(restore_trainer=not elastic_validation_colocation)
+
+    def _run_validation(self):
+        """Run validation after the required worker resources are active."""
         psrl_logger.debug("Starting validation process")
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -1664,6 +1919,7 @@ class PSRL_RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_parent_ids = []
+        sample_response_lengths = []
         request_ids = []
 
         test_batch_list = []
@@ -1795,6 +2051,32 @@ class PSRL_RayPPOTrainer:
             scores = []
             reward_extra_infos_dict_list = []
             acc_list = []
+            output_non_tensor_batch = test_output_gen_batch.non_tensor_batch
+            output_uids = output_non_tensor_batch.get("uid", None)
+            output_response_lengths = output_non_tensor_batch.get("response_unpadded_len", None)
+            if output_response_lengths is None:
+                output_response_lengths = np.full(
+                    len(test_output_gen_batch),
+                    test_output_gen_batch.batch["responses"].shape[-1],
+                    dtype=np.int64,
+                )
+            else:
+                output_response_lengths = np.asarray(output_response_lengths, dtype=np.int64)
+            if output_uids is not None:
+                response_length_by_uid = dict(
+                    zip(np.asarray(output_uids).tolist(), output_response_lengths.tolist(), strict=True)
+                )
+                response_lengths = np.asarray(
+                    [response_length_by_uid[request_id] for request_id in _request_ids],
+                    dtype=np.int64,
+                )
+            else:
+                response_lengths = output_response_lengths
+            if len(response_lengths) != len(_request_ids):
+                raise ValueError(
+                    "Validation response length count does not match request count: "
+                    f"{len(response_lengths)} != {len(_request_ids)}."
+                )
             for request_id in _request_ids:
                 reward_score = request_id_to_reward[request_id]["reward_score"]
                 extra_info = request_id_to_reward[request_id].get("reward_extra_info", {})
@@ -1806,6 +2088,8 @@ class PSRL_RayPPOTrainer:
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_infos_dict["reward_extra_info"].extend(reward_extra_infos_dict_list)
             reward_extra_infos_dict["acc"].extend(acc_list)
+            reward_extra_infos_dict["response_length"].extend(response_lengths.tolist())
+            sample_response_lengths.extend(response_lengths.tolist())
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -1858,8 +2142,15 @@ class PSRL_RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
-        with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
-            self.switch_to_trainer_mode()
+        if sample_response_lengths:
+            response_lengths = np.asarray(sample_response_lengths, dtype=np.int64)
+            response_length_limit = int(self.config.train_actor_rollout_ref.rollout.response_length)
+            metric_dict["val-aux/response_length/mean"] = float(response_lengths.mean())
+            metric_dict["val-aux/response_length/max"] = int(response_lengths.max())
+            metric_dict["val-aux/response_length/min"] = int(response_lengths.min())
+            metric_dict["val-aux/response_length/at_limit_ratio"] = float(
+                np.mean(response_lengths >= response_length_limit)
+            )
 
         return metric_dict
 
@@ -2549,12 +2840,18 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Initializing models in all rollout instances")
         # start rollout coordinator
         self.init_rollout_coordinator()
+        isolated_elastic_validation_init = (
+            self.elastic_trainer_pool_mode
+            and self.config.psrl.colocate_validate_and_train
+            and self.n_validate_instances > 0
+        )
         # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
-        if self.config.psrl.ps_mode == "cpu_ref":
-            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "full"))
-        else:
-            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
+        rollout_init_mode = "full" if self.config.psrl.ps_mode == "cpu_ref" else "empty"
+        if not isolated_elastic_validation_init:
+            model_init_futures.append(
+                self.rollout_coordinator.init_model.remote("rollout", rollout_init_mode)
+            )
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -2578,7 +2875,7 @@ class PSRL_RayPPOTrainer:
             self.dummy_wg = all_wg["dummy"]
             self.dummy_wg.init_model()
 
-        if self.is_rollout_mode_in_actor:
+        if self.is_rollout_mode_in_actor or isolated_elastic_validation_init:
             assert self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu", (
                 "Fused trainer and validator only support NIXL PS mode."
             )
@@ -2590,13 +2887,28 @@ class PSRL_RayPPOTrainer:
             psrl_logger.info("Initialized NIXL client in actor worker group")
             self.actor_wg.init_model("empty")
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
-            ray.get(self.actor_wg.execute_all_async("nixl_sleep", "meta"))
+            if isolated_elastic_validation_init:
+                self._sleep_trainer_for_elastic_trainer_pool()
+            else:
+                ray.get(self.actor_wg.execute_all_async("nixl_sleep", "meta"))
 
             psrl_logger.info("Initializing validation model")
             # NOTE(linsh): here we must use rollout coordinator to init model
             # for setting init event inside it.
             model_init_futures.append(self.rollout_coordinator.init_model.remote("validate", "empty"))
             ray.get(model_init_futures)
+            if isolated_elastic_validation_init:
+                self._sleep_validation_workers_after_initialization()
+                psrl_logger.info(
+                    "Elastic trainer pool: validation workers initialized and slept; "
+                    "initializing rollout workers with train_pool released."
+                )
+                ray.get(
+                    self.rollout_coordinator.init_model.remote(
+                        "rollout",
+                        rollout_init_mode,
+                    )
+                )
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
@@ -2643,7 +2955,7 @@ class PSRL_RayPPOTrainer:
             )
             expected_nixl_client_agents = self.ps_wg.world_size + self.actor_wg.world_size + rollout_world_size
             ray.get(self.ps_manager_handle.init_nixl_server.remote(expected_nixl_client_agents))
-            actor_protocol_mode = "meta" if self.is_rollout_mode_in_actor else "full"
+            actor_protocol_mode = "meta" if self._elastic_trainer_pool_trainer_sleeping else "full"
             rollout_full_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
 
             with log_dual_events("Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
@@ -2652,7 +2964,12 @@ class PSRL_RayPPOTrainer:
                 futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
                 futures.extend(self.actor_wg.execute_all_async("nixl_protocol", actor_protocol_mode))
                 futures.append(self.rollout_coordinator.nixl_protocol.remote(rollout_full_tag))
-                ray.get(futures)
+                pending_futures = list(futures)
+                while pending_futures:
+                    ready_futures, pending_futures = ray.wait(pending_futures, num_returns=1)
+                    # Consume each completed future immediately so a failed server/client
+                    # task is surfaced instead of being hidden behind other 600s waits.
+                    ray.get(ready_futures)
 
             # Now that all NIXL buffers are allocated (meta tensors replaced),
             # write the preloaded checkpoint tensors into the PS registered buffers.
@@ -2667,16 +2984,23 @@ class PSRL_RayPPOTrainer:
             psrl_logger.info("Binding PS worker group")
             ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
             psrl_logger.info("PS worker group bound successfully!")
+            if (
+                resolve_weight_fingerprint_options(
+                    self.config.psrl,
+                    flow="transfer_chain",
+                    model_version=0,
+                )
+                is not None
+            ):
+                ray.get(self.ps_wg.execute_all_async("log_weight_fingerprints", 0))
 
-            # Pull checkpoint weights from PS into gen and actor workers via NIXL.
-            # NOTE(lhy): gen/val/actor workers are now empty-initialized and must pull from PS on startup.
-            # When is_rollout_mode_in_actor is True, the actor is sleeping (meta mode) at this point
-            # and will pull from PS later in switch_to_trainer_mode, so skip here.
+            # Pull checkpoint weights from PS into active gen and actor workers via NIXL.
+            # Sleeping actor/validation workers pull after their corresponding wake transition.
             initial_pull_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
             with log_dual_events("Initial pull: PS → gen/actor workers", psrl_logger, event_type=EventType.INIT):
                 initial_pull_futures = []
                 initial_pull_futures.append(self.rollout_coordinator.initial_pull_from_ps.remote(initial_pull_tag))
-                if not self.is_rollout_mode_in_actor:
+                if not self._elastic_trainer_pool_trainer_sleeping:
                     initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model"))
                 ray.get(initial_pull_futures)
 
@@ -2691,11 +3015,11 @@ class PSRL_RayPPOTrainer:
         from training to rollout mode, particularly when validation and training are
         colocated.
         1. Deregister actor clients from NIXL to free up resources.
-        2. Wake up validation instances and allocate necessary resources.
+        2. Wake up validation instances and re-register their local tensors.
         3. Sync with the PS manager to update client information.
         4. Broadcast updated client information to all relevant clients.
-        5. Sync validation instances' model weights and status with the PS.
-        6. Resume the generation process in the rollout coordinator.
+        5. Pull current weights into validation instances.
+        6. Resume validation instances in the router and coordinator.
         """
         if not self.config.psrl.colocate_validate_and_train or self.is_rollout_mode_in_actor:
             return
@@ -2708,18 +3032,29 @@ class PSRL_RayPPOTrainer:
 
         _t = time.time()
         psrl_logger.info("Step 1 - Deregistering actor clients from NIXL...")
-        # actor_wg nixl client deregister weight memory
-        release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
-        ray.get(release_futures)
+        if self.elastic_trainer_pool_mode:
+            self._sleep_trainer_for_elastic_trainer_pool()
+        else:
+            release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
+            ray.get(release_futures)
+        # Mark the transition before waking validation workers so the finally
+        # path can reclaim partially-woken instances if any later stage fails.
+        self.is_rollout_mode_in_actor = True
         psrl_logger.info(f"Step 1 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
         psrl_logger.info("Step 2 - Waking up validation instances...")
-        # Allocate rollout space and register
-        futures = []
-        for i in range(self.n_validate_instances):
-            futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_wake_up"))
-        ray.get(futures)
+        resumed_instance_ids = list(
+            range(
+                self.n_rollout_instances,
+                self.n_rollout_instances + self.n_validate_instances,
+            )
+        )
+        wake_futures = [
+            validate_wg.execute_rank_zero_async("nixl_wake_up")
+            for validate_wg in self.validate_wg_list
+        ]
+        ray.get(wake_futures)
         psrl_logger.info(f"Step 2 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
@@ -2750,15 +3085,7 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info(f"Step 4 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
-        psrl_logger.info("Step 5 - Syncing validation instances' model weights & status with PS...")
-        # sync validation instances with ps
-        # the generation will be resumed in the rollout coordinator
-        resumed_instance_ids = list(
-            range(
-                self.n_rollout_instances,
-                self.n_rollout_instances + self.n_validate_instances,
-            )
-        )
+        psrl_logger.info("Step 5 - Pulling validation weights from PS...")
         ray.get(self.rollout_coordinator.sync_with_ps.remote(resumed_instance_ids))
         psrl_logger.info(f"Step 5 done in {time.time() - _t:.2f}s.")
 
@@ -2772,21 +3099,21 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info(f"Step 6 done in {time.time() - _t:.2f}s.")
 
         psrl_logger.info(f"Switched to rollout mode in {time.time() - _switch_start:.2f}s.")
-        self.is_rollout_mode_in_actor = True
 
-    def switch_to_trainer_mode(self):
-        """Switch the PSRL colocate part to trainer mode for training.
+    def switch_to_trainer_mode(self, *, restore_trainer: bool = True):
+        """
+        Switch colocated validation workers out of rollout mode.
 
-        This involves several steps to ensure that the system transitions smoothly
-        from rollout to training mode, particularly when validation and training are
-        colocated.
-        1. Notify agent loop workers about paused validation instances.
-        2. Interrupt the generation process in validation instances.
-        3. Put validation instances to sleep and deregister from NIXL.
-        4. Wake up the training actor and allocate necessary resources.
-        5. Sync with the PS manager to update client information.
-        6. Broadcast updated client information to all relevant clients.
-        7. Pull the latest model weights from the PS to the actor.
+        Args:
+            restore_trainer (bool): Whether to wake and synchronize the trainer.
+                Elastic validation sets this to False and returns train_pool
+                directly to elastic rollout and reward-model replicas.
+
+        This involves several steps to ensure that the system transitions smoothly.
+        1. Pause and sleep validation instances through the coordinator.
+        2. Wake up the training actor and allocate necessary resources.
+        3. Sync with the PS manager and broadcast updated client information.
+        4. Pull the latest model weights from the PS to the actor.
         """
         # notify coordinator + interrupt + sleep + upload actor
         if not self.config.psrl.colocate_validate_and_train or not self.is_rollout_mode_in_actor:
@@ -2796,44 +3123,42 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Switching to trainer mode...")
 
         _t = time.time()
-        psrl_logger.info("Step 1 - Pausing validation instances...")
-        # pause validation instances in router and coordinator
-        futures = []
-        paused_instance_ids = range(
+        psrl_logger.info("Step 1 - Pausing and sleeping validation instances...")
+        paused_instance_ids = list(range(
             self.n_rollout_instances,
             self.n_rollout_instances + self.n_validate_instances,
+        ))
+        ray.get(self.rollout_coordinator.pause_instances.remote(paused_instance_ids))
+        sleep_result = ray.get(
+            self.rollout_coordinator.exec_command.remote(
+                Command(type=CommandType.SLEEP, instance_ids=paused_instance_ids),
+                blocking=True,
+            )
         )
-        futures.append(self.rollout_router.pause_instances.remote(paused_instance_ids))
-        futures.append(self.rollout_coordinator.pause_instances.remote(paused_instance_ids))
-        ray.get(futures)
+        if sleep_result is not True:
+            raise RuntimeError(
+                f"Failed to sleep validation instances {paused_instance_ids}: {sleep_result!r}"
+            )
         psrl_logger.info(f"Step 1 done in {time.time() - _t:.2f}s.")
 
+        if not restore_trainer:
+            self.is_rollout_mode_in_actor = False
+            if self.elastic_trainer_pool_mode:
+                self._leave_elastic_trainer_pool_training_window()
+            psrl_logger.info(
+                f"Switched validation workers to sleep and returned train_pool "
+                f"to elastic replicas in {time.time() - _switch_start:.2f}s."
+            )
+            return
+
         _t = time.time()
-        psrl_logger.info("Step 2 - Interrupting generation of validation instances...")
-        # interrupt generation and sleep
-        futures = []
-        for i in range(self.n_validate_instances):
-            futures.append(self.validate_wg_list[i].execute_rank_zero_async("interrupt_generation"))
-        ray.get(futures)
+        psrl_logger.info("Step 2 - Waking up training actor...")
+        # Allocate trainer space and register
+        ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
         psrl_logger.info(f"Step 2 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
-        psrl_logger.info("Step 3 - Putting validation instances to sleep...")
-        # sleep validation instances and deregister from NIXL
-        futures = []
-        for i in range(self.n_validate_instances):
-            futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_sleep"))
-        ray.get(futures)
-        psrl_logger.info(f"Step 3 done in {time.time() - _t:.2f}s.")
-
-        _t = time.time()
-        psrl_logger.info("Step 4 - Waking up training actor...")
-        # Allocate trainer space and register
-        ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
-        psrl_logger.info(f"Step 4 done in {time.time() - _t:.2f}s.")
-
-        _t = time.time()
-        psrl_logger.info("Step 5 - Syncing with ps manager...")
+        psrl_logger.info("Step 3 - Syncing with ps manager...")
         # sync with server
         update_client_names = []  # to collect all updated client names for broadcasting
         futures = []
@@ -2844,18 +3169,19 @@ class PSRL_RayPPOTrainer:
         # receiver side: ps manager
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.actor_wg.world_size))
         ray.get(futures)
-        psrl_logger.info(f"Step 5 done in {time.time() - _t:.2f}s.")
+        psrl_logger.info(f"Step 3 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
-        psrl_logger.info("Step 6 - PS manager broadcasting updated client infos...")
+        psrl_logger.info("Step 4 - PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(update_client_names)
-        psrl_logger.info(f"Step 6 done in {time.time() - _t:.2f}s.")
+        psrl_logger.info(f"Step 4 done in {time.time() - _t:.2f}s.")
 
         _t = time.time()
-        psrl_logger.info("Step 7 - Pulling actor model from PS...")
+        psrl_logger.info("Step 5 - Pulling actor model from PS...")
         # pull actor model
         ray.get(self.actor_wg.execute_all_async("pull_model"))
-        psrl_logger.info(f"Step 7 done in {time.time() - _t:.2f}s.")
+        self._clear_fsdp2_grads_after_trainer_wake()
+        psrl_logger.info(f"Step 5 done in {time.time() - _t:.2f}s.")
 
         psrl_logger.info(f"Switched to trainer mode in {time.time() - _switch_start:.2f}s.")
         self.is_rollout_mode_in_actor = False
@@ -3241,6 +3567,7 @@ class PSRL_RayPPOTrainer:
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps == self.total_training_steps
+            self._set_elastic_training_step()
 
             with marked_timer("step", timing_raw):
                 # Wait for the training batch to be ready
@@ -3765,6 +4092,22 @@ class PSRL_RayPPOTrainer:
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 )
+                should_save = self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                )
+                save_before_validation = (
+                    should_save
+                    and should_validate
+                    and self.elastic_trainer_pool_mode
+                    and self.config.psrl.colocate_validate_and_train
+                )
+
+                # Save while the actor is still awake; elastic validation returns
+                # train_pool directly to rollout and reward-model replicas.
+                if save_before_validation:
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        with log_dual_events("Save checkpoint", psrl_logger, event_type=EventType.OTHER):
+                            self._save_checkpoint()
 
                 # validate
                 if should_validate:
@@ -3775,9 +4118,7 @@ class PSRL_RayPPOTrainer:
                                 last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
+                if should_save and not save_before_validation:
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         with log_dual_events("Save checkpoint", psrl_logger, event_type=EventType.OTHER):
                             self._save_checkpoint()
@@ -3841,6 +4182,7 @@ class PSRL_RayPPOTrainer:
         if self.elastic_executor is not None:
             ray.get(self.elastic_executor.stop.remote())
             self.elastic_executor = None
+        self.shutdown_reward_model_managers()
         self.stop_rollout_coordinator()
         self.stop_data_processor()
         self.stop_rollout_gateway()

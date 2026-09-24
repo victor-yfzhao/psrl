@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Extract and compare elastic scaling overheads from two PSRL runs.
 
-The parser reads ElasticExecutor.log, RolloutRouter.log, and
-RewardModelRouter.log from each run directory. It prints a compact comparison
-and can write four CSV files:
+The parser reads executor, router, and coordinator logs from each run
+directory. It prints a compact comparison
+and can write five CSV files:
 
 * overhead_events.csv: one row per extracted numeric metric.
 * overhead_summary.csv: descriptive statistics for each metric.
 * rebalance_effectiveness.csv: planned/accepted/interrupted/routed counts.
+* scaling_actions_per_step.csv: completed policy actions and instance transitions.
 * run_windows.csv: source-log timestamps and the selected relative-time window.
 
-Percentiles use linear interpolation over sorted samples. ``network_s`` keeps
-the runtime log's scope: ABORT to redispatch, not pure network transfer.
+``--usable-only`` drops request-migration interrupt/dispatch records that do
+not have a matching terminal ``post_scale_up_rebalance`` record.  This keeps
+aborted or incomplete requests out of latency statistics while preserving the
+raw parser behavior by default.
+
+Percentiles use linear interpolation over sorted samples. In current logs,
+``network_s`` spans requeue to redispatch and is not pure network transfer;
+``abort_to_redispatch_s`` preserves the full interruption-plus-redispatch span.
 """
 
 from __future__ import annotations
@@ -38,9 +45,36 @@ PREPARED_RE = re.compile(
 )
 
 FAST_POLICY_REASONS = {"cooldown", "decision_execution_in_progress"}
-LOG_FILES = ("ElasticExecutor.log", "RolloutRouter.log", "RewardModelRouter.log")
+_STEP_SCALING_METRICS = (
+    "actual_actions",
+    "scale_up_actions",
+    "scale_down_actions",
+    "sleep_instances",
+    "wakeup_instances",
+    "instance_transitions",
+)
+LOG_FILES = (
+    "ElasticExecutor.log",
+    "RolloutRouter.log",
+    "RewardModelRouter.log",
+    "RolloutCoordinator.log",
+    "RewardModelCoordinator.log",
+)
 TIME_METRICS = {
     "planner_s",
+    "state_analysis_s",
+    "candidate_ordering_s",
+    "candidate_set_construction_s",
+    "simulation_input_preparation_s",
+    "candidate_evaluation_wall_s",
+    "rebalance_simulation_s",
+    "router_simulation_s",
+    "simulation_wall_s",
+    "rebalance_router_overlap_s",
+    "candidate_scoring_s",
+    "best_candidate_selection_s",
+    "other_s",
+    "planner_other_s",
     "sleep_s",
     "wakeup_s",
     "post_scale_up_rebalance_trigger_s",
@@ -50,9 +84,31 @@ TIME_METRICS = {
     "network_trigger_s",
     "planner_batch_s",
     "planner_share_s",
+    "interrupt_s",
     "network_s",
+    "abort_to_redispatch_s",
     "reprefill_s",
     "migration_s",
+    "router_pause_s",
+    "state_probe_s",
+    "engine_sleep_s",
+    "engine_wakeup_s",
+    "router_update_s",
+    "model_sync_s",
+    "router_resume_s",
+    "planner_candidate_set_construction_share_s",
+    "planner_rebalance_simulation_share_s",
+    "planner_router_simulation_share_s",
+    "planner_best_candidate_selection_share_s",
+    "planner_other_share_s",
+    "engine_status_s",
+    "router_backlog_s",
+    "request_snapshot_s",
+    "trainer_hint_s",
+    "signal_build_s",
+    "signal_logging_s",
+    "input_other_s",
+    "input_total_s",
 }
 
 
@@ -67,8 +123,10 @@ class MetricEvent:
     cohort: str
     role: str
     method: str
+    step: str
     decision_id: str
     migration_id: str
+    request_id: str
     reason: str
     metric: str
     value: float
@@ -91,6 +149,18 @@ class MetricSummary:
     p99: float
     maximum: float
     total: float
+
+
+@dataclass(frozen=True)
+class ScalingActionStepSummary:
+    run: str
+    step: int
+    actual_actions: int
+    scale_up_actions: int
+    scale_down_actions: int
+    sleep_instances: int
+    wakeup_instances: int
+    instance_transitions: int
 
 
 @dataclass
@@ -197,11 +267,47 @@ def _normalize_overhead(parsed: ParsedOverhead) -> tuple[str, str, str, str, dic
             cohort = "fast_gate"
         else:
             cohort = "no_action_evaluation"
-        planner_s = _parse_number(fields.get("planner_s"))
-        if planner_s is not None:
-            metrics["planner_s"] = planner_s
-    elif raw_operation == "scale_up":
-        operation = "scale_up"
+        for metric in (
+            "planner_s",
+            "state_analysis_s",
+            "candidate_ordering_s",
+            "candidate_set_construction_s",
+            "simulation_input_preparation_s",
+            "candidate_evaluation_wall_s",
+            "rebalance_simulation_s",
+            "router_simulation_s",
+            "simulation_wall_s",
+            "rebalance_router_overlap_s",
+            "candidate_scoring_s",
+            "best_candidate_selection_s",
+            "other_s",
+        ):
+            value = _parse_number(fields.get(metric))
+            if value is not None:
+                metrics[metric] = value
+    elif raw_operation == "policy_input":
+        operation = "policy_input"
+        for metric in (
+            "engine_status_s",
+            "router_backlog_s",
+            "request_snapshot_s",
+            "trainer_hint_s",
+            "signal_build_s",
+            "signal_logging_s",
+            "input_other_s",
+            "input_total_s",
+        ):
+            value = _parse_number(fields.get(metric))
+            if value is not None:
+                metrics[metric] = value
+    elif raw_operation in {"scale_up", "scale_down"}:
+        operation = raw_operation
+        for metric in TIME_METRICS:
+            value = _parse_number(fields.get(metric))
+            if value is not None:
+                metrics[metric] = value
+    elif raw_operation in {"sleep", "wakeup"}:
+        operation = raw_operation
         for metric in TIME_METRICS:
             value = _parse_number(fields.get(metric))
             if value is not None:
@@ -224,8 +330,11 @@ def _normalize_overhead(parsed: ParsedOverhead) -> tuple[str, str, str, str, dic
     elif raw_operation == "planned_request_rebalance":
         operation = "rebalance_trigger"
         method = "request_level"
+        planner_s = _parse_number(fields.get("planner_s"))
         planned = _parse_number(fields.get("planned"))
         interrupted = _parse_number(fields.get("interrupted"))
+        if planner_s is not None:
+            metrics["planner_s"] = planner_s
         if planned is not None:
             metrics["planned_requests"] = planned
         if interrupted is not None:
@@ -239,7 +348,14 @@ def _normalize_overhead(parsed: ParsedOverhead) -> tuple[str, str, str, str, dic
         for metric in (
             "planner_batch_s",
             "planner_share_s",
+            "planner_candidate_set_construction_share_s",
+            "planner_rebalance_simulation_share_s",
+            "planner_router_simulation_share_s",
+            "planner_best_candidate_selection_share_s",
+            "planner_other_share_s",
+            "interrupt_s",
             "network_s",
+            "abort_to_redispatch_s",
             "reprefill_s",
             "migration_s",
         ):
@@ -250,7 +366,31 @@ def _normalize_overhead(parsed: ParsedOverhead) -> tuple[str, str, str, str, dic
         operation = "request_migration_dispatch"
         migration_id = fields.get("migration_id", "")
         method = "request_level" if migration_id.endswith(":planned") else "legacy"
-        for metric in ("planner_batch_s", "planner_share_s", "network_s"):
+        for metric in (
+            "planner_batch_s",
+            "planner_share_s",
+            "planner_candidate_set_construction_share_s",
+            "planner_rebalance_simulation_share_s",
+            "planner_router_simulation_share_s",
+            "planner_best_candidate_selection_share_s",
+            "planner_other_share_s",
+            "interrupt_s",
+            "network_s",
+            "abort_to_redispatch_s",
+        ):
+            value = _parse_number(fields.get(metric))
+            if value is not None:
+                metrics[metric] = value
+    elif raw_operation == "request_migration_interrupt":
+        operation = "request_migration_interrupt"
+        migration_id = fields.get("migration_id", "")
+        method = "request_level" if migration_id.endswith(":planned") else "legacy"
+        interrupt_s = _parse_number(fields.get("interrupt_s"))
+        if interrupt_s is not None:
+            metrics["interrupt_s"] = interrupt_s
+    elif raw_operation == "scaling_action":
+        operation = "scaling_action"
+        for metric in _STEP_SCALING_METRICS:
             value = _parse_number(fields.get(metric))
             if value is not None:
                 metrics[metric] = value
@@ -316,14 +456,69 @@ def collect_metric_events(
                     cohort=cohort,
                     role=role,
                     method=method,
+                    step=item.fields.get("step", ""),
                     decision_id=item.fields.get("decision_id", ""),
                     migration_id=item.fields.get("migration_id", ""),
+                    request_id=item.fields.get("request_id", ""),
                     reason=item.fields.get("reason", ""),
                     metric=metric,
                     value=value,
                 )
             )
     return events
+
+
+def filter_usable_migration_events(events: Iterable[MetricEvent]) -> list[MetricEvent]:
+    """Keep migration records with an observed terminal completion.
+
+    The selective-abort path can emit an interrupt or dispatch timing even
+    when the request never returns a final result.  A terminal record carrying
+    Both ``migration_s`` and ``reprefill_s`` on the terminal record are the
+    evidence that all three timing boundaries belong to one completed
+    migration. Match by request ID when available and fall back to migration
+    ID for older log formats.
+    """
+    event_list = list(events)
+    complete_exact_metrics: dict[tuple[str, str, str, str], set[str]] = {}
+    legacy_metrics: dict[tuple[str, str, str], set[str]] = {}
+    for event in event_list:
+        if event.operation != "request_migration":
+            continue
+        migration_key = (event.run, event.role, event.migration_id)
+        if event.request_id:
+            complete_exact_metrics.setdefault((*migration_key, event.request_id), set()).add(event.metric)
+        else:
+            legacy_metrics.setdefault(migration_key, set()).add(event.metric)
+
+    complete_exact = {
+        request_key
+        for request_key, metrics in complete_exact_metrics.items()
+        if {"migration_s", "reprefill_s"}.issubset(metrics)
+    }
+    usable_migrations = {
+        migration_key
+        for migration_key, metrics in legacy_metrics.items()
+        if {"migration_s", "reprefill_s"}.issubset(metrics)
+    }
+
+    migration_operations = {
+        "request_migration",
+        "request_migration_dispatch",
+        "request_migration_interrupt",
+    }
+    usable: list[MetricEvent] = []
+    for event in event_list:
+        if event.operation not in migration_operations:
+            usable.append(event)
+            continue
+        migration_key = (event.run, event.role, event.migration_id)
+        if event.request_id:
+            if (*migration_key, event.request_id) not in complete_exact:
+                continue
+        elif migration_key not in usable_migrations:
+            continue
+        usable.append(event)
+    return usable
 
 
 def describe_run_window(
@@ -390,6 +585,28 @@ def summarize_metric_events(events: Iterable[MetricEvent]) -> list[MetricSummary
     return summaries
 
 
+def summarize_scaling_actions_per_step(
+    events: Iterable[MetricEvent],
+) -> list[ScalingActionStepSummary]:
+    grouped: dict[tuple[str, int], dict[str, int]] = {}
+    for event in events:
+        if event.operation != "scaling_action" or event.metric not in _STEP_SCALING_METRICS:
+            continue
+        try:
+            step = int(event.step)
+        except (TypeError, ValueError):
+            continue
+        counts = grouped.setdefault(
+            (event.run, step),
+            {metric: 0 for metric in _STEP_SCALING_METRICS},
+        )
+        counts[event.metric] += int(event.value)
+    return [
+        ScalingActionStepSummary(run=run, step=step, **counts)
+        for (run, step), counts in sorted(grouped.items())
+    ]
+
+
 def _in_window(timestamp: datetime | None, origin: datetime | None, start_min: float, end_min: float | None) -> bool:
     if timestamp is None or origin is None:
         return False
@@ -404,9 +621,24 @@ def collect_rebalance_counts(
     *,
     start_min: float,
     end_min: float | None,
+    usable_only: bool = False,
 ) -> list[RebalanceCounts]:
     origin = min((item.timestamp for item in parsed_overheads), default=None)
     counts = {role: RebalanceCounts(run=label, role=role) for role in ("RewardModel", "Rollout")}
+
+    usable_records: set[tuple[str, str, str]] | None = None
+    if usable_only:
+        parsed_events = collect_metric_events(
+            label,
+            run_dir,
+            start_min=start_min,
+            end_min=end_min,
+        )
+        usable_records = {
+            (event.role, event.migration_id, event.request_id)
+            for event in filter_usable_migration_events(parsed_events)
+            if event.operation in {"request_migration", "request_migration_dispatch"}
+        }
 
     for item in parsed_overheads:
         if not _in_window(item.timestamp, origin, start_min, end_min):
@@ -427,9 +659,13 @@ def collect_rebalance_counts(
             row.planned += int(_parse_number(item.fields.get("planned")) or 0)
             row.interrupted += int(_parse_number(item.fields.get("interrupted")) or 0)
         elif operation == "post_scale_up_rebalance":
-            row.completed_overhead += 1
+            request_key = (role, item.fields.get("migration_id", ""), item.fields.get("request_id", ""))
+            if not usable_only or request_key in (usable_records or set()):
+                row.completed_overhead += 1
         elif operation == "request_migration_dispatch":
-            row.redispatched_overhead += 1
+            request_key = (role, item.fields.get("migration_id", ""), item.fields.get("request_id", ""))
+            if not usable_only or request_key in (usable_records or set()):
+                row.redispatched_overhead += 1
 
     for filename in ("RolloutRouter.log", "RewardModelRouter.log"):
         log_path = run_dir / filename
@@ -507,6 +743,26 @@ def print_rebalance_effectiveness(rows: Sequence[RebalanceCounts]) -> None:
         )
 
 
+def print_scaling_actions_per_step(
+    rows: Sequence[ScalingActionStepSummary],
+) -> None:
+    if not rows:
+        return
+    print("\nActual scaling actions per trainer step:")
+    print(
+        "| run | step | actions | scale up | scale down | slept instances | "
+        "woken instances | instance transitions |"
+    )
+    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for row in rows:
+        print(
+            f"| {row.run} | {row.step} | {row.actual_actions} | "
+            f"{row.scale_up_actions} | {row.scale_down_actions} | "
+            f"{row.sleep_instances} | {row.wakeup_instances} | "
+            f"{row.instance_transitions} |"
+        )
+
+
 def print_run_windows(windows: Sequence[RunWindow]) -> None:
     print("Input log windows:")
     print("| run | first overhead | last overhead | observed min | selected min |")
@@ -556,6 +812,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional directory for extracted events and summary CSV files.",
     )
+    parser.add_argument(
+        "--usable-only",
+        action="store_true",
+        help="Keep only migration samples with a matching terminal completion record.",
+    )
     return parser
 
 
@@ -582,6 +843,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             start_min=args.start_min,
             end_min=args.end_min,
         )
+        if args.usable_only:
+            events = filter_usable_migration_events(events)
         if not events:
             raise SystemExit(f"no supported overhead events found in {run_dir}")
         windows.append(
@@ -601,19 +864,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parsed,
                 start_min=args.start_min,
                 end_min=args.end_min,
+                usable_only=args.usable_only,
             )
         )
 
     summaries = summarize_metric_events(all_events)
+    scaling_actions_per_step = summarize_scaling_actions_per_step(all_events)
     print_run_windows(windows)
     print_comparison(summaries, labels)
     print_rebalance_effectiveness(effectiveness)
+    print_scaling_actions_per_step(scaling_actions_per_step)
 
     if args.output_dir is not None:
         output_dir = args.output_dir.expanduser().resolve()
         _write_csv(output_dir / "overhead_events.csv", [asdict(item) for item in all_events])
         _write_csv(output_dir / "overhead_summary.csv", [asdict(item) for item in summaries])
         _write_csv(output_dir / "run_windows.csv", [asdict(item) for item in windows])
+        _write_csv(
+            output_dir / "scaling_actions_per_step.csv",
+            [asdict(item) for item in scaling_actions_per_step],
+        )
         _write_csv(
             output_dir / "rebalance_effectiveness.csv",
             [item.as_row() for item in effectiveness],
