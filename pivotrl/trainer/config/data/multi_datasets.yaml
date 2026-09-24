@@ -28,7 +28,7 @@ use_shm: False
 #         reward_model_name: xxxxx
 
 train_datas: 
-  - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/gsm8k_verl/train.parquet
+  - file: data/gsm8k_verl/train.parquet
     data_source_name: openai/gsm8k
     prompt_key: prompt
     reward_model_dicts:
@@ -44,7 +44,7 @@ train_datas:
         # reward_model_name: DeepSeek-R1-Distill-Qwen-32B
         # reward_model_name: Qwen3-30B-A3B-Instruct
         reward_coef: 1.0
-  - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/dapo/dapo-math-17k.parquet
+  - file: data/dapo/dapo-math-17k.parquet
     data_source_name: dapo/dapo-math-17k
     prompt_key: prompt
     reward_model_dicts:
@@ -60,7 +60,7 @@ train_datas:
         # reward_model_name: DeepSeek-R1-Distill-Qwen-32B
         # reward_model_name: Qwen3-30B-A3B-Instruct
         reward_coef: 1.0
-  # - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/full-hh-rlhf/data/train.parquet
+  # - file: data/full-hh-rlhf/data/train.parquet
   #   data_source_name: full-hh-rlhf
   #   prompt_key: prompt
   #   reward_fn_key: data_source
@@ -72,7 +72,7 @@ train_datasets_ratios: [0.5,0.5]
 
 # Validation parquet. Can be a list or a single file.
 val_datas: 
-  - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/gsm8k_verl/test.parquet
+  - file: data/gsm8k_verl/test.parquet
     prompt_key: prompt
     reward_model_dicts:
       - reward_fn_key: data_source
@@ -80,7 +80,7 @@ val_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-  - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/dapo/aime-2024.parquet
+  - file: data/dapo/aime-2024.parquet
     prompt_key: prompt
     reward_model_dicts:
       - reward_fn_key: data_source
@@ -88,7 +88,7 @@ val_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-  # - file: /jizhicfs/pkuhetu/yfzhao/pivotrl/data/full-hh-rlhf/data/test.parquet
+  # - file: data/full-hh-rlhf/data/test.parquet
   #   prompt_key: prompt
   #   reward_fn_key: data_source
   #   reward_loop_type: gen

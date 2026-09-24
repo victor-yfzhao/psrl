@@ -57,7 +57,7 @@ class ResourcePoolManager:
             # Three colocated roles (actor, rollout, reward) need 3 CPUs; keep +1 spare
             # so WorkerGroup init helper tasks (get_master_addr_port) can still schedule
             # when all three roles already occupy a bundle.
-            # NOTE(claude): without the spare CPU, SubRayResourcePool init can deadlock
+            # NOTE: without the spare CPU, SubRayResourcePool init can deadlock
             # because every helper task is pinned to pgs[0] bundle 0
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes,

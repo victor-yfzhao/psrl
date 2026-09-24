@@ -68,7 +68,7 @@ export PIVOTRL_NEED_VALIDATION=${PIVOTRL_NEED_VALIDATION:-0}
 export PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD=${PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD:-True}
 shift || true
 
-COST_MODEL_DIR=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model
+COST_MODEL_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)/pivotrl/trainer/config/cost_model"
 # Match this folder's defaults (Qwen2.5-1.5B + GLM-Z1-9B); pass last so they win
 # over _common_deployment.sh routing defaults.
 ROLLOUT_COST_MODEL="${COST_MODEL_DIR}/qwen2.5_1.5b.json"

@@ -151,7 +151,7 @@ launch_deployment_mode() {
         esac
     fi
 
-    PIVOTRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl
+    : "${PIVOTRL_WORKSPACE:?PIVOTRL_WORKSPACE must be set}"
 
     if [[ "${PIVOTRL_DEPLOY_SMOKE}" == "1" ]]; then
         experiment_suffix="_smoke"

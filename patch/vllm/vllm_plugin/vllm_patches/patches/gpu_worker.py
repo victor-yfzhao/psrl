@@ -227,7 +227,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
-        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
+        # NOTE: This need to be done before `initialize_kv_cache`,
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)

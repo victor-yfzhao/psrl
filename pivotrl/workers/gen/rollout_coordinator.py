@@ -702,7 +702,7 @@ class RolloutCoordinator(CommandExtension):
                             await asyncio.gather(*sync_futures)
                             self._complete_command(command_id, interrupted_request_nums)
                         else:
-                            # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
+                            # NOTE: sometimes it's not necessary for the caller to wait for pulling from PS
                             self._complete_command(command_id, interrupted_request_nums)
                             await asyncio.gather(*sync_futures)  # Wait for the sync to complete
                 
@@ -928,7 +928,7 @@ class RolloutCoordinator(CommandExtension):
     async def _process_status_queue(self, instance_id: int):
         pivotrl_logger.info(f"Starting to process status queue for instance {instance_id}")
         while not self.stop_process_status_queue[instance_id]:
-            # TODO(lhy): add timeout handling for future fault tolerance of rollout instances
+            # TODO: add timeout handling for future fault tolerance of rollout instances
             recv_stats = await self.status_queues[instance_id].get_async(block=True, timeout=None)
             self.instance_to_engine_status[instance_id] = recv_stats
             pivotrl_logger.debug(
@@ -1143,7 +1143,7 @@ class RolloutCoordinator(CommandExtension):
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
                 """
-                # NOTE(lhy): currently, we only synchronize with PS for one instance at a time
+                # NOTE: currently, we only synchronize with PS for one instance at a time
                 # But the model pulling time can be overlapped
                 break
                 """
@@ -1422,7 +1422,7 @@ class RolloutCoordinator(CommandExtension):
 
             # ----------------------------------------------------------
             # In-place sync path (traditional).
-            # NOTE(lhy): we don't need to update the instance version here because the
+            # NOTE: we don't need to update the instance version here because the
             # version is updated in the `sync_with_ps` method of the GenWorker when
             # calling `pull_model_async`; the ps manager will update the instance version.
             # However, we need to update the latest stale model version here to avoid stale
@@ -1618,7 +1618,7 @@ class RolloutCoordinator(CommandExtension):
             "Partial rollout is only supported when status collection is enabled"
         )
         assert self.config.pivotrl.partial_rollout.enable, "Partial rollout is not enabled"
-        # TODO(lhy): refactor the router to be a global router
+        # TODO: refactor the router to be a global router
         # pivotrl_logger.info(
         #     f"Checking whether to synchronize with PS for instance {instance_id}, "
         #     f"ps model version: {self.ps_model_version}"

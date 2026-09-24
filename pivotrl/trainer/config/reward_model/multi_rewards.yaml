@@ -44,7 +44,7 @@ reward_models:
     model:
       path: Qwen/Qwen2.5-3B-Instruct
       use_shm: False
-      # path: /jizhicfs/pkuhetu/yfzhao/pivotrl/models/DeepSeek-R1-Distill-Qwen-32B
+      # path: models/DeepSeek-R1-Distill-Qwen-32B
       # path: models/Qwen3-30B-A3B-Instruct
       external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
       trust_remote_code: False
@@ -106,8 +106,8 @@ reward_models:
   #   rollout_nnodes_per_instance: 1
 
   #   model:
-  #     path: /jizhicfs/pkuhetu/models/Qwen3-8B
-  #     # path: /jizhicfs/pkuhetu/yfzhao/pivotrl/models/DeepSeek-R1-Distill-Qwen-32B
+  #     path: models/Qwen3-8B
+  #     # path: models/DeepSeek-R1-Distill-Qwen-32B
   #     # path: models/Qwen3-30B-A3B-Instruct
   #     external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
   #     trust_remote_code: False
@@ -163,7 +163,7 @@ reward_models:
   #   rollout_nnodes_per_instance: 1
 
   #   model:
-  #     path: /jizhicfs/pkuhetu/yfzhao/pivotrl/models/Skywork-Reward-V2-Qwen3-8B
+  #     path: models/Skywork-Reward-V2-Qwen3-8B
   #     external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
   #     trust_remote_code: False
 

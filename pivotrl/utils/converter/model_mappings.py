@@ -92,7 +92,7 @@ def reshape_qkv_to_3d(
     hidden = param.shape[1] if param.ndim == 2 else 1
     assert rows % num_groups_local == 0, f"rows={rows} is not divisible by num_groups_local={num_groups_local}."
     new_shape = (num_groups_local, rows // num_groups_local, hidden)
-    # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
+    # NOTE: param.data is always contiguous (it is directly from HF state_dict or vLLM
     # fused split), so reshape produces a view, not a copy.
     reshaped_data = param.data.reshape(new_shape)
     return make_slice_parameter(reshaped_data, param)
@@ -155,7 +155,7 @@ def reshape_q_to_5d(
         f"Expected rows={num_heads_local * head_size} but got {rows}."
     q_num_heads_per_group = num_heads_local // num_groups_local // 2
     new_shape = (num_groups_local, q_num_heads_per_group, 2, head_size, hidden)
-    # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
+    # NOTE: param.data is always contiguous (it is directly from HF state_dict or vLLM
     # fused split), so reshape produces a view, not a copy.
     reshaped_data = param.data.reshape(new_shape)
     return make_slice_parameter(reshaped_data, param)
@@ -374,7 +374,7 @@ def slice_qkv_proj_megatron(
 
     qkv_params: list[Parameter] = []
     for i, (offset, size) in enumerate(offset_and_sizes):
-        # NOTE(lhy): Keep as a 3D non-contiguous view to share storage with fused_param.
+        # NOTE: Keep as a 3D non-contiguous view to share storage with fused_param.
         # Do NOT reshape to 2D here: reshape() on a non-contiguous tensor triggers an implicit
         # copy, producing an independent tensor whose storage is separate from fused_param.
         # NIXL pull would then write to the copy and never update the actual
@@ -383,7 +383,7 @@ def slice_qkv_proj_megatron(
         # original_tensor.data.copy_() after transfer, correctly updating fused_param.
         data = fused_param.data.narrow(output_dim, offset, size)
         if attn_output_gate and i == 0:
-            # NOTE(zym) For Qwen3.5, megatron q_weights need special handling
+            # NOTE: For Qwen3.5, megatron q_weights need special handling
             q_num_heads_per_group = num_heads // num_split_heads // 2
             data = data.view(num_split_heads // tp_size, 2, q_num_heads_per_group, head_size, -1).transpose(1, 2)
         qkv_params.append(make_slice_parameter(data, fused_param))

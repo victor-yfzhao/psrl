@@ -651,7 +651,7 @@ class PivotRL_RewardModelRouter:
     The router accepts Ray ActorHandles, queues incoming requests, and forwards
     each to a replica chosen by the configured ``RewardModelRouteStrategyBase``.
 
-    NOTE(zyf): will enable to use http-server instead of ray actor in the future.
+    NOTE: will enable to use http-server instead of ray actor in the future.
     """
 
     def __init__(

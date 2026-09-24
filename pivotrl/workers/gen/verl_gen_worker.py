@@ -108,7 +108,7 @@ class PivotRL_VerlGenWorker(ActorRolloutRefWorker):
             # non_blocking=True).full_tensor() if isinstance(param, DTensor)
             # else param.to(device, non_blocking=True)) for name, param in
             # model_state_dict_cpu.items()))
-            # NOTE(lhy): Do we need to clear the cache after loading the model?
+            # NOTE: Do we need to clear the cache after loading the model?
             get_torch_device().empty_cache()
             torch.cuda.synchronize()
             torch.distributed.barrier()

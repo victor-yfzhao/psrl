@@ -87,7 +87,7 @@ class NIXLMetaServer:
         """
         pivotrl_logger.info(f"Waiting for {expected_agents} agents to connect and send sharding...")
         if self._is_all_client_shardings_recved:
-            # TODO(lhy): support elastic adding new clients after all clients are connected
+            # TODO: support elastic adding new clients after all clients are connected
             return True
         start = time.time()
         already_recved_agents = set()
@@ -106,7 +106,7 @@ class NIXLMetaServer:
                             self._add_client(agent_name, client_name)
                             already_recved_agents.add(agent_name)
                         if is_new_agent:
-                            # NOTE(yfzhao): A received sharding notif does not prove the
+                            # NOTE: A received sharding notif does not prove the
                             # server loaded this agent's metadata for reverse send_notif
                             pivotrl_logger.info(
                                 f"[nixl-handshake] received sharding from agent={agent_name} "
@@ -133,7 +133,7 @@ class NIXLMetaServer:
         """
         pivotrl_logger.info(f"Waiting for {expected_agents} agents to send client infos...")
         if self._is_all_client_infos_recved:
-            # TODO(lhy): support elastic adding new clients after all clients are connected
+            # TODO: support elastic adding new clients after all clients are connected
             return True
         start = time.time()
         already_recved_agents = set()

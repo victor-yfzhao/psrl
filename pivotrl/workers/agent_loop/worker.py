@@ -89,7 +89,7 @@ class PivotRL_AgentLoopWorker:
             )
 
         # Build logger
-        # TODO(lhy): support >1 workers
+        # TODO: support >1 workers
         self.log_prefix = "AgentLoopWorker"
         pivotrl_logger.addHandler(DualOutputHandler(self.config.pivotrl.logging_path, self.log_prefix))
 
@@ -313,12 +313,12 @@ class PivotRL_AgentLoopWorker:
                     dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                     if dispatch_request_idxs:
                         output = output.select_idxs(dispatch_request_idxs)
-                        # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
+                        # NOTE: The DataProto will be huge and slow to transfer when putting into
                         # the result queue, so we process the data inside the reward manager
                         # output = self._post_process(output)
                         await self.agent_loop_manager.put_result.remote(output)
 
-    # NOTE(lhy): This method is moved to the reward manager
+    # NOTE: This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
 

@@ -2,7 +2,7 @@ from pivotrl.utils.converter.model_mappings import ParameterMapping, register_mo
 
 
 # Megatron (all models)
-# NOTE(lhy): the name transformation is done by mbridge
+# NOTE: the name transformation is done by mbridge
 # That's why it is a class already been *bridged*, and it is not used for name transformation
 @register_model(["Megatron"])
 class BridgedMegatronParameterMapping(ParameterMapping):
@@ -10,7 +10,7 @@ class BridgedMegatronParameterMapping(ParameterMapping):
 
     def __init__(self, config):
         super().__init__(config)
-        # NOTE(lhy): this is a hack to ensure the lm_head can be transformed separately
+        # NOTE: this is a hack to ensure the lm_head can be transformed separately
         # Otherwise we need to handle the complex logic of sharding weight for lm_head and embedding layer
         self.original_tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
 

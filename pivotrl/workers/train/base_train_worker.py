@@ -32,7 +32,7 @@ class TrainInterface:
     ps_manager_handle: ray.actor.ActorHandle
 
 
-# NOTE(lhy): This class is used to abstract the base train worker for PivotRL.
+# NOTE: This class is used to abstract the base train worker for PivotRL.
 # It is used to handle the NIXL push and pull operations.
 # Cannot directly call this class, please use the derived classes instead.
 class PivotRL_BaseTrainWorker:
@@ -168,7 +168,7 @@ class PivotRL_BaseTrainWorker:
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                # NOTE(lhy): Now we use a dict to store the PS handle and the key
+                # NOTE: Now we use a dict to store the PS handle and the key
                 # and shards to transfer and merge them on the PS side.
                 # This is more efficient than calling transfer_train_to_gen for each key and shard, which will cause
                 # a lot of remote calls and may cause the ray actor collapse.
@@ -350,7 +350,7 @@ class PivotRL_BaseTrainWorker:
             # ---- DEBUG: log train info BEFORE push ----
             # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
             self.nixl_push_model()
-            # TODO(lhy): wait for the push to complete before the next iteration optimizer update
+            # TODO: wait for the push to complete before the next iteration optimizer update
             # This will enable the NIXL push to be overlapped with the next iteration training
             self.wait_for_nixl_push_completion()
             self.param_sync_plan.after_push(self.unified_state_dict)

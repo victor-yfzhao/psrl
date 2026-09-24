@@ -808,7 +808,7 @@ class StalenessInventory:
 
         During moving, clear the occupied entries from the
         current buffer and re-occupy them in the earliest available buffer.
-        NOTE(lhy): The buffer id is not used for moving, but only for assertion.
+        NOTE: The buffer id is not used for moving, but only for assertion.
 
         Args:
             entry_infos (Union[EntryInfo, List[EntryInfo]]): The entry infos to move.
@@ -934,7 +934,7 @@ class StalenessInventory:
                 first_reserved_entry_id = None
                 exchange_buffer_id = None
                 # Move RESERVED entries from other buffers within staleness limit
-                # NOTE(lhy): we only need to consider buffers within
+                # NOTE: we only need to consider buffers within
                 # the staleness limit / less than the current buffer id
                 # Otherwise, the entry cannot be moved to the current buffer / have no benefit to move
                 for bid in range(model_version, min(model_version + self.staleness, buffer_id) + 1):
@@ -1081,7 +1081,7 @@ class StalenessInventory:
         )
         occupy_num = buffer.get_first_non_occupied()
         self._update_buffer_status(buffer_id)
-        # NOTE(lhy): seems occupy_num is exactly entry_id + 1
+        # NOTE: seems occupy_num is exactly entry_id + 1
         # need to check
         return buffer_id, entry_id, occupy_num
 
@@ -1180,7 +1180,7 @@ class StalenessInventory:
             )
             occupy_num = buffer.get_first_non_occupied()
             self._update_buffer_status(buffer_id)
-            # NOTE(lhy): seems occupy_num is exactly entry_id + 1
+            # NOTE: seems occupy_num is exactly entry_id + 1
             # need to check
             return buffer_id, entry_id, occupy_num
 
@@ -1270,7 +1270,7 @@ class StalenessInventory:
                 )
                 occupy_num = buffer.get_first_non_occupied()
                 self._update_buffer_status(buffer_id)
-                # NOTE(lhy): seems occupy_num is exactly entry_id + 1
+                # NOTE: seems occupy_num is exactly entry_id + 1
                 # need to check
                 return buffer_id, entry_id, occupy_num
 

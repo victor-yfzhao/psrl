@@ -4,11 +4,11 @@
 # Launch Docker on all nodes
 # ./docker_manager.sh start all
 
-# Check Docker status of node 28.49.198.139
-# ./docker_manager.sh status 28.49.198.139
+# Check Docker status of a node
+# ./docker_manager.sh status <node-ip>
 
-# Check Docker logs of node 28.49.198.139
-# ./docker_manager.sh logs 28.49.198.139
+# Check Docker logs of a node
+# ./docker_manager.sh logs <node-ip>
 #
 # Requires SANDBOX_NODE_NUM and SANDBOX_NODE_IPS (env; $1/$2 are used for action/host):
 #   SANDBOX_NODE_NUM=8 SANDBOX_NODE_IPS="ip1:8,ip2:8,..." ./docker_manager.sh start all

@@ -283,7 +283,7 @@ class PivotRL_FSDPTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker):
 
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
+        # NOTE: the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module_fsdp, "The actor module must be initialized before calling init_nixl_client."
         self.nixl_storage_client = NIXLStorageClient(
@@ -443,7 +443,7 @@ class PivotRL_FSDPTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker):
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
 
-        # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
+        # NOTE: aggressive_empty_cache is used to ensure no torch reserved memory exists
         # so torch won't trigger cudaFree from the mempool side
         # otherwise it will cause double cuMemRelease (first pause, then free) in tms
         aggressive_empty_cache(force_sync=True)
@@ -694,7 +694,7 @@ class PivotRL_FSDPTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
     def compute_log_prob(self, data: DataProto):
-        # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
+        # NOTE: compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         with log_dual_events("Recompute log_prob", pivotrl_logger, event_type=EventType.OTHER):

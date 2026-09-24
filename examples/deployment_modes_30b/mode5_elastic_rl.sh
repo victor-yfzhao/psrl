@@ -12,6 +12,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common_deployment.sh"
+COST_MODEL_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)/pivotrl/trainer/config/cost_model"
 
 export PIVOTRL_DEPLOY_MODE=elastic_rl
 export PIVOTRL_DEPLOY_EXPERIMENT=__debug__mode5_share_16_elastic_rl
@@ -57,7 +58,7 @@ pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_enable=true \
 pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_basis=request_count \
 pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_mode=raw \
 +reward_models_config.reward_models.2.routing_strategy.method=itl \
-+reward_models_config.reward_models.2.routing_strategy.cost_model_path=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model/qwen3_30b_a3b_thinking_2507.json \
++reward_models_config.reward_models.2.routing_strategy.cost_model_path=${COST_MODEL_DIR}/qwen3_30b_a3b_thinking_2507.json \
 +reward_models_config.reward_models.2.routing_strategy.delta_throughput_threshold=0.005 \
 +reward_models_config.reward_models.2.routing_strategy.request_budget=1024 \
 +reward_models_config.reward_models.2.routing_strategy.max_num_waiting_reqs_after_preemption=3 \

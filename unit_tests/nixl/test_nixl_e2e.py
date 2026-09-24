@@ -167,7 +167,7 @@ class TrainClientActor:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
 
-        # NOTE(lhy): must create client here before loading the model
+        # NOTE: must create client here before loading the model
         if engine_type == "megatron":
             self._init_megatron_parallel(megatron_config)
         self.client = NIXLStorageClient(
@@ -416,7 +416,7 @@ class GenClientActor:
             f"world_size {world_size} is not divisible by {self.tp_size * self.pp_size}"
         )
 
-        # NOTE(lhy): must create client here before loading the model
+        # NOTE: must create client here before loading the model
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,

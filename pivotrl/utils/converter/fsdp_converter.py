@@ -328,7 +328,7 @@ class FSDPConverter(BaseConverter):
                         shard_mesh=OrderedDict([(local_param.ndim - 1, next(iter(sharding.shard_mesh.values())))]),
                         shard_indices=list(sharding.shard_indices),
                     )
-            # NOTE(lhy): Reshape Q/K/V local shards to 3D to match slice_qkv_proj_megatron layout
+            # NOTE: Reshape Q/K/V local shards to 3D to match slice_qkv_proj_megatron layout
             # and update sharding to reflect the new tensor shape.
             local_param, sharding = self.maybe_reshape_qkv_to_3d(param_name, local_param, sharding)
             converted_state_dict[param_name] = local_param

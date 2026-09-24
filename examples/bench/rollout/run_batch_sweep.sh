@@ -16,8 +16,6 @@ set -euo pipefail
 #   bash examples/bench/rollout/run_batch_sweep.sh 8 1024
 #   bash examples/bench/rollout/run_batch_sweep.sh 8 1024 8
 
-export PIVOTRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl 
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLLOUT_SCRIPT="${ROLLOUT_SCRIPT:-${SCRIPT_DIR}/run_rollout_test.sh}"
 

@@ -7,7 +7,7 @@
 [ -n "$1" ] && SANDBOX_NODE_IPS="$1"
 [ -n "$2" ] && SANDBOX_NODE_NUM="$2"
 
-SANDBOX_SERVER_PATH=${SANDBOX_SERVER_PATH:-"/jizhicfs/johnnyslin/sandbox-docker/SandboxFusion"}
+: "${SANDBOX_SERVER_PATH:?SANDBOX_SERVER_PATH must be set}"
 
 if [ -z "$SANDBOX_NODE_IPS" ]; then
     echo "Error: SANDBOX_NODE_IPS is not set"

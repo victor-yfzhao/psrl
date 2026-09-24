@@ -96,7 +96,7 @@ class RolloutGateway:
 
     async def health_check(self) -> dict[str, bool]:
         """Simple health check endpoint."""
-        # TODO(linsh) implement thorough health checks
+        # TODO: implement thorough health checks
         return {"ok": True}
 
     async def add_worker(self, request: Request):

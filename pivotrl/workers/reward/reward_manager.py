@@ -29,7 +29,7 @@ pivotrl_logger = logging.getLogger(__file__)
 pivotrl_logger.setLevel(os.getenv("PIVOTRL_LOGGING_LEVEL", "WARN"))
 
 
-# TODO(linsh): reward_model_router is prepared for generative reward models in the future.
+# TODO: reward_model_router is prepared for generative reward models in the future.
 class RewardManager(CommandExtension):
     def __init__(
         self,

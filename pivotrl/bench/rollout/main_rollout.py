@@ -99,7 +99,7 @@ class SimpleRolloutTester:
             max_num_batched_tokens = max_model_len
         
         expert_parallel_size = int(rollout_config.get("expert_parallel_size", 1))
-        # NOTE(claude): Match pivotrl.workers.gen.vllm_rollout: EP>1 enables vLLM expert parallel.
+        # NOTE: Match pivotrl.workers.gen.vllm_rollout: EP>1 enables vLLM expert parallel.
         enable_expert_parallel = expert_parallel_size > 1
         if enable_expert_parallel and expert_parallel_size != int(rollout_config.tensor_parallel_size):
             raise ValueError(

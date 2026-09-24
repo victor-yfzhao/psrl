@@ -1195,8 +1195,16 @@ def test_rm_router_routing_update_signal_is_sticky():
     asyncio.run(asyncio.wait_for(router._wait_for_routing_update(), timeout=0.5))
 
 
-_QWEN3_8B_COST_MODEL = (
-    "/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model/qwen3_8b.json"
+_QWEN3_8B_COST_MODEL = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "pivotrl",
+        "trainer",
+        "config",
+        "cost_model",
+        "qwen3_8b.json",
+    )
 )
 
 

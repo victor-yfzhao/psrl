@@ -107,7 +107,7 @@
 #             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
 #             env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
 #             if bundle_indices is not None:
-#                 # TODO(zyf): fix this problem
+#                 # TODO: fix this problem
 #                 local_ids = [x % 8 for x in bundle_indices]
 #                 env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, local_ids))
 #                 env_vars["WORLD_SIZE"] = str(len(bundle_indices))
@@ -251,7 +251,7 @@
 #         if self.config.rollout.mode == "sync":
 #             self._build_distributed()
 #         elif self.config.rollout.mode == "pivotrl_async":
-#             # NOTE(lhy): No need to build distributed for pivotrl_async mode
+#             # NOTE: No need to build distributed for pivotrl_async mode
 #             # vllm will handle the distributed communication internally
 #             pass
 #         else:

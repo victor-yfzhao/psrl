@@ -41,7 +41,7 @@ class HFConverter(BaseConverter):
         for param_name, param in hf_state_dict.items():
             assert isinstance(param, torch.Tensor), f"Expected Tensor for {param_name}, got {type(param)}."
             sharding = NIXLSharding.default()
-            # NOTE(lhy): PS holds full (non-TP-sharded) weights, so num_heads_local = global num_heads.
+            # NOTE: PS holds full (non-TP-sharded) weights, so num_heads_local = global num_heads.
             # maybe_reshape_qkv_to_3d is a no-op when model_info does not contain num_heads.
             param, sharding = self.maybe_reshape_qkv_to_3d(param_name, param, sharding)
             param_dict = maybe_convert_to_smaller_parts(self.model_info, param_name, param)

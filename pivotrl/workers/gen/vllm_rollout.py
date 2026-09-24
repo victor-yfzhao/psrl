@@ -505,7 +505,7 @@ class PivotRL_vLLMRollout:
                 stat_loggers=stat_loggers,
             )
 
-        # NOTE(lhy): sleep mode is not supported when using NIXL
+        # NOTE: sleep mode is not supported when using NIXL
         # Because it will cause illegal memory registration
         """
         # Offload vllm model to reduce peak memory usage
@@ -816,7 +816,7 @@ class PivotRL_vLLMRollout:
                 # Pooling models don't generate tokens, so use empty response
                 response_ids = []
                 response_len = 0
-                # TODO(zyf): need to check the finish_reason of the pooling model
+                # TODO: need to check the finish_reason of the pooling model
                 # interrupted = vllm_output.outputs[0].finish_reason == "abort"
                 interrupted = False
             else:
@@ -1174,7 +1174,7 @@ class PivotRL_vLLMRollout:
             prompt_idx is the index of the prompt in the batch
         """
         # Ensure all abort requests in the queue are processed before starting generation
-        # NOTE(lhy): currently, only the preempted requests are put into the abort queue.
+        # NOTE: currently, only the preempted requests are put into the abort queue.
         # Other requests are aborted (e.g., partial rollout) directly by the scheduler.
         if self.scheduler_abort_queue is not None:
             await self._wait_for_all_scheduler_abort_requests_processed()

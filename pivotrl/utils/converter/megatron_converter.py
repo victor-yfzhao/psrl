@@ -89,7 +89,7 @@ class MegatronConverter(BaseConverter):
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding
 
-        # NOTE(lhy): a workaround for lm_head
+        # NOTE: a workaround for lm_head
         # if PP is not used and the word embedding is shared
         # we manually set the lm_head
         if self.mpu.pp_rank == self.mpu.pp_size - 1 and self.parameter_mapping.original_tie_word_embeddings:
@@ -182,7 +182,7 @@ class MegatronConverter(BaseConverter):
             assert "linear_fc1" in full_name, "Only linear_fc1 should have 2 corresponding hf names after split"
             try:
                 if "shared_experts" in full_name:
-                    # NOTE(zym): shared_experts use tp_size, not etp_size
+                    # NOTE: shared_experts use tp_size, not etp_size
                     sliced_params = slice_gate_up_proj(
                         fused_param=param,
                         output_sizes=[
@@ -268,10 +268,10 @@ class MegatronConverter(BaseConverter):
         Returns a NIXLSharding object.
         """
         is_etp_param = "mlp.experts" in full_name and self.mpu.etp_size > 1
-        # NOTE(zym): When enabling both ep and tp, ep param also has attribute "tensor_model_parallel" which is True,
+        # NOTE: When enabling both ep and tp, ep param also has attribute "tensor_model_parallel" which is True,
         # so we need to exclude ep param when determining is_tp_param
         is_tp_param = getattr(param, "tensor_model_parallel", False) and "mlp.experts" not in full_name
-        # NOTE(zym): etp param also has attribute "tensor_model_parallel" which is True,
+        # NOTE: etp param also has attribute "tensor_model_parallel" which is True,
         # so we need to first determine is_etp_param
         if is_etp_param:
             shard_size = self.mpu.etp_size

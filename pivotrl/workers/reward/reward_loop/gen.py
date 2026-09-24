@@ -68,7 +68,7 @@ def tokenize_rm_chat_prompt(
     original_side = getattr(tokenizer, "truncation_side", "right")
     tokenizer.truncation_side = "left"
     try:
-        # NOTE(claude): padding=False so short prompts are not padded to prompt_length
+        # NOTE: padding=False so short prompts are not padded to prompt_length
         return tokenizer.apply_chat_template(
             messages,
             tokenize=True,

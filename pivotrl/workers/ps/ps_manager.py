@@ -48,7 +48,7 @@ class ModelStore:
     model_state_dict_ref: ray.ObjectRef | None = None  # ray object_ref
 
 
-# TODO(lhy): Ensure PSManager is a singleton
+# TODO: Ensure PSManager is a singleton
 @add_busy_polling_lock
 class PSManager(RequestStatusTracker):
     def __init__(
@@ -79,7 +79,7 @@ class PSManager(RequestStatusTracker):
         self.rollout_instance_tracker: dict[
             int, RolloutInstanceStatus
         ] = {}  # Maps rollout instance IDs to their corresponding info
-        # NOTE(lhy): Initialized at version 0 (representing the loaded checkpoint before any
+        # NOTE: Initialized at version 0 (representing the loaded checkpoint before any
         # training step). This avoids a None check in pull_model_state_dict_nixl during the
         # initial pull that happens before the first training push.
         self.model_store: ModelStore = ModelStore(version_tag=0)
@@ -518,7 +518,7 @@ class PSManager(RequestStatusTracker):
         for entry_id in reserved_entry_ids:
             entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
             prompt_id = entry_info.prompt_id
-            # NOTE(lhy): we should abort all requests of the prompt, not just the recorded ones
+            # NOTE: we should abort all requests of the prompt, not just the recorded ones
             abort_request_ids.extend([prompt_id * self.rollout_n + i for i in range(self.rollout_n)])
             """
             request_idxs = entry_info.request_idx
@@ -643,7 +643,7 @@ class PSManager(RequestStatusTracker):
 
         while len(self.check_abort_versions) > 0:
             version_to_abort = min(self.check_abort_versions)
-            # NOTE(linsh): The READY order of buffers can not be guaranteed
+            # NOTE: The READY order of buffers can not be guaranteed
             # so we need more strict checks to avoid aborting requests too early.
             # `curr_ps_model_version - 1` is READY and consumed by training workers
             # so we need to check from `curr_ps_model_version` to `version_to_abort + staleness`
@@ -817,7 +817,7 @@ class PSManager(RequestStatusTracker):
         )
 
         if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
-            # NOTE(lhy): rollout_coordinator is only used when the version actually changes.
+            # NOTE: rollout_coordinator is only used when the version actually changes.
             # At init-time (version 0 → 0), this branch is skipped, so coordinator need not be bound yet.
             assert self.rollout_coordinator is not None, (
                 "Rollout coordinator is not set. Please set it before updating rollout instance model version."

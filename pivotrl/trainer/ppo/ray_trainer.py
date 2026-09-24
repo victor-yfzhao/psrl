@@ -133,7 +133,7 @@ class PivotRL_RayPPOTrainer:
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
 
         self.use_critic = need_critic(self.config)
-        self.ray_worker_group_cls = ray_worker_group_cls  # NOTE(lhy): ray_worker_group_cls is used only in train side
+        self.ray_worker_group_cls = ray_worker_group_cls  # NOTE: ray_worker_group_cls is used only in train side
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
@@ -234,7 +234,7 @@ class PivotRL_RayPPOTrainer:
         self._init_ps_manager()
 
         # initialize data processor
-        # NOTE(lhy): data processor must be initialized before initializing other workers
+        # NOTE: data processor must be initialized before initializing other workers
         # so that the total_training_steps can be obtained and the optimizer config
         # (related to weight decay, lr schedule, etc.) can be set
         # otherwise, it will cause error when running Megatron backend
@@ -2543,7 +2543,7 @@ class PivotRL_RayPPOTrainer:
         def create_worker_group(resource_pool, class_dict, wg_kwargs=wg_kwargs):
             # if there is only one worker class in the resource pool, we can directly create a worker group
             # so that we can use 'execute_all_async' and other low-level APIs
-            # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused`
+            # NOTE: in newest verl, we can use `create_colocated_worker_cls_fused`
             # to create a fused worker group and low-level APIs can also be used
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
@@ -2602,7 +2602,7 @@ class PivotRL_RayPPOTrainer:
                     return await future
             
             # Concurrency control within max_concurrent tasks at a time
-            # NOTE(lhy): currently set to 1 (the default sync version) to
+            # NOTE: currently set to 1 (the default sync version) to
             # avoid the stuck issue when multiple bundles are trying to be placed
             # at the same time (verl is using STRICT_PACK mode)
             # To reproduce the issue, you can set it to 16 and
@@ -2655,7 +2655,7 @@ class PivotRL_RayPPOTrainer:
                 assert len(class_dict) == 1, "Reward model resource pool should only have one worker class."
                 reward_model_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
-                # NOTE(linsh): adapt wg_kwargs for fused train worker
+                # NOTE: adapt wg_kwargs for fused train worker
                 # if want to add specific env args.
                 if self.config.pivotrl.tms.range in ["train", "all"] or self.config.pivotrl.tms.enable_nixl:
                     # add tms config to train workers
@@ -2672,13 +2672,13 @@ class PivotRL_RayPPOTrainer:
                         "LD_PRELOAD": dynlib_path,
                         "TMS_INIT_ENABLE": "1",
                         "TMS_INIT_ENABLE_CPU_BACKUP": "0",
-                        # NOTE(linsh): torch_memory_saver is not compatible with expandable segments
+                        # NOTE: torch_memory_saver is not compatible with expandable segments
                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
                         "PIVOTRL_TMS_ENABLE": "1" if self.config.pivotrl.tms.range in ["train", "all"] else "",
                     }
                 else:
                     train_wg_kwargs = wg_kwargs
-                    # NOTE(lhy): Still cannot use expandable segments, will cause NIXL error
+                    # NOTE: Still cannot use expandable segments, will cause NIXL error
                     # train_wg_kwargs["worker_env"] = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
                 pivotrl_logger.info(f"train_wg_kwargs: {train_wg_kwargs}")
                 train_tasks.append((resource_pool, class_dict, train_wg_kwargs))
@@ -2824,7 +2824,7 @@ class PivotRL_RayPPOTrainer:
                     nixl_client_futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
                 # Init model skeleton on meta device; weights are loaded after NIXL protocol completes.
                 model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
-                # NOTE(claude): dispatch preload immediately into each PS actor's serial queue; it will
+                # NOTE: dispatch preload immediately into each PS actor's serial queue; it will
                 # start as soon as that actor's init_model completes, overlapping with gen/val/train
                 # model initialization and NIXL protocol to hide disk I/O latency.
                 preload_futures = self.ps_wg.execute_all_async("preload_checkpoint_to_cpu")
@@ -2845,7 +2845,7 @@ class PivotRL_RayPPOTrainer:
             and self.config.pivotrl.colocate_validate_and_train
             and self.n_validate_instances > 0
         )
-        # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
+        # NOTE: must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
         rollout_init_mode = "full" if self.config.pivotrl.ps_mode == "cpu_ref" else "empty"
         if not isolated_elastic_validation_init:
@@ -2867,7 +2867,7 @@ class PivotRL_RayPPOTrainer:
         #     self.rm_wg.init_model()
 
         if not (self.use_critic or (self.use_reference_policy and not self.ref_in_actor)):
-            # NOTE(linsh): when not using critic or reference policy,
+            # NOTE: when not using critic or reference policy,
             # if we directly call `init_model` of actor_wg, Ray will view the fused worker
             # as an async actor and run `run_async_func_or_coro_in_event_loop`, which will
             # make it invalid to call async function such as `trainer_mode` in `init_model`.
@@ -2893,7 +2893,7 @@ class PivotRL_RayPPOTrainer:
                 ray.get(self.actor_wg.execute_all_async("nixl_sleep", "meta"))
 
             pivotrl_logger.info("Initializing validation model")
-            # NOTE(linsh): here we must use rollout coordinator to init model
+            # NOTE: here we must use rollout coordinator to init model
             # for setting init event inside it.
             model_init_futures.append(self.rollout_coordinator.init_model.remote("validate", "empty"))
             ray.get(model_init_futures)
@@ -2917,7 +2917,7 @@ class PivotRL_RayPPOTrainer:
             # init validate wg -> offload -> init actor wg
             # ray.get(model_init_futures)
             pivotrl_logger.info("Initializing validation model")
-            # NOTE(linsh): here we must use rollout coordinator to init model
+            # NOTE: here we must use rollout coordinator to init model
             # for setting init event inside it.
             model_init_futures.append(self.rollout_coordinator.init_model.remote("validate", "empty"))
             ray.get(model_init_futures)
@@ -3196,7 +3196,7 @@ class PivotRL_RayPPOTrainer:
             dict: A dictionary mapping each source agent to a list of destination agents.
         """
         # simple round-robin broadcast plan
-        # NOTE(linsh): currently only PS manager broadcasting is implemented.
+        # NOTE: currently only PS manager broadcasting is implemented.
         # This method can be extended for more complex plans if needed.
         broadcast_plan = {src_agent: [] for src_agent in src_agent_names}
         for i, dst_agent in enumerate(dst_agent_names):
@@ -3377,7 +3377,7 @@ class PivotRL_RayPPOTrainer:
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
 
-        # TODO(lhy): push the actor model state dict to the PS worker (though it is not necessary to do so)
+        # TODO: push the actor model state dict to the PS worker (though it is not necessary to do so)
 
         # load dataloader
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
@@ -3957,7 +3957,7 @@ class PivotRL_RayPPOTrainer:
 
                 batch.batch["token_level_scores"] = reward_tensor
 
-                # record_rollout_rm_metrics(batch, output_path="/jizhicfs/pkuhetu/yfzhao/pivotrl/logs/test_metrics.jsonl")
+                # record_rollout_rm_metrics(batch, output_path="logs/test_metrics.jsonl")
                 with marked_timer("adv", timing_raw, color="brown"):
                     with log_dual_events("Compute advantage", pivotrl_logger, event_type=EventType.OTHER):
                         # compute rewards. apply_kl_penalty if available

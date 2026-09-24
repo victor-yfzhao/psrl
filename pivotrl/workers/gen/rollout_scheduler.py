@@ -37,7 +37,7 @@ class RolloutScheduler(Scheduler):
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
         req_id_in_waiting = [req.request_id for req in self.waiting]
-        # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
+        # NOTE: we need to patch the original vllm SchedulerStats to add:
         # 1. `need_to_abort_reqs` field. This is a set of request IDs that need to be aborted.
         # 2. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
         # 3. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
@@ -81,7 +81,7 @@ class RolloutScheduler(Scheduler):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
-        # NOTE(lhy): We examine the number of waiting requests to
+        # NOTE: We examine the number of waiting requests to
         # determine whether to abort the preempted request.
         # Once aborted, the preempted request will be put back to
         # the rollout router to be scheduled again.
@@ -89,7 +89,7 @@ class RolloutScheduler(Scheduler):
             "max_num_waiting_reqs_after_preemption", 0
         )
         if len(self.waiting) > max_num_waiting_reqs_after_preemption:
-            # NOTE(lhy): the `need_to_abort_reqs` is set and put
+            # NOTE: the `need_to_abort_reqs` is set and put
             # into the scheduler stats. Afterwards inside vllm
             # rollout, the abortion will be performed.
             print(

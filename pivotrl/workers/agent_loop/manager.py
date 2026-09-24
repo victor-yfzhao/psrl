@@ -542,7 +542,7 @@ class PivotRL_AgentLoopManager:
             pivotrl_logger.debug(f"Got {len(data)} requests from data queue")
 
             # Wait for version update in ps
-            # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
+            # NOTE: we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
             expected_ps_version = self._get_expected_ps_version()
             if expected_ps_version > self.curr_ps_version_tag:
                 pivotrl_logger.debug(f"Waiting for ps model version: {expected_ps_version}")
@@ -845,7 +845,7 @@ class PivotRL_AgentLoopManager:
 
                         if not add_data:
                             # Retry immediately and no occupation
-                            # NOTE(linsh): data has been popped from data pool in `_group_post_process`
+                            # NOTE: data has been popped from data pool in `_group_post_process`
                             pivotrl_logger.info(
                                 f"Post-processing function returned empty data for "
                                 f"prompt {sample_id}. Retrying immediately."
@@ -1456,7 +1456,7 @@ class PivotRL_AgentLoopManager:
         assert buffer is not None, (
             f"{'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} not found or already consumed."
         )
-        # NOTE(linsh): we will delete buffer during aborting requests of specific versions
+        # NOTE: we will delete buffer during aborting requests of specific versions
         # This is because the inflight requests of the remaining entries
         # in the buffer can still be utilized for training
         return buffer

@@ -261,7 +261,7 @@ class VllmConverter(BaseConverter):
                         raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
                     out = {}
                     ep_size = getattr(module, "ep_size", 1)
-                    # NOTE(zym) Though module has attribute "ep_rank", the value is incorrect,
+                    # NOTE: Though module has attribute "ep_rank", the value is incorrect,
                     # and now we only have dp=1, so we use tp_rank as ep_rank
                     ep_rank = (
                         self.tp_rank if ep_size > 1 else 0
@@ -374,7 +374,7 @@ class VllmConverter(BaseConverter):
                             shard_indices = [(tp_rank // num_kv_head_replicas,)]
             elif isinstance(module, RowParallelLinear):
                 if param_name == "bias":
-                    # NOTE(zym) bias doesn't need to be sharded
+                    # NOTE: bias doesn't need to be sharded
                     tp_size = 1
                     shard_indices = [(0,)]
                     shard_dim = 0
@@ -388,14 +388,14 @@ class VllmConverter(BaseConverter):
                     shard_dim = 1
             elif isinstance(module, ReplicatedLinear):
                 # qwen2_moe  mlp.gate.weight
-                # NOTE(zym): ReplicatedLinear layer doesn't use tp, but it still has tp_size
+                # NOTE: ReplicatedLinear layer doesn't use tp, but it still has tp_size
                 # which is equal to get_tensor_model_parallel_world_size().
                 # Refer to vllm/vllm/model_executor/layers/linear.py
                 tp_size = 1
                 shard_indices = [(0,)]
                 shard_dim = 0
             elif isinstance(module, Qwen3_5GatedDeltaNet):
-                # NOTE(zym): For param dt_bias and A_log
+                # NOTE: For param dt_bias and A_log
                 shard_dim = 0
             else:
                 raise ValueError(f"Unsupported module type for sharding: {type(module)}")

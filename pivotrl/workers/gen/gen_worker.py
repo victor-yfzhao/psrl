@@ -432,13 +432,13 @@ class PivotRL_GenWorker(Worker):
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
-            # TODO(zyf): fix this problem
+            # TODO: fix this problem
             local_ids = [x % 8 for x in bundle_indices]
             env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, local_ids))
             env_vars["WORLD_SIZE"] = str(len(bundle_indices))
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
-        # NOTE(linsh): Expandable segments are not compatible with
+        # NOTE: Expandable segments are not compatible with
         # memory pool of sleep mode in vLLM.
         # Please track https://github.com/pytorch/pytorch/issues/147851 for more infos.
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
@@ -814,7 +814,7 @@ class PivotRL_GenWorker(Worker):
         self._log_sleep_wake_timing("sleep", "engine_sleep", stage_start)
         await self._log_tp_worker_tms_timing("sleep")
         if self.pivotrl_config.tms.range in ["rollout", "all"]:
-            # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
+            # NOTE: empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.
             stage_start = time.perf_counter()
             aggressive_empty_cache(force_sync=True)
@@ -1014,7 +1014,7 @@ class PivotRL_GenWorker(Worker):
         assert init_mode in ["full", "empty"], "init_mode must be either 'full' or 'empty'"
 
         try:
-            # NOTE(linsh): For validation (fused), we will use config in `train_actor_rollout_ref.rollout`.
+            # NOTE: For validation (fused), we will use config in `train_actor_rollout_ref.rollout`.
             # For rollout, we will use config in `gen_actor_rollout_ref.rollout`.
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
             model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
@@ -1296,7 +1296,7 @@ class PivotRL_GenWorker(Worker):
                 )  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
-            # NOTE(linsh): transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
+            # NOTE: transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
             params_to_load = [
                 (
                     name,
@@ -1507,7 +1507,7 @@ class PivotRL_GenWorker(Worker):
             with log_dual_events("Pull model (partial rollout)", pivotrl_logger, event_type=EventType.PULL):
                 await self.pull_model_async()
 
-        # NOTE(lhy): The version obtained from the PS manager is the actual model version after the pull
+        # NOTE: The version obtained from the PS manager is the actual model version after the pull
         # It may be higher than the required version due to the pushing happens between waiting and pulling
         self.curr_rollout_instance_model_version = (
             await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(

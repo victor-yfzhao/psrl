@@ -33,7 +33,7 @@ python plot.py ../paper_exp/e2e/logs/4+4_moe_staleness_1_greedy \
 '''
 
 '''
-python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
+python plot.py logs/ablation_new \
 --substring StatCollector \
 --xlabel "time(s)" \
 --ylabel "instance request num" \
@@ -42,7 +42,7 @@ python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
 --processor instance_request_num_indexed_by_time
 '''
 
-python plot.py /jizhicfs/lhy/pivotrl_agent/examples/dapo_trainer/logs/DAPO-Qwen3-30B-A3B-megatron-staleness_3 \
+python plot.py logs/DAPO-Qwen3-30B-A3B-megatron-staleness_3 \
 --substring StatCollector \
 --xlabel "time(s)" \
 --ylabel "instance request num" \

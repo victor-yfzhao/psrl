@@ -173,7 +173,7 @@ class NIXLStorageClient:
     def release_temp_memory(self):
         """Release all temporary memory and deregister descriptors.
 
-        NOTE(linsh): deregistration is done globally. Here we just clear the local mappings.
+        NOTE: deregistration is done globally. Here we just clear the local mappings.
         """
         # Clear all temporary mappings
         self._temp_tensor_mapping = {}
@@ -289,7 +289,7 @@ class NIXLStorageClient:
         Returns:
             Merged list of (base_addr, nbytes, device_id, mem_type) tuples.
 
-        NOTE(lhy): Do NOT use this on regions from _record_region_registration.
+        NOTE: Do NOT use this on regions from _record_region_registration.
         Each entry there is one untyped_storage = one cudaMalloc allocation.
         Merging two virtually-adjacent allocations is invalid for RDMA/UCX:
         the pin is per-allocation, so check_xfer_state returns ERR at transfer time.
@@ -327,7 +327,7 @@ class NIXLStorageClient:
         descs = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], dlist)
         return self.agent.register_memory(descs)
 
-    # NOTE(lhy): low-level nixl api is time consuming, so we use high-level register memory
+    # NOTE: low-level nixl api is time consuming, so we use high-level register memory
     # maintained by us to ensure all tensors are registered
     def _ensure_all_tensor_registered_low_level(self):
         """Check if all tensors are registered."""
@@ -807,7 +807,7 @@ class NIXLStorageClient:
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                     if not reg_list:
                         continue
-                    # NOTE(lhy): do not call _merge_contiguous_regions here.
+                    # NOTE: do not call _merge_contiguous_regions here.
                     # See the docstring of _merge_contiguous_regions for more details.
                     # reg_list = self._merge_contiguous_regions(reg_list)
                     # self._mtype_to_reg_region_lists[mem_type] = reg_list
@@ -940,7 +940,7 @@ class NIXLStorageClient:
                 raise TimeoutError("Timeout waiting for server metadata to be fetched and connected.")
             time.sleep(0.1)
         self._is_connected = True
-        # NOTE(yfzhao): Client only waits until it can see the server, not until
+        # NOTE: Client only waits until it can see the server, not until
         # the server has loaded this client's metadata for reverse notify
         pivotrl_logger.info(
             f"[nixl-handshake] {self.client_name} connect done: "
@@ -1492,7 +1492,7 @@ class NIXLStorageClient:
         self._write_contiguous_event_cache.clear()
         self.xfer_handles.clear()
 
-    # NOTE(lhy): This use low-level NIXL API to merge fragmented transfers into a single transfer,
+    # NOTE: This use low-level NIXL API to merge fragmented transfers into a single transfer,
     # which is more efficient than finishing each transfer individually.
     def merge_and_finish_cached_xfer(self, timeout: float = 600.0):
         """Merge and finish cached transfers."""
@@ -1715,7 +1715,7 @@ class NIXLStorageClient:
                                 f"Copied data from temporary contiguous tensor to original "
                                 f"non-contiguous tensor for key {key} shard {shard_idx}"
                             )
-                    # NOTE(lhy): can keep the handle for future reuse
+                    # NOTE: can keep the handle for future reuse
                     # but no obvious performance gain, so we just pop it here
                     self.xfer_handles.pop(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                     break
@@ -1990,7 +1990,7 @@ class NIXLMultiStorageClients:
         self._is_connected = True
         for client in self.multi_clients:
             client._is_connected = True
-        # NOTE(yfzhao): Same one-way readiness as NIXLStorageClient.connect_to_server
+        # NOTE: Same one-way readiness as NIXLStorageClient.connect_to_server
         pivotrl_logger.info(
             f"[nixl-handshake] {self.agent_name} connect done: "
             f"fetch_md={t_fetch - t0:.3f}s send_local_md={t_send - t_fetch:.3f}s "
@@ -2156,7 +2156,7 @@ class NIXLMultiStorageClients:
                 client.load_state_dict_into_registered_tensors(state_dict)
 
     def shutdown(self):
-        # TODO(lhy): better shutdown logic
+        # TODO: better shutdown logic
         # May release twice if multi clients have shared memory
         for client in self.multi_clients:
             client.shutdown()

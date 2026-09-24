@@ -22,9 +22,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 
-[project.urls]
-Homepage="https://github.com/lhy101/pivotrl"
-
 [tool.setuptools]
 package-dir = {"" = "."}
 packages = ["pivotrl"]

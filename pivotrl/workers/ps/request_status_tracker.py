@@ -12,7 +12,7 @@ from pivotrl.workers.ps.staleness_controller import EntryInfo
 pivotrl_logger = get_ps_logger()
 
 
-# NOTE(lhy): This is the status of the requests in the PivotRL system.
+# NOTE: This is the status of the requests in the PivotRL system.
 # It is different from the RequestStatus in vLLM, which is the status of the requests in the scheduler.
 class PivotRL_RequestStatus(Enum):
     """Represents the status of a request in the system.
@@ -66,7 +66,7 @@ class RequestStatusTracker:
             self.alg_rollout_n = self.rollout_n
         self.val_rollout_n = self.pivotrl_config.val_rollout_n
 
-        # NOTE(lhy): The `rollout_request_buffer` is not used anymore,
+        # NOTE: The `rollout_request_buffer` is not used anymore,
         # we should try to keep the ps_manager/request_status tracker only store the meta data!
         self.rollout_request_buffer = {}  # deprecated: buffer for storing request data during rollout processing
 

@@ -2,10 +2,10 @@
 # Then run the initiator script
 # export UCX_LOG_LEVEL=debug
 
-TARGET_IP=28.49.196.77
+: "${TARGET_IP:?TARGET_IP must be set}"
 PIVOTRL_WORKSPACE=${PIVOTRL_WORKSPACE}/pivotrl_agent
 CONDA_ENV_FILE=${PIVOTRL_WORKSPACE}/../activate
-CONDA_ENV_NAME=pivotrl-lhy-agent
+CONDA_ENV_NAME=${CONDA_ENV_NAME:-pivotrl}
 GPU_ID=2
 IP=${TARGET_IP}
 

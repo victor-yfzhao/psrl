@@ -144,7 +144,7 @@ class PivotRL_MegatronTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker
 
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
+        # NOTE: the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
         self.nixl_storage_client = NIXLStorageClient(
@@ -250,7 +250,7 @@ class PivotRL_MegatronTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
 
-        # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
+        # NOTE: aggressive_empty_cache is used to ensure no torch reserved memory exists
         # so torch won't trigger cudaFree from the mempool side
         # otherwise it will cause double cuMemRelease (first pause, then free) in tms
         aggressive_empty_cache(force_sync=True)
@@ -391,7 +391,7 @@ class PivotRL_MegatronTrainWorker(ActorRolloutRefWorker, PivotRL_BaseTrainWorker
         Restore inv_freq for all RotaryEmbedding modules from PS after pull
         and clear lru_cache to discard stale cos/sin tensors.
 
-        NOTE(lhy): Megatron's RotaryEmbedding.inv_freq is a plain tensor attribute
+        NOTE: Megatron's RotaryEmbedding.inv_freq is a plain tensor attribute
         (not register_buffer), so it is not covered by named_buffers(). We extract
         inv_freq from the HF-named buffers returned by PS and apply directly.
         """

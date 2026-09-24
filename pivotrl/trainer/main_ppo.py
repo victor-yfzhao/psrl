@@ -175,7 +175,7 @@ def run_ppo(config) -> None:
 
     _validate_cluster_plasma_backing(config)
 
-    # NOTE(claude): keep the handle list alive for the entire job lifetime so Ray
+    # NOTE: keep the handle list alive for the entire job lifetime so Ray
     # does not garbage-collect the reservation actors before the job finishes.
     _slot_reservers = _reserve_excess_nodes(config)
 
@@ -549,7 +549,7 @@ class TaskRunner:
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
-        # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
+        # NOTE: add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
         self.add_dummy_worker(config)
 
         # Download the checkpoint from HDFS to the local machine.
@@ -569,7 +569,7 @@ class TaskRunner:
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        # NOTE(linsh): lazily import `PivotRL_RayPPOTrainer` here to avoid implicit ray.init()
+        # NOTE: lazily import `PivotRL_RayPPOTrainer` here to avoid implicit ray.init()
         # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
         from verl.utils.dataset.rl_dataset import collate_fn
 

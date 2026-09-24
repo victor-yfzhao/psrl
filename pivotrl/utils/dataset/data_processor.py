@@ -27,7 +27,7 @@ class DatasetType:
     test: str = "test"
 
 
-# NOTE(lhy): ray.remote must be declared here
+# NOTE: ray.remote must be declared here
 # otherwise their will be weird bugs (NCCL broadcast/all-gather hangs, randomly crashed) during vllm generation
 @ray.remote
 class DataProcessor:

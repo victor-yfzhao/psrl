@@ -469,7 +469,7 @@ class RewardModelCoordinator(CommandExtension):
     async def _process_status_queue(self, instance_id: int):
         pivotrl_logger.info(f"Starting to process status queue for instance {instance_id}")
         while not self.stop_process_status_queue[instance_id]:
-            # TODO(lhy) (from rollout coordinator):
+            # TODO: (from rollout coordinator):
             # add timeout handling for future fault tolerance of rollout instances
             recv_stats = await self.status_queues[instance_id].get_async(block=True, timeout=None)
             self.instance_to_engine_status[instance_id] = recv_stats
@@ -582,7 +582,7 @@ class RewardModelCoordinator(CommandExtension):
         return await self.reward_model_router.get_candidate_evaluation_snapshot.remote(top_t)
 
     async def init_route_strategy(self):
-        # TODO(zyf): need to decide whether to use the route strategy for rm
+        # TODO: need to decide whether to use the route strategy for rm
         pass
 
         # await self._is_init_model.wait()

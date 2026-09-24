@@ -29,7 +29,7 @@ from pivotrl.utils.nixl import (
 pivotrl_logger = get_ps_logger()
 
 
-# TODO(lhy): Implement the PSStoragePlan
+# TODO: Implement the PSStoragePlan
 # support zero/half/full redundancy for PSStorageWorker
 @dataclass
 class PSStoragePlan:
@@ -84,7 +84,7 @@ class PSStorageWorker:
         setup_ps_logger(self.pivotrl_config.logging_path, self.log_prefix)
         pivotrl_logger.info(f"Initialized on {get_worker_info()}.")
 
-        # NOTE(lhy): currently hard code the net device to bond1
+        # NOTE: currently hard code the net device to bond1
         # os.environ["UCX_NET_DEVICES"] = "bond1"
 
     def get_replica_id(self) -> int:
@@ -100,12 +100,12 @@ class PSStorageWorker:
 
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
+        # NOTE: the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.train_meta_hf_model and self.gen_meta_hf_model, \
         #     "The HuggingFace models must be initialized before calling init_nixl_client."
         self.use_gpu = self.pivotrl_config.ps_mode == "nixl_gpu"
-        # TODO(lhy): maybe support train and gen use different ps mode
+        # TODO: maybe support train and gen use different ps mode
         self.agent_name = ps_agent_name(self.rank)
         self.client_for_push_name = ps_client_push_name(self.rank)
         self.client_for_pull_name = ps_client_pull_name(self.rank)
@@ -239,7 +239,7 @@ class PSStorageWorker:
         persistent=False) are not stored in state_dict() and are therefore not
         transferred by NIXL. They are needed by train workers after TMS resume.
 
-        NOTE(lhy): init_empty_weights() only moves parameters to meta device;
+        NOTE: init_empty_weights() only moves parameters to meta device;
         register_buffer() calls are not intercepted, so non-persistent buffers
         on train_meta_hf_model already hold correct CPU values. No extra model
         instantiation is required.
@@ -360,7 +360,7 @@ class PSStorageWorker:
             return {}
 
         if canonical not in ckpt_keys:
-            # NOTE(zym) For Qwen3_5ForConditionalGeneration
+            # NOTE: For Qwen3_5ForConditionalGeneration
             canonical = "model.language_model.embed_tokens.weight"
 
         assert canonical in ckpt_keys, (

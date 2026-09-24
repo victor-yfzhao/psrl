@@ -12,7 +12,7 @@ cd "${PIVOTRL_PATH}/unit_tests/nixl"
 
 CASE=4
 
-# NOTE(lhy): HSDP/FSDP precision is not aligned, because we use FSDP1 in the unit test.
+# NOTE: HSDP/FSDP precision is not aligned, because we use FSDP1 in the unit test.
 
 # HSDP 16 GPUs Case
 if [ $CASE -eq 0 ]; then

@@ -12,6 +12,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common_deployment.sh"
+COST_MODEL_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)/pivotrl/trainer/config/cost_model"
 
 export PIVOTRL_DEPLOY_MODE=elastic_rl
 export PIVOTRL_DEPLOY_EXPERIMENT=mode5_migration_bs_128_share_32_elastic_rl
@@ -60,7 +61,7 @@ pivotrl.deployment.elastic_rm.itl_policy.candidate_evaluation_cpp_binary=${PIVOT
 pivotrl.deployment.elastic_rm.itl_policy.candidate_evaluation_cpp_timeout_s=${PIVOTRL_CANDIDATE_EVALUATION_CPP_TIMEOUT_S} \
 pivotrl.deployment.elastic_rm.itl_policy.exclusive_rebalance_migration_queue=True \
 +reward_models_config.reward_models.2.routing_strategy.method=itl \
-+reward_models_config.reward_models.2.routing_strategy.cost_model_path=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model/glm_z1_9b_0414.json \
++reward_models_config.reward_models.2.routing_strategy.cost_model_path=${COST_MODEL_DIR}/glm_z1_9b_0414.json \
 +reward_models_config.reward_models.2.routing_strategy.delta_throughput_threshold=0.005 \
 +reward_models_config.reward_models.2.routing_strategy.request_budget=1024 \
 +reward_models_config.reward_models.2.routing_strategy.max_num_waiting_reqs_after_preemption=3 \

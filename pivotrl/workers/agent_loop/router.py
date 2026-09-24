@@ -103,7 +103,7 @@ class RolloutRouter:
             self.config.pivotrl.deployment.n_validate_instances if self.config.pivotrl.colocate_validate_and_train else 0
         )
 
-        # TODO(linsh): currently we only support balance strategy on rollout instances
+        # TODO: currently we only support balance strategy on rollout instances
         # we may extend it to validate instances in the future with dynamic routing strategy
         if self.config.pivotrl.redundant_rollout.enable:
             self.rollout_n = self.config.pivotrl.redundant_rollout.redundant_rollout_n
@@ -266,7 +266,7 @@ class RolloutRouter:
             instance_to_engine_status (dict[int, EngineStats]): Latest engine status information.
             **kwargs: Keyword arguments for the update.
         """
-        # NOTE(lhy): This method is called by RolloutCoordinator
+        # NOTE: This method is called by RolloutCoordinator
         # Each agent loop worker contains a RolloutRouter, which shares the same engine status
         # Note that the instance_to_engine_status may be stale and some instances may be absent at beginning
 
@@ -1044,7 +1044,7 @@ class RolloutRouter:
 
         return chosen_rollout_instance
 
-    # TODO(lhy): move this back to router again
+    # TODO: move this back to router again
     # since log_prob no need to transfered to vllm rollout engine many times (partial rollout)
     @deprecated("It is moved to the `post_process_outputs` inside vllm rollout now")
     def _consolidate_responses(
@@ -1624,7 +1624,7 @@ class RolloutRouter:
     async def pause_routing(self):
         """Interrupt the routing."""
         self._pause_routing = True
-        # NOTE(lhy): asyncio lock cannot be shared across concurrency groups (each group has its
+        # NOTE: asyncio lock cannot be shared across concurrency groups (each group has its
         # own event loop). Poll _is_routing instead because a plain bool read/write is safe across threads
         # under CPython's GIL.
         while self._is_routing:
@@ -2072,7 +2072,7 @@ class RolloutRouter:
                     candidate_migrate_instance_ids.append((instance_id, ratio))
 
         # We choose the instance with the highest ratio to migrate
-        # TODO(lhy): support multiple instances to migrate and finer-grained migration strategy
+        # TODO: support multiple instances to migrate and finer-grained migration strategy
         # Currently, we only support one instance to migrate,
         # and all the requests on the instance will be interrupted and looped back to the router.
         if len(candidate_migrate_instance_ids) > 0:
@@ -2194,7 +2194,7 @@ class RolloutRouter:
             if kv_cache_utilization > self.config.pivotrl.sync_and_mig_strategy.sync.threshold:
                 return False
         elif self.config.pivotrl.sync_and_mig_strategy.sync.indicator == "hypothesis_test":
-            # TODO(lhy): Implement hypothesis test after refactor
+            # TODO: Implement hypothesis test after refactor
             # We attempt to synchronize with PS and check if there is any
             # benefit from synchronization
             raise NotImplementedError("Hypothesis test is not implemented")

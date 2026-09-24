@@ -119,7 +119,7 @@ class CommunicationPlanner:
 
     def __init__(self, restrict_client_group_comm: bool = False):
         """Initialize the communication planner"""
-        # NOTE(lhy): if restrict_client_group_comm is True,
+        # NOTE: if restrict_client_group_comm is True,
         # we will restrict communciation only happens between client groups
         self.restrict_client_group_comm = restrict_client_group_comm
 
@@ -333,7 +333,7 @@ class CommunicationPlanner:
 
         restrict_target_to_source_client_group_mapping = {}
         if self.restrict_client_group_comm:
-            # NOTE(lhy): for pull we don't have any restriction
+            # NOTE: for pull we don't have any restriction
             # for push, we currently use round robin to map target client groups to source client groups
             # this should be improved to use a more intelligent mapping
             if is_push_to_ps:
