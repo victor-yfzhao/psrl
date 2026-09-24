@@ -31,7 +31,7 @@ index d41c77f..c547bc6 100644
  
  if enabled_plugins.get('OBJ')
 -    subdir('obj')
-+    # The PSRL installation does not use the object-store backend.
++    # The PivotRL installation does not use the object-store backend.
  endif
  
  if enabled_plugins.get('AZURE_BLOB')

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-# Importing psrl.utils.nixl creates PortScanner.remote() at module load time.
+# Importing pivotrl.utils.nixl creates PortScanner.remote() at module load time.
 # These converter tests only need the data types, so keep Ray process-free.
 if "ray" not in sys.modules:
     _ray = types.ModuleType("ray")
@@ -39,20 +39,20 @@ if "ray" not in sys.modules:
     _ray.remote = _remote_decorator
     sys.modules["ray"] = _ray
 
-from psrl.utils.converter.base_converter import BaseConverter
-from psrl.utils.converter.fsdp_converter import split_qwen3_5_fused_fsdp_param
-from psrl.utils.converter.hf_converter import maybe_convert_to_smaller_parts
-from psrl.utils.converter.model_mappings import (
+from pivotrl.utils.converter.base_converter import BaseConverter
+from pivotrl.utils.converter.fsdp_converter import split_qwen3_5_fused_fsdp_param
+from pivotrl.utils.converter.hf_converter import maybe_convert_to_smaller_parts
+from pivotrl.utils.converter.model_mappings import (
     MappingType,
     get_qkv_tp_layout,
     reshape_visual_block_qkv,
     slice_qkv_proj,
     visual_qkv_tp_shard_spec,
 )
-from psrl.utils.converter.modeling.hf_modeling import HFParameterMapping
-from psrl.utils.converter.param_sync import DTypeCastSync, ParamSyncPlan
-from psrl.utils.converter.vllm_converter import VllmConverter
-from psrl.utils.nixl.nixl_spec import NIXLSharding
+from pivotrl.utils.converter.modeling.hf_modeling import HFParameterMapping
+from pivotrl.utils.converter.param_sync import DTypeCastSync, ParamSyncPlan
+from pivotrl.utils.converter.vllm_converter import VllmConverter
+from pivotrl.utils.nixl.nixl_spec import NIXLSharding
 from torch.nn import Parameter
 from vllm.model_executor.layers.linear import QKVParallelLinear
 

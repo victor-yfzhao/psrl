@@ -2,7 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from psrl.workers.reward.reward_model.coordinator import RewardModelCoordinator
+from pivotrl.workers.reward.reward_model.coordinator import RewardModelCoordinator
 
 
 class _FakeRewardWorkerGroup:

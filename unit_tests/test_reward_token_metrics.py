@@ -1,6 +1,6 @@
 import numpy as np
 
-from psrl.utils.reward_token_metrics import extract_reward_model_token_counts
+from pivotrl.utils.reward_token_metrics import extract_reward_model_token_counts
 
 
 def test_extract_reward_model_token_counts_recursively():

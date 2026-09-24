@@ -40,7 +40,7 @@ if "ray" not in sys.modules:
 
 
 def _load_vllm_extension_module():
-    path = Path(__file__).parents[3] / "psrl/workers/gen/vllm_extension.py"
+    path = Path(__file__).parents[3] / "pivotrl/workers/gen/vllm_extension.py"
     spec = importlib.util.spec_from_file_location("_test_vllm_extension_weight_loading", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -126,7 +126,7 @@ def test_node_shared_preload_uses_lazy_safetensors(monkeypatch, tmp_path: Path) 
         observed_load_configs.append(load_config)
         return Loader()
 
-    from psrl.utils import node_shared_weight_cache
+    from pivotrl.utils import node_shared_weight_cache
 
     monkeypatch.setattr(module, "get_model_loader", get_model_loader)
     monkeypatch.setattr(
@@ -155,7 +155,7 @@ def test_node_shared_preload_uses_lazy_safetensors(monkeypatch, tmp_path: Path) 
         ),
         vllm_config=SimpleNamespace(
             additional_config={
-                "psrl_nixl_weight_arena": {
+                "pivotrl_nixl_weight_arena": {
                     "reward_enabled": True,
                     "reward_cpu_cache_mode": "node_shared",
                     "reward_cpu_cache_pin_memory": False,
@@ -164,7 +164,7 @@ def test_node_shared_preload_uses_lazy_safetensors(monkeypatch, tmp_path: Path) 
                 }
             }
         ),
-        _psrl_weight_arena_handle=object(),
+        _pivotrl_weight_arena_handle=object(),
     )
 
     assert worker.preload_weights_to_cpu_cache(load_format="auto") == 0
@@ -173,7 +173,7 @@ def test_node_shared_preload_uses_lazy_safetensors(monkeypatch, tmp_path: Path) 
     assert load_config.load_format == "safetensors"
     assert load_config.safetensors_load_strategy == "lazy"
     assert load_config.model_loader_extra_config == {}
-    assert worker._psrl_reward_weight_cache_state == {
+    assert worker._pivotrl_reward_weight_cache_state == {
         "ready": True,
         "source": "node_shared_checkpoint",
         "checkpoint_fingerprint": "checkpoint-fingerprint",

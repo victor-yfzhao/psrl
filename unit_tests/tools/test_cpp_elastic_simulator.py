@@ -6,11 +6,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from psrl.utils.elastic_rm.cpp_candidate_evaluator import (
+from pivotrl.utils.elastic_rm.cpp_candidate_evaluator import (
     CppCandidateEvaluator,
     CppCandidateEvaluatorError,
 )
-from psrl.utils.elastic_rm.request_level_candidate_evaluator import (
+from pivotrl.utils.elastic_rm.request_level_candidate_evaluator import (
     RoleCandidatePlan,
     RoleSnapshot,
     evaluate_role_candidate,

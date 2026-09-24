@@ -13,7 +13,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace psrl::elastic_simulator {
+namespace pivotrl::elastic_simulator {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -999,4 +999,4 @@ functional_checksum(const std::vector<RoleEvaluationResult> &results) {
   return hash;
 }
 
-} // namespace psrl::elastic_simulator
+} // namespace pivotrl::elastic_simulator

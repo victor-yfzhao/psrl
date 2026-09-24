@@ -10,16 +10,16 @@ UCX_GIT_REF="${UCX_GIT_REF:-v1.20.0}"
 NIXL_VERSION="0.10.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PSRL_PATH="$(dirname "$SCRIPT_DIR")"
-THIRD_PARTY_PATH="$PSRL_PATH/third_party"
+PIVOTRL_PATH="$(dirname "$SCRIPT_DIR")"
+THIRD_PARTY_PATH="$PIVOTRL_PATH/third_party"
 UCX_PREFIX="${UCX_PREFIX:-$THIRD_PARTY_PATH/ucx_1_20_rkey65535}"
 NIXL_PREFIX="${NIXL_PREFIX:-$THIRD_PARTY_PATH/nixl_ucx_1_20_rkey65535_backlog4096}"
 UCX_SOURCE_DIR="${UCX_SOURCE_DIR:-$THIRD_PARTY_PATH/ucx_1_20_rkey65535_src}"
 NIXL_SOURCE_DIR="${NIXL_SOURCE_DIR:-$THIRD_PARTY_PATH/nixl_0_10_1_ucx_1_20_rkey65535_backlog4096_src}"
 NIXL_SUBPROJECT_CACHE_DIR="${NIXL_SUBPROJECT_CACHE_DIR:-}"
-UCX_PATCH_FILE="$PSRL_PATH/patch/ucx/ucx-1.20.0-rkey-config-uint16-dynamic.patch"
-NIXL_PATCH_FILE="$PSRL_PATH/patch/nixl/nixl.patch"
-UCX_INSTALL_MARKER="$UCX_PREFIX/.psrl-ucx-1.20-worker-config-uint16-complete"
+UCX_PATCH_FILE="$PIVOTRL_PATH/patch/ucx/ucx-1.20.0-rkey-config-uint16-dynamic.patch"
+NIXL_PATCH_FILE="$PIVOTRL_PATH/patch/nixl/nixl.patch"
+UCX_INSTALL_MARKER="$UCX_PREFIX/.pivotrl-ucx-1.20-worker-config-uint16-complete"
 mkdir -p "$THIRD_PARTY_PATH"
 
 if [[ -x "$UCX_PREFIX/bin/ucx_info" ]] && \
@@ -131,6 +131,6 @@ python -m pip install --force-reinstall --no-deps \
 popd
 rm -rf "$NIXL_SOURCE_DIR"
 
-touch "$NIXL_PREFIX/.psrl-nixl-0.10.1-ucx-1.20-rkey65535-backlog4096-complete"
+touch "$NIXL_PREFIX/.pivotrl-nixl-0.10.1-ucx-1.20-rkey65535-backlog4096-complete"
 
 echo "Successfully installed UCX $REQUIRED_UCX_VERSION (ep/rkey configs=UINT16_MAX) and NIXL $NIXL_VERSION (backlog=4096)"

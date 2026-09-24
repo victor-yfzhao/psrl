@@ -7,7 +7,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from psrl.utils.weight_arena import (
+from pivotrl.utils.weight_arena import (
     get_fsdp_param_groups,
     materialize_fsdp2_model_weights_in_arena,
 )

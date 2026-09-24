@@ -10,9 +10,9 @@ from vllm import LLM, SamplingParams
 
 
 def _snapshot_arena(worker) -> int:
-    from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
+    from pivotrl.utils.weight_arena import snapshot_weight_arena_to_cpu
 
-    handle = worker.model_runner._psrl_weight_arena_handle
+    handle = worker.model_runner._pivotrl_weight_arena_handle
     worker._weight_arena_smoke_cpu_cache = snapshot_weight_arena_to_cpu(
         handle,
         pin_memory=False,
@@ -21,10 +21,10 @@ def _snapshot_arena(worker) -> int:
 
 
 def _restore_arena(worker) -> int:
-    from psrl.utils.weight_arena import restore_weight_arena_from_cpu
+    from pivotrl.utils.weight_arena import restore_weight_arena_from_cpu
 
     return restore_weight_arena_from_cpu(
-        worker.model_runner._psrl_weight_arena_handle,
+        worker.model_runner._pivotrl_weight_arena_handle,
         worker._weight_arena_smoke_cpu_cache,
     )
 
@@ -51,7 +51,7 @@ def main() -> None:
     llm = LLM(
         model=args.model,
         dtype="bfloat16",
-        load_format="psrl_arena_dummy" if direct else "dummy",
+        load_format="pivotrl_arena_dummy" if direct else "dummy",
         enforce_eager=not args.cudagraph,
         enable_sleep_mode=args.tms_cycles > 0,
         max_model_len=128,
@@ -61,10 +61,10 @@ def main() -> None:
         distributed_executor_backend="uni",
         disable_custom_all_reduce=True,
         disable_log_stats=True,
-        worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
+        worker_extension_cls="pivotrl.workers.gen.vllm_extension.vLLMWorkerExtension",
         additional_config={
-            "psrl_role": "rollout",
-            "psrl_nixl_weight_arena": arena_config,
+            "pivotrl_role": "rollout",
+            "pivotrl_nixl_weight_arena": arena_config,
         },
     )
 

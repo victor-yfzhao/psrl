@@ -1,6 +1,6 @@
 import asyncio
 
-from psrl.utils.server.command import Command, CommandExtension, CommandType
+from pivotrl.utils.server.command import Command, CommandExtension, CommandType
 
 
 def test_timed_out_command_remains_synchronizable_without_requeue():

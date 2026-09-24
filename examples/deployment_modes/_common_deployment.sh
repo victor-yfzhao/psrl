@@ -2,41 +2,41 @@
 # Shared launch body for the five deployment-mode example scripts.
 #
 # Each mode script (mode1_disaggregated.sh ... mode5_elastic_rl.sh) exports a
-# small set of PSRL_DEPLOY_* env vars describing its pool topology / mode flags,
+# small set of PIVOTRL_DEPLOY_* env vars describing its pool topology / mode flags,
 # then sources this file and calls `launch_deployment_mode "$@"`. Extra hydra
 # overrides can be passed as "$@" from the mode script.
 #
 # Required env vars (set by the mode script before calling):
-#   PSRL_DEPLOY_MODE          one of disaggregated|colocated|rollout_rm_colocated|
+#   PIVOTRL_DEPLOY_MODE          one of disaggregated|colocated|rollout_rm_colocated|
 #                             trainer_pool_only|elastic_rl
-#   PSRL_DEPLOY_EXPERIMENT    experiment name string
-#   PSRL_DEPLOY_STALENESS     staleness (modes 2/3 require 0)
-#   PSRL_DEPLOY_RM_ASYNC      True|False (modes 2/3 require True)
-#   PSRL_DEPLOY_NNODES        total cluster nodes
-#   PSRL_DEPLOY_TRAIN_NNODES  train_pool nodes
-#   PSRL_DEPLOY_TRAIN_NGPUS   gpus per train node
-#   PSRL_DEPLOY_SHARED_NNODES   shared_rollout_pool nodes (0/unused for mode 2)
-#   PSRL_DEPLOY_SHARED_NGPUS    gpus per shared node, or a Hydra list like [4, 8]
-#   PSRL_DEPLOY_RM_NUM_REPLICAS  gen-RM num_replicas (non-elastic modes 1/4)
+#   PIVOTRL_DEPLOY_EXPERIMENT    experiment name string
+#   PIVOTRL_DEPLOY_STALENESS     staleness (modes 2/3 require 0)
+#   PIVOTRL_DEPLOY_RM_ASYNC      True|False (modes 2/3 require True)
+#   PIVOTRL_DEPLOY_NNODES        total cluster nodes
+#   PIVOTRL_DEPLOY_TRAIN_NNODES  train_pool nodes
+#   PIVOTRL_DEPLOY_TRAIN_NGPUS   gpus per train node
+#   PIVOTRL_DEPLOY_SHARED_NNODES   shared_rollout_pool nodes (0/unused for mode 2)
+#   PIVOTRL_DEPLOY_SHARED_NGPUS    gpus per shared node, or a Hydra list like [4, 8]
+#   PIVOTRL_DEPLOY_RM_NUM_REPLICAS  gen-RM num_replicas (non-elastic modes 1/4)
 #                                set to 0 to leave default
-#   PSRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
-#   PSRL_NEED_VALIDATION      0|1 (default: 0; 1 enables periodic validation)
-#   PSRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
-#   PSRL_DEPLOY_MODEL_NAME    rollout model directory name (default: Qwen2.5-7B)
-#   PSRL_DEPLOY_RM_MODEL_NAME reward model directory name (default: DeepSeek-R1-Distill-Qwen-7B)
-#   PSRL_DEPLOY_MODEL_PATH    optional absolute rollout model path
-#   PSRL_DEPLOY_RM_MODEL_PATH optional absolute reward model path
-#   PSRL_DEPLOY_ROLLOUT_TP    rollout tensor parallelism (default: 1)
-#   PSRL_DEPLOY_RM_TP         reward-model tensor parallelism (default: 1)
-#   PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN  True|False (default: False)
-#   PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE   True|False (default: True)
-#   PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION    validation vLLM memory fraction (default: 0.6)
-#   PSRL_DEPLOY_VAL_BEFORE_TRAIN               True|False (default: False)
-#   PSRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
+#   PIVOTRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
+#   PIVOTRL_NEED_VALIDATION      0|1 (default: 0; 1 enables periodic validation)
+#   PIVOTRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
+#   PIVOTRL_DEPLOY_MODEL_NAME    rollout model directory name (default: Qwen2.5-7B)
+#   PIVOTRL_DEPLOY_RM_MODEL_NAME reward model directory name (default: DeepSeek-R1-Distill-Qwen-7B)
+#   PIVOTRL_DEPLOY_MODEL_PATH    optional absolute rollout model path
+#   PIVOTRL_DEPLOY_RM_MODEL_PATH optional absolute reward model path
+#   PIVOTRL_DEPLOY_ROLLOUT_TP    rollout tensor parallelism (default: 1)
+#   PIVOTRL_DEPLOY_RM_TP         reward-model tensor parallelism (default: 1)
+#   PIVOTRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN  True|False (default: False)
+#   PIVOTRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE   True|False (default: True)
+#   PIVOTRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION    validation vLLM memory fraction (default: 0.6)
+#   PIVOTRL_DEPLOY_VAL_BEFORE_TRAIN               True|False (default: False)
+#   PIVOTRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
 #
 # Optional positional args to launch_deployment_mode are forwarded to main_ppo.
 
-_psrl_total_gpus_from_node_spec() {
+_pivotrl_total_gpus_from_node_spec() {
     local ngpus_spec=$1
     local nnodes=$2
     local total=0
@@ -50,27 +50,27 @@ _psrl_total_gpus_from_node_spec() {
     if [[ "${ngpus_spec}" =~ ^\[(.*)\]$ ]]; then
         local values=${BASH_REMATCH[1]}
         values=${values// /}
-        IFS=',' read -ra _psrl_gpu_values <<< "${values}"
-        for value in "${_psrl_gpu_values[@]}"; do
+        IFS=',' read -ra _pivotrl_gpu_values <<< "${values}"
+        for value in "${_pivotrl_gpu_values[@]}"; do
             if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-                echo "Invalid GPU count '${value}' in PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}" >&2
+                echo "Invalid GPU count '${value}' in PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}" >&2
                 return 1
             fi
             total=$(( total + value ))
         done
-        if [[ "${#_psrl_gpu_values[@]}" -ne "${nnodes}" ]]; then
-            echo "PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec} has ${#_psrl_gpu_values[@]} entries, expected PSRL_DEPLOY_SHARED_NNODES=${nnodes}" >&2
+        if [[ "${#_pivotrl_gpu_values[@]}" -ne "${nnodes}" ]]; then
+            echo "PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec} has ${#_pivotrl_gpu_values[@]} entries, expected PIVOTRL_DEPLOY_SHARED_NNODES=${nnodes}" >&2
             return 1
         fi
         echo "${total}"
         return
     fi
 
-    echo "Invalid PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}; expected integer or Hydra list like [4, 8]" >&2
+    echo "Invalid PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}; expected integer or Hydra list like [4, 8]" >&2
     return 1
 }
 
-_psrl_vllm_ep_size_for_model() {
+_pivotrl_vllm_ep_size_for_model() {
     local model_path=$1
     local tp_size=$2
 
@@ -119,41 +119,41 @@ PY
 launch_deployment_mode() {
     set -xeuo pipefail
 
-    : "${PSRL_DEPLOY_MODE:?PSRL_DEPLOY_MODE must be set by the mode script}"
-    : "${PSRL_DEPLOY_EXPERIMENT:?PSRL_DEPLOY_EXPERIMENT must be set}"
-    : "${PSRL_DEPLOY_STALENESS:?PSRL_DEPLOY_STALENESS must be set}"
-    : "${PSRL_DEPLOY_RM_ASYNC:?PSRL_DEPLOY_RM_ASYNC must be set}"
-    : "${PSRL_DEPLOY_NNODES:?PSRL_DEPLOY_NNODES must be set}"
-    : "${PSRL_DEPLOY_TRAIN_NNODES:?PSRL_DEPLOY_TRAIN_NNODES must be set}"
-    : "${PSRL_DEPLOY_TRAIN_NGPUS:?PSRL_DEPLOY_TRAIN_NGPUS must be set}"
-    : "${PSRL_DEPLOY_SHARED_NNODES:?PSRL_DEPLOY_SHARED_NNODES must be set}"
-    : "${PSRL_DEPLOY_SHARED_NGPUS:?PSRL_DEPLOY_SHARED_NGPUS must be set}"
-    PSRL_DEPLOY_SMOKE=${PSRL_DEPLOY_SMOKE:-0}
-    PSRL_NEED_VALIDATION=${PSRL_NEED_VALIDATION:-0}
-    # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-gsm8k}
-    # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-dapo}
-    PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-mixed}
-    PSRL_DEPLOY_RM_NUM_REPLICAS=${PSRL_DEPLOY_RM_NUM_REPLICAS:-0}
-    PSRL_DEPLOY_TRAINER_READY_GRACE_S=${PSRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
-    PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN:-False}
-    PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE=${PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE:-True}
-    PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION=${PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION:-0.6}
-    PSRL_DEPLOY_VAL_BEFORE_TRAIN=${PSRL_DEPLOY_VAL_BEFORE_TRAIN:-False}
-    PSRL_DEPLOY_EXTRA=${PSRL_DEPLOY_EXTRA:-}
-    if [[ -z "${PSRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
-        case "${PSRL_DEPLOY_MODE}" in
+    : "${PIVOTRL_DEPLOY_MODE:?PIVOTRL_DEPLOY_MODE must be set by the mode script}"
+    : "${PIVOTRL_DEPLOY_EXPERIMENT:?PIVOTRL_DEPLOY_EXPERIMENT must be set}"
+    : "${PIVOTRL_DEPLOY_STALENESS:?PIVOTRL_DEPLOY_STALENESS must be set}"
+    : "${PIVOTRL_DEPLOY_RM_ASYNC:?PIVOTRL_DEPLOY_RM_ASYNC must be set}"
+    : "${PIVOTRL_DEPLOY_NNODES:?PIVOTRL_DEPLOY_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_TRAIN_NNODES:?PIVOTRL_DEPLOY_TRAIN_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_TRAIN_NGPUS:?PIVOTRL_DEPLOY_TRAIN_NGPUS must be set}"
+    : "${PIVOTRL_DEPLOY_SHARED_NNODES:?PIVOTRL_DEPLOY_SHARED_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_SHARED_NGPUS:?PIVOTRL_DEPLOY_SHARED_NGPUS must be set}"
+    PIVOTRL_DEPLOY_SMOKE=${PIVOTRL_DEPLOY_SMOKE:-0}
+    PIVOTRL_NEED_VALIDATION=${PIVOTRL_NEED_VALIDATION:-0}
+    # PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-gsm8k}
+    # PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-dapo}
+    PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-mixed}
+    PIVOTRL_DEPLOY_RM_NUM_REPLICAS=${PIVOTRL_DEPLOY_RM_NUM_REPLICAS:-0}
+    PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S=${PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
+    PIVOTRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN=${PIVOTRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN:-False}
+    PIVOTRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE=${PIVOTRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE:-True}
+    PIVOTRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION=${PIVOTRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION:-0.6}
+    PIVOTRL_DEPLOY_VAL_BEFORE_TRAIN=${PIVOTRL_DEPLOY_VAL_BEFORE_TRAIN:-False}
+    PIVOTRL_DEPLOY_EXTRA=${PIVOTRL_DEPLOY_EXTRA:-}
+    if [[ -z "${PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
+        case "${PIVOTRL_DEPLOY_MODE}" in
             colocated|trainer_pool_only)
-                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=True
+                PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD=True
                 ;;
             *)
-                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN}
+                PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD=${PIVOTRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN}
                 ;;
         esac
     fi
 
-    PSRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl
+    PIVOTRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl
 
-    if [[ "${PSRL_DEPLOY_SMOKE}" == "1" ]]; then
+    if [[ "${PIVOTRL_DEPLOY_SMOKE}" == "1" ]]; then
         experiment_suffix="_smoke"
         total_training_steps=10
         test_freq=-1
@@ -171,31 +171,31 @@ launch_deployment_mode() {
         n_resp_per_prompt=16
     fi
 
-    if [[ "${PSRL_NEED_VALIDATION}" == "1" ]]; then
+    if [[ "${PIVOTRL_NEED_VALIDATION}" == "1" ]]; then
         experiment_suffix="${experiment_suffix}_val"
         test_freq=5
     fi
 
     project_name='verl_deployment_modes'
-    MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-Qwen2.5-1.5B}
-    RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-GLM-Z1-9B-0414}
-    # MODEL_NAME=${PSRL_DEPLOY_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
-    # RM_MODEL_NAME=${PSRL_DEPLOY_RM_MODEL_NAME:-Qwen3-8B}
-    experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
+    MODEL_NAME=${PIVOTRL_DEPLOY_MODEL_NAME:-Qwen2.5-1.5B}
+    RM_MODEL_NAME=${PIVOTRL_DEPLOY_RM_MODEL_NAME:-GLM-Z1-9B-0414}
+    # MODEL_NAME=${PIVOTRL_DEPLOY_MODEL_NAME:-DeepSeek-R1-Distill-Qwen-7B}
+    # RM_MODEL_NAME=${PIVOTRL_DEPLOY_RM_MODEL_NAME:-Qwen3-8B}
+    experiment_name="${PIVOTRL_DEPLOY_DATASET}_${PIVOTRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${experiment_suffix}"
 
-    source ${PSRL_WORKSPACE}/env/env_311.sh
+    source ${PIVOTRL_WORKSPACE}/env/env_311.sh
 
-    HOME=${PSRL_WORKSPACE}
-    PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
+    HOME=${PIVOTRL_WORKSPACE}
+    PIVOTRL_PATH=$(python -c "import pivotrl; import os; print(os.path.dirname(os.path.dirname(pivotrl.__file__)))")
     
-    HF_MODEL_PATH=${PSRL_DEPLOY_MODEL_PATH:-${PSRL_WORKSPACE}/models/${MODEL_NAME}}
-    RM_MODEL_PATH=${PSRL_DEPLOY_RM_MODEL_PATH:-${PSRL_WORKSPACE}/models/${RM_MODEL_NAME}}
+    HF_MODEL_PATH=${PIVOTRL_DEPLOY_MODEL_PATH:-${PIVOTRL_WORKSPACE}/models/${MODEL_NAME}}
+    RM_MODEL_PATH=${PIVOTRL_DEPLOY_RM_MODEL_PATH:-${PIVOTRL_WORKSPACE}/models/${RM_MODEL_NAME}}
 
-    # Data config (Hydra / OmegaConf), aligned with psrl/trainer/config/data/multi_datasets.yaml
-    GSM8K_TRAIN="${PSRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
-    GSM8K_TEST="${PSRL_WORKSPACE}/data/gsm8k_verl/test.parquet"
-    DAPO_TRAIN="${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"
-    DAPO_VAL="${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"
+    # Data config (Hydra / OmegaConf), aligned with pivotrl/trainer/config/data/multi_datasets.yaml
+    GSM8K_TRAIN="${PIVOTRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
+    GSM8K_TEST="${PIVOTRL_WORKSPACE}/data/gsm8k_verl/test.parquet"
+    DAPO_TRAIN="${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"
+    DAPO_VAL="${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"
 
     _DS_NAIVE="reward_fn_key:data_source,reward_loop_type:naive,reward_fn:default,reward_model_name:null,reward_coef:1.0"
     _DS_DAPO="reward_fn_key:data_source,reward_loop_type:dapo,reward_fn:default,reward_model_name:null,reward_coef:1.0"
@@ -207,7 +207,7 @@ launch_deployment_mode() {
     _ROW_VAL_GSM8K="{file:${GSM8K_TEST},prompt_key:prompt,reward_model_dicts:[{${_DS_NAIVE}}]}"
     _ROW_VAL_DAPO="{file:${DAPO_VAL},prompt_key:prompt,reward_model_dicts:[{${_DS_DAPO}}]}"
 
-    case "${PSRL_DEPLOY_DATASET}" in
+    case "${PIVOTRL_DEPLOY_DATASET}" in
         dapo)
             TRAIN_DATAS="[${_ROW_TRAIN_DAPO}]"
             VAL_DATAS="[${_ROW_VAL_DAPO}]"
@@ -224,32 +224,32 @@ launch_deployment_mode() {
             TRAIN_DATASETS_RATIOS='[0.5,0.5]'
             ;;
         *)
-            echo "Invalid PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET}; expected dapo, gsm8k, or mixed" >&2
+            echo "Invalid PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET}; expected dapo, gsm8k, or mixed" >&2
             return 1
             ;;
     esac
 
     # rollout settings
-    GEN_TP=${PSRL_DEPLOY_ROLLOUT_TP:-1}
+    GEN_TP=${PIVOTRL_DEPLOY_ROLLOUT_TP:-1}
     GEN_PP=1
-    GEN_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
+    GEN_EP=$(_pivotrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
     GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
     # reward-model rollout settings
-    RM_TP=${PSRL_DEPLOY_RM_TP:-1}
+    RM_TP=${PIVOTRL_DEPLOY_RM_TP:-1}
     RM_PP=1
-    RM_EP=$(_psrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
+    RM_EP=$(_pivotrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
     RM_NGPUS_PER_NODE_PER_INSTANCE=$(( ${RM_TP} * ${RM_PP} ))
 
     # validation settings (on train_pool; does not use elastic path)
     VAL_TP=1
     VAL_PP=1
-    VAL_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
-    VAL_INSTANCES=$(( (${PSRL_DEPLOY_TRAIN_NNODES} * ${PSRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
+    VAL_EP=$(_pivotrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
+    VAL_INSTANCES=$(( (${PIVOTRL_DEPLOY_TRAIN_NNODES} * ${PIVOTRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
     VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
     sp_size=1
-    fsdp_size=${PSRL_DEPLOY_TRAIN_NGPUS}
+    fsdp_size=${PIVOTRL_DEPLOY_TRAIN_NGPUS}
     use_dynamic_bsz=True
 
     adv_estimator=grpo
@@ -278,7 +278,7 @@ launch_deployment_mode() {
     rollout_is="token"
     rollout_is_threshold=2.0
 
-    offload=${PSRL_DEPLOY_OPTIMIZER_OFFLOAD}
+    offload=${PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD}
 
     REWARD_MODELS=(
         reward_models_config.reward_normalization=none
@@ -301,9 +301,9 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.model.path=${RM_MODEL_PATH}
         reward_models_config.reward_models.2.model.use_shm=False
         reward_models_config.reward_models.2.model.trust_remote_code=False
-        reward_models_config.reward_models.2.rollout._target_=psrl.workers.config.RolloutConfig
+        reward_models_config.reward_models.2.rollout._target_=pivotrl.workers.config.RolloutConfig
         reward_models_config.reward_models.2.rollout.name=vllm
-        reward_models_config.reward_models.2.rollout.mode=psrl_async
+        reward_models_config.reward_models.2.rollout.mode=pivotrl_async
         reward_models_config.reward_models.2.rollout.disable_attn=False
         reward_models_config.reward_models.2.rollout.dtype=bfloat16
         reward_models_config.reward_models.2.rollout.gpu_memory_utilization=0.8
@@ -336,104 +336,104 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.sampling_config.top_k=-1
     )
 
-    mkdir -p "${PSRL_WORKSPACE}/logs/${project_name}"
+    mkdir -p "${PIVOTRL_WORKSPACE}/logs/${project_name}"
 
     # ---- Mode-derived deployment args ----
     DEPLOY_ARGS=(
-        psrl.deployment.mode=${PSRL_DEPLOY_MODE}
-        psrl.staleness=${PSRL_DEPLOY_STALENESS}
-        reward_models_config.launch_reward_fn_async=${PSRL_DEPLOY_RM_ASYNC}
-        psrl.deployment.elastic_rm.shared_nnodes=${PSRL_DEPLOY_SHARED_NNODES}
-        "psrl.deployment.elastic_rm.shared_ngpus_per_node=${PSRL_DEPLOY_SHARED_NGPUS}"
-        psrl.deployment.elastic_rm.trainer_ready_grace_s=${PSRL_DEPLOY_TRAINER_READY_GRACE_S}
-        psrl.deployment.train_nnodes=${PSRL_DEPLOY_TRAIN_NNODES}
-        psrl.deployment.train_ngpus_per_node=${PSRL_DEPLOY_TRAIN_NGPUS}
-        psrl.deployment.total_nnodes=${PSRL_DEPLOY_NNODES}
-        psrl.deployment.rollout_nnodes_per_instance=1
-        psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE}
-        psrl.deployment.n_validate_instances=${VAL_INSTANCES}
-        psrl.deployment.validate_nnodes_per_instance=1
-        psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE}
+        pivotrl.deployment.mode=${PIVOTRL_DEPLOY_MODE}
+        pivotrl.staleness=${PIVOTRL_DEPLOY_STALENESS}
+        reward_models_config.launch_reward_fn_async=${PIVOTRL_DEPLOY_RM_ASYNC}
+        pivotrl.deployment.elastic_rm.shared_nnodes=${PIVOTRL_DEPLOY_SHARED_NNODES}
+        "pivotrl.deployment.elastic_rm.shared_ngpus_per_node=${PIVOTRL_DEPLOY_SHARED_NGPUS}"
+        pivotrl.deployment.elastic_rm.trainer_ready_grace_s=${PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S}
+        pivotrl.deployment.train_nnodes=${PIVOTRL_DEPLOY_TRAIN_NNODES}
+        pivotrl.deployment.train_ngpus_per_node=${PIVOTRL_DEPLOY_TRAIN_NGPUS}
+        pivotrl.deployment.total_nnodes=${PIVOTRL_DEPLOY_NNODES}
+        pivotrl.deployment.rollout_nnodes_per_instance=1
+        pivotrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE}
+        pivotrl.deployment.n_validate_instances=${VAL_INSTANCES}
+        pivotrl.deployment.validate_nnodes_per_instance=1
+        pivotrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE}
     )
 
     # Non-elastic modes (disaggregated, trainer_pool_only) use independent rollout
     # / reward pools; main_ppo needs an explicit n_rollout_instances and (for the
     # gen RM) num_replicas. Elastic modes auto-compute these from the pool sizes.
-    case "${PSRL_DEPLOY_MODE}" in
+    case "${PIVOTRL_DEPLOY_MODE}" in
         disaggregated|trainer_pool_only)
-            SHARED_TOTAL_NGPUS=$(_psrl_total_gpus_from_node_spec "${PSRL_DEPLOY_SHARED_NGPUS}" "${PSRL_DEPLOY_SHARED_NNODES}")
+            SHARED_TOTAL_NGPUS=$(_pivotrl_total_gpus_from_node_spec "${PIVOTRL_DEPLOY_SHARED_NGPUS}" "${PIVOTRL_DEPLOY_SHARED_NNODES}")
             N_ROLLOUT_INSTANCES=$(( SHARED_TOTAL_NGPUS / ( GEN_TP * GEN_PP ) ))
             DEPLOY_ARGS+=(
-                psrl.deployment.n_rollout_instances=${N_ROLLOUT_INSTANCES}
-                psrl.deployment.elastic_rm.enable=False
+                pivotrl.deployment.n_rollout_instances=${N_ROLLOUT_INSTANCES}
+                pivotrl.deployment.elastic_rm.enable=False
             )
-            if [[ "${PSRL_DEPLOY_RM_NUM_REPLICAS}" != "0" ]]; then
-                DEPLOY_ARGS+=( reward_models_config.reward_models.2.num_replicas=${PSRL_DEPLOY_RM_NUM_REPLICAS} )
+            if [[ "${PIVOTRL_DEPLOY_RM_NUM_REPLICAS}" != "0" ]]; then
+                DEPLOY_ARGS+=( reward_models_config.reward_models.2.num_replicas=${PIVOTRL_DEPLOY_RM_NUM_REPLICAS} )
             fi
             ;;
         colocated|rollout_rm_colocated|elastic_rl)
-            DEPLOY_ARGS+=( psrl.deployment.elastic_rm.enable=True )
+            DEPLOY_ARGS+=( pivotrl.deployment.elastic_rm.enable=True )
             ;;
         *)
-            echo "Unknown PSRL_DEPLOY_MODE=${PSRL_DEPLOY_MODE}" >&2
+            echo "Unknown PIVOTRL_DEPLOY_MODE=${PIVOTRL_DEPLOY_MODE}" >&2
             exit 1
             ;;
     esac
 
     # Modes 1-4 use simple routing with a practically unbounded preemption
     # waiting cap. Mode 5 keeps the stricter cap required by elastic scaling.
-    case "${PSRL_DEPLOY_MODE}" in
+    case "${PIVOTRL_DEPLOY_MODE}" in
         elastic_rl)
             ROUTING_ARGS=(
-                psrl.routing_strategy.method=throughput_optimal
-                psrl.routing_strategy.candidate_sort_indicator=reserve_capability
-                psrl.routing_strategy.enable_multi_priority_queue=True
-                psrl.routing_strategy.enable_group_sampling_on_multi_instances=True
-                psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen2.5_1.5b.json
-                psrl.routing_strategy.delta_throughput_threshold=0.2
-                psrl.routing_strategy.request_budget=1024
-                psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3
-                psrl.routing_strategy.max_concurrent_seqs_per_instance=512
+                pivotrl.routing_strategy.method=throughput_optimal
+                pivotrl.routing_strategy.candidate_sort_indicator=reserve_capability
+                pivotrl.routing_strategy.enable_multi_priority_queue=True
+                pivotrl.routing_strategy.enable_group_sampling_on_multi_instances=True
+                pivotrl.routing_strategy.cost_model_path=${PIVOTRL_PATH}/pivotrl/trainer/config/cost_model/qwen2.5_1.5b.json
+                pivotrl.routing_strategy.delta_throughput_threshold=0.2
+                pivotrl.routing_strategy.request_budget=1024
+                pivotrl.routing_strategy.max_num_waiting_reqs_after_preemption=3
+                pivotrl.routing_strategy.max_concurrent_seqs_per_instance=512
             )
             ;;
         disaggregated|colocated|rollout_rm_colocated|trainer_pool_only)
             ROUTING_ARGS=(
-                psrl.routing_strategy.method=round_robin
-                psrl.routing_strategy.candidate_sort_indicator=version
-                psrl.routing_strategy.enable_multi_priority_queue=False
-                psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000
-                ++gen_actor_rollout_ref.rollout.use_psrl_scheduler=True
+                pivotrl.routing_strategy.method=round_robin
+                pivotrl.routing_strategy.candidate_sort_indicator=version
+                pivotrl.routing_strategy.enable_multi_priority_queue=False
+                pivotrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000
+                ++gen_actor_rollout_ref.rollout.use_pivotrl_scheduler=True
                 ++reward_models_config.reward_models.2.routing_strategy.method=round_robin
-                ++reward_models_config.reward_models.2.rollout.use_psrl_scheduler=True
+                ++reward_models_config.reward_models.2.rollout.use_pivotrl_scheduler=True
             )
             ;;
     esac
 
     # Extra mode-specific overrides (space-separated string) split into args.
-    if [[ -n "${PSRL_DEPLOY_EXTRA}" ]]; then
+    if [[ -n "${PIVOTRL_DEPLOY_EXTRA}" ]]; then
         # shellcheck disable=SC2206
-        DEPLOY_ARGS+=( ${PSRL_DEPLOY_EXTRA} )
+        DEPLOY_ARGS+=( ${PIVOTRL_DEPLOY_EXTRA} )
     fi
 
-    PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
-        psrl.ps_manager_ip=${LOCAL_IP} \
-        psrl.reward_service_ip=${LOCAL_IP} \
-        psrl.rollout_n=${n_resp_per_prompt} \
-        psrl.staleness_buffer_entries=${train_prompt_bsz} \
-        psrl.ps_mode=nixl_cpu \
-        psrl.logging_path=${PSRL_PATH}/logs/${project_name}/${experiment_name} \
+    PYTHONUNBUFFERED=1 python -m pivotrl.trainer.main_ppo \
+        pivotrl.ps_manager_ip=${LOCAL_IP} \
+        pivotrl.reward_service_ip=${LOCAL_IP} \
+        pivotrl.rollout_n=${n_resp_per_prompt} \
+        pivotrl.staleness_buffer_entries=${train_prompt_bsz} \
+        pivotrl.ps_mode=nixl_cpu \
+        pivotrl.logging_path=${PIVOTRL_PATH}/logs/${project_name}/${experiment_name} \
         \
         "${DEPLOY_ARGS[@]}" \
         \
-        psrl.log_prob.enable_rollout_engine_log_prob=True \
-        psrl.colocate_validate_and_train=${PSRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN} \
-        psrl.fuse_rollout_with_validate=${PSRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE} \
+        pivotrl.log_prob.enable_rollout_engine_log_prob=True \
+        pivotrl.colocate_validate_and_train=${PIVOTRL_DEPLOY_COLOCATE_VALIDATE_AND_TRAIN} \
+        pivotrl.fuse_rollout_with_validate=${PIVOTRL_DEPLOY_FUSE_ROLLOUT_WITH_VALIDATE} \
         \
-        psrl.nixl.server_port=23456 \
-        psrl.group_post_process.enable=False \
-        psrl.group_post_process.name=dynamic_sampling_filter \
-        psrl.redundant_rollout.enable=False \
-        psrl.partial_rollout.enable=True \
+        pivotrl.nixl.server_port=23456 \
+        pivotrl.group_post_process.enable=False \
+        pivotrl.group_post_process.name=dynamic_sampling_filter \
+        pivotrl.redundant_rollout.enable=False \
+        pivotrl.partial_rollout.enable=True \
         \
         "${ROUTING_ARGS[@]}" \
         \
@@ -463,7 +463,7 @@ launch_deployment_mode() {
         train_actor_rollout_ref.rollout.val_kwargs.n=1 \
         train_actor_rollout_ref.rollout.expert_parallel_size=${VAL_EP} \
         train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-        train_actor_rollout_ref.rollout.gpu_memory_utilization=${PSRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION} \
+        train_actor_rollout_ref.rollout.gpu_memory_utilization=${PIVOTRL_DEPLOY_VAL_GPU_MEMORY_UTILIZATION} \
         train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
         train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
         train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -497,18 +497,18 @@ launch_deployment_mode() {
         algorithm.kl_ctrl.kl_coef=${kl_coef} \
         algorithm.rollout_correction.rollout_is=${rollout_is} \
         algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
-        psrl.proactive_filter_strategy.method="retry" \
-        psrl.proactive_filter_strategy.threshold=0 \
+        pivotrl.proactive_filter_strategy.method="retry" \
+        pivotrl.proactive_filter_strategy.threshold=0 \
         \
         trainer.logger='["console", "wandb"]' \
         +trainer.wandb_proxy=http://star-proxy.oa.com:3128 \
         trainer.project_name="${project_name}" \
         trainer.experiment_name="${experiment_name}" \
-        trainer.val_before_train=${PSRL_DEPLOY_VAL_BEFORE_TRAIN} \
+        trainer.val_before_train=${PIVOTRL_DEPLOY_VAL_BEFORE_TRAIN} \
         trainer.test_freq=${test_freq} \
         trainer.save_freq=${save_freq} \
         trainer.total_epochs=1 \
         trainer.total_training_steps=${total_training_steps} \
         "$@" \
-        2>&1 | tee ${PSRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
+        2>&1 | tee ${PIVOTRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
 }

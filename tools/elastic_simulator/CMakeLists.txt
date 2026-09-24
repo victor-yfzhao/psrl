@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psrl_elastic_simulator LANGUAGES CXX)
+project(pivotrl_elastic_simulator LANGUAGES CXX)
 
 include(CTest)
 find_package(Threads REQUIRED)

@@ -61,26 +61,26 @@ def _load_generation_loop_classes():
         def from_config(cls, config):
             raise AssertionError("server rollout is disabled in this test")
 
-    agent_loop_package = types.ModuleType("psrl.workers.agent_loop")
+    agent_loop_package = types.ModuleType("pivotrl.workers.agent_loop")
     agent_loop_package.__path__ = []
-    loops_package = types.ModuleType("psrl.workers.agent_loop.loops")
+    loops_package = types.ModuleType("pivotrl.workers.agent_loop.loops")
     loops_package.__path__ = []
-    base_module = types.ModuleType("psrl.workers.agent_loop.loops.base_agent_loop")
+    base_module = types.ModuleType("pivotrl.workers.agent_loop.loops.base_agent_loop")
     base_module.AgentLoopBase = AgentLoopBase
-    gateway_module = types.ModuleType("psrl.workers.agent_loop.gateway_client")
+    gateway_module = types.ModuleType("pivotrl.workers.agent_loop.gateway_client")
     gateway_module.RolloutGatewayClient = RolloutGatewayClient
-    utils_module = types.ModuleType("psrl.workers.agent_loop.loops.utils")
+    utils_module = types.ModuleType("pivotrl.workers.agent_loop.loops.utils")
     utils_module.TerminateReason = TerminateReason
     utils_module.register = lambda name: lambda cls: cls
     verl_module = types.ModuleType("verl")
     verl_module.DataProto = _Output
 
     stub_modules = {
-        "psrl.workers.agent_loop": agent_loop_package,
-        "psrl.workers.agent_loop.loops": loops_package,
-        "psrl.workers.agent_loop.loops.base_agent_loop": base_module,
-        "psrl.workers.agent_loop.gateway_client": gateway_module,
-        "psrl.workers.agent_loop.loops.utils": utils_module,
+        "pivotrl.workers.agent_loop": agent_loop_package,
+        "pivotrl.workers.agent_loop.loops": loops_package,
+        "pivotrl.workers.agent_loop.loops.base_agent_loop": base_module,
+        "pivotrl.workers.agent_loop.gateway_client": gateway_module,
+        "pivotrl.workers.agent_loop.loops.utils": utils_module,
         "verl": verl_module,
     }
     previous_modules = {name: sys.modules.get(name) for name in stub_modules}
@@ -95,7 +95,7 @@ def _load_generation_loop_classes():
                 "BatchGenerateAgentLoop",
             ),
         ):
-            module_path = REPO_ROOT / "psrl" / "workers" / "agent_loop" / "loops" / file_name
+            module_path = REPO_ROOT / "pivotrl" / "workers" / "agent_loop" / "loops" / file_name
             spec = importlib.util.spec_from_file_location(module_name, module_path)
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
@@ -112,7 +112,7 @@ GENERATION_LOOP_CLASSES = _load_generation_loop_classes()
 def _make_generation_loop(loop_class, *, output: _Output, reward_method: _RemoteMethod):
     loop = loop_class.__new__(loop_class)
     loop.config = SimpleNamespace(
-        psrl=SimpleNamespace(server_rollout=SimpleNamespace(enable=False)),
+        pivotrl=SimpleNamespace(server_rollout=SimpleNamespace(enable=False)),
         reward_models_config=SimpleNamespace(launch_reward_fn_async=False),
     )
     loop.response_length = 16
@@ -164,10 +164,10 @@ def _load_agent_data_types():
             self.meta_info = meta_info or {}
             self.batch = batch
 
-    environments_module = types.ModuleType("psrl.environments.base")
+    environments_module = types.ModuleType("pivotrl.environments.base")
     environments_module.ConversationType = list
     environments_module.Environment = object
-    metrics_module = types.ModuleType("psrl.utils.reward_token_metrics")
+    metrics_module = types.ModuleType("pivotrl.utils.reward_token_metrics")
     metrics_module.extract_reward_model_token_counts = lambda extra_info: (0, 0)
     omegaconf_module = types.ModuleType("omegaconf")
     omegaconf_module.DictConfig = dict
@@ -179,8 +179,8 @@ def _load_agent_data_types():
     verl_module.DataProto = DataProto
 
     stub_modules = {
-        "psrl.environments.base": environments_module,
-        "psrl.utils.reward_token_metrics": metrics_module,
+        "pivotrl.environments.base": environments_module,
+        "pivotrl.utils.reward_token_metrics": metrics_module,
         "omegaconf": omegaconf_module,
         "ray": ray_module,
         "transformers": transformers_module,
@@ -189,7 +189,7 @@ def _load_agent_data_types():
     previous_modules = {name: sys.modules.get(name) for name in stub_modules}
     sys.modules.update(stub_modules)
     try:
-        module_path = REPO_ROOT / "psrl" / "workers" / "agent_loop" / "agent_data" / "base.py"
+        module_path = REPO_ROOT / "pivotrl" / "workers" / "agent_loop" / "agent_data" / "base.py"
         spec = importlib.util.spec_from_file_location("agent_data_base_for_reward_bypass_test", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

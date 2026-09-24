@@ -32,29 +32,29 @@ def _load_round_robin_strategy():
     verl_module.DataProto = object
     stub_modules["verl"] = verl_module
 
-    cost_model_module = types.ModuleType("psrl.utils.cost_model_path")
+    cost_model_module = types.ModuleType("pivotrl.utils.cost_model_path")
     cost_model_module.resolve_cost_model_json_path = lambda *args, **kwargs: None
-    stub_modules["psrl.utils.cost_model_path"] = cost_model_module
+    stub_modules["pivotrl.utils.cost_model_path"] = cost_model_module
 
-    diagnostics_module = types.ModuleType("psrl.utils.elastic_rm.diagnostics")
+    diagnostics_module = types.ModuleType("pivotrl.utils.elastic_rm.diagnostics")
     diagnostics_module.log_elastic_rm_backlog_diag = lambda *args, **kwargs: None
-    stub_modules["psrl.utils.elastic_rm.diagnostics"] = diagnostics_module
+    stub_modules["pivotrl.utils.elastic_rm.diagnostics"] = diagnostics_module
 
-    itl_module = types.ModuleType("psrl.utils.elastic_rm.itl_scaling_policy")
+    itl_module = types.ModuleType("pivotrl.utils.elastic_rm.itl_scaling_policy")
     itl_module.ITLModelParams = object
     itl_module.compute_itl = lambda *args, **kwargs: 0.0
     itl_module.resolve_itl_model_params = lambda *args, **kwargs: None
-    stub_modules["psrl.utils.elastic_rm.itl_scaling_policy"] = itl_module
+    stub_modules["pivotrl.utils.elastic_rm.itl_scaling_policy"] = itl_module
 
-    logger_module = types.ModuleType("psrl.utils.logger")
+    logger_module = types.ModuleType("pivotrl.utils.logger")
     logger_module.DualOutputHandler = object
-    stub_modules["psrl.utils.logger"] = logger_module
+    stub_modules["pivotrl.utils.logger"] = logger_module
 
-    gen_package = types.ModuleType("psrl.workers.gen")
+    gen_package = types.ModuleType("pivotrl.workers.gen")
     gen_package.__path__ = []
-    stub_modules["psrl.workers.gen"] = gen_package
+    stub_modules["pivotrl.workers.gen"] = gen_package
 
-    stats_module = types.ModuleType("psrl.workers.gen.stats_collector")
+    stats_module = types.ModuleType("pivotrl.workers.gen.stats_collector")
 
     class _EngineStats:
         def __init__(self, **kwargs):
@@ -65,13 +65,13 @@ def _load_round_robin_strategy():
             return {}
 
     stats_module.EngineStats = _EngineStats
-    stub_modules["psrl.workers.gen.stats_collector"] = stats_module
+    stub_modules["pivotrl.workers.gen.stats_collector"] = stats_module
 
     previous_modules = {name: sys.modules.get(name) for name in stub_modules}
     sys.modules.update(stub_modules)
     try:
         module_path = (
-            Path(__file__).resolve().parents[3] / "psrl" / "workers" / "reward" / "reward_model" / "router.py"
+            Path(__file__).resolve().parents[3] / "pivotrl" / "workers" / "reward" / "reward_model" / "router.py"
         )
         spec = importlib.util.spec_from_file_location("reward_model_router_for_test", module_path)
         assert spec is not None and spec.loader is not None
@@ -118,7 +118,7 @@ def test_rm_router_reads_exclusive_rebalance_switch_from_nested_dictconfig(monke
     )
     config = OmegaConf.create(
         {
-            "psrl": {
+            "pivotrl": {
                 "deployment": {
                     "elastic_rm": {
                         "itl_policy": {
@@ -132,7 +132,7 @@ def test_rm_router_reads_exclusive_rebalance_switch_from_nested_dictconfig(monke
         }
     )
 
-    router = ROUTER_MODULE.PSRL_RewardModelRouter(
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter(
         worker_handles=[],
         worker_groups=None,
         config=config,
@@ -146,7 +146,7 @@ def _request(uid):
 
 
 def test_prepare_request_migrations_accepts_only_matching_inflight_sources():
-    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
     router._uid_to_inflight_instance = {"active": 0, "moved": 1, "389": 6, "invalid-target": 0}
     router.request_counts = {instance_id: 0 for instance_id in range(7)}
     router._planned_migration_destinations = {}
@@ -211,7 +211,7 @@ def test_rm_planned_destination_forces_valid_target_and_invalid_target_falls_bac
             self.calls.append((list(candidates), dict(route_kwargs["active_loads"])))
             return min(candidates) if candidates else None
 
-    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
     router.paused_worker_indices = set()
     router.worker_probe_backoff_until = {}
     router.waiting_admission_cap = None
@@ -256,7 +256,7 @@ def test_rm_interrupted_result_requeues_before_migration_completion():
             self.completed.append(request_uid)
             return None, "not_tracked"
 
-    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
     tracker = _Tracker()
     request = types.SimpleNamespace(non_tensor_batch={"uid": ["42"]})
     result = types.SimpleNamespace(
@@ -294,7 +294,7 @@ def test_rm_exclusive_rebalance_queue_is_fifo_and_forces_simulated_destinations(
             return destination
 
     async def scenario():
-        router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+        router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
         router._exclusive_rebalance_migration_queue_enabled = True
         router._rebalance_requests_to_route = deque()
         router._rebalance_pending_request_ids = set()
@@ -354,7 +354,7 @@ def test_rm_exclusive_rebalance_queue_is_fifo_and_forces_simulated_destinations(
 
 def test_rm_unreachable_rebalance_target_requeues_without_migration_timing():
     async def scenario():
-        router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+        router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
         router._exclusive_rebalance_migration_queue_enabled = True
         router._rebalance_requests_to_route = deque()
         router._rebalance_pending_request_ids = set()
@@ -404,7 +404,7 @@ def test_rm_unreachable_rebalance_target_requeues_without_migration_timing():
 
 def test_rm_unreachable_rebalance_target_uses_normal_route_when_available():
     async def scenario():
-        router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+        router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
         router._exclusive_rebalance_migration_queue_enabled = True
         router._rebalance_requests_to_route = deque()
         router._rebalance_pending_request_ids = set()
@@ -459,7 +459,7 @@ def test_rm_unreachable_rebalance_target_uses_normal_route_when_available():
 
 def test_rm_normal_fallback_exception_requeues_request():
     async def scenario():
-        router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+        router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
         router._exclusive_rebalance_migration_queue_enabled = True
         router._rebalance_requests_to_route = deque()
         router._rebalance_pending_request_ids = set()
@@ -504,7 +504,7 @@ def test_rm_normal_fallback_exception_requeues_request():
 
 
 def test_rm_deferred_interrupt_timing_is_not_logged_at_requeue():
-    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
     overhead = {"interrupt_s": 0.1}
     router._migration_overhead = types.SimpleNamespace(mark_requeued=lambda request_uid: overhead)
     logged = []
@@ -516,7 +516,7 @@ def test_rm_deferred_interrupt_timing_is_not_logged_at_requeue():
 
 
 def test_rm_exclusive_rebalance_queue_disabled_preserves_normal_requeue():
-    router = ROUTER_MODULE.PSRL_RewardModelRouter.__new__(ROUTER_MODULE.PSRL_RewardModelRouter)
+    router = ROUTER_MODULE.PivotRL_RewardModelRouter.__new__(ROUTER_MODULE.PivotRL_RewardModelRouter)
     router._exclusive_rebalance_migration_queue_enabled = False
     router._rebalance_pending_request_ids = set()
     router._rebalance_requests_to_route = deque()

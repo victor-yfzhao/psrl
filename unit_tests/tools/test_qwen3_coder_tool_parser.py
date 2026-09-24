@@ -1,7 +1,7 @@
 import json
 
-from psrl.tools.tool_parser import Qwen3XMLToolParser
-from psrl.tools.tool_parser.base import ToolParser
+from pivotrl.tools.tool_parser import Qwen3XMLToolParser
+from pivotrl.tools.tool_parser.base import ToolParser
 
 
 class _Tokenizer:

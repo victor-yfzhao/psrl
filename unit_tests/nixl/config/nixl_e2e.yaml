@@ -27,11 +27,11 @@ test:
 
 # Model configuration
 model:
-  path: ${oc.env:PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+  path: ${oc.env:PIVOTRL_WORKSPACE}/models/Qwen2.5-Math-7B
 
 # Logging configuration
 logging:
-  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log
+  path: ${oc.env:PIVOTRL_WORKSPACE}/pivotrl/unit_tests/nixl/log
   level: INFO
 
 # Network configuration

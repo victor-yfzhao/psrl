@@ -1,4 +1,4 @@
-from psrl.utils.ray_storage import plasma_backing_error
+from pivotrl.utils.ray_storage import plasma_backing_error
 
 
 def test_plasma_backing_requires_object_store_plus_reserve() -> None:
@@ -17,7 +17,7 @@ def test_plasma_backing_requires_object_store_plus_reserve() -> None:
 def test_plasma_backing_accepts_sufficient_capacity() -> None:
     snapshot = {
         "node_id": "node-1",
-        "plasma_directory": "/dev/shm/psrl-ray-plasma",
+        "plasma_directory": "/dev/shm/pivotrl-ray-plasma",
         "object_store_bytes": 100,
         "backing_capacity_bytes": 1000,
         "shm_free_bytes": 1000,
@@ -28,7 +28,7 @@ def test_plasma_backing_accepts_sufficient_capacity() -> None:
 def test_plasma_still_requires_shared_memory_reserve() -> None:
     snapshot = {
         "node_id": "node-1",
-        "plasma_directory": "/dev/shm/psrl-ray-plasma",
+        "plasma_directory": "/dev/shm/pivotrl-ray-plasma",
         "object_store_bytes": 100,
         "backing_capacity_bytes": 1000,
         "shm_free_bytes": 5,

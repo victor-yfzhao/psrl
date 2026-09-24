@@ -7,8 +7,8 @@ using the new class-based API.
 
 import os
 
-from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from pivotrl.utils.converter import create_parameter_mapping
+from pivotrl.utils.converter.vllm_converter import convert_vllm_inplace
 
 
 def example_with_real_model():
@@ -19,13 +19,13 @@ def example_with_real_model():
     # Read distributed info from environment variables
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    psrl_workspace = os.environ.get("PSRL_WORKSPACE", "./psrl_workspace")
-    print(f"rank: {rank}, world_size: {world_size}, psrl_workspace: {psrl_workspace}")
+    pivotrl_workspace = os.environ.get("PIVOTRL_WORKSPACE", "./pivotrl_workspace")
+    print(f"rank: {rank}, world_size: {world_size}, pivotrl_workspace: {pivotrl_workspace}")
 
     # Initialize torch distributed
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-    model_path = f"{psrl_workspace}/models/Qwen2.5-0.5B-Instruct"
+    model_path = f"{pivotrl_workspace}/models/Qwen2.5-0.5B-Instruct"
     llm = LLM(
         model=model_path,
         tensor_parallel_size=world_size,

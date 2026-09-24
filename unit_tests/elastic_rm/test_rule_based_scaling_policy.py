@@ -2,13 +2,13 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.elastic_rm.rule_based_scaling_policy import RuleBasedScalingPolicy
-from psrl.utils.elastic_rm.scaling_policy import InstanceSignal
+from pivotrl.trainer.ppo.utils import PivotRL_Role
+from pivotrl.utils.elastic_rm.rule_based_scaling_policy import RuleBasedScalingPolicy
+from pivotrl.utils.elastic_rm.scaling_policy import InstanceSignal
 
 
 def _config():
-    return SimpleNamespace(psrl=SimpleNamespace(logging_path="/tmp"))
+    return SimpleNamespace(pivotrl=SimpleNamespace(logging_path="/tmp"))
 
 
 def _policy(**rule_overrides):
@@ -60,9 +60,9 @@ def _signal(
 def test_high_kv_cache_scales_up_only_on_free_device():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(signals)
@@ -71,7 +71,7 @@ def test_high_kv_cache_scales_up_only_on_free_device():
     assert len(decision.actions) == 1
     action = decision.actions[0]
     assert action.action_type == "scale_up"
-    assert action.role_name == PSRL_Role.Rollout
+    assert action.role_name == PivotRL_Role.Rollout
     assert action.preferred_instance_ids == [1]
     assert action.pre_sleep_other_preferred is None
     assert policy.allow_preemptive_scale_up is False
@@ -81,9 +81,9 @@ def test_high_kv_cache_scales_up_only_on_free_device():
 def test_high_kv_cache_does_not_preempt_when_target_device_is_occupied():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=1),
     ]
 
     decision = policy.decide(signals)
@@ -95,10 +95,10 @@ def test_high_kv_cache_does_not_preempt_when_target_device_is_occupied():
 def test_high_kv_cache_does_not_use_device_reserved_for_training():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.91, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
         _signal(
-            PSRL_Role.RewardModel,
+            PivotRL_Role.RewardModel,
             0,
             awake=False,
             kv_cache=0.0,
@@ -116,36 +116,36 @@ def test_high_kv_cache_does_not_use_device_reserved_for_training():
 def test_router_backlog_scales_up_when_awake_instance_is_not_saturated():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(
         signals,
-        router_backlog_by_role={PSRL_Role.Rollout: 3},
+        router_backlog_by_role={PivotRL_Role.Rollout: 3},
     )
 
     assert decision.reason == "rule_based_router_backlog_scale_up"
     assert len(decision.actions) == 1
     action = decision.actions[0]
     assert action.action_type == "scale_up"
-    assert action.role_name == PSRL_Role.Rollout
+    assert action.role_name == PivotRL_Role.Rollout
     assert action.preferred_instance_ids == [1]
 
 
 def test_router_backlog_does_not_duplicate_pending_scale_up():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, kv_cache=0.0, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(
         signals,
-        router_backlog_by_role={PSRL_Role.Rollout: 3},
-        pending_scale_up_by_role={PSRL_Role.Rollout: 1},
+        router_backlog_by_role={PivotRL_Role.Rollout: 3},
+        pending_scale_up_by_role={PivotRL_Role.Rollout: 1},
     )
 
     assert decision.actions == []
@@ -155,9 +155,9 @@ def test_router_backlog_does_not_duplicate_pending_scale_up():
 def test_low_kv_cache_scales_down_even_with_local_requests():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.6, bundle=0),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.6, bundle=0),
         _signal(
-            PSRL_Role.Rollout,
+            PivotRL_Role.Rollout,
             1,
             awake=True,
             kv_cache=0.05,
@@ -165,7 +165,7 @@ def test_low_kv_cache_scales_down_even_with_local_requests():
             running=3,
             waiting=2,
         ),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(signals)
@@ -174,15 +174,15 @@ def test_low_kv_cache_scales_down_even_with_local_requests():
     assert len(decision.actions) == 1
     action = decision.actions[0]
     assert action.action_type == "scale_down"
-    assert action.role_name == PSRL_Role.Rollout
+    assert action.role_name == PivotRL_Role.Rollout
     assert action.preferred_instance_ids == [1]
 
 
 def test_low_kv_cache_keeps_minimum_awake_instances():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.05, bundle=0),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.05, bundle=0),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=1),
     ]
 
     decision = policy.decide(signals)
@@ -195,9 +195,9 @@ def test_low_kv_cache_keeps_minimum_awake_instances():
 def test_threshold_equality_does_not_trigger(kv_cache):
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=True, kv_cache=kv_cache, bundle=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=True, kv_cache=kv_cache, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(signals)
@@ -209,16 +209,16 @@ def test_stale_low_signal_does_not_scale_down():
     policy = _policy()
     stale_timestamp = (datetime.now() - timedelta(seconds=10)).isoformat()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, kv_cache=0.5, bundle=0),
         _signal(
-            PSRL_Role.Rollout,
+            PivotRL_Role.Rollout,
             1,
             awake=True,
             kv_cache=0.05,
             bundle=1,
             timestamp=stale_timestamp,
         ),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, kv_cache=0.5, bundle=2),
     ]
 
     decision = policy.decide(signals)

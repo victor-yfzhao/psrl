@@ -2,13 +2,13 @@
 set -xeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-PSRL_PATH=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
+PIVOTRL_PATH=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
 
-source "${PSRL_PATH}/env/env_311.sh"
-export PYTHONPATH="${PSRL_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
-export PSRL_LOGGING_PATH="${PSRL_PATH}/unit_tests/nixl/log"
-export PSRL_LOGGING_LEVEL=INFO
-cd "${PSRL_PATH}/unit_tests/nixl"
+source "${PIVOTRL_PATH}/env/env_311.sh"
+export PYTHONPATH="${PIVOTRL_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+export PIVOTRL_LOGGING_PATH="${PIVOTRL_PATH}/unit_tests/nixl/log"
+export PIVOTRL_LOGGING_LEVEL=INFO
+cd "${PIVOTRL_PATH}/unit_tests/nixl"
 
 CASE=4
 
@@ -24,7 +24,7 @@ if [ $CASE -eq 0 ]; then
         test.fsdp_hybrid.fsdp_size=8 \
         test.gen.tensor_parallel_size=2 \
         test.gen.pipeline_parallel_size=2 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -41,7 +41,7 @@ if [ $CASE -eq 1 ]; then
         test.megatron.context_parallel_size=1 \
         test.gen.tensor_parallel_size=4 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-32B \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-32B \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -55,7 +55,7 @@ if [ $CASE -eq 2 ]; then
         test.fsdp_hybrid.fsdp_size=8 \
         test.gen.tensor_parallel_size=2 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -72,7 +72,7 @@ if [ $CASE -eq 3 ]; then
         test.megatron.context_parallel_size=1 \
         test.gen.tensor_parallel_size=4 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-32B \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-32B \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -89,7 +89,7 @@ if [ $CASE -eq 4 ]; then
         test.megatron.context_parallel_size=1 \
         test.gen.tensor_parallel_size=8 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-72B \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-72B \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -103,6 +103,6 @@ if [ $CASE -eq 5 ]; then
         test.fsdp_hybrid.fsdp_size=32 \
         test.gen.tensor_parallel_size=8 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-72B \
+        model.path=${PIVOTRL_WORKSPACE}/models/Qwen2.5-72B \
         2>&1 | tee test_nixl_e2e.log
 fi

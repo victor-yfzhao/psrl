@@ -32,18 +32,18 @@ class PatchManager:
 
     def apply_from_env(self):
         """
-        Apply patches specified in PSRL_VLLM_PATCHES environment variable.
+        Apply patches specified in PIVOTRL_VLLM_PATCHES environment variable.
 
-        Format: PSRL_VLLM_PATCHES="PatchOne,PatchTwo"
+        Format: PIVOTRL_VLLM_PATCHES="PatchOne,PatchTwo"
         Supported values:
           - Comma-separated patch names (e.g., "PatchA,PatchB")
           - "TMS" to apply TMSWorkerPatch
           - "TMS:GRAPH" to apply TMSWorkerPatch, TMSCUDAGraphWrapperPatch, and TMSCudaGraphManagerPatch
         """
-        env_patches = os.environ.get("PSRL_VLLM_PATCHES", "").strip()
+        env_patches = os.environ.get("PIVOTRL_VLLM_PATCHES", "").strip()
 
         if not env_patches:
-            logger.info("No custom patches specified (PSRL_VLLM_PATCHES not set)")
+            logger.info("No custom patches specified (PIVOTRL_VLLM_PATCHES not set)")
             return
 
         if env_patches in ("TMS", "TMS:GRAPH"):
@@ -52,7 +52,7 @@ class PatchManager:
                 import torch_memory_saver  # noqa: F401
             except ImportError:
                 logger.error(
-                    "PSRL_VLLM_PATCHES is set to apply TMS patches, "
+                    "PIVOTRL_VLLM_PATCHES is set to apply TMS patches, "
                     "but 'torch_memory_saver' is not installed. "
                     "Please install it via 'pip install torch_memory_saver==0.0.9'."
                 )
@@ -107,7 +107,7 @@ def register_patches():
     manager.apply_from_env()
     weight_arena_requested = any(
         os.environ.get(name, "0") == "1"
-        for name in ("PSRL_VLLM_WEIGHT_ARENA", "VLLM_PSRL_WEIGHT_ARENA")
+        for name in ("PIVOTRL_VLLM_WEIGHT_ARENA", "VLLM_PIVOTRL_WEIGHT_ARENA")
     )
     if weight_arena_requested:
         register_direct_weight_arena_loader()

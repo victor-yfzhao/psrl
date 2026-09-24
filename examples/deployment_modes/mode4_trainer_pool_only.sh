@@ -8,9 +8,9 @@
 # 4 main RM replicas) + train pool (8 GPUs, actor + idle rollout/rm replicas on
 # DISJOINT bundles, time-multiplexed with actor via NIXL sleep/wake).
 #
-# Requirements: psrl.ps_mode in {nixl_cpu, nixl_gpu}. Idle rollout and idle rm
+# Requirements: pivotrl.ps_mode in {nixl_cpu, nixl_gpu}. Idle rollout and idle rm
 # replicas each occupy one GPU bundle on train_pool and must NOT share bundles;
-# ensure IDLE_ROLLOUT_INSTANCES + IDLE_RM_INSTANCES <= PSRL_DEPLOY_TRAIN_NGPUS.
+# ensure IDLE_ROLLOUT_INSTANCES + IDLE_RM_INSTANCES <= PIVOTRL_DEPLOY_TRAIN_NGPUS.
 #
 # Usage: bash mode4_trainer_pool_only.sh [smoke_test=0] [extra hydra overrides...]
 set -euo pipefail
@@ -25,21 +25,21 @@ source "${SCRIPT_DIR}/_common_deployment.sh"
 IDLE_ROLLOUT_INSTANCES=${IDLE_ROLLOUT_INSTANCES:-4}
 IDLE_RM_INSTANCES=${IDLE_RM_INSTANCES:-4}
 
-export PSRL_DEPLOY_MODE=trainer_pool_only
-export PSRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_4_rm_4_trainer_pool_only
-export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
+export PIVOTRL_DEPLOY_MODE=trainer_pool_only
+export PIVOTRL_DEPLOY_EXPERIMENT=mode4_bs_128_roll_4_rm_4_trainer_pool_only
+export PIVOTRL_DEPLOY_STALENESS=${STALENESS:-2}
 # Mode 4 is a disaggregated concurrent pipeline (like mode 1) PLUS fixed idle
 # replicas on train_pool. 
 # With sync reward the rollout worker would block on the rm per request and the
 # "running concurrently" intent would be lost.
-export PSRL_DEPLOY_RM_ASYNC=False
-export PSRL_DEPLOY_NNODES=2
-export PSRL_DEPLOY_TRAIN_NNODES=1
-export PSRL_DEPLOY_TRAIN_NGPUS=8
-export PSRL_DEPLOY_SHARED_NNODES=1
-export PSRL_DEPLOY_SHARED_NGPUS=4
-export PSRL_DEPLOY_RM_NUM_REPLICAS=4
-export PSRL_DEPLOY_SMOKE=${1:-0}
+export PIVOTRL_DEPLOY_RM_ASYNC=False
+export PIVOTRL_DEPLOY_NNODES=2
+export PIVOTRL_DEPLOY_TRAIN_NNODES=1
+export PIVOTRL_DEPLOY_TRAIN_NGPUS=8
+export PIVOTRL_DEPLOY_SHARED_NNODES=1
+export PIVOTRL_DEPLOY_SHARED_NGPUS=4
+export PIVOTRL_DEPLOY_RM_NUM_REPLICAS=4
+export PIVOTRL_DEPLOY_SMOKE=${1:-0}
 shift || true
 
 # Mode 4 deliberately does NOT set the elastic_rm policy / cooldown / itl_policy /
@@ -48,10 +48,10 @@ shift || true
 # no ElasticExecutor / ScalingPolicy / monitor loop is created and those knobs
 # are inert. Mode 4 drives its idle replicas directly via coordinator
 # exec_command (SLEEP/WAKE_UP) + actor NIXL sleep/wake, gated by the two counts
-# below. Override PSRL_DEPLOY_EXTRA to add any extra hydra flags if needed.
-export PSRL_DEPLOY_EXTRA="\
-psrl.deployment.trainer_pool_idle_rollout_instances=${IDLE_ROLLOUT_INSTANCES} \
-psrl.deployment.trainer_pool_idle_rm_instances=${IDLE_RM_INSTANCES} \
+# below. Override PIVOTRL_DEPLOY_EXTRA to add any extra hydra flags if needed.
+export PIVOTRL_DEPLOY_EXTRA="\
+pivotrl.deployment.trainer_pool_idle_rollout_instances=${IDLE_ROLLOUT_INSTANCES} \
+pivotrl.deployment.trainer_pool_idle_rm_instances=${IDLE_RM_INSTANCES} \
 "
 
 launch_deployment_mode "$@"

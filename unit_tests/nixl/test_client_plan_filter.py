@@ -30,9 +30,9 @@ if "ray" not in sys.modules:
     sys.modules["ray"] = ray_stub
     sys.modules["ray.actor"] = ray_actor_stub
 
-from psrl.utils.nixl.client import NIXLStorageClient
-from psrl.utils.nixl.comm_plan import NIXLCommPlan
-from psrl.utils.nixl.nixl_spec import NIXLClientType
+from pivotrl.utils.nixl.client import NIXLStorageClient
+from pivotrl.utils.nixl.comm_plan import NIXLCommPlan
+from pivotrl.utils.nixl.nixl_spec import NIXLClientType
 
 
 @pytest.mark.parametrize(

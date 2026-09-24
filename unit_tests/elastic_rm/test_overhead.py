@@ -8,7 +8,7 @@ import pytest
 
 
 def _load_module():
-    module_path = Path(__file__).resolve().parents[2] / "psrl" / "utils" / "elastic_rm" / "overhead.py"
+    module_path = Path(__file__).resolve().parents[2] / "pivotrl" / "utils" / "elastic_rm" / "overhead.py"
     spec = importlib.util.spec_from_file_location("elastic_overhead_for_test", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

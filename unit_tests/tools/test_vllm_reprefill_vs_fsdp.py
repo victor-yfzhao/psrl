@@ -246,7 +246,7 @@ def test_mode5_geometric_rs_and_offpolicy_metrics_match_rollout_corr_signs():
     assert kept["token_masked_fraction"] == 0.0
 
 
-def test_psrl_batch_tensors_use_left_padding_masks_and_explicit_positions():
+def test_pivotrl_batch_tensors_use_left_padding_masks_and_explicit_positions():
     cases = [
         SimpleNamespace(
             case_id="short",
@@ -260,7 +260,7 @@ def test_psrl_batch_tensors_use_left_padding_masks_and_explicit_positions():
         ),
     ]
 
-    tensors = MODULE._build_psrl_batch_tensors(
+    tensors = MODULE._build_pivotrl_batch_tensors(
         cases,
         pad_token_id=0,
         prompt_length=4,

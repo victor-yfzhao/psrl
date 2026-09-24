@@ -11,9 +11,9 @@ from unittest.mock import AsyncMock
 def _load_rollout_router():
     repo_root = Path(__file__).resolve().parents[3]
     package_paths = {
-        "psrl.workers.agent_loop": repo_root / "psrl" / "workers" / "agent_loop",
-        "psrl.workers.ps": repo_root / "psrl" / "workers" / "ps",
-        "psrl.workers.gen": repo_root / "psrl" / "workers" / "gen",
+        "pivotrl.workers.agent_loop": repo_root / "pivotrl" / "workers" / "agent_loop",
+        "pivotrl.workers.ps": repo_root / "pivotrl" / "workers" / "ps",
+        "pivotrl.workers.gen": repo_root / "pivotrl" / "workers" / "gen",
     }
     stub_packages = {}
     for name, path in package_paths.items():
@@ -23,8 +23,8 @@ def _load_rollout_router():
     previous_modules = {name: sys.modules.get(name) for name in stub_packages}
     sys.modules.update(stub_packages)
     try:
-        module_path = package_paths["psrl.workers.agent_loop"] / "router.py"
-        spec = importlib.util.spec_from_file_location("psrl.workers.agent_loop.router", module_path)
+        module_path = package_paths["pivotrl.workers.agent_loop"] / "router.py"
+        spec = importlib.util.spec_from_file_location("pivotrl.workers.agent_loop.router", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

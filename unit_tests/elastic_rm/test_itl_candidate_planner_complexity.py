@@ -2,15 +2,15 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
-from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.elastic_rm.itl_harmonic_scaling_policy import ITLHarmonicScalingPolicy
-from psrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy
-from psrl.utils.elastic_rm.scaling_policy import InstanceSignal
+from pivotrl.trainer.ppo.utils import PivotRL_Role
+from pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy import ITLHarmonicScalingPolicy
+from pivotrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy
+from pivotrl.utils.elastic_rm.scaling_policy import InstanceSignal
 
 
 def _policy(policy_cls=ITLHarmonicScalingPolicy, *, max_batch: int = 8):
     return policy_cls(
-        config=SimpleNamespace(psrl=SimpleNamespace(logging_path="/tmp")),
+        config=SimpleNamespace(pivotrl=SimpleNamespace(logging_path="/tmp")),
         policy_config={
             "enable_policy": True,
             "cooldown_ms": 0,
@@ -45,11 +45,11 @@ def _signal(role, instance_id, *, awake, running, tokens, bundles):
 def test_heterogeneous_count_dp_reuses_one_conflict_group(policy_cls):
     policy = _policy(policy_cls, max_batch=4)
     rollout = [
-        _signal(PSRL_Role.Rollout, index, awake=False, running=0, tokens=0, bundles=(index,)) for index in range(8)
+        _signal(PivotRL_Role.Rollout, index, awake=False, running=0, tokens=0, bundles=(index,)) for index in range(8)
     ]
     rm = [
         _signal(
-            PSRL_Role.RewardModel,
+            PivotRL_Role.RewardModel,
             0,
             awake=True,
             running=39,
@@ -57,7 +57,7 @@ def test_heterogeneous_count_dp_reuses_one_conflict_group(policy_cls):
             bundles=(0, 1, 2, 3),
         ),
         _signal(
-            PSRL_Role.RewardModel,
+            PivotRL_Role.RewardModel,
             1,
             awake=True,
             running=38,
@@ -80,11 +80,11 @@ def test_heterogeneous_count_dp_reuses_one_conflict_group(policy_cls):
 def test_heterogeneous_planner_computes_each_victim_phi_once(monkeypatch):
     policy = _policy(max_batch=8)
     rollout = [
-        _signal(PSRL_Role.Rollout, index, awake=False, running=0, tokens=0, bundles=(index,)) for index in range(16)
+        _signal(PivotRL_Role.Rollout, index, awake=False, running=0, tokens=0, bundles=(index,)) for index in range(16)
     ]
     rm = [
         _signal(
-            PSRL_Role.RewardModel,
+            PivotRL_Role.RewardModel,
             index,
             awake=True,
             running=index + 1,

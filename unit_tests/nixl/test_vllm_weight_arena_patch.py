@@ -153,7 +153,7 @@ def test_ep_metadata_uses_cpu_inside_meta_model_construction() -> None:
 
 
 def test_direct_runtime_buffer_is_initialized_in_place() -> None:
-    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+    from pivotrl.utils.weight_arena import materialize_module_weights_in_arena
 
     model = _RuntimeBufferProbe()
     handle = materialize_module_weights_in_arena(
@@ -180,7 +180,7 @@ def test_direct_runtime_buffer_is_initialized_in_place() -> None:
 
 
 def test_direct_runtime_buffer_rejects_unknown_non_persistent_buffer() -> None:
-    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+    from pivotrl.utils.weight_arena import materialize_module_weights_in_arena
 
     model = _RuntimeBufferProbe(supported=False)
     materialize_module_weights_in_arena(
@@ -205,7 +205,7 @@ def test_materialization_is_role_specific() -> None:
 
 def test_finalize_pending_weight_arena_replaces_tms_pool(monkeypatch) -> None:
     arena_config = {"max_chunk_gb": 1, "alignment_bytes": 256}
-    runner = SimpleNamespace(_psrl_weight_arena_pending_config=arena_config)
+    runner = SimpleNamespace(_pivotrl_weight_arena_pending_config=arena_config)
     calls = []
     monkeypatch.setattr(
         weight_arena,
@@ -216,7 +216,7 @@ def test_finalize_pending_weight_arena_replaces_tms_pool(monkeypatch) -> None:
     finalize_pending_weight_arena(runner)
 
     assert calls == [(runner, arena_config, True)]
-    assert not hasattr(runner, "_psrl_weight_arena_pending_config")
+    assert not hasattr(runner, "_pivotrl_weight_arena_pending_config")
 
 
 def test_finalize_pending_weight_arena_is_noop_without_request(monkeypatch) -> None:
@@ -241,8 +241,8 @@ def test_finalize_pending_weight_arena_is_noop_without_request(monkeypatch) -> N
 )
 def test_weight_arena_enablement_is_role_specific(role, config, expected) -> None:
     additional_config = {
-        "psrl_role": role,
-        "psrl_nixl_weight_arena": config,
+        "pivotrl_role": role,
+        "pivotrl_nixl_weight_arena": config,
     }
     assert _weight_arena_enabled(additional_config) is expected
 

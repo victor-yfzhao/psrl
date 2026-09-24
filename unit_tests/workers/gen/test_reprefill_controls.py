@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from omegaconf import OmegaConf
-from psrl.utils.rollout.reprefill import (
+from pivotrl.utils.rollout.reprefill import (
     collect_reprefill_log_probs,
     filter_rollout_request_ids,
     merge_reprefill_log_probs,
@@ -119,7 +119,7 @@ def test_reprefill_update_keeps_old_prefix_when_prompt_mismatches():
 
 
 def test_experiment_switches_are_disabled_by_default():
-    config_path = Path(__file__).resolve().parents[3] / "psrl/trainer/config/psrl/psrl.yaml"
+    config_path = Path(__file__).resolve().parents[3] / "pivotrl/trainer/config/pivotrl/pivotrl.yaml"
     config = OmegaConf.load(config_path)
     assert config.log_prob.update_reprefill_log_probs is False
     assert config.deployment.disaggregated_rollout_interrupt.enable is False

@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
-from psrl.workers.reward.gen_reward_function.default_gen_rm import DefaultGenRewardFunction
-from psrl.workers.reward.reward_loop.gen import tokenize_rm_chat_prompt
+from pivotrl.workers.reward.gen_reward_function.default_gen_rm import DefaultGenRewardFunction
+from pivotrl.workers.reward.reward_loop.gen import tokenize_rm_chat_prompt
 
 _WORKSPACE = Path(__file__).resolve().parents[3]
 _QWEN_PATH = _WORKSPACE / "models" / "Qwen2.5-1.5B"

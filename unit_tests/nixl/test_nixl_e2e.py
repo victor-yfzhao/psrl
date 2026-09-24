@@ -9,18 +9,18 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from omegaconf import DictConfig, OmegaConf
-from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
-from psrl.utils.converter.megatron_converter import convert_megatron_inplace
-from psrl.utils.converter.vllm_converter import convert_vllm_inplace
-from psrl.utils.nixl import (
+from pivotrl.utils.converter import create_parameter_mapping
+from pivotrl.utils.converter.fsdp_converter import convert_fsdp_inplace
+from pivotrl.utils.converter.megatron_converter import convert_megatron_inplace
+from pivotrl.utils.converter.vllm_converter import convert_vllm_inplace
+from pivotrl.utils.nixl import (
     GLOBAL_PORT_SCANNER,
     NIXLClientType,
     NIXLInterface,
     NIXLMetaServer,
     NIXLStorageClient,
 )
-from psrl.workers.ps import (
+from pivotrl.workers.ps import (
     PSClassWithInitArgs,
     PSResourcePool,
     PSResourceSpec,
@@ -86,8 +86,8 @@ class GlobalStore:
 
 @ray.remote
 class MetaServerActor:
-    def __init__(self, server_name, psrl_config, expected_agents, log_dir):
-        self.server = NIXLMetaServer(server_name, psrl_config.nixl)
+    def __init__(self, server_name, pivotrl_config, expected_agents, log_dir):
+        self.server = NIXLMetaServer(server_name, pivotrl_config.nixl)
         self.expected_agents = expected_agents
         self.client_name = server_name
         os.makedirs(log_dir, exist_ok=True)
@@ -134,7 +134,7 @@ class TrainClientActor:
         rank,
         world_size,
         server_name,
-        psrl_config,
+        pivotrl_config,
         backend,
         torch_port,
         log_dir,
@@ -175,7 +175,7 @@ class TrainClientActor:
             server_name=server_name,
             use_gpu=True,
             client_type=NIXLClientType.PUSH_SIDE,
-            nixl_config=psrl_config.nixl,
+            nixl_config=pivotrl_config.nixl,
             nixl_interface=nixl_interface,
             client_group_id=self._get_replica_id(),
             logging_path=log_dir,
@@ -373,7 +373,7 @@ class GenClientActor:
         rank,
         world_size,
         server_name,
-        psrl_config,
+        pivotrl_config,
         backend,
         torch_port,
         log_dir,
@@ -422,7 +422,7 @@ class GenClientActor:
             server_name=server_name,
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
-            nixl_config=psrl_config.nixl,
+            nixl_config=pivotrl_config.nixl,
             nixl_interface=nixl_interface,
             client_group_id=self._get_replica_id(),
             logging_path=log_dir,
@@ -529,7 +529,7 @@ class GenClientActor:
         self.client.shutdown()
 
 
-def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, nixl_interface: NIXLInterface):
+def create_ps_worker_group(train_engine_type, num_ps, pivotrl_config, model_path, nixl_interface: NIXLInterface):
     model_config = OmegaConf.create({"path": model_path, "use_shm": False, "trust_remote_code": False})
     ray_nodes = ray.nodes()
     ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
@@ -552,7 +552,7 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, n
         ray.remote(PSStorageWorker),
         storage_plan,
         model_config,
-        psrl_config,
+        pivotrl_config,
         nixl_interface,
     )
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
@@ -565,7 +565,7 @@ def test_nixl_e2e(cfg: DictConfig):
     os.makedirs(log_dir, exist_ok=True)
     ray.init(
         ignore_reinit_error=True,
-        runtime_env={"env_vars": {"PSRL_LOGGING_PATH": log_dir}},
+        runtime_env={"env_vars": {"PIVOTRL_LOGGING_PATH": log_dir}},
     )
     listen_ip = cfg.network.listen_ip
     print(f"meta server listen_ip: {listen_ip}")
@@ -590,7 +590,7 @@ def test_nixl_e2e(cfg: DictConfig):
     # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
     train_engine_type = cfg.test.train_engine_type
 
-    psrl_config = OmegaConf.create(
+    pivotrl_config = OmegaConf.create(
         {
             "logging_path": log_dir,
             "ps_manager_ip": listen_ip,
@@ -612,13 +612,13 @@ def test_nixl_e2e(cfg: DictConfig):
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)
-    ).remote(server_name, psrl_config, num_train + num_gen + num_ps, log_dir)
+    ).remote(server_name, pivotrl_config, num_train + num_gen + num_ps, log_dir)
     ray.get(server.init_finished.remote())
     end_time = time.time()
     print(f"[PASS] server init done. time: {end_time - start_time}s")
 
     start_time = time.time()
-    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model.path, nixl_interface)
+    ps_wg = create_ps_worker_group(train_engine_type, num_ps, pivotrl_config, cfg.model.path, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
     ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
@@ -651,7 +651,7 @@ def test_nixl_e2e(cfg: DictConfig):
             rank,
             num_train,
             server_name,
-            psrl_config,
+            pivotrl_config,
             backend,
             torch_port_train,
             log_dir,
@@ -674,7 +674,7 @@ def test_nixl_e2e(cfg: DictConfig):
             rank,
             num_gen,
             server_name,
-            psrl_config,
+            pivotrl_config,
             backend,
             torch_port_gen,
             log_dir,

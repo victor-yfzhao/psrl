@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace psrl::elastic_simulator {
+namespace pivotrl::elastic_simulator {
 
 struct PriorityValue {
   enum class Kind { kNull, kNumber, kString, kArray };
@@ -158,4 +158,4 @@ evaluate_role_candidate(const RoleEvaluationContext &context,
 std::uint64_t
 functional_checksum(const std::vector<RoleEvaluationResult> &results);
 
-} // namespace psrl::elastic_simulator
+} // namespace pivotrl::elastic_simulator

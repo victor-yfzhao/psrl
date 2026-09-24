@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 import ray
-from psrl.utils.ray import lazy_get, lazy_put
+from pivotrl.utils.ray import lazy_get, lazy_put
 
 
 def test_lazy_vs_normal_put_get():

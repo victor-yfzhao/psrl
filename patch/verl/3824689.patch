@@ -16,16 +16,16 @@ index e7fa9926..c6d75bd5 100644
  NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
  # Paths
 -RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-+HOME=${PSRL_WORKSPACE}
++HOME=${PIVOTRL_WORKSPACE}
  # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 -MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
 -CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 -TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 -TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-+MODEL_PATH=${MODEL_PATH:-"${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
-+CKPTS_DIR=${CKPTS_DIR:-"${PSRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
-+TRAIN_FILE=${TRAIN_FILE:-"${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
-+TEST_FILE=${TEST_FILE:-"${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
++MODEL_PATH=${MODEL_PATH:-"${PIVOTRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
++CKPTS_DIR=${CKPTS_DIR:-"${PIVOTRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
++TRAIN_FILE=${TRAIN_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
++TEST_FILE=${TEST_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
  
  # Algorithm
  temperature=1.0
@@ -88,7 +88,7 @@ index a866e968..63188ff6 100644
 -WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 -RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 -NNODES=${NNODES:-4}
-+RUNTIME_ENV=${RUNTIME_ENV:-"${PSRL_WORKSPACE}/psrl/third_party/verl/verl/trainer/runtime_env.yaml"}
++RUNTIME_ENV=${RUNTIME_ENV:-"${PIVOTRL_WORKSPACE}/pivotrl/third_party/verl/verl/trainer/runtime_env.yaml"}
 +NNODES=${NNODES:-8}
  # Paths
 -RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
@@ -97,10 +97,10 @@ index a866e968..63188ff6 100644
 -TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 -TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 +# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-+MODEL_PATH=${MODEL_PATH:-"${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
-+CKPTS_DIR=${CKPTS_DIR:-"${PSRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
-+TRAIN_FILE=${TRAIN_FILE:-"${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
-+TEST_FILE=${TEST_FILE:-"${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
++MODEL_PATH=${MODEL_PATH:-"${PIVOTRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
++CKPTS_DIR=${CKPTS_DIR:-"${PIVOTRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
++TRAIN_FILE=${TRAIN_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
++TEST_FILE=${TEST_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
  
  # Algorithm
  temperature=1.0
@@ -328,8 +328,8 @@ index feb73a54..cab31dbc 100644
          options.update(self._options)
 +        if hasattr(self.cls, "configure_worker"):
 +            config = self.kwargs.get("config", None)
-+            psrl_config = self.kwargs.get("psrl_config", None)
-+            # Specialized for PSRL
++            pivotrl_config = self.kwargs.get("pivotrl_config", None)
++            # Specialized for PivotRL
 +            gen_interface = self.kwargs.get("gen_interface", None)
 +            dp_idx = 0
 +            if gen_interface is not None:
@@ -339,7 +339,7 @@ index feb73a54..cab31dbc 100644
 +            bundle_indices = range(len(placement_group.bundle_specs))
 +            resources, env_vars, init_kwargs = self.cls.configure_worker(
 +                config=config,
-+                psrl_config=psrl_config,
++                pivotrl_config=pivotrl_config,
 +                num_gpus=num_gpus,
 +                dp_idx=dp_idx,
 +                bundle_indices=bundle_indices,
@@ -690,7 +690,7 @@ index b7d89134..c99b0091 100644
  from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
  
 +USE_TMS = False
-+if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++if os.environ.get("PIVOTRL_TMS_ENABLE", "0") == "1":
 +    USE_TMS = True
 +    from torch_memory_saver import torch_memory_saver
 +else:
@@ -1395,7 +1395,7 @@ index db2e3fb1..4ea866f7 100644
  from verl.workers.rollout import get_rollout_class
  
 +USE_TMS = False
-+if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++if os.environ.get("PIVOTRL_TMS_ENABLE", "0") == "1":
 +    USE_TMS = True
 +    from torch_memory_saver import torch_memory_saver
 +else:

@@ -9,7 +9,7 @@ import os
 import time
 
 import torch
-from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
+from pivotrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import (
@@ -32,13 +32,13 @@ def example_with_real_model():
     # Read distributed info from environment variables
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    psrl_workspace = os.environ.get("PSRL_WORKSPACE", "./psrl_workspace")
-    print(f"rank: {rank}, world_size: {world_size}, psrl_workspace: {psrl_workspace}")
+    pivotrl_workspace = os.environ.get("PIVOTRL_WORKSPACE", "./pivotrl_workspace")
+    print(f"rank: {rank}, world_size: {world_size}, pivotrl_workspace: {pivotrl_workspace}")
 
     # Initialize torch distributed
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-    model = AutoModelForCausalLM.from_pretrained(f"{psrl_workspace}/models/Qwen2.5-0.5B-Instruct")
+    model = AutoModelForCausalLM.from_pretrained(f"{pivotrl_workspace}/models/Qwen2.5-0.5B-Instruct")
     fsdp_model = FSDP(
         model,
         # auto_wrap_policy=auto_wrap,
@@ -65,7 +65,7 @@ def example_with_real_model():
         print(f"[rank{rank}] {name}: {param}")
 
     # Convert to HuggingFace format
-    from psrl.utils.converter import create_parameter_mapping
+    from pivotrl.utils.converter import create_parameter_mapping
 
     parameter_mapping = create_parameter_mapping("FSDP", model.config)
     hf_state_dict, sharding = convert_fsdp_inplace(parameter_mapping, fsdp_model, fsdp_strategy="fsdp")

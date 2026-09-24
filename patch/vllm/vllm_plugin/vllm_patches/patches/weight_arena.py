@@ -17,11 +17,11 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+pivotrl_logger = logging.getLogger(__file__)
+pivotrl_logger.setLevel(os.getenv("PIVOTRL_LOGGING_LEVEL", "WARN"))
 
 _ORIGINAL_LOAD_MODEL = GPUModelRunner.load_model
-DIRECT_ARENA_DUMMY_LOAD_FORMAT = "psrl_arena_dummy"
+DIRECT_ARENA_DUMMY_LOAD_FORMAT = "pivotrl_arena_dummy"
 _DIRECT_LOADER_REGISTERED = False
 
 
@@ -31,7 +31,7 @@ def _role_materialization(arena_config: dict[str, Any], role: str) -> str:
 
 
 def _max_chunk_bytes(arena_config: dict[str, Any]) -> int:
-    from psrl.utils.weight_arena import gb_to_bytes
+    from pivotrl.utils.weight_arena import gb_to_bytes
 
     return gb_to_bytes(arena_config["max_chunk_gb"], field_name="max_chunk_gb")
 
@@ -155,8 +155,8 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
 
     def load_model(self, vllm_config, model_config, prefix: str = ""):
         additional_config = vllm_config.additional_config or {}
-        arena_config = additional_config.get("psrl_nixl_weight_arena", {})
-        role = additional_config.get("psrl_role", "rollout")
+        arena_config = additional_config.get("pivotrl_nixl_weight_arena", {})
+        role = additional_config.get("pivotrl_role", "rollout")
         enabled_key = "reward_enabled" if role == "reward" else "rollout_enabled"
         if role not in ("rollout", "reward") or not arena_config.get(enabled_key, False):
             raise RuntimeError(f"The direct arena loader is not enabled for role={role!r}.")
@@ -186,7 +186,7 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
                 vllm_config.parallel_config,
             )
 
-            from psrl.utils.weight_arena import materialize_module_weights_in_arena
+            from pivotrl.utils.weight_arena import materialize_module_weights_in_arena
 
             handle = materialize_module_weights_in_arena(
                 model,
@@ -198,9 +198,9 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
             process_weights_after_loading(model, model_config, target_device)
             initialized_runtime_buffers = _initialize_direct_runtime_buffers(model)
             handle.assert_module_weights_in_arena(model)
-            model._psrl_weight_arena_handle = handle
-            model._psrl_weight_arena_runtime_buffers = initialized_runtime_buffers
-            psrl_logger.warning(
+            model._pivotrl_weight_arena_handle = handle
+            model._pivotrl_weight_arena_runtime_buffers = initialized_runtime_buffers
+            pivotrl_logger.warning(
                 "[NIXL_WEIGHT_ARENA] role=%s stage=initialize_runtime_buffers count=%d",
                 role,
                 len(initialized_runtime_buffers),
@@ -209,7 +209,7 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
                 model_kind = "moe_ep" if vllm_config.parallel_config.enable_expert_parallel else "moe_tp"
             else:
                 model_kind = "dense"
-            model._psrl_weight_arena_model_kind = model_kind
+            model._pivotrl_weight_arena_model_kind = model_kind
         return model.eval()
 
 
@@ -286,24 +286,24 @@ def _pack_loaded_model(
     replace_tms_pool: bool,
 ) -> None:
     _assert_no_cudagraph_has_been_captured(model_runner)
-    if hasattr(model_runner, "_psrl_weight_arena_handle"):
+    if hasattr(model_runner, "_pivotrl_weight_arena_handle"):
         raise RuntimeError("Rollout weight arena cannot repack a model after initialization.")
 
-    from psrl.utils.weight_arena import (
+    from pivotrl.utils.weight_arena import (
         pack_module_weights,
         pack_module_weights_in_fresh_tms_pool,
     )
 
     model = model_runner.get_model()
     packer = pack_module_weights_in_fresh_tms_pool if replace_tms_pool else pack_module_weights
-    model_runner._psrl_weight_arena_handle = packer(
+    model_runner._pivotrl_weight_arena_handle = packer(
         model,
         max_chunk_bytes=_max_chunk_bytes(arena_config),
         alignment_bytes=int(arena_config["alignment_bytes"]),
     )
-    stats = model_runner._psrl_weight_arena_handle.stats
-    role = (model_runner.vllm_config.additional_config or {}).get("psrl_role", "rollout")
-    psrl_logger.warning(
+    stats = model_runner._pivotrl_weight_arena_handle.stats
+    role = (model_runner.vllm_config.additional_config or {}).get("pivotrl_role", "rollout")
+    pivotrl_logger.warning(
         "[NIXL_WEIGHT_ARENA] role=%s rank=%d materialization=repack arenas=%d unique_storages=%d "
         "tensor_bindings=%d storage_bytes=%d arena_bytes=%d largest_storage_bytes=%d pack_s=%.6f "
         "tms_source_reserved_bytes=%d tms_source_active_bytes=%d tms_source_active_allocations=%d "
@@ -321,22 +321,22 @@ def _pack_loaded_model(
         stats.tms_source_active_bytes,
         stats.tms_source_active_allocations,
         replace_tms_pool,
-        model_runner._psrl_weight_arena_handle.base_addresses,
+        model_runner._pivotrl_weight_arena_handle.base_addresses,
     )
 
 
 def _adopt_direct_weight_arena(model_runner: GPUModelRunner) -> None:
     _assert_no_cudagraph_has_been_captured(model_runner)
     model = model_runner.get_model()
-    handle = getattr(model, "_psrl_weight_arena_handle", None)
+    handle = getattr(model, "_pivotrl_weight_arena_handle", None)
     if handle is None:
         raise RuntimeError("Direct weight arena loader did not attach an arena handle.")
     handle.assert_module_weights_in_arena(model)
-    model_runner._psrl_weight_arena_handle = handle
+    model_runner._pivotrl_weight_arena_handle = handle
     stats = handle.stats
-    role = (model_runner.vllm_config.additional_config or {}).get("psrl_role", "rollout")
-    model_kind = getattr(model, "_psrl_weight_arena_model_kind", "unknown")
-    psrl_logger.warning(
+    role = (model_runner.vllm_config.additional_config or {}).get("pivotrl_role", "rollout")
+    model_kind = getattr(model, "_pivotrl_weight_arena_model_kind", "unknown")
+    pivotrl_logger.warning(
         "[NIXL_WEIGHT_ARENA] role=%s rank=%d model_kind=%s materialization=direct "
         "arenas=%d unique_storages=%d "
         "tensor_bindings=%d storage_bytes=%d arena_bytes=%d largest_storage_bytes=%d pack_s=%.6f "
@@ -357,17 +357,17 @@ def _adopt_direct_weight_arena(model_runner: GPUModelRunner) -> None:
 
 def finalize_pending_weight_arena(model_runner: GPUModelRunner) -> None:
     """Pack after Worker.load_model exits the original TMS weights pool."""
-    arena_config = getattr(model_runner, "_psrl_weight_arena_pending_config", None)
+    arena_config = getattr(model_runner, "_pivotrl_weight_arena_pending_config", None)
     if arena_config is None:
         return
-    delattr(model_runner, "_psrl_weight_arena_pending_config")
+    delattr(model_runner, "_pivotrl_weight_arena_pending_config")
     _pack_loaded_model(model_runner, arena_config, replace_tms_pool=True)
 
 
 def _weight_arena_enabled(additional_config: dict[str, Any] | None) -> bool:
     additional_config = additional_config or {}
-    arena_config = additional_config.get("psrl_nixl_weight_arena", {})
-    role = additional_config.get("psrl_role", "rollout")
+    arena_config = additional_config.get("pivotrl_nixl_weight_arena", {})
+    role = additional_config.get("pivotrl_role", "rollout")
     enabled_key = "reward_enabled" if role == "reward" else "rollout_enabled"
     return bool(arena_config.get(enabled_key, False))
 
@@ -378,10 +378,10 @@ class WeightArenaModelRunnerPatch(vLLMPatch[GPUModelRunner]):
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         additional_config = self.vllm_config.additional_config or {}
-        arena_config = additional_config.get("psrl_nixl_weight_arena", {})
+        arena_config = additional_config.get("pivotrl_nixl_weight_arena", {})
         enabled = _weight_arena_enabled(additional_config)
         if enabled:
-            if hasattr(self, "_psrl_weight_arena_handle"):
+            if hasattr(self, "_pivotrl_weight_arena_handle"):
                 raise RuntimeError("Rollout weight arena cannot repack a model after initialization.")
             _assert_no_cudagraph_has_been_captured(self)
             _assert_supported_compilation_mode(self)
@@ -391,18 +391,18 @@ class WeightArenaModelRunnerPatch(vLLMPatch[GPUModelRunner]):
         if not enabled:
             return
 
-        role = additional_config.get("psrl_role", "rollout")
+        role = additional_config.get("pivotrl_role", "rollout")
         materialization = _role_materialization(arena_config, role)
         if materialization == "direct":
             _adopt_direct_weight_arena(self)
             return
         if materialization != "repack":
             raise RuntimeError(
-                f"psrl.nixl.weight_arena.{role}_materialization must be 'direct' or 'repack', "
+                f"pivotrl.nixl.weight_arena.{role}_materialization must be 'direct' or 'repack', "
                 f"got {materialization!r}."
             )
 
-        if os.environ.get("PSRL_VLLM_PATCHES", "").startswith("TMS"):
-            self._psrl_weight_arena_pending_config = arena_config
+        if os.environ.get("PIVOTRL_VLLM_PATCHES", "").startswith("TMS"):
+            self._pivotrl_weight_arena_pending_config = arena_config
             return
         _pack_loaded_model(self, arena_config, replace_tms_pool=False)

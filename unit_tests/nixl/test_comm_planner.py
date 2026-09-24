@@ -2,9 +2,9 @@
 """
 Comprehensive test for communication planner with custom sorting algorithm.
 
-Requires: torch, ray, and the `nixl` Python extension (via `import psrl.utils.nixl`).
+Requires: torch, ray, and the `nixl` Python extension (via `import pivotrl.utils.nixl`).
 If Ray is unavailable, a minimal stub is installed below so `PortScanner.remote()` can import;
-you still need `nixl` for `psrl.utils.nixl.client` to load.
+you still need `nixl` for `pivotrl.utils.nixl.client` to load.
 """
 
 import os
@@ -48,16 +48,16 @@ import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from psrl.utils.nixl.comm_plan import global_comm_planner
-from psrl.utils.nixl.network_topology import NetworkTopology
-from psrl.utils.nixl.nixl_spec import (
+from pivotrl.utils.nixl.comm_plan import global_comm_planner
+from pivotrl.utils.nixl.network_topology import NetworkTopology
+from pivotrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
     NIXLSharding,
     NIXLShardMetaInfo,
     NIXLTensorInfo,
 )
-from psrl.utils.nixl.server import NIXLMetaServer
+from pivotrl.utils.nixl.server import NIXLMetaServer
 
 
 def _make_weight_tensor_info(global_shard_indices: list[int], total_global_shards: int = 4) -> NIXLTensorInfo:

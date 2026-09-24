@@ -8,7 +8,7 @@ import torch
 # Add the parent directory to the path to import the module
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from psrl.utils.nixl.nixl_spec import NIXLSharding
+from pivotrl.utils.nixl.nixl_spec import NIXLSharding
 
 
 class TestNIXLSharding(unittest.TestCase):

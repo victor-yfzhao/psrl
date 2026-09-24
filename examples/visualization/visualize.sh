@@ -1,1 +1,1 @@
-python -m psrl.utils.visualization.log_visualizer --web --port 23333
+python -m pivotrl.utils.visualization.log_visualizer --web --port 23333

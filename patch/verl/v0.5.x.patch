@@ -16,16 +16,16 @@ index 9574f772..c7fe15a4 100644
  NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
  # Paths
 -RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-+HOME=${PSRL_WORKSPACE}
++HOME=${PIVOTRL_WORKSPACE}
  # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 -MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
 -CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 -TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 -TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-+MODEL_PATH=${MODEL_PATH:-"${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
-+CKPTS_DIR=${CKPTS_DIR:-"${PSRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
-+TRAIN_FILE=${TRAIN_FILE:-"${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
-+TEST_FILE=${TEST_FILE:-"${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
++MODEL_PATH=${MODEL_PATH:-"${PIVOTRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
++CKPTS_DIR=${CKPTS_DIR:-"${PIVOTRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
++TRAIN_FILE=${TRAIN_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
++TEST_FILE=${TEST_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
  
  # Algorithm
  temperature=1.0
@@ -88,7 +88,7 @@ index aebb1482..b3685926 100644
 -WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 -RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 -NNODES=${NNODES:-4}
-+RUNTIME_ENV=${RUNTIME_ENV:-"${PSRL_WORKSPACE}/psrl/third_party/verl/verl/trainer/runtime_env.yaml"}
++RUNTIME_ENV=${RUNTIME_ENV:-"${PIVOTRL_WORKSPACE}/pivotrl/third_party/verl/verl/trainer/runtime_env.yaml"}
 +NNODES=${NNODES:-8}
  # Paths
 -RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
@@ -97,10 +97,10 @@ index aebb1482..b3685926 100644
 -TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 -TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 +# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-+MODEL_PATH=${MODEL_PATH:-"${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
-+CKPTS_DIR=${CKPTS_DIR:-"${PSRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
-+TRAIN_FILE=${TRAIN_FILE:-"${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
-+TEST_FILE=${TEST_FILE:-"${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
++MODEL_PATH=${MODEL_PATH:-"${PIVOTRL_WORKSPACE}/models/Qwen2.5-Math-7B"}
++CKPTS_DIR=${CKPTS_DIR:-"${PIVOTRL_WORKSPACE}/ckpts/${project_name}/${exp_name}"}
++TRAIN_FILE=${TRAIN_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"}
++TEST_FILE=${TEST_FILE:-"${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"}
  
  # Algorithm
  temperature=1.0
@@ -237,7 +237,7 @@ index b692206b..d6c8e600 100644
 +        
 +        if hasattr(self.cls, "configure_worker"):
 +            config = self.kwargs.get("config", None)
-+            # Specialized for PSRL
++            # Specialized for PivotRL
 +            gen_interface = self.kwargs.get("gen_interface", None)
 +            dp_idx = 0
 +            if gen_interface is not None:

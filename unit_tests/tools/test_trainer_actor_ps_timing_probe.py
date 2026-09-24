@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
-from psrl.tools.trainer_actor_ps_timing_probe import (
+from pivotrl.tools.trainer_actor_ps_timing_probe import (
     _assert_fingerprints_match,
     _compose_config,
     _summarize_worker_wake,
@@ -11,7 +11,7 @@ from psrl.tools.trainer_actor_ps_timing_probe import (
 
 
 def test_weight_arena_is_enabled_by_default() -> None:
-    config_path = Path(__file__).parents[2] / "psrl/trainer/config/psrl/psrl.yaml"
+    config_path = Path(__file__).parents[2] / "pivotrl/trainer/config/pivotrl/pivotrl.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.nixl.weight_arena.actor_enabled is True
@@ -21,11 +21,11 @@ def test_weight_arena_is_enabled_by_default() -> None:
 
 
 def test_reward_node_shared_cache_is_enabled_by_default() -> None:
-    config_path = Path(__file__).parents[2] / "psrl/trainer/config/psrl/psrl.yaml"
+    config_path = Path(__file__).parents[2] / "pivotrl/trainer/config/pivotrl/pivotrl.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.nixl.weight_arena.reward_cpu_cache_mode == "node_shared"
-    assert config.nixl.weight_arena.reward_node_cache_dir == "/dev/shm/psrl-rm-weight-cache"
+    assert config.nixl.weight_arena.reward_node_cache_dir == "/dev/shm/pivotrl-rm-weight-cache"
     assert config.nixl.weight_arena.reward_node_cache_backend == "auto"
     assert config.nixl.weight_arena.reward_node_cache_shm_reserve_gb == 256
     assert config.nixl.weight_arena.reward_node_cache_memfd_reserve_gb == 256
@@ -121,8 +121,8 @@ def test_compose_config_enables_weight_arena(tmp_path) -> None:
 
     config = _compose_config(args, "127.0.0.1", 12345)
 
-    assert config.psrl.nixl.weight_arena.actor_enabled is True
-    assert config.psrl.nixl.weight_arena.max_chunk_gb == 2
+    assert config.pivotrl.nixl.weight_arena.actor_enabled is True
+    assert config.pivotrl.nixl.weight_arena.max_chunk_gb == 2
     assert config.train_actor_rollout_ref.actor.fsdp_config.optimizer_offload is True
 
 
@@ -138,7 +138,7 @@ def test_compose_config_explicitly_disables_weight_arena_for_baseline(tmp_path) 
 
     config = _compose_config(args, "127.0.0.1", 12345)
 
-    assert config.psrl.nixl.weight_arena.actor_enabled is False
+    assert config.pivotrl.nixl.weight_arena.actor_enabled is False
 
 
 def test_exact_fingerprint_comparison_reports_changed_tensor() -> None:

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from psrl.workers.gen.vllm_rollout import (
+from pivotrl.workers.gen.vllm_rollout import (
     _ensure_vllm_hf_rope_overrides,
     _normalize_rope_override_dict,
 )

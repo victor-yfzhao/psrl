@@ -24,7 +24,7 @@ Currently, every PS Storage Worker independently reads the full model checkpoint
 
 ## Config
 
-New fields under the `ps` config block in `psrl/trainer/config/psrl/psrl.yaml`:
+New fields under the `ps` config block in `pivotrl/trainer/config/pivotrl/pivotrl.yaml`:
 
 ```yaml
 ps:
@@ -33,7 +33,7 @@ ps:
     algorithm: binary_tree  # Broadcast algorithm; reserved for future: ring
 ```
 
-Corresponding dataclasses (added to the existing psrl config schema):
+Corresponding dataclasses (added to the existing pivotrl config schema):
 
 ```python
 @dataclass
@@ -75,7 +75,7 @@ New path (broadcast_init.enabled = True):
 
 ## Section 1: MetaServer Extension — PS-to-PS ClientInfo Distribution
 
-**File:** `psrl/utils/nixl/server.py`
+**File:** `pivotrl/utils/nixl/server.py`
 **Function:** `_get_relevant_client_names_for_agent`
 
 This function determines which ClientInfos are broadcast to a given agent during `nixl_protocol` Phase 2b. Currently PS workers only receive ClientInfos for train/gen workers. The extension:
@@ -90,7 +90,7 @@ After this change, every PS worker holds the GPU descriptors for all other PS wo
 
 ## Section 2: Binary Tree Broadcast Plan
 
-**New file:** `psrl/workers/ps/broadcast.py`
+**New file:** `pivotrl/workers/ps/broadcast.py`
 
 Encapsulates broadcast topology logic, keeping PSManager and PSStorageWorker clean.
 
@@ -133,7 +133,7 @@ Depth = `ceil(log2(N))` rounds. For N=256, this is 8 rounds.
 
 ## Section 3: PSStorageWorker Changes
 
-**File:** `psrl/workers/ps/ps_storage_worker.py`
+**File:** `pivotrl/workers/ps/ps_storage_worker.py`
 
 ### Initialization path change
 
@@ -182,7 +182,7 @@ Each PS worker already has its own rank and knows the world size. The mapping fr
 
 ## Section 4: PSManager Coordination
 
-**File:** `psrl/workers/ps/ps_manager.py`
+**File:** `pivotrl/workers/ps/ps_manager.py`
 
 New method `_coordinate_broadcast_init()`, called after `nixl_protocol()` completes and rank 0 has called `preload_checkpoint_to_cpu()` + `write_checkpoint_to_registered_tensors()` (non-root workers skip both in broadcast_init mode):
 
@@ -240,7 +240,7 @@ nixl_protocol() completes
 
 ## Extensibility Notes
 
-- **New algorithms**: Add a new subclass of `BroadcastPlan` in `psrl/workers/ps/broadcast.py` and register it in `build_broadcast_plan()`. No changes to PSManager or PSStorageWorker needed.
+- **New algorithms**: Add a new subclass of `BroadcastPlan` in `pivotrl/workers/ps/broadcast.py` and register it in `build_broadcast_plan()`. No changes to PSManager or PSStorageWorker needed.
 - **Non-full-replica sharding**: When a PS worker holds only a subset of keys, `broadcast_send_to_children` needs to filter keys to those held locally. The plan object can be extended with a `keys_for_sender(rank)` method. The rest of the coordination loop is unchanged.
 - **Partial broadcast** (e.g., only broadcast a subset of layers): `_all_keys()` can be parameterized without touching the broadcast topology logic.
 
@@ -250,9 +250,9 @@ nixl_protocol() completes
 
 | File | Change |
 |------|--------|
-| `psrl/trainer/config/psrl/psrl.yaml` | Add `ps.broadcast_init` config block |
-| `psrl/trainer/config/` (dataclass schema) | Add `BroadcastInitConfig`, extend `PSConfig` |
-| `psrl/utils/nixl/server.py` | Extend `_get_relevant_client_names_for_agent` to include PS-to-PS ClientInfos |
-| `psrl/workers/ps/ps_storage_worker.py` | Conditionalize disk load on rank; add `broadcast_send_to_children`, `do_transfer_train_to_gen_after_broadcast` |
-| `psrl/workers/ps/ps_manager.py` | Add `_coordinate_broadcast_init()`; call it when `broadcast_init.enabled` |
-| `psrl/workers/ps/broadcast.py` | **New file**: `BroadcastPlan`, `BinaryTreeBroadcastPlan`, `build_broadcast_plan` |
+| `pivotrl/trainer/config/pivotrl/pivotrl.yaml` | Add `ps.broadcast_init` config block |
+| `pivotrl/trainer/config/` (dataclass schema) | Add `BroadcastInitConfig`, extend `PSConfig` |
+| `pivotrl/utils/nixl/server.py` | Extend `_get_relevant_client_names_for_agent` to include PS-to-PS ClientInfos |
+| `pivotrl/workers/ps/ps_storage_worker.py` | Conditionalize disk load on rank; add `broadcast_send_to_children`, `do_transfer_train_to_gen_after_broadcast` |
+| `pivotrl/workers/ps/ps_manager.py` | Add `_coordinate_broadcast_init()`; call it when `broadcast_init.enabled` |
+| `pivotrl/workers/ps/broadcast.py` | **New file**: `BroadcastPlan`, `BinaryTreeBroadcastPlan`, `build_broadcast_plan` |

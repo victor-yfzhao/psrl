@@ -6,8 +6,8 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 TMS_PATH=${TMS_PATH:-third_party/torch_memory_saver}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PSRL_PATH="$(dirname "$SCRIPT_DIR")"
-THIRD_PARTY_PATH="$PSRL_PATH/third_party"
+PIVOTRL_PATH="$(dirname "$SCRIPT_DIR")"
+THIRD_PARTY_PATH="$PIVOTRL_PATH/third_party"
 mkdir -p $THIRD_PARTY_PATH
 
 echo "1. Install torch_memory_saver"

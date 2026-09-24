@@ -60,7 +60,7 @@ def test_sleep_clears_default_allocator_after_tms_pools(
         "torch_memory_saver",
         SimpleNamespace(torch_memory_saver=_MemorySaver),
     )
-    monkeypatch.setenv("PSRL_VLLM_PATCHES", patches)
+    monkeypatch.setenv("PIVOTRL_VLLM_PATCHES", patches)
     monkeypatch.setattr(
         gpu_worker,
         "_release_inactive_cuda_cache",

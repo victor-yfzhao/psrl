@@ -7,34 +7,34 @@ from types import MethodType, SimpleNamespace
 
 
 def _load_manager_class():
-    agent_loop_package = types.ModuleType("psrl.workers.agent_loop")
+    agent_loop_package = types.ModuleType("pivotrl.workers.agent_loop")
     agent_loop_package.__path__ = []
-    ps_package = types.ModuleType("psrl.workers.ps")
+    ps_package = types.ModuleType("pivotrl.workers.ps")
     ps_package.__path__ = []
 
-    prometheus_module = types.ModuleType("psrl.workers.agent_loop.prometheus_utils")
+    prometheus_module = types.ModuleType("pivotrl.workers.agent_loop.prometheus_utils")
     prometheus_module.update_prometheus_config = lambda *args, **kwargs: None
-    request_status_module = types.ModuleType("psrl.workers.ps.request_status_tracker")
-    request_status_module.PSRL_RequestStatus = SimpleNamespace(RUNNING="RUNNING")
-    staleness_module = types.ModuleType("psrl.workers.ps.staleness_controller")
+    request_status_module = types.ModuleType("pivotrl.workers.ps.request_status_tracker")
+    request_status_module.PivotRL_RequestStatus = SimpleNamespace(RUNNING="RUNNING")
+    staleness_module = types.ModuleType("pivotrl.workers.ps.staleness_controller")
     staleness_module.EntryInfo = type("EntryInfo", (), {})
 
     stub_modules = {
-        "psrl.workers.agent_loop": agent_loop_package,
-        "psrl.workers.agent_loop.prometheus_utils": prometheus_module,
-        "psrl.workers.ps": ps_package,
-        "psrl.workers.ps.request_status_tracker": request_status_module,
-        "psrl.workers.ps.staleness_controller": staleness_module,
+        "pivotrl.workers.agent_loop": agent_loop_package,
+        "pivotrl.workers.agent_loop.prometheus_utils": prometheus_module,
+        "pivotrl.workers.ps": ps_package,
+        "pivotrl.workers.ps.request_status_tracker": request_status_module,
+        "pivotrl.workers.ps.staleness_controller": staleness_module,
     }
     previous_modules = {name: sys.modules.get(name) for name in stub_modules}
     sys.modules.update(stub_modules)
     try:
-        module_path = Path(__file__).resolve().parents[3] / "psrl" / "workers" / "agent_loop" / "manager.py"
+        module_path = Path(__file__).resolve().parents[3] / "pivotrl" / "workers" / "agent_loop" / "manager.py"
         spec = importlib.util.spec_from_file_location("agent_loop_manager_for_recovery_test", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.PSRL_AgentLoopManager
+        return module.PivotRL_AgentLoopManager
     finally:
         for name, previous_module in previous_modules.items():
             if previous_module is None:
@@ -43,7 +43,7 @@ def _load_manager_class():
                 sys.modules[name] = previous_module
 
 
-PSRL_AgentLoopManager = _load_manager_class()
+PivotRL_AgentLoopManager = _load_manager_class()
 
 
 class _RemoteMethod:
@@ -60,7 +60,7 @@ class _RemoteMethod:
 
 
 def _make_manager():
-    manager = PSRL_AgentLoopManager.__new__(PSRL_AgentLoopManager)
+    manager = PivotRL_AgentLoopManager.__new__(PivotRL_AgentLoopManager)
     manager.train_result_queue = asyncio.Queue()
     manager.val_result_queue = asyncio.Queue()
     manager._validation_recovery_done = asyncio.Event()

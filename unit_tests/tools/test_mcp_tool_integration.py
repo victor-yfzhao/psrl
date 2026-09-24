@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest  # noqa: F401
-from psrl.tools.base import initialize_tools_from_config  # noqa: F401
+from pivotrl.tools.base import initialize_tools_from_config  # noqa: F401
 
 
 class _FakeManager:
@@ -62,14 +62,14 @@ async def test_mcp_tool_output_contract(monkeypatch, tmp_path: Path):
     )
 
     # Patch discovery/initialization to avoid importing/initializing fastmcp.
-    from psrl.tools.mcp_clients.manager import MCPClientManager  # noqa: F401
+    from pivotrl.tools.mcp_clients.manager import MCPClientManager  # noqa: F401
 
     async def _noop_initialize(self):
         self._initialized = True  # noqa: SLF001
         return None
 
     async def _fake_fetch(self, tool_selected_list=None):  # noqa: ARG001
-        from psrl.tools.mcp_clients.schema import MCPToolSchema
+        from pivotrl.tools.mcp_clients.schema import MCPToolSchema
 
         # Populate mapping as real discovery would.
         self._tool_client_mapping["dummy_echo"] = _DummyClient()  # noqa: SLF001
@@ -127,14 +127,14 @@ async def test_mcp_tool_timeout(monkeypatch, tmp_path: Path):
         """
     )
 
-    from psrl.tools.mcp_clients.manager import MCPClientManager
+    from pivotrl.tools.mcp_clients.manager import MCPClientManager
 
     async def _noop_initialize(self):
         self._initialized = True  # noqa: SLF001
         return None
 
     async def _fake_fetch(self, tool_selected_list=None):  # noqa: ARG001
-        from psrl.tools.mcp_clients.schema import MCPToolSchema
+        from pivotrl.tools.mcp_clients.schema import MCPToolSchema
 
         self._tool_client_mapping["dummy_echo"] = _DummyClient()  # noqa: SLF001
 

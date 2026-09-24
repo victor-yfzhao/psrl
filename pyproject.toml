@@ -7,15 +7,15 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "psrl"
+name = "pivotrl"
 version = "0.0.1"
-description = "PSRL is a post-training framework for LLMs that supports both synchronous and asynchronous training paradigms through staleness control, streaming rollout and parameter server architecture."
+description = "PivotRL is a post-training framework for LLMs that supports both synchronous and asynchronous training paradigms through staleness control, streaming rollout and parameter server architecture."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "cachetools>=5.0.0",
-    "vllm-psrl-patches @ file:patch/vllm/vllm_plugin",
+    "vllm-pivotrl-patches @ file:patch/vllm/vllm_plugin",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -23,19 +23,19 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage="https://github.com/lhy101/psrl"
+Homepage="https://github.com/lhy101/pivotrl"
 
 [tool.setuptools]
 package-dir = {"" = "."}
-packages = ["psrl"]
+packages = ["pivotrl"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-psrl = ["trainer/config/*.yaml"]
+pivotrl = ["trainer/config/*.yaml"]
 
 [tool.ruff]
 line-length = 119
-src = ["psrl"]
+src = ["pivotrl"]
 
 [tool.ruff.lint]
 select = [

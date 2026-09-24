@@ -6,10 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import torch
-from psrl.utils.server.command import Command, CommandExtension, CommandType
-from psrl.workers.gen import gen_worker
-from psrl.workers.gen.gen_worker import PSRL_GenWorker
-from psrl.workers.gen.rollout_coordinator import RolloutCoordinator
+from pivotrl.utils.server.command import Command, CommandExtension, CommandType
+from pivotrl.workers.gen import gen_worker
+from pivotrl.workers.gen.gen_worker import PivotRL_GenWorker
+from pivotrl.workers.gen.rollout_coordinator import RolloutCoordinator
 
 
 def _make_coordinator():
@@ -134,7 +134,7 @@ def test_first_validation_wake_replaces_dummy_weights_at_version_zero(monkeypatc
     monkeypatch.setattr(gen_worker, "shared_pull_model_context_async", unlocked_pull)
 
     skipped = asyncio.run(
-        PSRL_GenWorker.sync_with_ps(
+        PivotRL_GenWorker.sync_with_ps(
             worker,
             ps_version=0,
             sync_after_wake_up=False,
@@ -145,7 +145,7 @@ def test_first_validation_wake_replaces_dummy_weights_at_version_zero(monkeypatc
     worker.pull_model_async.assert_not_awaited()
 
     asyncio.run(
-        PSRL_GenWorker.sync_with_ps(
+        PivotRL_GenWorker.sync_with_ps(
             worker,
             ps_version=0,
             sync_after_wake_up=True,
@@ -180,7 +180,7 @@ def test_wake_pull_tracks_actual_ps_version_newer_than_target(monkeypatch):
     monkeypatch.setattr(gen_worker, "shared_pull_model_context_async", unlocked_pull)
 
     asyncio.run(
-        PSRL_GenWorker.sync_with_ps(
+        PivotRL_GenWorker.sync_with_ps(
             worker,
             ps_version=4,
             sync_after_wake_up=True,
@@ -210,9 +210,9 @@ def test_rollout_fingerprints_are_persisted_by_gen_worker(monkeypatch):
         }
     ]
     warning = MagicMock()
-    monkeypatch.setattr(gen_worker.psrl_logger, "warning", warning)
+    monkeypatch.setattr(gen_worker.pivotrl_logger, "warning", warning)
 
-    PSRL_GenWorker._log_rollout_weight_fingerprints(object(), records, model_version=3)
+    PivotRL_GenWorker._log_rollout_weight_fingerprints(object(), records, model_version=3)
 
     assert warning.call_count == 2
     logged_records = [json.loads(log_call.args[1]) for log_call in warning.call_args_list]
@@ -232,4 +232,4 @@ def test_rollout_fingerprint_logging_rejects_missing_engine_core_record():
     ]
 
     with pytest.raises(RuntimeError, match="did not return a fingerprint record"):
-        PSRL_GenWorker._log_rollout_weight_fingerprints(object(), records, model_version=3)
+        PivotRL_GenWorker._log_rollout_weight_fingerprints(object(), records, model_version=3)

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from psrl.trainer.ppo import ray_trainer
+from pivotrl.trainer.ppo import ray_trainer
 
 
 def _remote_handle():
@@ -12,9 +12,9 @@ def _remote_handle():
 
 
 def _make_validation_switch_trainer(*, elastic: bool):
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.config = SimpleNamespace(
-        psrl=SimpleNamespace(colocate_validate_and_train=True),
+        pivotrl=SimpleNamespace(colocate_validate_and_train=True),
         train_actor_rollout_ref=SimpleNamespace(
             actor=SimpleNamespace(strategy="fsdp2"),
         ),
@@ -48,7 +48,7 @@ def _make_validation_switch_trainer(*, elastic: bool):
 
 
 def test_enter_elastic_validation_window_reserves_without_waking_trainer():
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.elastic_trainer_pool_mode = True
     trainer._elastic_trainer_pool_training_active = False
     entries = [{"instance_id": 0}]
@@ -66,7 +66,7 @@ def test_enter_elastic_validation_window_reserves_without_waking_trainer():
 
 
 def test_validation_workers_sleep_before_train_pool_rollout_initialization():
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.n_rollout_instances = 2
     trainer.n_validate_instances = 2
     trainer.is_rollout_mode_in_actor = True
@@ -171,10 +171,10 @@ def test_non_elastic_validation_still_restores_trainer():
 
 
 def test_validation_failure_still_returns_train_pool_to_elastic():
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.elastic_trainer_pool_mode = True
     trainer.config = SimpleNamespace(
-        psrl=SimpleNamespace(colocate_validate_and_train=True),
+        pivotrl=SimpleNamespace(colocate_validate_and_train=True),
     )
     trainer.is_rollout_mode_in_actor = True
     trainer._enter_elastic_trainer_pool_validation_window = MagicMock()
@@ -191,11 +191,11 @@ def test_validation_failure_still_returns_train_pool_to_elastic():
 
 
 def test_validation_switch_failure_after_trainer_sleep_still_runs_cleanup():
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.elastic_trainer_pool_mode = True
     trainer.is_rollout_mode_in_actor = False
     trainer.config = SimpleNamespace(
-        psrl=SimpleNamespace(colocate_validate_and_train=True),
+        pivotrl=SimpleNamespace(colocate_validate_and_train=True),
     )
     trainer._enter_elastic_trainer_pool_validation_window = MagicMock()
 
@@ -215,13 +215,13 @@ def test_validation_switch_failure_after_trainer_sleep_still_runs_cleanup():
 
 
 def test_elastic_trainer_wake_clears_fsdp2_grads_after_model_pull():
-    trainer = ray_trainer.PSRL_RayPPOTrainer.__new__(ray_trainer.PSRL_RayPPOTrainer)
+    trainer = ray_trainer.PivotRL_RayPPOTrainer.__new__(ray_trainer.PivotRL_RayPPOTrainer)
     trainer.elastic_trainer_pool_mode = True
     trainer.trainer_pool_only_mode = False
     trainer._elastic_trainer_pool_trainer_sleeping = True
     trainer._trainer_before_sleep_weight_fingerprints = None
     trainer.config = SimpleNamespace(
-        psrl=SimpleNamespace(ps_mode="nixl_cpu"),
+        pivotrl=SimpleNamespace(ps_mode="nixl_cpu"),
         train_actor_rollout_ref=SimpleNamespace(
             actor=SimpleNamespace(strategy="fsdp2"),
         ),

@@ -49,7 +49,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             2,
             "elastic_rm scale_up_handler decision_id=1 begin task={'role_name': "
-            "<PSRL_Role.RewardModel: 6>, 'num_instances': 2, 'training_step': 1, "
+            "<PivotRL_Role.RewardModel: 6>, 'num_instances': 2, 'training_step': 1, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(
@@ -64,7 +64,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             4,
             "elastic_rm scale_up_handler decision_id=2 begin task={'role_name': "
-            "<PSRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 1, "
+            "<PivotRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 1, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(
@@ -80,7 +80,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             6,
             "elastic_rm scale_down_handler decision_id=3 begin task={'role_name': "
-            "<PSRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 1, "
+            "<PivotRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 1, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(
@@ -90,7 +90,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             8,
             "elastic_rm scale_down_handler decision_id=4 begin task={'role_name': "
-            "<PSRL_Role.RewardModel: 6>, 'num_instances': 1, 'training_step': 1, "
+            "<PivotRL_Role.RewardModel: 6>, 'num_instances': 1, 'training_step': 1, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(
@@ -100,7 +100,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             10,
             "elastic_rm scale_up_handler decision_id=6 begin task={'role_name': "
-            "<PSRL_Role.RewardModel: 6>, 'num_instances': 1, 'training_step': 1, "
+            "<PivotRL_Role.RewardModel: 6>, 'num_instances': 1, 'training_step': 1, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(
@@ -115,7 +115,7 @@ def test_collect_run_excludes_initialization_and_incomplete_next_batch(tmp_path)
         _line(
             28,
             "elastic_rm scale_up_handler decision_id=5 begin task={'role_name': "
-            "<PSRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 22, "
+            "<PivotRL_Role.Rollout: 2>, 'num_instances': 1, 'training_step': 22, "
             "'pre_wake_other_preferred': []}",
         ),
         _line(

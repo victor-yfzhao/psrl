@@ -4,8 +4,8 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
-_MODULE_PATH = Path(__file__).parents[2] / "psrl/utils/nixl/fingerprint.py"
-_SPEC = importlib.util.spec_from_file_location("psrl_weight_fingerprint_test_module", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).parents[2] / "pivotrl/utils/nixl/fingerprint.py"
+_SPEC = importlib.util.spec_from_file_location("pivotrl_weight_fingerprint_test_module", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
@@ -83,7 +83,7 @@ def test_version_schedule_prefers_full_fingerprint() -> None:
 
 
 def test_repository_config_keeps_weight_verification_disabled_by_default() -> None:
-    config_path = Path(__file__).parents[2] / "psrl/trainer/config/psrl/psrl.yaml"
+    config_path = Path(__file__).parents[2] / "pivotrl/trainer/config/pivotrl/pivotrl.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.nixl.weight_verification.enable is False

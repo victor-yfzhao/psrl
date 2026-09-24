@@ -8,25 +8,25 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
-export PSRL_DEPLOY_MODE=disaggregated
-export PSRL_DEPLOY_EXPERIMENT=mode1_bs_128_disaggregated_interrupt_10s
-export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
-export PSRL_DEPLOY_RM_ASYNC=True
-export PSRL_DEPLOY_NNODES=7
-export PSRL_DEPLOY_TRAIN_NNODES=2
-export PSRL_DEPLOY_TRAIN_NGPUS=8
-export PSRL_DEPLOY_SHARED_NNODES=1
-export PSRL_DEPLOY_SHARED_NGPUS=8
-export PSRL_DEPLOY_RM_NUM_REPLICAS=8
-export PSRL_DEPLOY_SMOKE=${1:-0}
-export PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-dapo}
-export PSRL_NEED_VALIDATION=${PSRL_NEED_VALIDATION:-1}
-export PSRL_DISAGG_INTERRUPT_INTERVAL_S=${PSRL_DISAGG_INTERRUPT_INTERVAL_S:-10}
+export PIVOTRL_DEPLOY_MODE=disaggregated
+export PIVOTRL_DEPLOY_EXPERIMENT=mode1_bs_128_disaggregated_interrupt_10s
+export PIVOTRL_DEPLOY_STALENESS=${STALENESS:-2}
+export PIVOTRL_DEPLOY_RM_ASYNC=True
+export PIVOTRL_DEPLOY_NNODES=7
+export PIVOTRL_DEPLOY_TRAIN_NNODES=2
+export PIVOTRL_DEPLOY_TRAIN_NGPUS=8
+export PIVOTRL_DEPLOY_SHARED_NNODES=1
+export PIVOTRL_DEPLOY_SHARED_NGPUS=8
+export PIVOTRL_DEPLOY_RM_NUM_REPLICAS=8
+export PIVOTRL_DEPLOY_SMOKE=${1:-0}
+export PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-dapo}
+export PIVOTRL_NEED_VALIDATION=${PIVOTRL_NEED_VALIDATION:-1}
+export PIVOTRL_DISAGG_INTERRUPT_INTERVAL_S=${PIVOTRL_DISAGG_INTERRUPT_INTERVAL_S:-10}
 shift || true
 
-export PSRL_DEPLOY_EXTRA="\
-psrl.deployment.disaggregated_rollout_interrupt.enable=True \
-psrl.deployment.disaggregated_rollout_interrupt.interval_s=${PSRL_DISAGG_INTERRUPT_INTERVAL_S} \
+export PIVOTRL_DEPLOY_EXTRA="\
+pivotrl.deployment.disaggregated_rollout_interrupt.enable=True \
+pivotrl.deployment.disaggregated_rollout_interrupt.interval_s=${PIVOTRL_DISAGG_INTERRUPT_INTERVAL_S} \
 "
 
 launch_qwen7b_rm32b_deployment_mode "$@"

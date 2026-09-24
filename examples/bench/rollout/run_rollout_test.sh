@@ -5,21 +5,21 @@ set -xeuo pipefail
 # This script runs a simplified rollout performance test using vLLM AsyncLLM directly
 
 # Set up environment
-source ${PSRL_WORKSPACE}/env/env_311.sh
+source ${PIVOTRL_WORKSPACE}/env/env_311.sh
 
-HOME=${PSRL_WORKSPACE}
-PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
+HOME=${PIVOTRL_WORKSPACE}
+PIVOTRL_PATH=$(python -c "import pivotrl; import os; print(os.path.dirname(os.path.dirname(pivotrl.__file__)))")
 
 # Model configuration
 MODEL_NAME=${MODEL_NAME:-Qwen2.5-7B}
-HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_WORKSPACE}/models/${MODEL_NAME}}
+HF_MODEL_PATH=${HF_MODEL_PATH:-${PIVOTRL_WORKSPACE}/models/${MODEL_NAME}}
 
 # vLLM configuration (simplified - no complex deployment)
 GEN_TP=${1:-1}  # Tensor parallel size for generation
 GEN_PP=1  # Pipeline parallel size for generation
 
 # Detect MoE and default EP=TP (same convention as deployment_modes/_common_deployment.sh).
-_psrl_vllm_ep_size_for_model() {
+_pivotrl_vllm_ep_size_for_model() {
     local model_path=$1
     local tp_size=$2
 
@@ -70,7 +70,7 @@ max_prompt_length=${2:-128}
 batch_size=${3:-1}
 disable_attn=${4:-true}
 # Optional 5th arg / GEN_EP env override; otherwise auto-detect MoE EP=TP.
-GEN_EP=${5:-${GEN_EP:-$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")}}
+GEN_EP=${5:-${GEN_EP:-$(_pivotrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")}}
 max_response_length=8192
 
 max_model_len=$((max_prompt_length + max_response_length))
@@ -86,7 +86,7 @@ top_k=-1
 
 enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL:-False}
 
-profile_root=${PROFILE_ROOT:-${PSRL_WORKSPACE}/examples/bench/rollout/exp}
+profile_root=${PROFILE_ROOT:-${PIVOTRL_WORKSPACE}/examples/bench/rollout/exp}
 profile_logs_dir=${PROFILE_LOGS_DIR:-${profile_root}/details}
 summary_dir=${PROFILE_SUMMARY_DIR:-${profile_root}/summary}
 disable_tag=$(echo "${disable_attn}" | tr '[:upper:]' '[:lower:]')
@@ -103,8 +103,8 @@ else
     unset VLLM_DISABLE_ATTN || true
 fi
 
-PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
-    psrl.logging_path=${summary_dir} \
+PYTHONUNBUFFERED=1 python -m pivotrl.bench.rollout.main_rollout \
+    pivotrl.logging_path=${summary_dir} \
     \
     model.path="${HF_MODEL_PATH}" \
     +model.override_config.max_position_embeddings=32768 \

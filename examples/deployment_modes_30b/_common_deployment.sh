@@ -2,36 +2,36 @@
 # Shared launch body for the five deployment-mode example scripts.
 #
 # Each mode script (mode1_disaggregated.sh ... mode5_elastic_rl.sh) exports a
-# small set of PSRL_DEPLOY_* env vars describing its pool topology / mode flags,
+# small set of PIVOTRL_DEPLOY_* env vars describing its pool topology / mode flags,
 # then sources this file and calls `launch_deployment_mode "$@"`. Extra hydra
 # overrides can be passed as "$@" from the mode script.
 #
 # Required env vars (set by the mode script before calling):
-#   PSRL_DEPLOY_MODE          one of disaggregated|colocated|rollout_rm_colocated|
+#   PIVOTRL_DEPLOY_MODE          one of disaggregated|colocated|rollout_rm_colocated|
 #                             trainer_pool_only|elastic_rl
-#   PSRL_DEPLOY_EXPERIMENT    experiment name string
-#   PSRL_DEPLOY_STALENESS     staleness (modes 2/3 require 0)
-#   PSRL_DEPLOY_RM_ASYNC      True|False (modes 2/3 require True)
-#   PSRL_DEPLOY_NNODES        total cluster nodes
-#   PSRL_DEPLOY_TRAIN_NNODES  train_pool nodes
-#   PSRL_DEPLOY_TRAIN_NGPUS   gpus per train node
-#   PSRL_DEPLOY_SHARED_NNODES   shared_rollout_pool nodes (0/unused for mode 2)
-#   PSRL_DEPLOY_SHARED_NGPUS    gpus per shared node, or a Hydra list like [4, 8]
-#   PSRL_DEPLOY_RM_NUM_REPLICAS  gen-RM num_replicas (non-elastic modes 1/4)
+#   PIVOTRL_DEPLOY_EXPERIMENT    experiment name string
+#   PIVOTRL_DEPLOY_STALENESS     staleness (modes 2/3 require 0)
+#   PIVOTRL_DEPLOY_RM_ASYNC      True|False (modes 2/3 require True)
+#   PIVOTRL_DEPLOY_NNODES        total cluster nodes
+#   PIVOTRL_DEPLOY_TRAIN_NNODES  train_pool nodes
+#   PIVOTRL_DEPLOY_TRAIN_NGPUS   gpus per train node
+#   PIVOTRL_DEPLOY_SHARED_NNODES   shared_rollout_pool nodes (0/unused for mode 2)
+#   PIVOTRL_DEPLOY_SHARED_NGPUS    gpus per shared node, or a Hydra list like [4, 8]
+#   PIVOTRL_DEPLOY_RM_NUM_REPLICAS  gen-RM num_replicas (non-elastic modes 1/4)
 #                                set to 0 to leave default
-#   PSRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
-#   PSRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
-#   PSRL_DEPLOY_TRAIN_BACKEND fsdp2|megatron (default: fsdp2)
-#   PSRL_DEPLOY_MEGATRON_TP   Megatron tensor parallel size
-#   PSRL_DEPLOY_MEGATRON_PP   Megatron pipeline parallel size
-#   PSRL_DEPLOY_MEGATRON_CP   Megatron context parallel size
-#   PSRL_DEPLOY_MEGATRON_EP   Megatron expert parallel size
-#   PSRL_DEPLOY_MEGATRON_ETP  Megatron expert tensor parallel size
-#   PSRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
+#   PIVOTRL_DEPLOY_SMOKE         0|1 (smoke test: 2 steps, small bsz)
+#   PIVOTRL_DEPLOY_DATASET       dapo|gsm8k|mixed (default: dapo; mixed is 1:1)
+#   PIVOTRL_DEPLOY_TRAIN_BACKEND fsdp2|megatron (default: fsdp2)
+#   PIVOTRL_DEPLOY_MEGATRON_TP   Megatron tensor parallel size
+#   PIVOTRL_DEPLOY_MEGATRON_PP   Megatron pipeline parallel size
+#   PIVOTRL_DEPLOY_MEGATRON_CP   Megatron context parallel size
+#   PIVOTRL_DEPLOY_MEGATRON_EP   Megatron expert parallel size
+#   PIVOTRL_DEPLOY_MEGATRON_ETP  Megatron expert tensor parallel size
+#   PIVOTRL_DEPLOY_EXTRA         space-separated extra hydra overrides appended last
 #
 # Optional positional args to launch_deployment_mode are forwarded to main_ppo.
 
-_psrl_total_gpus_from_node_spec() {
+_pivotrl_total_gpus_from_node_spec() {
     local ngpus_spec=$1
     local nnodes=$2
     local total=0
@@ -45,27 +45,27 @@ _psrl_total_gpus_from_node_spec() {
     if [[ "${ngpus_spec}" =~ ^\[(.*)\]$ ]]; then
         local values=${BASH_REMATCH[1]}
         values=${values// /}
-        IFS=',' read -ra _psrl_gpu_values <<< "${values}"
-        for value in "${_psrl_gpu_values[@]}"; do
+        IFS=',' read -ra _pivotrl_gpu_values <<< "${values}"
+        for value in "${_pivotrl_gpu_values[@]}"; do
             if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-                echo "Invalid GPU count '${value}' in PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}" >&2
+                echo "Invalid GPU count '${value}' in PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}" >&2
                 return 1
             fi
             total=$(( total + value ))
         done
-        if [[ "${#_psrl_gpu_values[@]}" -ne "${nnodes}" ]]; then
-            echo "PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec} has ${#_psrl_gpu_values[@]} entries, expected PSRL_DEPLOY_SHARED_NNODES=${nnodes}" >&2
+        if [[ "${#_pivotrl_gpu_values[@]}" -ne "${nnodes}" ]]; then
+            echo "PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec} has ${#_pivotrl_gpu_values[@]} entries, expected PIVOTRL_DEPLOY_SHARED_NNODES=${nnodes}" >&2
             return 1
         fi
         echo "${total}"
         return
     fi
 
-    echo "Invalid PSRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}; expected integer or Hydra list like [4, 8]" >&2
+    echo "Invalid PIVOTRL_DEPLOY_SHARED_NGPUS=${ngpus_spec}; expected integer or Hydra list like [4, 8]" >&2
     return 1
 }
 
-_psrl_vllm_ep_size_for_model() {
+_pivotrl_vllm_ep_size_for_model() {
     local model_path=$1
     local tp_size=$2
 
@@ -114,50 +114,50 @@ PY
 launch_deployment_mode() {
     set -xeuo pipefail
 
-    : "${PSRL_DEPLOY_MODE:?PSRL_DEPLOY_MODE must be set by the mode script}"
-    : "${PSRL_DEPLOY_EXPERIMENT:?PSRL_DEPLOY_EXPERIMENT must be set}"
-    : "${PSRL_DEPLOY_STALENESS:?PSRL_DEPLOY_STALENESS must be set}"
-    : "${PSRL_DEPLOY_RM_ASYNC:?PSRL_DEPLOY_RM_ASYNC must be set}"
-    : "${PSRL_DEPLOY_NNODES:?PSRL_DEPLOY_NNODES must be set}"
-    : "${PSRL_DEPLOY_TRAIN_NNODES:?PSRL_DEPLOY_TRAIN_NNODES must be set}"
-    : "${PSRL_DEPLOY_TRAIN_NGPUS:?PSRL_DEPLOY_TRAIN_NGPUS must be set}"
-    : "${PSRL_DEPLOY_SHARED_NNODES:?PSRL_DEPLOY_SHARED_NNODES must be set}"
-    : "${PSRL_DEPLOY_SHARED_NGPUS:?PSRL_DEPLOY_SHARED_NGPUS must be set}"
-    PSRL_DEPLOY_SMOKE=${PSRL_DEPLOY_SMOKE:-0}
-    # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-gsm8k}
-    # PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-dapo}
-    PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET:-mixed}
-    PSRL_DEPLOY_RM_NUM_REPLICAS=${PSRL_DEPLOY_RM_NUM_REPLICAS:-0}
-    PSRL_DEPLOY_TRAINER_READY_GRACE_S=${PSRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
-    PSRL_DEPLOY_EXTRA=${PSRL_DEPLOY_EXTRA:-}
-    PSRL_DEPLOY_TRAIN_BACKEND=${PSRL_DEPLOY_TRAIN_BACKEND:-fsdp2}
-    PSRL_DEPLOY_MEGATRON_TP=${PSRL_DEPLOY_MEGATRON_TP:-2}
-    PSRL_DEPLOY_MEGATRON_PP=${PSRL_DEPLOY_MEGATRON_PP:-2}
-    PSRL_DEPLOY_MEGATRON_CP=${PSRL_DEPLOY_MEGATRON_CP:-1}
-    PSRL_DEPLOY_MEGATRON_EP=${PSRL_DEPLOY_MEGATRON_EP:-1}
-    PSRL_DEPLOY_MEGATRON_ETP=${PSRL_DEPLOY_MEGATRON_ETP:-1}
-    PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU=${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU:-1}
-    PSRL_DEPLOY_MEGATRON_USE_MBRIDGE=${PSRL_DEPLOY_MEGATRON_USE_MBRIDGE:-True}
-    PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD:-False}
-    PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD=${PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD:-True}
-    PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD=${PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD:-True}
-    PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS=${PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS:-1}
-    PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF=${PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF:-0.01}
-    PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF=${PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF:-0.001}
-    if [[ -z "${PSRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
-        case "${PSRL_DEPLOY_MODE}" in
+    : "${PIVOTRL_DEPLOY_MODE:?PIVOTRL_DEPLOY_MODE must be set by the mode script}"
+    : "${PIVOTRL_DEPLOY_EXPERIMENT:?PIVOTRL_DEPLOY_EXPERIMENT must be set}"
+    : "${PIVOTRL_DEPLOY_STALENESS:?PIVOTRL_DEPLOY_STALENESS must be set}"
+    : "${PIVOTRL_DEPLOY_RM_ASYNC:?PIVOTRL_DEPLOY_RM_ASYNC must be set}"
+    : "${PIVOTRL_DEPLOY_NNODES:?PIVOTRL_DEPLOY_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_TRAIN_NNODES:?PIVOTRL_DEPLOY_TRAIN_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_TRAIN_NGPUS:?PIVOTRL_DEPLOY_TRAIN_NGPUS must be set}"
+    : "${PIVOTRL_DEPLOY_SHARED_NNODES:?PIVOTRL_DEPLOY_SHARED_NNODES must be set}"
+    : "${PIVOTRL_DEPLOY_SHARED_NGPUS:?PIVOTRL_DEPLOY_SHARED_NGPUS must be set}"
+    PIVOTRL_DEPLOY_SMOKE=${PIVOTRL_DEPLOY_SMOKE:-0}
+    # PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-gsm8k}
+    # PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-dapo}
+    PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET:-mixed}
+    PIVOTRL_DEPLOY_RM_NUM_REPLICAS=${PIVOTRL_DEPLOY_RM_NUM_REPLICAS:-0}
+    PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S=${PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S:-5}
+    PIVOTRL_DEPLOY_EXTRA=${PIVOTRL_DEPLOY_EXTRA:-}
+    PIVOTRL_DEPLOY_TRAIN_BACKEND=${PIVOTRL_DEPLOY_TRAIN_BACKEND:-fsdp2}
+    PIVOTRL_DEPLOY_MEGATRON_TP=${PIVOTRL_DEPLOY_MEGATRON_TP:-2}
+    PIVOTRL_DEPLOY_MEGATRON_PP=${PIVOTRL_DEPLOY_MEGATRON_PP:-2}
+    PIVOTRL_DEPLOY_MEGATRON_CP=${PIVOTRL_DEPLOY_MEGATRON_CP:-1}
+    PIVOTRL_DEPLOY_MEGATRON_EP=${PIVOTRL_DEPLOY_MEGATRON_EP:-1}
+    PIVOTRL_DEPLOY_MEGATRON_ETP=${PIVOTRL_DEPLOY_MEGATRON_ETP:-1}
+    PIVOTRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU=${PIVOTRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU:-1}
+    PIVOTRL_DEPLOY_MEGATRON_USE_MBRIDGE=${PIVOTRL_DEPLOY_MEGATRON_USE_MBRIDGE:-True}
+    PIVOTRL_DEPLOY_MEGATRON_PARAM_OFFLOAD=${PIVOTRL_DEPLOY_MEGATRON_PARAM_OFFLOAD:-False}
+    PIVOTRL_DEPLOY_MEGATRON_GRAD_OFFLOAD=${PIVOTRL_DEPLOY_MEGATRON_GRAD_OFFLOAD:-True}
+    PIVOTRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD=${PIVOTRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD:-True}
+    PIVOTRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS=${PIVOTRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS:-1}
+    PIVOTRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF=${PIVOTRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF:-0.01}
+    PIVOTRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF=${PIVOTRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF:-0.001}
+    if [[ -z "${PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD+x}" ]]; then
+        case "${PIVOTRL_DEPLOY_MODE}" in
             colocated|trainer_pool_only)
-                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=True
+                PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD=True
                 ;;
             *)
-                PSRL_DEPLOY_OPTIMIZER_OFFLOAD=False
+                PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD=False
                 ;;
         esac
     fi
 
-    PSRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl
+    PIVOTRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl
 
-    if [[ "${PSRL_DEPLOY_SMOKE}" == "1" ]]; then
+    if [[ "${PIVOTRL_DEPLOY_SMOKE}" == "1" ]]; then
         experiment_suffix="_smoke"
         total_training_steps=50
         test_freq=-1
@@ -175,7 +175,7 @@ launch_deployment_mode() {
         n_resp_per_prompt=16
     fi
 
-    case "${PSRL_DEPLOY_TRAIN_BACKEND}" in
+    case "${PIVOTRL_DEPLOY_TRAIN_BACKEND}" in
         fsdp|fsdp2)
             TRAINER_CONFIG_NAME=ppo_trainer
             train_backend_suffix=""
@@ -186,12 +186,12 @@ launch_deployment_mode() {
             export CUDA_DEVICE_MAX_CONNECTIONS=1
 
             for value in \
-                "${PSRL_DEPLOY_MEGATRON_TP}" \
-                "${PSRL_DEPLOY_MEGATRON_PP}" \
-                "${PSRL_DEPLOY_MEGATRON_CP}" \
-                "${PSRL_DEPLOY_MEGATRON_EP}" \
-                "${PSRL_DEPLOY_MEGATRON_ETP}" \
-                "${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}"; do
+                "${PIVOTRL_DEPLOY_MEGATRON_TP}" \
+                "${PIVOTRL_DEPLOY_MEGATRON_PP}" \
+                "${PIVOTRL_DEPLOY_MEGATRON_CP}" \
+                "${PIVOTRL_DEPLOY_MEGATRON_EP}" \
+                "${PIVOTRL_DEPLOY_MEGATRON_ETP}" \
+                "${PIVOTRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}"; do
                 if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
                     echo "Megatron parallel and micro-batch sizes must be positive integers, got '${value}'" >&2
                     return 1
@@ -199,7 +199,7 @@ launch_deployment_mode() {
             done
             ;;
         *)
-            echo "Invalid PSRL_DEPLOY_TRAIN_BACKEND=${PSRL_DEPLOY_TRAIN_BACKEND}; expected fsdp2 or megatron" >&2
+            echo "Invalid PIVOTRL_DEPLOY_TRAIN_BACKEND=${PIVOTRL_DEPLOY_TRAIN_BACKEND}; expected fsdp2 or megatron" >&2
             return 1
             ;;
     esac
@@ -208,21 +208,21 @@ launch_deployment_mode() {
     MODEL_NAME='Qwen2.5-32B'
     # RM_MODEL_NAME='DeepSeek-R1-Distill-Qwen-32B'
     RM_MODEL_NAME='Qwen3-30B-A3B-Thinking-2507'
-    experiment_name="${PSRL_DEPLOY_DATASET}_${PSRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${train_backend_suffix}${experiment_suffix}"
+    experiment_name="${PIVOTRL_DEPLOY_DATASET}_${PIVOTRL_DEPLOY_EXPERIMENT}_${MODEL_NAME}_${RM_MODEL_NAME}${train_backend_suffix}${experiment_suffix}"
 
-    source ${PSRL_WORKSPACE}/env/env_311.sh
+    source ${PIVOTRL_WORKSPACE}/env/env_311.sh
 
-    HOME=${PSRL_WORKSPACE}
-    PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
+    HOME=${PIVOTRL_WORKSPACE}
+    PIVOTRL_PATH=$(python -c "import pivotrl; import os; print(os.path.dirname(os.path.dirname(pivotrl.__file__)))")
     
-    HF_MODEL_PATH=${PSRL_WORKSPACE}/models/${MODEL_NAME}
-    RM_MODEL_PATH=${PSRL_WORKSPACE}/models/${RM_MODEL_NAME}
+    HF_MODEL_PATH=${PIVOTRL_WORKSPACE}/models/${MODEL_NAME}
+    RM_MODEL_PATH=${PIVOTRL_WORKSPACE}/models/${RM_MODEL_NAME}
 
-    # Data config (Hydra / OmegaConf), aligned with psrl/trainer/config/data/multi_datasets.yaml
-    GSM8K_TRAIN="${PSRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
-    GSM8K_TEST="${PSRL_WORKSPACE}/data/gsm8k_verl/test.parquet"
-    DAPO_TRAIN="${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"
-    DAPO_VAL="${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet"
+    # Data config (Hydra / OmegaConf), aligned with pivotrl/trainer/config/data/multi_datasets.yaml
+    GSM8K_TRAIN="${PIVOTRL_WORKSPACE}/data/gsm8k_verl/train.parquet"
+    GSM8K_TEST="${PIVOTRL_WORKSPACE}/data/gsm8k_verl/test.parquet"
+    DAPO_TRAIN="${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet"
+    DAPO_VAL="${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet"
 
     _DS_NAIVE="reward_fn_key:data_source,reward_loop_type:naive,reward_fn:default,reward_model_name:null,reward_coef:1.0"
     _DS_DAPO="reward_fn_key:data_source,reward_loop_type:dapo,reward_fn:default,reward_model_name:null,reward_coef:1.0"
@@ -234,7 +234,7 @@ launch_deployment_mode() {
     _ROW_VAL_GSM8K="{file:${GSM8K_TEST},prompt_key:prompt,reward_model_dicts:[{${_DS_NAIVE}}]}"
     _ROW_VAL_DAPO="{file:${DAPO_VAL},prompt_key:prompt,reward_model_dicts:[{${_DS_DAPO}}]}"
 
-    case "${PSRL_DEPLOY_DATASET}" in
+    case "${PIVOTRL_DEPLOY_DATASET}" in
         dapo)
             TRAIN_DATAS="[${_ROW_TRAIN_DAPO}]"
             VAL_DATAS="[${_ROW_VAL_DAPO}]"
@@ -251,7 +251,7 @@ launch_deployment_mode() {
             TRAIN_DATASETS_RATIOS='[0.5,0.5]'
             ;;
         *)
-            echo "Invalid PSRL_DEPLOY_DATASET=${PSRL_DEPLOY_DATASET}; expected dapo, gsm8k, or mixed" >&2
+            echo "Invalid PIVOTRL_DEPLOY_DATASET=${PIVOTRL_DEPLOY_DATASET}; expected dapo, gsm8k, or mixed" >&2
             return 1
             ;;
     esac
@@ -259,24 +259,24 @@ launch_deployment_mode() {
     # rollout settings
     GEN_TP=4
     GEN_PP=1
-    GEN_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
+    GEN_EP=$(_pivotrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${GEN_TP}")
     GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
     # reward-model rollout settings
     RM_TP=4
     RM_PP=1
-    RM_EP=$(_psrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
+    RM_EP=$(_pivotrl_vllm_ep_size_for_model "${RM_MODEL_PATH}" "${RM_TP}")
     RM_NGPUS_PER_NODE_PER_INSTANCE=$(( ${RM_TP} * ${RM_PP} ))
 
     # validation settings (on train_pool; does not use elastic path)
     VAL_TP=8
     VAL_PP=1
-    VAL_EP=$(_psrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
-    VAL_INSTANCES=$(( (${PSRL_DEPLOY_TRAIN_NNODES} * ${PSRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
+    VAL_EP=$(_pivotrl_vllm_ep_size_for_model "${HF_MODEL_PATH}" "${VAL_TP}")
+    VAL_INSTANCES=$(( (${PIVOTRL_DEPLOY_TRAIN_NNODES} * ${PIVOTRL_DEPLOY_TRAIN_NGPUS}) / ( ${VAL_TP} * ${VAL_PP} ) ))
     VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
     sp_size=1
-    fsdp_size=${PSRL_DEPLOY_TRAIN_NGPUS}
+    fsdp_size=${PIVOTRL_DEPLOY_TRAIN_NGPUS}
     use_dynamic_bsz=True
 
     adv_estimator=grpo
@@ -305,9 +305,9 @@ launch_deployment_mode() {
     rollout_is="token"
     rollout_is_threshold=2.0
 
-    offload=${PSRL_DEPLOY_OPTIMIZER_OFFLOAD}
+    offload=${PIVOTRL_DEPLOY_OPTIMIZER_OFFLOAD}
 
-    case "${PSRL_DEPLOY_TRAIN_BACKEND}" in
+    case "${PIVOTRL_DEPLOY_TRAIN_BACKEND}" in
         fsdp|fsdp2)
             TRAIN_BACKEND_ARGS=(
                 train_actor_rollout_ref.model.use_remove_padding=True
@@ -323,30 +323,30 @@ launch_deployment_mode() {
             TRAIN_BACKEND_ARGS=(
                 train_actor_rollout_ref.model.use_remove_padding=False
                 train_actor_rollout_ref.actor.use_dynamic_bsz=False
-                train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}
-                train_actor_rollout_ref.actor.megatron.param_offload=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
-                train_actor_rollout_ref.actor.megatron.grad_offload=${PSRL_DEPLOY_MEGATRON_GRAD_OFFLOAD}
-                train_actor_rollout_ref.actor.megatron.optimizer_offload=${PSRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD}
-                train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${PSRL_DEPLOY_MEGATRON_TP}
-                train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${PSRL_DEPLOY_MEGATRON_PP}
-                train_actor_rollout_ref.actor.megatron.context_parallel_size=${PSRL_DEPLOY_MEGATRON_CP}
-                train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${PSRL_DEPLOY_MEGATRON_EP}
-                train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${PSRL_DEPLOY_MEGATRON_ETP}
-                train_actor_rollout_ref.actor.megatron.use_mbridge=${PSRL_DEPLOY_MEGATRON_USE_MBRIDGE}
+                train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PIVOTRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}
+                train_actor_rollout_ref.actor.megatron.param_offload=${PIVOTRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.grad_offload=${PIVOTRL_DEPLOY_MEGATRON_GRAD_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.optimizer_offload=${PIVOTRL_DEPLOY_MEGATRON_OPTIMIZER_OFFLOAD}
+                train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_TP}
+                train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_PP}
+                train_actor_rollout_ref.actor.megatron.context_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_CP}
+                train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_EP}
+                train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_ETP}
+                train_actor_rollout_ref.actor.megatron.use_mbridge=${PIVOTRL_DEPLOY_MEGATRON_USE_MBRIDGE}
                 train_actor_rollout_ref.actor.megatron.use_remove_padding=False
                 train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
                 train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
-                train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=${PSRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS}
+                train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=${PIVOTRL_DEPLOY_MEGATRON_RECOMPUTE_NUM_LAYERS}
                 +train_actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
                 +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
-                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=${PSRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF}
-                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=${PSRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF}
-                train_actor_rollout_ref.ref.megatron.param_offload=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
-                train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${PSRL_DEPLOY_MEGATRON_TP}
-                train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${PSRL_DEPLOY_MEGATRON_PP}
-                train_actor_rollout_ref.ref.megatron.context_parallel_size=${PSRL_DEPLOY_MEGATRON_CP}
-                train_actor_rollout_ref.ref.megatron.expert_model_parallel_size=${PSRL_DEPLOY_MEGATRON_EP}
-                train_actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${PSRL_DEPLOY_MEGATRON_ETP}
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=${PIVOTRL_DEPLOY_MEGATRON_MOE_AUX_LOSS_COEFF}
+                +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=${PIVOTRL_DEPLOY_MEGATRON_MOE_Z_LOSS_COEFF}
+                train_actor_rollout_ref.ref.megatron.param_offload=${PIVOTRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
+                train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_TP}
+                train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_PP}
+                train_actor_rollout_ref.ref.megatron.context_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_CP}
+                train_actor_rollout_ref.ref.megatron.expert_model_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_EP}
+                train_actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${PIVOTRL_DEPLOY_MEGATRON_ETP}
             )
             ;;
     esac
@@ -372,9 +372,9 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.model.path=${RM_MODEL_PATH}
         reward_models_config.reward_models.2.model.use_shm=False
         reward_models_config.reward_models.2.model.trust_remote_code=False
-        reward_models_config.reward_models.2.rollout._target_=psrl.workers.config.RolloutConfig
+        reward_models_config.reward_models.2.rollout._target_=pivotrl.workers.config.RolloutConfig
         reward_models_config.reward_models.2.rollout.name=vllm
-        reward_models_config.reward_models.2.rollout.mode=psrl_async
+        reward_models_config.reward_models.2.rollout.mode=pivotrl_async
         reward_models_config.reward_models.2.rollout.disable_attn=False
         reward_models_config.reward_models.2.rollout.dtype=bfloat16
         reward_models_config.reward_models.2.rollout.gpu_memory_utilization=0.65
@@ -401,105 +401,105 @@ launch_deployment_mode() {
         reward_models_config.reward_models.2.sampling_config.top_k=-1
     )
 
-    mkdir -p "${PSRL_WORKSPACE}/logs/${project_name}"
+    mkdir -p "${PIVOTRL_WORKSPACE}/logs/${project_name}"
 
     # ---- Mode-derived deployment args ----
     DEPLOY_ARGS=(
-        psrl.deployment.mode=${PSRL_DEPLOY_MODE}
-        psrl.staleness=${PSRL_DEPLOY_STALENESS}
-        reward_models_config.launch_reward_fn_async=${PSRL_DEPLOY_RM_ASYNC}
-        psrl.deployment.elastic_rm.shared_nnodes=${PSRL_DEPLOY_SHARED_NNODES}
-        "psrl.deployment.elastic_rm.shared_ngpus_per_node=${PSRL_DEPLOY_SHARED_NGPUS}"
-        psrl.deployment.elastic_rm.trainer_ready_grace_s=${PSRL_DEPLOY_TRAINER_READY_GRACE_S}
-        psrl.deployment.train_nnodes=${PSRL_DEPLOY_TRAIN_NNODES}
-        psrl.deployment.train_ngpus_per_node=${PSRL_DEPLOY_TRAIN_NGPUS}
-        psrl.deployment.total_nnodes=${PSRL_DEPLOY_NNODES}
-        psrl.deployment.rollout_nnodes_per_instance=1
-        psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE}
-        psrl.deployment.n_validate_instances=${VAL_INSTANCES}
-        psrl.deployment.validate_nnodes_per_instance=1
-        psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE}
+        pivotrl.deployment.mode=${PIVOTRL_DEPLOY_MODE}
+        pivotrl.staleness=${PIVOTRL_DEPLOY_STALENESS}
+        reward_models_config.launch_reward_fn_async=${PIVOTRL_DEPLOY_RM_ASYNC}
+        pivotrl.deployment.elastic_rm.shared_nnodes=${PIVOTRL_DEPLOY_SHARED_NNODES}
+        "pivotrl.deployment.elastic_rm.shared_ngpus_per_node=${PIVOTRL_DEPLOY_SHARED_NGPUS}"
+        pivotrl.deployment.elastic_rm.trainer_ready_grace_s=${PIVOTRL_DEPLOY_TRAINER_READY_GRACE_S}
+        pivotrl.deployment.train_nnodes=${PIVOTRL_DEPLOY_TRAIN_NNODES}
+        pivotrl.deployment.train_ngpus_per_node=${PIVOTRL_DEPLOY_TRAIN_NGPUS}
+        pivotrl.deployment.total_nnodes=${PIVOTRL_DEPLOY_NNODES}
+        pivotrl.deployment.rollout_nnodes_per_instance=1
+        pivotrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE}
+        pivotrl.deployment.n_validate_instances=${VAL_INSTANCES}
+        pivotrl.deployment.validate_nnodes_per_instance=1
+        pivotrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE}
     )
 
     # Non-elastic modes (disaggregated, trainer_pool_only) use independent rollout
     # / reward pools; main_ppo needs an explicit n_rollout_instances and (for the
     # gen RM) num_replicas. Elastic modes auto-compute these from the pool sizes.
-    case "${PSRL_DEPLOY_MODE}" in
+    case "${PIVOTRL_DEPLOY_MODE}" in
         disaggregated|trainer_pool_only)
-            SHARED_TOTAL_NGPUS=$(_psrl_total_gpus_from_node_spec "${PSRL_DEPLOY_SHARED_NGPUS}" "${PSRL_DEPLOY_SHARED_NNODES}")
+            SHARED_TOTAL_NGPUS=$(_pivotrl_total_gpus_from_node_spec "${PIVOTRL_DEPLOY_SHARED_NGPUS}" "${PIVOTRL_DEPLOY_SHARED_NNODES}")
             N_ROLLOUT_INSTANCES=$(( SHARED_TOTAL_NGPUS / ( GEN_TP * GEN_PP ) ))
             DEPLOY_ARGS+=(
-                psrl.deployment.n_rollout_instances=${N_ROLLOUT_INSTANCES}
-                psrl.deployment.elastic_rm.enable=False
+                pivotrl.deployment.n_rollout_instances=${N_ROLLOUT_INSTANCES}
+                pivotrl.deployment.elastic_rm.enable=False
             )
-            if [[ "${PSRL_DEPLOY_RM_NUM_REPLICAS}" != "0" ]]; then
-                DEPLOY_ARGS+=( reward_models_config.reward_models.2.num_replicas=${PSRL_DEPLOY_RM_NUM_REPLICAS} )
+            if [[ "${PIVOTRL_DEPLOY_RM_NUM_REPLICAS}" != "0" ]]; then
+                DEPLOY_ARGS+=( reward_models_config.reward_models.2.num_replicas=${PIVOTRL_DEPLOY_RM_NUM_REPLICAS} )
             fi
             ;;
         colocated|rollout_rm_colocated|elastic_rl)
-            DEPLOY_ARGS+=( psrl.deployment.elastic_rm.enable=True )
+            DEPLOY_ARGS+=( pivotrl.deployment.elastic_rm.enable=True )
             ;;
         *)
-            echo "Unknown PSRL_DEPLOY_MODE=${PSRL_DEPLOY_MODE}" >&2
+            echo "Unknown PIVOTRL_DEPLOY_MODE=${PIVOTRL_DEPLOY_MODE}" >&2
             exit 1
             ;;
     esac
 
     # Modes 1-4 use simple routing with a practically unbounded preemption
     # waiting cap. Mode 5 keeps the stricter cap required by elastic scaling.
-    case "${PSRL_DEPLOY_MODE}" in
+    case "${PIVOTRL_DEPLOY_MODE}" in
         elastic_rl)
             ROUTING_ARGS=(
-                psrl.routing_strategy.method=throughput_optimal
-                psrl.routing_strategy.candidate_sort_indicator=reserve_capability
-                psrl.routing_strategy.enable_multi_priority_queue=True
-                psrl.routing_strategy.enable_group_sampling_on_multi_instances=True
-                psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_32b.json
-                psrl.routing_strategy.delta_throughput_threshold=0.2
-                psrl.routing_strategy.request_budget=1024
-                psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3
-                psrl.routing_strategy.max_concurrent_seqs_per_instance=512
+                pivotrl.routing_strategy.method=throughput_optimal
+                pivotrl.routing_strategy.candidate_sort_indicator=reserve_capability
+                pivotrl.routing_strategy.enable_multi_priority_queue=True
+                pivotrl.routing_strategy.enable_group_sampling_on_multi_instances=True
+                pivotrl.routing_strategy.cost_model_path=${PIVOTRL_PATH}/pivotrl/trainer/config/cost_model/qwen_32b.json
+                pivotrl.routing_strategy.delta_throughput_threshold=0.2
+                pivotrl.routing_strategy.request_budget=1024
+                pivotrl.routing_strategy.max_num_waiting_reqs_after_preemption=3
+                pivotrl.routing_strategy.max_concurrent_seqs_per_instance=512
             )
             ;;
         disaggregated|colocated|rollout_rm_colocated|trainer_pool_only)
             ROUTING_ARGS=(
-                psrl.routing_strategy.method=round_robin
-                psrl.routing_strategy.candidate_sort_indicator=version
-                psrl.routing_strategy.enable_multi_priority_queue=False
-                psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000
-                ++gen_actor_rollout_ref.rollout.use_psrl_scheduler=True
+                pivotrl.routing_strategy.method=round_robin
+                pivotrl.routing_strategy.candidate_sort_indicator=version
+                pivotrl.routing_strategy.enable_multi_priority_queue=False
+                pivotrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000
+                ++gen_actor_rollout_ref.rollout.use_pivotrl_scheduler=True
                 ++reward_models_config.reward_models.2.routing_strategy.method=round_robin
-                ++reward_models_config.reward_models.2.rollout.use_psrl_scheduler=True
+                ++reward_models_config.reward_models.2.rollout.use_pivotrl_scheduler=True
             )
             ;;
     esac
 
     # Extra mode-specific overrides (space-separated string) split into args.
-    if [[ -n "${PSRL_DEPLOY_EXTRA}" ]]; then
+    if [[ -n "${PIVOTRL_DEPLOY_EXTRA}" ]]; then
         # shellcheck disable=SC2206
-        DEPLOY_ARGS+=( ${PSRL_DEPLOY_EXTRA} )
+        DEPLOY_ARGS+=( ${PIVOTRL_DEPLOY_EXTRA} )
     fi
 
-    PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
+    PYTHONUNBUFFERED=1 python -m pivotrl.trainer.main_ppo \
         --config-name="${TRAINER_CONFIG_NAME}" \
-        psrl.ps_manager_ip=${LOCAL_IP} \
-        psrl.reward_service_ip=${LOCAL_IP} \
-        psrl.rollout_n=${n_resp_per_prompt} \
-        psrl.staleness_buffer_entries=${train_prompt_bsz} \
-        psrl.ps_mode=nixl_cpu \
-        psrl.logging_path=${PSRL_PATH}/logs/${project_name}/${experiment_name} \
+        pivotrl.ps_manager_ip=${LOCAL_IP} \
+        pivotrl.reward_service_ip=${LOCAL_IP} \
+        pivotrl.rollout_n=${n_resp_per_prompt} \
+        pivotrl.staleness_buffer_entries=${train_prompt_bsz} \
+        pivotrl.ps_mode=nixl_cpu \
+        pivotrl.logging_path=${PIVOTRL_PATH}/logs/${project_name}/${experiment_name} \
         \
         "${DEPLOY_ARGS[@]}" \
         \
-        psrl.log_prob.enable_rollout_engine_log_prob=True \
-        psrl.colocate_validate_and_train=False \
-        psrl.fuse_rollout_with_validate=True \
+        pivotrl.log_prob.enable_rollout_engine_log_prob=True \
+        pivotrl.colocate_validate_and_train=False \
+        pivotrl.fuse_rollout_with_validate=True \
         \
-        psrl.nixl.server_port=23456 \
-        psrl.group_post_process.enable=False \
-        psrl.group_post_process.name=dynamic_sampling_filter \
-        psrl.redundant_rollout.enable=False \
-        psrl.partial_rollout.enable=True \
+        pivotrl.nixl.server_port=23456 \
+        pivotrl.group_post_process.enable=False \
+        pivotrl.group_post_process.name=dynamic_sampling_filter \
+        pivotrl.redundant_rollout.enable=False \
+        pivotrl.partial_rollout.enable=True \
         \
         "${ROUTING_ARGS[@]}" \
         \
@@ -558,8 +558,8 @@ launch_deployment_mode() {
         algorithm.kl_ctrl.kl_coef=${kl_coef} \
         algorithm.rollout_correction.rollout_is=${rollout_is} \
         algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
-        psrl.proactive_filter_strategy.method="retry" \
-        psrl.proactive_filter_strategy.threshold=0 \
+        pivotrl.proactive_filter_strategy.method="retry" \
+        pivotrl.proactive_filter_strategy.threshold=0 \
         \
         trainer.logger='["console", "wandb"]' \
         +trainer.wandb_proxy=http://star-proxy.oa.com:3128 \
@@ -571,5 +571,5 @@ launch_deployment_mode() {
         trainer.total_epochs=1 \
         trainer.total_training_steps=${total_training_steps} \
         "$@" \
-        2>&1 | tee ${PSRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
+        2>&1 | tee ${PIVOTRL_WORKSPACE}/logs/${experiment_name}_${LOCAL_IP}.log
 }

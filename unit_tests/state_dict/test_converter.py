@@ -21,9 +21,9 @@ from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
-from psrl.utils.converter.base_converter import BaseConverter
-from psrl.utils.converter.hf_converter import HFConverter, convert_hf_inplace
-from psrl.utils.converter.model_mappings import (
+from pivotrl.utils.converter.base_converter import BaseConverter
+from pivotrl.utils.converter.hf_converter import HFConverter, convert_hf_inplace
+from pivotrl.utils.converter.model_mappings import (
     ParameterMapping,
     create_parameter_mapping,
     model_registry,
@@ -31,9 +31,9 @@ from psrl.utils.converter.model_mappings import (
     reshape_qkv_to_3d,
     slice_qkv_proj,
 )
-from psrl.utils.converter.modeling.fsdp_modeling import FSDPParameterMapping
-from psrl.utils.converter.modeling.hf_modeling import HFParameterMapping
-from psrl.utils.nixl.nixl_spec import NIXLSharding
+from pivotrl.utils.converter.modeling.fsdp_modeling import FSDPParameterMapping
+from pivotrl.utils.converter.modeling.hf_modeling import HFParameterMapping
+from pivotrl.utils.nixl.nixl_spec import NIXLSharding
 from torch.nn import Parameter
 
 # ---------------------------------------------------------------------------

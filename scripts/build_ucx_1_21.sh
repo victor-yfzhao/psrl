@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UCX_VERSION="${UCX_VERSION:-v1.21.0}"
 MAX_JOBS="${MAX_JOBS:-32}"
 CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
-BUILD_ROOT="${UCX_BUILD_ROOT:-/tmp/psrl-ucx-1.21}"
+BUILD_ROOT="${UCX_BUILD_ROOT:-/tmp/pivotrl-ucx-1.21}"
 PREFIX="${UCX_PREFIX:-${REPO_ROOT}/third_party/ucx_1_21}"
 DESTDIR="${UCX_DESTDIR:-}"
 SOURCE_DIR="${BUILD_ROOT}/ucx"
@@ -40,7 +40,7 @@ cd build
 make -j "${MAX_JOBS}"
 make ${DESTDIR:+DESTDIR="${DESTDIR}"} install-strip
 INSTALL_PREFIX="${DESTDIR}${PREFIX}"
-touch "${INSTALL_PREFIX}/.psrl-ucx-1.21-complete"
+touch "${INSTALL_PREFIX}/.pivotrl-ucx-1.21-complete"
 echo "Built upstream UCX ${UCX_VERSION} with UCP_WORKER_MAX_RKEY_CONFIG=UINT16_MAX"
 echo "prefix=${PREFIX}"
 if [[ -z "${DESTDIR}" ]]; then

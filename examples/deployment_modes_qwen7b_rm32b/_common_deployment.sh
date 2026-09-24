@@ -6,10 +6,10 @@ HETERO_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd
 # shellcheck disable=SC1091
 source "${HETERO_SCRIPT_DIR}/../deployment_modes/_common_deployment.sh"
 
-export PSRL_DEPLOY_MODEL_NAME=Qwen2.5-7B
-export PSRL_DEPLOY_RM_MODEL_NAME=Qwen3-30B-A3B-Thinking-2507
-export PSRL_DEPLOY_ROLLOUT_TP=1
-export PSRL_DEPLOY_RM_TP=4
+export PIVOTRL_DEPLOY_MODEL_NAME=Qwen2.5-7B
+export PIVOTRL_DEPLOY_RM_MODEL_NAME=Qwen3-30B-A3B-Thinking-2507
+export PIVOTRL_DEPLOY_ROLLOUT_TP=1
+export PIVOTRL_DEPLOY_RM_TP=4
 
 launch_qwen7b_rm32b_deployment_mode() {
     launch_deployment_mode \

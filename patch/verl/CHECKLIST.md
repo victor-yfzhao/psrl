@@ -4,14 +4,14 @@ This document lists the key components and methods that need to be checked and v
 
 ## Train Workers
 
-### PSRL_MegatronTrainWorker
+### PivotRL_MegatronTrainWorker
 
 Methods to check:
 
 - `__init__`
 - `compute_log_prob`
 
-### PSRL_FSDPTrainWorker
+### PivotRL_FSDPTrainWorker
 
 Methods to check:
 
@@ -19,7 +19,7 @@ Methods to check:
 
 ## Generation Workers
 
-### PSRL_GenWorker
+### PivotRL_GenWorker
 
 Methods to check:
 
@@ -27,7 +27,7 @@ Methods to check:
 
 ## Rollout Components
 
-### PSRL_vLLMRollout
+### PivotRL_vLLMRollout
 
 Methods to check:
 
@@ -43,7 +43,7 @@ Methods to check:
 
 ## Ray PPO Trainer
 
-### PSRL_RayPPOTrainer
+### PivotRL_RayPPOTrainer
 
 Methods to check:
 

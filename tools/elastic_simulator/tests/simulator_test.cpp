@@ -10,13 +10,13 @@
 
 namespace {
 
-using psrl::elastic_simulator::evaluate_role_candidate;
-using psrl::elastic_simulator::InstanceSnapshot;
-using psrl::elastic_simulator::prepare_role_evaluation_context;
-using psrl::elastic_simulator::RequestSnapshot;
-using psrl::elastic_simulator::RoleCandidatePlan;
-using psrl::elastic_simulator::RoleSnapshot;
-using psrl::elastic_simulator::RoutingStrategy;
+using pivotrl::elastic_simulator::evaluate_role_candidate;
+using pivotrl::elastic_simulator::InstanceSnapshot;
+using pivotrl::elastic_simulator::prepare_role_evaluation_context;
+using pivotrl::elastic_simulator::RequestSnapshot;
+using pivotrl::elastic_simulator::RoleCandidatePlan;
+using pivotrl::elastic_simulator::RoleSnapshot;
+using pivotrl::elastic_simulator::RoutingStrategy;
 
 void check(bool condition, const std::string &message) {
   if (!condition) {

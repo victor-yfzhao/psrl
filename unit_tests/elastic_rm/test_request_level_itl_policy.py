@@ -1,24 +1,24 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-import psrl.utils.elastic_rm.itl_scaling_policy as itl_policy_module
+import pivotrl.utils.elastic_rm.itl_scaling_policy as itl_policy_module
 import pytest
-from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.elastic_rm.cpp_candidate_evaluator import (
+from pivotrl.trainer.ppo.utils import PivotRL_Role
+from pivotrl.utils.elastic_rm.cpp_candidate_evaluator import (
     CppBatchEvaluation,
     CppCandidateEvaluatorError,
 )
-from psrl.utils.elastic_rm.itl_harmonic_scaling_policy import (
+from pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy import (
     ITLHarmonicScalingPolicy,
 )
-from psrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy, _ITLCandidate
-from psrl.utils.elastic_rm.request_level_candidate_evaluator import RoleCandidatePlan
-from psrl.utils.elastic_rm.scaling_policy import InstanceSignal, ScalingAction
+from pivotrl.utils.elastic_rm.itl_scaling_policy import ITLScalingPolicy, _ITLCandidate
+from pivotrl.utils.elastic_rm.request_level_candidate_evaluator import RoleCandidatePlan
+from pivotrl.utils.elastic_rm.scaling_policy import InstanceSignal, ScalingAction
 
 
 def _config(rollout_method="throughput_optimal", rm_method="itl"):
     return SimpleNamespace(
-        psrl=SimpleNamespace(
+        pivotrl=SimpleNamespace(
             logging_path="/tmp",
             routing_strategy=SimpleNamespace(method=rollout_method),
         ),
@@ -148,17 +148,17 @@ def _instance(instance_id, *, awake, requests):
 
 def _fixture():
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=13),
-        _signal(PSRL_Role.Rollout, 1, awake=False),
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=1, tokens=1),
-        _signal(PSRL_Role.RewardModel, 1, awake=False),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=13),
+        _signal(PivotRL_Role.Rollout, 1, awake=False),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=1, tokens=1),
+        _signal(PivotRL_Role.RewardModel, 1, awake=False),
     ]
     grouped = {
-        PSRL_Role.Rollout: signals[:2],
-        PSRL_Role.RewardModel: signals[2:],
+        PivotRL_Role.Rollout: signals[:2],
+        PivotRL_Role.RewardModel: signals[2:],
     }
     snapshots = {
-        PSRL_Role.Rollout: {
+        PivotRL_Role.Rollout: {
             "role": "Rollout",
             "strategy": "throughput_optimal",
             "instances": [
@@ -168,7 +168,7 @@ def _fixture():
             "pending_requests": [],
             "max_concurrent_requests": 32,
         },
-        PSRL_Role.RewardModel: {
+        PivotRL_Role.RewardModel: {
             "role": "RewardModel",
             "strategy": "itl",
             "instances": [
@@ -182,7 +182,7 @@ def _fixture():
     candidate = _ITLCandidate(
         action=ScalingAction(
             action_type="scale_up",
-            role_name=PSRL_Role.Rollout,
+            role_name=PivotRL_Role.Rollout,
             model_name="model",
             num_instances=1,
             preferred_instance_ids=[1],
@@ -219,7 +219,7 @@ def test_request_level_policy_scores_candidate_and_attaches_rebalance_plan():
 def test_harmonic_decide_records_planner_phase_breakdown():
     policy = _policy(max_workers=2, policy_cls=ITLHarmonicScalingPolicy)
     grouped, snapshots, _ = _fixture()
-    signals = grouped[PSRL_Role.Rollout] + grouped[PSRL_Role.RewardModel]
+    signals = grouped[PivotRL_Role.Rollout] + grouped[PivotRL_Role.RewardModel]
     try:
         policy.decide(
             signals,
@@ -258,11 +258,11 @@ def test_harmonic_decide_records_planner_phase_breakdown():
 def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
     policy = _policy(max_workers=2, min_awake_per_role=0)
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=1, tokens=1),
-        _signal(PSRL_Role.RewardModel, 0, awake=False),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=1, tokens=1),
+        _signal(PivotRL_Role.RewardModel, 0, awake=False),
     ]
     snapshots = {
-        PSRL_Role.Rollout: {
+        PivotRL_Role.Rollout: {
             "role": "Rollout",
             "strategy": "throughput_optimal",
             "instances": [
@@ -271,7 +271,7 @@ def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
             "pending_requests": [],
             "max_concurrent_requests": 32,
         },
-        PSRL_Role.RewardModel: {
+        PivotRL_Role.RewardModel: {
             "role": "RewardModel",
             "strategy": "itl",
             "instances": [
@@ -286,7 +286,7 @@ def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
     candidate = _ITLCandidate(
         action=ScalingAction(
             action_type="scale_up",
-            role_name=PSRL_Role.RewardModel,
+            role_name=PivotRL_Role.RewardModel,
             model_name="model",
             num_instances=1,
             preferred_instance_ids=[0],
@@ -304,7 +304,7 @@ def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
     try:
         decision = policy.decide(
             signals,
-            router_backlog_by_role={PSRL_Role.RewardModel: {"request_count": 1, "token_count": 1}},
+            router_backlog_by_role={PivotRL_Role.RewardModel: {"request_count": 1, "token_count": 1}},
             request_level_snapshots_by_role=snapshots,
         )
     finally:
@@ -315,7 +315,7 @@ def test_request_level_policy_selects_scale_up_from_zero_awake_rm(monkeypatch):
     assert candidate.current_throughput == 0.0
     assert candidate.next_throughput > 0.0
     assert candidate.request_level_results_by_role is not None
-    assert candidate.request_level_results_by_role[PSRL_Role.RewardModel].routed_count == 1
+    assert candidate.request_level_results_by_role[PivotRL_Role.RewardModel].routed_count == 1
 
 
 def test_request_level_switch_preserves_candidate_construction_and_phi():
@@ -378,7 +378,7 @@ def test_request_level_candidate_results_are_independent_of_worker_count():
 def test_request_level_policy_rejects_missing_snapshot_for_whole_cycle():
     policy = _policy()
     grouped, _, _ = _fixture()
-    signals = grouped[PSRL_Role.Rollout] + grouped[PSRL_Role.RewardModel]
+    signals = grouped[PivotRL_Role.Rollout] + grouped[PivotRL_Role.RewardModel]
     try:
         decision = policy.decide(
             signals,
@@ -502,7 +502,7 @@ def test_request_level_policy_propagates_cpp_backend_failure(monkeypatch):
     )
     policy = _policy(candidate_backend="cpp", cpp_binary="/fake/elastic_simulator")
     grouped, snapshots, _ = _fixture()
-    signals = grouped[PSRL_Role.Rollout] + grouped[PSRL_Role.RewardModel]
+    signals = grouped[PivotRL_Role.Rollout] + grouped[PivotRL_Role.RewardModel]
     try:
         with pytest.raises(CppCandidateEvaluatorError, match="exited with code 1"):
             policy.decide(

@@ -21,8 +21,8 @@ from vllm.utils.torch_utils import weak_ref_tensors
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+pivotrl_logger = logging.getLogger(__file__)
+pivotrl_logger.setLevel(os.getenv("PIVOTRL_LOGGING_LEVEL", "WARN"))
 
 
 @min_vllm_version("0.18.1")
@@ -66,7 +66,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                psrl_logger.debug(
+                pivotrl_logger.debug(
                     "Capturing a cudagraph on (%s,%s)",
                     self.runtime_mode.name,
                     entry.batch_descriptor,

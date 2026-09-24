@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-# Importing PSRL's NIXL package otherwise creates a Ray actor at module load.
+# Importing PivotRL's NIXL package otherwise creates a Ray actor at module load.
 if "ray" not in sys.modules:
     _ray = types.ModuleType("ray")
     _ray_actor = types.ModuleType("ray.actor")
@@ -38,7 +38,7 @@ if "ray" not in sys.modules:
     _ray.remote = _remote_decorator
     sys.modules["ray"] = _ray
 
-from psrl.utils.converter.param_sync import (
+from pivotrl.utils.converter.param_sync import (
     DTypeCastSync,
     ParamSyncPlan,
     ZeroCenteredGammaSync,
@@ -59,22 +59,22 @@ def _load_workspace_module(module_name: str, relative_path: str):
 
 vLLMWorkerExtension = _load_workspace_module(
     "_qwen35_test_vllm_extension",
-    "psrl/workers/gen/vllm_extension.py",
+    "pivotrl/workers/gen/vllm_extension.py",
 ).vLLMWorkerExtension
-PSRL_BaseTrainWorker = _load_workspace_module(
+PivotRL_BaseTrainWorker = _load_workspace_module(
     "_qwen35_test_base_train_worker",
-    "psrl/workers/train/base_train_worker.py",
-).PSRL_BaseTrainWorker
+    "pivotrl/workers/train/base_train_worker.py",
+).PivotRL_BaseTrainWorker
 
 GAMMA_KEY = "model.language_model.layers.0.linear_attn.norm.weight"
 A_LOG_KEY = "model.language_model.layers.0.linear_attn.A_log"
 
 
 def _make_train_worker(state_dict, sync_plan):
-    worker = object.__new__(PSRL_BaseTrainWorker)
+    worker = object.__new__(PivotRL_BaseTrainWorker)
     worker.worker_rank = 0
     worker.pull_times = 0
-    worker.psrl_config = SimpleNamespace(ps_mode="nixl_cpu")
+    worker.pivotrl_config = SimpleNamespace(ps_mode="nixl_cpu")
     worker.train_interface = SimpleNamespace(ps_manager_handle=None)
     worker._cached_ps_nixl_agent_names = ["ps_agent"]
     worker._cached_ps_nixl_train_storage_client_names = ["ps_client"]

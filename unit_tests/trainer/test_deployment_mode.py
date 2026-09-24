@@ -1,13 +1,13 @@
 """Unit tests for lightweight deployment-mode resolution and validation.
 
-Verifies that each `psrl.deployment.mode` value resolves to the expected
+Verifies that each `pivotrl.deployment.mode` value resolves to the expected
 `elastic_rm` flag combination and that backward-compat inference (mode=null)
 preserves legacy behavior.
 """
 
 import pytest
 from omegaconf import OmegaConf
-from psrl.utils.deployment_mode import (
+from pivotrl.utils.deployment_mode import (
     expand_ngpus_per_node,
     resolve_deployment_mode,
     validate_trainer_sleep_optimizer_offload,
@@ -26,7 +26,7 @@ def _make_config(
 ):
     cfg = OmegaConf.create(
         {
-            "psrl": {
+            "pivotrl": {
                 "colocate": colocate,
                 "colocate_validate_and_train": colocate_validate_and_train,
                 "deployment": {
@@ -55,7 +55,7 @@ def _make_config(
 
 
 def _resolved(cfg):
-    return resolve_deployment_mode(cfg), cfg.psrl.deployment.elastic_rm
+    return resolve_deployment_mode(cfg), cfg.pivotrl.deployment.elastic_rm
 
 
 def test_disaggregated():

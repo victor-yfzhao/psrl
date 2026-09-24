@@ -1,6 +1,6 @@
-# PSRL
+# PivotRL
 
-PSRL is a post-training framework for LLMs that supports both synchronous and asynchronous training paradigms through staleness control, streaming rollout and parameter server architecture.
+PivotRL is a post-training framework for LLMs that supports both synchronous and asynchronous training paradigms through staleness control, streaming rollout and parameter server architecture.
 
 ## Quick Start
 
@@ -15,8 +15,8 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 
 ```bash
 # Use conda to manage the environment
-conda create -n psrl python=3.11
-conda activate psrl
+conda create -n pivotrl python=3.11
+conda activate pivotrl
 
 # Install all dependencies (including NIXL and Megatron)
 # If you have an existing **editable** vLLM or veRL installation,
@@ -26,7 +26,7 @@ bash scripts/install_nixl.sh
 bash scripts/install_megatron.sh
 bash scripts/install_tms.sh
 
-# Install PSRL
+# Install PivotRL
 pip install -e .
 ```
 
@@ -46,9 +46,9 @@ As an example, you can run the following command to start training:
 bash examples/ppo_trainer/fsdp/train.sh
 ```
 
-## Contributing to PSRL
+## Contributing to PivotRL
 
-PSRL is open to everyone and welcomes all kinds of contributions! Please feel free to submit an Issue or PR. Before contributing, please use [pre-commit](https://pre-commit.com/#usage) to lint and format the codebase:
+PivotRL is open to everyone and welcomes all kinds of contributions! Please feel free to submit an Issue or PR. Before contributing, please use [pre-commit](https://pre-commit.com/#usage) to lint and format the codebase:
 
 ```bash
 uv pip install pre-commit
@@ -63,6 +63,6 @@ pre-commit run
 
 ## Acknowledgements
 
-PSRL is built upon the foundations of [verl](https://github.com/volcengine/verl), an open-source RLHF framework from ByteDance Seed.
+PivotRL is built upon the foundations of [verl](https://github.com/volcengine/verl), an open-source RLHF framework from ByteDance Seed.
 
 We also appreciate all the pioneering and inspirable projects from the community, including but not limited to vLLM, OpenRLHF, AReaL and NeMo-RL.

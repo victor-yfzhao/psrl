@@ -53,30 +53,30 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common_deployment.sh"
 
-export PSRL_DEPLOY_MODE=elastic_rl
-export PSRL_DEPLOY_EXPERIMENT="mode6_ablation_${POLICY}_cost${USE_COST_MODEL}_rebalance${USE_REBALANCE}_interrupt${INTERRUPT_VLLM_WAITING}"
-export PSRL_DEPLOY_STALENESS=${STALENESS:-2}
-export PSRL_DEPLOY_RM_ASYNC=False
-export PSRL_DEPLOY_NNODES=4
-export PSRL_DEPLOY_TRAIN_NNODES=2
-export PSRL_DEPLOY_TRAIN_NGPUS=8
-export PSRL_DEPLOY_SHARED_NNODES=2
-export PSRL_DEPLOY_SHARED_NGPUS=8
-export PSRL_DEPLOY_RM_NUM_REPLICAS=0
-export PSRL_DEPLOY_SMOKE=${1:-0}
-export PSRL_NEED_VALIDATION=${PSRL_NEED_VALIDATION:-0}
+export PIVOTRL_DEPLOY_MODE=elastic_rl
+export PIVOTRL_DEPLOY_EXPERIMENT="mode6_ablation_${POLICY}_cost${USE_COST_MODEL}_rebalance${USE_REBALANCE}_interrupt${INTERRUPT_VLLM_WAITING}"
+export PIVOTRL_DEPLOY_STALENESS=${STALENESS:-2}
+export PIVOTRL_DEPLOY_RM_ASYNC=False
+export PIVOTRL_DEPLOY_NNODES=4
+export PIVOTRL_DEPLOY_TRAIN_NNODES=2
+export PIVOTRL_DEPLOY_TRAIN_NGPUS=8
+export PIVOTRL_DEPLOY_SHARED_NNODES=2
+export PIVOTRL_DEPLOY_SHARED_NGPUS=8
+export PIVOTRL_DEPLOY_RM_NUM_REPLICAS=0
+export PIVOTRL_DEPLOY_SMOKE=${1:-0}
+export PIVOTRL_NEED_VALIDATION=${PIVOTRL_NEED_VALIDATION:-0}
 shift || true
 
-COST_MODEL_DIR=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/psrl/trainer/config/cost_model
+COST_MODEL_DIR=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model
 # Rollout routing in parent _common_deployment.sh points at qwen2.5_1.5b.json.
 # This folder's model is Qwen2.5-7B; pass the matching file last so it wins.
 ROLLOUT_COST_MODEL="${COST_MODEL_DIR}/qwen2.5_7b.json"
 RM_COST_MODEL="${COST_MODEL_DIR}/qwen3_30b_a3b_thinking_2507.json"
 
 if [[ "${USE_COST_MODEL}" == "1" ]]; then
-    COST_MODEL_OVERRIDE="psrl.deployment.elastic_rm.itl_policy.cost_model_path=${COST_MODEL_DIR}"
+    COST_MODEL_OVERRIDE="pivotrl.deployment.elastic_rm.itl_policy.cost_model_path=${COST_MODEL_DIR}"
 else
-    COST_MODEL_OVERRIDE="psrl.deployment.elastic_rm.itl_policy.cost_model_path=null"
+    COST_MODEL_OVERRIDE="pivotrl.deployment.elastic_rm.itl_policy.cost_model_path=null"
 fi
 
 REQUEST_LEVEL_OVERRIDE="true"
@@ -92,26 +92,26 @@ else
     INTERRUPT_WAITING_OVERRIDE="false"
 fi
 
-export PSRL_DEPLOY_EXTRA="\
-psrl.deployment.elastic_rm.enable_policy=True \
-psrl.deployment.elastic_rm.scaling_policy_variant=${POLICY} \
-psrl.deployment.elastic_rm.enable_trainer_pool=True \
-psrl.deployment.elastic_rm.min_awake_per_role=0 \
-psrl.deployment.elastic_rm.cooldown_ms=10000 \
-psrl.deployment.elastic_rm.hysteresis=0.05 \
-psrl.deployment.elastic_rm.monitor_interval_ms=1000 \
-psrl.deployment.elastic_rm.wakeup_immunity_ms=10000 \
-psrl.deployment.elastic_rm.interrupt_vllm_waiting_when_running_only=${INTERRUPT_WAITING_OVERRIDE} \
-psrl.deployment.elastic_rm.itl_policy.decision_window_s=60.0 \
-psrl.deployment.elastic_rm.itl_policy.throughput_objective=sum \
-psrl.deployment.elastic_rm.itl_policy.max_scale_instances_per_action=32 \
-psrl.deployment.elastic_rm.itl_policy.router_waiting_top_t=-1 \
-psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_enable=true \
-psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_basis=request_count \
-psrl.deployment.elastic_rm.itl_policy.role_throughput_weight_mode=raw \
-psrl.deployment.elastic_rm.itl_policy.enable_heterogeneous_parallelism_candidates=true \
-psrl.deployment.elastic_rm.itl_policy.enable_request_level_candidate_evaluation=${REQUEST_LEVEL_OVERRIDE} \
-psrl.deployment.elastic_rm.itl_policy.rebalance_after_scale_up=${REBALANCE_OVERRIDE} \
+export PIVOTRL_DEPLOY_EXTRA="\
+pivotrl.deployment.elastic_rm.enable_policy=True \
+pivotrl.deployment.elastic_rm.scaling_policy_variant=${POLICY} \
+pivotrl.deployment.elastic_rm.enable_trainer_pool=True \
+pivotrl.deployment.elastic_rm.min_awake_per_role=0 \
+pivotrl.deployment.elastic_rm.cooldown_ms=10000 \
+pivotrl.deployment.elastic_rm.hysteresis=0.05 \
+pivotrl.deployment.elastic_rm.monitor_interval_ms=1000 \
+pivotrl.deployment.elastic_rm.wakeup_immunity_ms=10000 \
+pivotrl.deployment.elastic_rm.interrupt_vllm_waiting_when_running_only=${INTERRUPT_WAITING_OVERRIDE} \
+pivotrl.deployment.elastic_rm.itl_policy.decision_window_s=60.0 \
+pivotrl.deployment.elastic_rm.itl_policy.throughput_objective=sum \
+pivotrl.deployment.elastic_rm.itl_policy.max_scale_instances_per_action=32 \
+pivotrl.deployment.elastic_rm.itl_policy.router_waiting_top_t=-1 \
+pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_enable=true \
+pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_basis=request_count \
+pivotrl.deployment.elastic_rm.itl_policy.role_throughput_weight_mode=raw \
+pivotrl.deployment.elastic_rm.itl_policy.enable_heterogeneous_parallelism_candidates=true \
+pivotrl.deployment.elastic_rm.itl_policy.enable_request_level_candidate_evaluation=${REQUEST_LEVEL_OVERRIDE} \
+pivotrl.deployment.elastic_rm.itl_policy.rebalance_after_scale_up=${REBALANCE_OVERRIDE} \
 ${COST_MODEL_OVERRIDE} \
 +reward_models_config.reward_models.2.routing_strategy.method=itl \
 +reward_models_config.reward_models.2.routing_strategy.cost_model_path=${RM_COST_MODEL} \
@@ -124,5 +124,5 @@ ${COST_MODEL_OVERRIDE} \
 echo "mode6 ablation: POLICY=${POLICY} USE_COST_MODEL=${USE_COST_MODEL} USE_REBALANCE=${USE_REBALANCE} INTERRUPT_VLLM_WAITING=${INTERRUPT_VLLM_WAITING}"
 
 launch_deployment_mode \
-    psrl.routing_strategy.cost_model_path=${ROLLOUT_COST_MODEL} \
+    pivotrl.routing_strategy.cost_model_path=${ROLLOUT_COST_MODEL} \
     "$@"

@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from psrl.workers.ps.ps_manager import PSManager
-from psrl.workers.ps.staleness_controller import EntryInfo, StalenessInventory
+from pivotrl.workers.ps.ps_manager import PSManager
+from pivotrl.workers.ps.staleness_controller import EntryInfo, StalenessInventory
 
 
 def _validation_entry(prompt_id: int) -> EntryInfo:
@@ -45,7 +45,7 @@ def test_validation_reserve_indicator_uses_capacity_without_version_arithmetic()
     manager.val_rollout_n = 1
     manager.max_aborted_version = 100
     manager._abort_request_ids = set()
-    manager.psrl_config = SimpleNamespace(staleness=2)
+    manager.pivotrl_config = SimpleNamespace(staleness=2)
 
     assert manager.get_reserve_indicator(0, [0], is_validate=True) == [0.0]
 

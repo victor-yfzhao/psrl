@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NIXL_VERSION="${NIXL_VERSION:-0.10.1}"
 MAX_JOBS="${MAX_JOBS:-32}"
-BUILD_ROOT="${NIXL_BUILD_ROOT:-/tmp/psrl-nixl-${NIXL_VERSION}}"
+BUILD_ROOT="${NIXL_BUILD_ROOT:-/tmp/pivotrl-nixl-${NIXL_VERSION}}"
 SOURCE_DIR="${NIXL_SOURCE_DIR:-${BUILD_ROOT}/nixl}"
 UCX_PREFIX="${UCX_PREFIX:-${REPO_ROOT}/third_party/ucx_1_21}"
 PREFIX="${NIXL_PREFIX:-${REPO_ROOT}/third_party/nixl}"
@@ -12,12 +12,12 @@ DESTDIR="${NIXL_DESTDIR:-}"
 WHEEL_DIR="${NIXL_WHEEL_DIR:-${BUILD_ROOT}/wheelhouse}"
 BUILD_WHEEL="${NIXL_BUILD_WHEEL:-false}"
 PATCH_FILE="${REPO_ROOT}/patch/nixl/nixl-0.10.1-ucx-1.21-build.patch"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/psrl-uv-cache}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/psrl-xdg-cache}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/pivotrl-uv-cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/pivotrl-xdg-cache}"
 export UV_NO_BUILD_ISOLATION="${UV_NO_BUILD_ISOLATION:-1}"
 
 if [[ "${NIXL_VERSION}" != "0.10.1" ]]; then
-    echo "The PSRL compatibility patch is pinned to NIXL 0.10.1" >&2
+    echo "The PivotRL compatibility patch is pinned to NIXL 0.10.1" >&2
     exit 1
 fi
 if [[ ! -x "${UCX_PREFIX}/bin/ucx_info" ]]; then
@@ -72,7 +72,7 @@ if [[ "${BUILD_WHEEL}" == "true" ]]; then
         .
 fi
 
-touch "${DESTDIR}${PREFIX}/.psrl-nixl-${NIXL_VERSION}-complete"
+touch "${DESTDIR}${PREFIX}/.pivotrl-nixl-${NIXL_VERSION}-complete"
 
 echo "Built NIXL ${NIXL_VERSION} against ${UCX_PREFIX}"
 echo "prefix=${PREFIX}"

@@ -5,17 +5,17 @@ set -xeuo pipefail
 # This script runs a simplified rollout performance test with real data using vLLM AsyncLLM directly
 
 # Set up environment
-source ${PSRL_WORKSPACE}/env/psrl.sh
+source ${PIVOTRL_WORKSPACE}/env/pivotrl.sh
 
-HOME=${PSRL_WORKSPACE}
-PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
+HOME=${PIVOTRL_WORKSPACE}
+PIVOTRL_PATH=$(python -c "import pivotrl; import os; print(os.path.dirname(os.path.dirname(pivotrl.__file__)))")
 
 # Model configuration
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B
+HF_MODEL_PATH=${PIVOTRL_WORKSPACE}/models/Qwen2.5-32B
 
 # Data configuration
-TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
-TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
+TRAIN_FILE=${PIVOTRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
+TEST_FILE=${PIVOTRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
 # vLLM configuration (simplified - no complex deployment)
 GEN_TP=4  # Tensor parallel size for generation
@@ -39,8 +39,8 @@ top_p=1.0
 top_k=-1
 
 # Run the simplified rollout performance test with real data
-PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
-    psrl.logging_path=${PSRL_PATH}/examples/bench/rollout/summary \
+PYTHONUNBUFFERED=1 python -m pivotrl.bench.rollout.main_rollout \
+    pivotrl.logging_path=${PIVOTRL_PATH}/examples/bench/rollout/summary \
     \
     model.path="$HF_MODEL_PATH" \
     +model.override_config.max_position_embeddings=32768 \
@@ -69,6 +69,6 @@ PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
     rollout_test.num_iterations=${num_iterations} \
     rollout_test.warmup_iterations=${warmup_iterations} \
     rollout_test.mode=${test_mode} \
-    rollout_test.profile_logs_dir=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/details \
+    rollout_test.profile_logs_dir=${PIVOTRL_WORKSPACE}/pivotrl/examples/bench/rollout/details \
     rollout_test.profile_log_file=Real_TP${GEN_TP}_PP${GEN_PP}_B${batch_size}_P${max_prompt_length}_R${max_response_length} \
     2>&1 | tee rollout_test.log

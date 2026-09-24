@@ -1,6 +1,6 @@
 # Comment Style Guide
 
-This guide documents the comment conventions used in PSRL.
+This guide documents the comment conventions used in PivotRL.
 All new code must follow these conventions.
 
 ## 1. Annotation Markers
@@ -111,9 +111,9 @@ Every `assert` **must** include a descriptive message.
 assert self.nixl_storage_client is not None, "nixl_storage_client is not initialized."
 
 # Multi-line (condition too long, or message too long)
-assert self.psrl_config.ps_mode in ("nixl_cpu", "nixl_gpu"), (
+assert self.pivotrl_config.ps_mode in ("nixl_cpu", "nixl_gpu"), (
     "push_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode, "
-    f"got: {self.psrl_config.ps_mode!r}."
+    f"got: {self.pivotrl_config.ps_mode!r}."
 )
 ```
 
@@ -125,19 +125,19 @@ Rules:
 ## 7. Logging
 
 ```python
-psrl_logger = logging.getLogger(__file__)
+pivotrl_logger = logging.getLogger(__file__)
 
-psrl_logger.debug("Getting the current PS model version...")
-psrl_logger.info("[validate_config] All configuration checks passed successfully!")
-psrl_logger.info(
+pivotrl_logger.debug("Getting the current PS model version...")
+pivotrl_logger.info("[validate_config] All configuration checks passed successfully!")
+pivotrl_logger.info(
     f"Pushing key {key} shards {shards_to_transfer} to {target_client_name} "
     f"for version {next_ps_model_version} with {len(shards_to_transfer)} shards."
 )
-psrl_logger.warning(f"[{log_prefix}]: failed to log {name}: {e}")
+pivotrl_logger.warning(f"[{log_prefix}]: failed to log {name}: {e}")
 ```
 
 Rules:
-- Use `psrl_logger`, never `print()`.
+- Use `pivotrl_logger`, never `print()`.
 - Prefix with `[component_name]` for messages emitted from key entry points.
 - End messages with a **period**.
 - Multi-line: use implicit string concatenation inside `logger.xxx(...)`, not `\`.

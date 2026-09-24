@@ -13,8 +13,8 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+pivotrl_logger = logging.getLogger(__file__)
+pivotrl_logger.setLevel(os.getenv("PIVOTRL_LOGGING_LEVEL", "WARN"))
 
 _ORIGINAL_WORKER_LOAD_MODEL = Worker.load_model
 
@@ -57,7 +57,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         finalize_pending_weight_arena(self.model_runner)
 
     def log_tms_timing(self, operation: str, stage: str, elapsed_s: float, tag: str | None = None) -> None:
-        timing = getattr(self, "_psrl_current_tms_timing", None)
+        timing = getattr(self, "_pivotrl_current_tms_timing", None)
         if timing is not None and timing.get("operation") == operation:
             timing["stages"].append(
                 {
@@ -67,8 +67,8 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                 }
             )
             if stage == "total":
-                setattr(self, f"_psrl_last_{operation}_timing", timing)
-        psrl_logger.warning(
+                setattr(self, f"_pivotrl_last_{operation}_timing", timing)
+        pivotrl_logger.warning(
             "[VLLM_SLEEP_WAKE_TIMING] scope=tp_worker operation=%s stage=%s tag=%s "
             "host=%s rank=%s local_rank=%s pid=%s elapsed_s=%.6f",
             operation,
@@ -86,7 +86,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         from torch_memory_saver import torch_memory_saver
 
         total_start = time.perf_counter()
-        self._psrl_current_tms_timing = {"operation": "sleep", "stages": []}
+        self._pivotrl_current_tms_timing = {"operation": "sleep", "stages": []}
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
@@ -107,7 +107,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             stage_start = time.perf_counter()
             torch_memory_saver.pause("kv_cache")
             self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="kv_cache")
-            if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
+            if os.environ.get("PIVOTRL_VLLM_PATCHES", "") == "TMS:GRAPH":
                 stage_start = time.perf_counter()
                 torch_memory_saver.pause("graph")
                 self.log_tms_timing("sleep", "pause", time.perf_counter() - stage_start, tag="graph")
@@ -131,7 +131,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         device = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device)
         gib = 1024**3
-        psrl_logger.warning(
+        pivotrl_logger.warning(
             "[VLLM_SLEEP_MEMORY] stage=worker_after_sleep host=%s rank=%s local_rank=%s "
             "pid=%s device=cuda:%s gpu_uuid=%s gpu_name=%s freed=%.2f GB "
             "cache_reserved_before=%.2f GB cache_reserved_after=%.2f GB cache_reserved_freed=%.2f GB "
@@ -158,7 +158,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             total / gib,
         )
         self.log_tms_timing("sleep", "total", time.perf_counter() - total_start)
-        # psrl_logger.info(
+        # pivotrl_logger.info(
         #     "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
         #     format_gib(freed_bytes),
         #     format_gib(used_bytes),
@@ -169,7 +169,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         from torch_memory_saver import torch_memory_saver
 
         total_start = time.perf_counter()
-        self._psrl_current_tms_timing = {"operation": "wake", "stages": []}
+        self._pivotrl_current_tms_timing = {"operation": "wake", "stages": []}
         free_bytes_before_wake_up = torch.cuda.mem_get_info()[0]
 
         for tag in tags:
@@ -202,7 +202,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         increased_bytes = free_bytes_before_wake_up - free_bytes_after_wake_up
         used_bytes = total - free_bytes_after_wake_up
         assert increased_bytes >= 0, "Memory usage increased after waking up."
-        psrl_logger.info(
+        pivotrl_logger.info(
             "Wake up mode increased %.2f GiB memory, %.2f GiB memory is still in use.",
             format_gib(increased_bytes),
             format_gib(used_bytes),

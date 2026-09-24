@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from psrl.utils.optimizer_state import (
+from pivotrl.utils.optimizer_state import (
     assert_optimizer_state_offloaded,
     summarize_optimizer_state_devices,
 )

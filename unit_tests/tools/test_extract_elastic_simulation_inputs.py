@@ -46,7 +46,7 @@ def test_parse_candidate_normalizes_python_repr() -> None:
     body = (
         "* candidate[2] scale_up RewardModel/Qwen3-30B-A3B-Thinking-2507 "
         "num_instances=1 preferred=[4] pre_wake=None "
-        "pre_sleep=[{'role_name': <PSRL_Role.Rollout: 2>, "
+        "pre_sleep=[{'role_name': <PivotRL_Role.Rollout: 2>, "
         "'model_name': 'Qwen2.5-7B', 'instance_id': 9}]"
     )
     candidate = parse_candidate(body)

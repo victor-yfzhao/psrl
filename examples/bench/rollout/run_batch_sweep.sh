@@ -6,7 +6,7 @@ set -euo pipefail
 # other groups. Override GPU_IDS with a comma-separated list when needed.
 #
 # Usage:
-#   export PSRL_WORKSPACE=/path/to/psrl
+#   export PIVOTRL_WORKSPACE=/path/to/pivotrl
 #   bash examples/bench/rollout/run_batch_sweep.sh [tp] [prompt_len] [ep]
 #
 # EP defaults to auto-detect in run_rollout_test.sh (MoE => EP=TP, dense => EP=1).
@@ -16,13 +16,13 @@ set -euo pipefail
 #   bash examples/bench/rollout/run_batch_sweep.sh 8 1024
 #   bash examples/bench/rollout/run_batch_sweep.sh 8 1024 8
 
-export PSRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl 
+export PIVOTRL_WORKSPACE=/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl 
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLLOUT_SCRIPT="${ROLLOUT_SCRIPT:-${SCRIPT_DIR}/run_rollout_test.sh}"
 
-if [[ -z "${PSRL_WORKSPACE:-}" ]]; then
-    echo "Error: PSRL_WORKSPACE is not set."
+if [[ -z "${PIVOTRL_WORKSPACE:-}" ]]; then
+    echo "Error: PIVOTRL_WORKSPACE is not set."
     exit 1
 fi
 
@@ -47,7 +47,7 @@ failed=()
 
 echo "=========================================="
 echo "Rollout batch sweep"
-echo "PSRL_WORKSPACE: ${PSRL_WORKSPACE}"
+echo "PIVOTRL_WORKSPACE: ${PIVOTRL_WORKSPACE}"
 echo "TP: ${GEN_TP}, EP: ${GEN_EP:-auto}, prompt_len: ${MAX_PROMPT_LENGTH}"
 echo "Models: ${MODEL_NAMES[*]}"
 echo "disable_attn: ${DISABLE_ATTN_VALUES[*]}"
@@ -105,13 +105,13 @@ for model_name in "${MODEL_NAMES[@]}"; do
     done
 done
 
-profile_root="${PROFILE_ROOT:-${PSRL_WORKSPACE}/examples/bench/rollout/exp}"
+profile_root="${PROFILE_ROOT:-${PIVOTRL_WORKSPACE}/examples/bench/rollout/exp}"
 profile_logs_dir="${PROFILE_LOGS_DIR:-${profile_root}/details}"
 summary_root="${PROFILE_SUMMARY_DIR:-${profile_root}/summary}"
 run_logs_dir="${RUN_LOGS_DIR:-.}"
 mkdir -p "${profile_logs_dir}" "${summary_root}" "${run_logs_dir}"
 
-status_dir=$(mktemp -d "${TMPDIR:-/tmp}/psrl_batch_sweep.XXXXXX")
+status_dir=$(mktemp -d "${TMPDIR:-/tmp}/pivotrl_batch_sweep.XXXXXX")
 cleanup_status_dir() {
     rm -rf -- "${status_dir}"
 }

@@ -12,8 +12,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGra
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+pivotrl_logger = logging.getLogger(__file__)
+pivotrl_logger.setLevel(os.getenv("PIVOTRL_LOGGING_LEVEL", "WARN"))
 
 
 @min_vllm_version("0.18.1")
@@ -55,7 +55,7 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
                     forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
-                    psrl_logger.debug("CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc)
+                    pivotrl_logger.debug("CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc)
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                         forward_fn(CUDAGraphMode.PIECEWISE)
                     else:

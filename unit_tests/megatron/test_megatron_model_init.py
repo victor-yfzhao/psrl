@@ -17,7 +17,7 @@ from verl.utils.torch_dtypes import PrecisionType
 # Import verl utilities
 from verl.workers.megatron_workers import set_random_seed
 
-QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE", "/tmp") + "/models/Qwen2.5-0.5B-Instruct"
+QWEN_MODEL_PATH = os.environ.get("PIVOTRL_WORKSPACE", "/tmp") + "/models/Qwen2.5-0.5B-Instruct"
 
 
 def make_dual_print(log_path, prefix=None):
@@ -128,8 +128,8 @@ class MegatronClient:
 
     def _covert_model(self):
         """Convert model"""
-        from psrl.utils.converter import create_parameter_mapping
-        from psrl.utils.converter.megatron_converter import convert_megatron_inplace
+        from pivotrl.utils.converter import create_parameter_mapping
+        from pivotrl.utils.converter.megatron_converter import convert_megatron_inplace
         from transformers import AutoConfig
 
         model_config = AutoConfig.from_pretrained(self.model_path)
@@ -148,7 +148,7 @@ class MegatronClient:
 
 def test_megatron():
     """Test Megatron client"""
-    log_dir = os.environ.get("PSRL_WORKSPACE") + "/psrl/unit_tests/megatron/log"
+    log_dir = os.environ.get("PIVOTRL_WORKSPACE") + "/pivotrl/unit_tests/megatron/log"
     os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
 

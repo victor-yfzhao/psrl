@@ -1,4 +1,4 @@
-# PSRL Elastic Simulator
+# PivotRL Elastic Simulator
 
 This standalone C++17 benchmark consumes the schema-v1 JSONL produced by
 `scripts/extract_elastic_simulation_inputs.py`. It evaluates the baseline and
@@ -20,19 +20,19 @@ persistent subprocess. With the binary at the default build path, enable it in
 the mode5 launcher with:
 
 ```bash
-PSRL_CANDIDATE_EVALUATION_BACKEND=cpp \
+PIVOTRL_CANDIDATE_EVALUATION_BACKEND=cpp \
   bash examples/deployment_modes_qwen7b_rm32b/mode5_elastic_rl.sh
 ```
 
-Set `PSRL_CANDIDATE_EVALUATION_CPP_BINARY` when the release binary is installed
+Set `PIVOTRL_CANDIDATE_EVALUATION_CPP_BINARY` when the release binary is installed
 elsewhere. The mode5 launchers default to `cpp`; set
-`PSRL_CANDIDATE_EVALUATION_BACKEND=python` to select the Python implementation.
+`PIVOTRL_CANDIDATE_EVALUATION_BACKEND=python` to select the Python implementation.
 A configured C++ backend fails at policy startup if its binary is missing or
 not executable, and evaluator process/protocol failures propagate instead of
 being converted into a no-action scaling decision.
 
 Schema-v1 priority fields represent numeric infinities with the standard-JSON
-objects `{"__psrl_float__":"inf"}` and `{"__psrl_float__":"-inf"}`. This
+objects `{"__pivotrl_float__":"inf"}` and `{"__pivotrl_float__":"-inf"}`. This
 preserves the live router's reserve-capability ordering without emitting the
 non-standard JSON tokens `Infinity` or `-Infinity`.
 

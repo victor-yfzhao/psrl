@@ -10,7 +10,7 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from psrl.workers.gen.gen_worker import GenInterface, PSRL_GenWorker
+from pivotrl.workers.gen.gen_worker import GenInterface, PivotRL_GenWorker
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import (
     NodeAffinitySchedulingStrategy,
@@ -91,8 +91,8 @@ def _probe_bundle_gpu_identity() -> dict[str, object]:
 @ray.remote(num_cpus=0)
 class _NIXLProbeMetaServer:
     def __init__(self, nixl_config, expected_agents: int):
-        from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-        from psrl.utils.nixl import NIXLMetaServer
+        from pivotrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+        from pivotrl.utils.nixl import NIXLMetaServer
 
         self.server = NIXLMetaServer(NIXL_META_SERVER_NAME, nixl_config)
         self.expected_agents = expected_agents
@@ -190,11 +190,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _build_tms_weight_arena_config(probe_role: str):
     reward_materialization = os.environ.get(
-        "PSRL_TMS_VLLM_REWARD_MATERIALIZATION", "direct"
+        "PIVOTRL_TMS_VLLM_REWARD_MATERIALIZATION", "direct"
     )
     if reward_materialization not in {"direct", "repack"}:
         raise ValueError(
-            "PSRL_TMS_VLLM_REWARD_MATERIALIZATION must be direct or repack, "
+            "PIVOTRL_TMS_VLLM_REWARD_MATERIALIZATION must be direct or repack, "
             f"got {reward_materialization!r}"
         )
     return OmegaConf.create(
@@ -205,26 +205,26 @@ def _build_tms_weight_arena_config(probe_role: str):
             "rollout_materialization": "direct",
             "reward_materialization": reward_materialization,
             "reward_cpu_cache_mode": os.environ.get(
-                "PSRL_TMS_VLLM_REWARD_CPU_CACHE_MODE", "node_shared"
+                "PIVOTRL_TMS_VLLM_REWARD_CPU_CACHE_MODE", "node_shared"
             ),
             "reward_node_cache_dir": os.environ.get(
-                "PSRL_TMS_VLLM_REWARD_NODE_CACHE_DIR",
-                "/dev/shm/psrl-rm-weight-cache",
+                "PIVOTRL_TMS_VLLM_REWARD_NODE_CACHE_DIR",
+                "/dev/shm/pivotrl-rm-weight-cache",
             ),
             "reward_node_cache_wait_timeout_s": float(
                 os.environ.get(
-                    "PSRL_TMS_VLLM_REWARD_NODE_CACHE_WAIT_TIMEOUT_S", "1800"
+                    "PIVOTRL_TMS_VLLM_REWARD_NODE_CACHE_WAIT_TIMEOUT_S", "1800"
                 )
             ),
             "reward_cpu_cache_pin_memory": _env_bool(
-                "PSRL_TMS_VLLM_REWARD_CPU_CACHE_PIN_MEMORY", False
+                "PIVOTRL_TMS_VLLM_REWARD_CPU_CACHE_PIN_MEMORY", False
             ),
             "max_chunk_gb": float(
-                os.environ.get("PSRL_TMS_VLLM_WEIGHT_ARENA_MAX_CHUNK_GB", "4")
+                os.environ.get("PIVOTRL_TMS_VLLM_WEIGHT_ARENA_MAX_CHUNK_GB", "4")
             ),
             "alignment_bytes": int(
                 os.environ.get(
-                    "PSRL_TMS_VLLM_WEIGHT_ARENA_ALIGNMENT_BYTES", "256"
+                    "PIVOTRL_TMS_VLLM_WEIGHT_ARENA_ALIGNMENT_BYTES", "256"
                 )
             ),
         }
@@ -267,14 +267,14 @@ def _collect_gpu_snapshots(stage: str) -> list[dict[str, str]]:
 def _default_model_path() -> str:
     repo_root = Path(__file__).resolve().parents[3]
     local_model = repo_root / "models" / "Qwen" / "Qwen2.5-0.5B"
-    return os.environ.get("PSRL_RM_SMOKE_MODEL", str(local_model))
+    return os.environ.get("PIVOTRL_RM_SMOKE_MODEL", str(local_model))
 
 
-def _build_psrl_config(tmp_path: Path, *, load_real_weights_at_init: bool):
+def _build_pivotrl_config(tmp_path: Path, *, load_real_weights_at_init: bool):
     # Without an arena, elastic_rm.enable gates whether init_model loads GPU weights
     # after CPU preload. Arena-backed reward workers always construct the final CPU
     # mirror during init so the first wake is not a checkpoint-layout reload.
-    elastic_rm_enable = _env_bool("PSRL_RM_SMOKE_ELASTIC_RM", True)
+    elastic_rm_enable = _env_bool("PIVOTRL_RM_SMOKE_ELASTIC_RM", True)
     if load_real_weights_at_init:
         elastic_rm_enable = False
     return OmegaConf.create(
@@ -295,7 +295,7 @@ def _build_psrl_config(tmp_path: Path, *, load_real_weights_at_init: bool):
             "tms": {
                 "range": "all",
                 "enable_nixl": False,
-                "enable_cuda_graph": _env_bool("PSRL_RM_SMOKE_ENABLE_CUDA_GRAPH", False),
+                "enable_cuda_graph": _env_bool("PIVOTRL_RM_SMOKE_ENABLE_CUDA_GRAPH", False),
             },
             "server_rollout": {"enable": False},
             "status_collection": {"enable": False},
@@ -312,28 +312,28 @@ def _build_psrl_config(tmp_path: Path, *, load_real_weights_at_init: bool):
 
 
 def _build_reward_config(model_path: str):
-    # Fast profile for small models / local iteration (PSRL_RM_SMOKE_FAST=1).
-    if _env_bool("PSRL_RM_SMOKE_FAST", False):
+    # Fast profile for small models / local iteration (PIVOTRL_RM_SMOKE_FAST=1).
+    if _env_bool("PIVOTRL_RM_SMOKE_FAST", False):
         prompt_length = 32
-        response_length = int(os.environ.get("PSRL_RM_SMOKE_MAX_TOKENS", "4"))
-        max_model_len = int(os.environ.get("PSRL_RM_SMOKE_MAX_MODEL_LEN", "64"))
+        response_length = int(os.environ.get("PIVOTRL_RM_SMOKE_MAX_TOKENS", "4"))
+        max_model_len = int(os.environ.get("PIVOTRL_RM_SMOKE_MAX_MODEL_LEN", "64"))
         max_num_batched_tokens = max_model_len
         max_num_seqs = 1
-        gpu_memory_utilization = float(os.environ.get("PSRL_RM_SMOKE_GPU_MEMORY_UTILIZATION", "0.4"))
+        gpu_memory_utilization = float(os.environ.get("PIVOTRL_RM_SMOKE_GPU_MEMORY_UTILIZATION", "0.4"))
         disable_kv_cache = True
-        enforce_eager = _env_bool("PSRL_RM_SMOKE_ENFORCE_EAGER", True)
+        enforce_eager = _env_bool("PIVOTRL_RM_SMOKE_ENFORCE_EAGER", True)
     else:
-        prompt_length = int(os.environ.get("PSRL_RM_SMOKE_PROMPT_LENGTH", str(_PROD_PROMPT_LENGTH)))
-        response_length = int(os.environ.get("PSRL_RM_SMOKE_RESPONSE_LENGTH", str(_PROD_RESPONSE_LENGTH)))
-        max_model_len = int(os.environ.get("PSRL_RM_SMOKE_MAX_MODEL_LEN", str(_PROD_MAX_MODEL_LEN)))
+        prompt_length = int(os.environ.get("PIVOTRL_RM_SMOKE_PROMPT_LENGTH", str(_PROD_PROMPT_LENGTH)))
+        response_length = int(os.environ.get("PIVOTRL_RM_SMOKE_RESPONSE_LENGTH", str(_PROD_RESPONSE_LENGTH)))
+        max_model_len = int(os.environ.get("PIVOTRL_RM_SMOKE_MAX_MODEL_LEN", str(_PROD_MAX_MODEL_LEN)))
         max_num_batched_tokens = int(
-            os.environ.get("PSRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
+            os.environ.get("PIVOTRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
         )
-        max_num_seqs = int(os.environ.get("PSRL_RM_SMOKE_MAX_NUM_SEQS", "10240"))
-        gpu_memory_utilization = float(os.environ.get("PSRL_RM_SMOKE_GPU_MEMORY_UTILIZATION", "0.8"))
-        disable_kv_cache = _env_bool("PSRL_RM_SMOKE_DISABLE_KV_CACHE", False)
-        if "PSRL_RM_SMOKE_ENFORCE_EAGER" in os.environ:
-            enforce_eager = _env_bool("PSRL_RM_SMOKE_ENFORCE_EAGER", True)
+        max_num_seqs = int(os.environ.get("PIVOTRL_RM_SMOKE_MAX_NUM_SEQS", "10240"))
+        gpu_memory_utilization = float(os.environ.get("PIVOTRL_RM_SMOKE_GPU_MEMORY_UTILIZATION", "0.8"))
+        disable_kv_cache = _env_bool("PIVOTRL_RM_SMOKE_DISABLE_KV_CACHE", False)
+        if "PIVOTRL_RM_SMOKE_ENFORCE_EAGER" in os.environ:
+            enforce_eager = _env_bool("PIVOTRL_RM_SMOKE_ENFORCE_EAGER", True)
         else:
             enforce_eager = True
 
@@ -349,9 +349,9 @@ def _build_reward_config(model_path: str):
                 "override_config": {},
             },
             "rollout": {
-                "_target_": "psrl.workers.config.RolloutConfig",
+                "_target_": "pivotrl.workers.config.RolloutConfig",
                 "name": "vllm",
-                "mode": "psrl_async",
+                "mode": "pivotrl_async",
                 "disable_attn": False,
                 "dtype": "bfloat16",
                 "gpu_memory_utilization": gpu_memory_utilization,
@@ -421,11 +421,11 @@ def _assert_generated(output: DataProto | tuple[DataProto, object], stage: str) 
 
 
 def _init_timeout_s() -> int:
-    return int(os.environ.get("PSRL_RM_SMOKE_INIT_TIMEOUT_S", "900"))
+    return int(os.environ.get("PIVOTRL_RM_SMOKE_INIT_TIMEOUT_S", "900"))
 
 
 def _wake_timeout_s() -> int:
-    return int(os.environ.get("PSRL_RM_SMOKE_WAKE_TIMEOUT_S", "900"))
+    return int(os.environ.get("PIVOTRL_RM_SMOKE_WAKE_TIMEOUT_S", "900"))
 
 
 @pytest.mark.integration
@@ -433,7 +433,7 @@ def _wake_timeout_s() -> int:
 def test_reward_model_tms_generate_sleep_wakeup_generate(tmp_path: Path):
     """Exercise the RM TMS path end-to-end.
 
-    Default (PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT=1): load real GPU weights
+    Default (PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT=1): load real GPU weights
     during init_model after CPU preload, then sleep — tests whether sleep footprint
     differs from the dummy-only elastic init path.
 
@@ -442,12 +442,12 @@ def test_reward_model_tms_generate_sleep_wakeup_generate(tmp_path: Path):
       2. sleep(level=2)
       3. wake_up -> generate -> sleep -> wake_up -> generate
 
-    Set PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT=0 to reproduce production elastic
+    Set PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT=0 to reproduce production elastic
     init (skip GPU load before first sleep).
-    Set PSRL_RM_SMOKE_FAST=1 for the small-config smoke profile.
+    Set PIVOTRL_RM_SMOKE_FAST=1 for the small-config smoke profile.
     """
-    if os.environ.get("PSRL_RUN_RM_TMS_SMOKE") != "1":
-        pytest.skip("Set PSRL_RUN_RM_TMS_SMOKE=1 to run the RM TMS smoke test.")
+    if os.environ.get("PIVOTRL_RUN_RM_TMS_SMOKE") != "1":
+        pytest.skip("Set PIVOTRL_RUN_RM_TMS_SMOKE=1 to run the RM TMS smoke test.")
     if not torch.cuda.is_available():
         pytest.skip("RM TMS smoke test requires CUDA.")
 
@@ -455,15 +455,15 @@ def test_reward_model_tms_generate_sleep_wakeup_generate(tmp_path: Path):
     if not (Path(model_path) / "config.json").exists():
         pytest.skip(f"RM smoke model is unavailable: {model_path}")
 
-    load_real_weights_at_init = _env_bool("PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", True)
-    psrl_config = _build_psrl_config(tmp_path, load_real_weights_at_init=load_real_weights_at_init)
+    load_real_weights_at_init = _env_bool("PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", True)
+    pivotrl_config = _build_pivotrl_config(tmp_path, load_real_weights_at_init=load_real_weights_at_init)
     reward_config = _build_reward_config(model_path)
     init_timeout_s = _init_timeout_s()
     wake_timeout_s = _wake_timeout_s()
 
-    resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+    resources, env_vars, init_kwargs = PivotRL_GenWorker.configure_worker(
         config=reward_config,
-        psrl_config=psrl_config,
+        pivotrl_config=pivotrl_config,
         num_gpus=1,
         dp_idx=0,
         bundle_indices=[0],
@@ -490,7 +490,7 @@ def test_reward_model_tms_generate_sleep_wakeup_generate(tmp_path: Path):
     try:
         print(
             f"RM smoke profile: load_real_weights_at_init={load_real_weights_at_init}, "
-            f"gen_worker_elastic_rm_enable={bool(psrl_config.deployment.elastic_rm.enable)}, "
+            f"gen_worker_elastic_rm_enable={bool(pivotrl_config.deployment.elastic_rm.enable)}, "
             f"max_model_len={reward_config.rollout.max_model_len}, "
             f"max_num_seqs={reward_config.rollout.max_num_seqs}, "
             f"gpu_memory_utilization={reward_config.rollout.gpu_memory_utilization}",
@@ -505,11 +505,11 @@ def test_reward_model_tms_generate_sleep_wakeup_generate(tmp_path: Path):
             num_gpus=resources.get("num_gpus", 1),
             num_cpus=resources.get("num_cpus", 1),
             runtime_env={"env_vars": actor_env},
-        )(PSRL_GenWorker)
+        )(PivotRL_GenWorker)
         actor = RewardWorker.remote(
             config=reward_config,
             role="reward",
-            psrl_config=psrl_config,
+            pivotrl_config=pivotrl_config,
             gen_interface=gen_interface,
             instance_id=0,
             reward_model_name="rm_tms_smoke",
@@ -571,19 +571,19 @@ def _run_bisect_case(
 ) -> int:
     """Init RM (elastic dummy-only) -> sleep -> return GPU0 used MiB after sleep."""
     model_path = _default_model_path()
-    load_real_weights_at_init = _env_bool("PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", False)
-    psrl_config = _build_psrl_config(tmp_path, load_real_weights_at_init=load_real_weights_at_init)
+    load_real_weights_at_init = _env_bool("PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", False)
+    pivotrl_config = _build_pivotrl_config(tmp_path, load_real_weights_at_init=load_real_weights_at_init)
     reward_config = _build_reward_config(model_path)
 
-    resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+    resources, env_vars, init_kwargs = PivotRL_GenWorker.configure_worker(
         config=reward_config,
-        psrl_config=psrl_config,
+        pivotrl_config=pivotrl_config,
         num_gpus=1,
         dp_idx=0,
         bundle_indices=[0],
         role="reward",
     )
-    vllm_patches_override = os.environ.get("PSRL_RM_SMOKE_VLLM_PATCHES", "").strip()
+    vllm_patches_override = os.environ.get("PIVOTRL_RM_SMOKE_VLLM_PATCHES", "").strip()
     actor_env = {
         **env_vars,
         "WG_BACKEND": "ray",
@@ -596,18 +596,18 @@ def _run_bisect_case(
         "TOKENIZERS_PARALLELISM": "false",
     }
     if vllm_patches_override:
-        actor_env["PSRL_VLLM_PATCHES"] = vllm_patches_override
+        actor_env["PIVOTRL_VLLM_PATCHES"] = vllm_patches_override
 
     print(
         f"\n{'=' * 72}\n"
         f"BISect {experiment}: {description}\n"
         f"  load_real_weights_at_init={load_real_weights_at_init}\n"
-        f"  elastic_rm.enable={bool(psrl_config.deployment.elastic_rm.enable)}\n"
+        f"  elastic_rm.enable={bool(pivotrl_config.deployment.elastic_rm.enable)}\n"
         f"  max_model_len={reward_config.rollout.max_model_len}\n"
         f"  max_num_seqs={reward_config.rollout.max_num_seqs}\n"
         f"  enforce_eager={reward_config.rollout.enforce_eager}\n"
-        f"  PSRL_VLLM_PATCHES={actor_env.get('PSRL_VLLM_PATCHES', '<unset>')}\n"
-        f"  tms.enable_cuda_graph={bool(psrl_config.tms.enable_cuda_graph)}\n"
+        f"  PIVOTRL_VLLM_PATCHES={actor_env.get('PIVOTRL_VLLM_PATCHES', '<unset>')}\n"
+        f"  tms.enable_cuda_graph={bool(pivotrl_config.tms.enable_cuda_graph)}\n"
         f"{'=' * 72}",
         flush=True,
     )
@@ -619,11 +619,11 @@ def _run_bisect_case(
         num_gpus=resources.get("num_gpus", 1),
         num_cpus=resources.get("num_cpus", 1),
         runtime_env={"env_vars": actor_env},
-    )(PSRL_GenWorker)
+    )(PivotRL_GenWorker)
     actor = RewardWorker.remote(
         config=reward_config,
         role="reward",
-        psrl_config=psrl_config,
+        pivotrl_config=pivotrl_config,
         gen_interface=gen_interface,
         instance_id=0,
         reward_model_name="rm_tms_smoke",
@@ -652,13 +652,13 @@ def test_rm_tms_sleep_bisect_experiments(tmp_path: Path):
     Runs baseline (prod RM config) then A–D one at a time:
       A: max_num_seqs 10240 -> 1024 (rollout default)
       B: enforce_eager True -> False (rollout default)
-      C: PSRL_VLLM_PATCHES TMS -> TMS:GRAPH (rollout patch stack)
+      C: PIVOTRL_VLLM_PATCHES TMS -> TMS:GRAPH (rollout patch stack)
       D: max_model_len 21504 -> 11264 (rollout-aligned)
 
-    Set PSRL_RUN_RM_TMS_BISECT=1 to run. Uses elastic init (no GPU load before sleep).
+    Set PIVOTRL_RUN_RM_TMS_BISECT=1 to run. Uses elastic init (no GPU load before sleep).
     """
-    if os.environ.get("PSRL_RUN_RM_TMS_BISECT") != "1":
-        pytest.skip("Set PSRL_RUN_RM_TMS_BISECT=1 to run RM sleep bisect experiments.")
+    if os.environ.get("PIVOTRL_RUN_RM_TMS_BISECT") != "1":
+        pytest.skip("Set PIVOTRL_RUN_RM_TMS_BISECT=1 to run RM sleep bisect experiments.")
     if not torch.cuda.is_available():
         pytest.skip("RM sleep bisect requires CUDA.")
 
@@ -682,40 +682,40 @@ def test_rm_tms_sleep_bisect_experiments(tmp_path: Path):
         (
             "A",
             "max_num_seqs=1024 (rollout default)",
-            {"PSRL_RM_SMOKE_MAX_NUM_SEQS": "1024"},
+            {"PIVOTRL_RM_SMOKE_MAX_NUM_SEQS": "1024"},
         ),
         (
             "B",
             "enforce_eager=False (rollout default)",
-            {"PSRL_RM_SMOKE_ENFORCE_EAGER": "0"},
+            {"PIVOTRL_RM_SMOKE_ENFORCE_EAGER": "0"},
         ),
         (
             "C",
-            "PSRL_VLLM_PATCHES=TMS:GRAPH (rollout patch stack)",
+            "PIVOTRL_VLLM_PATCHES=TMS:GRAPH (rollout patch stack)",
             {
-                "PSRL_RM_SMOKE_VLLM_PATCHES": "TMS:GRAPH",
-                "PSRL_RM_SMOKE_ENABLE_CUDA_GRAPH": "1",
+                "PIVOTRL_RM_SMOKE_VLLM_PATCHES": "TMS:GRAPH",
+                "PIVOTRL_RM_SMOKE_ENABLE_CUDA_GRAPH": "1",
             },
         ),
         (
             "D",
             "max_model_len=11264 (rollout-aligned)",
             {
-                "PSRL_RM_SMOKE_MAX_MODEL_LEN": str(_ROLLOUT_ALIGNED_MAX_MODEL_LEN),
-                "PSRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS": str(_ROLLOUT_ALIGNED_MAX_MODEL_LEN),
+                "PIVOTRL_RM_SMOKE_MAX_MODEL_LEN": str(_ROLLOUT_ALIGNED_MAX_MODEL_LEN),
+                "PIVOTRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS": str(_ROLLOUT_ALIGNED_MAX_MODEL_LEN),
             },
         ),
     ]
 
     # Keys we own for bisect; restore after all cases.
     bisect_keys = {
-        "PSRL_RM_SMOKE_MAX_NUM_SEQS",
-        "PSRL_RM_SMOKE_ENFORCE_EAGER",
-        "PSRL_RM_SMOKE_VLLM_PATCHES",
-        "PSRL_RM_SMOKE_ENABLE_CUDA_GRAPH",
-        "PSRL_RM_SMOKE_MAX_MODEL_LEN",
-        "PSRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS",
-        "PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT",
+        "PIVOTRL_RM_SMOKE_MAX_NUM_SEQS",
+        "PIVOTRL_RM_SMOKE_ENFORCE_EAGER",
+        "PIVOTRL_RM_SMOKE_VLLM_PATCHES",
+        "PIVOTRL_RM_SMOKE_ENABLE_CUDA_GRAPH",
+        "PIVOTRL_RM_SMOKE_MAX_MODEL_LEN",
+        "PIVOTRL_RM_SMOKE_MAX_NUM_BATCHED_TOKENS",
+        "PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT",
     }
     saved_env = {k: os.environ.get(k) for k in bisect_keys}
 
@@ -727,7 +727,7 @@ def test_rm_tms_sleep_bisect_experiments(tmp_path: Path):
                     os.environ[key] = saved_env[key]
                 else:
                     os.environ.pop(key, None)
-            os.environ["PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT"] = "0"
+            os.environ["PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT"] = "0"
             for key, value in overrides.items():
                 os.environ[key] = value
             case_tmp = tmp_path / f"bisect_{experiment}"
@@ -769,32 +769,32 @@ def _tms_vllm_model_path(env_name: str, relative_path: str) -> str:
 
 def _build_tms_comparison_reward_config(model_path: str, tp_size: int, ep_size: int = 1):
     reward_config = _build_reward_config(model_path)
-    max_model_len = int(os.environ.get("PSRL_TMS_VLLM_MAX_MODEL_LEN", "16384"))
+    max_model_len = int(os.environ.get("PIVOTRL_TMS_VLLM_MAX_MODEL_LEN", "16384"))
     reward_config.rollout.tensor_model_parallel_size = tp_size
     reward_config.rollout.expert_parallel_size = ep_size
     reward_config.rollout.prompt_length = int(
-        os.environ.get("PSRL_TMS_VLLM_PROMPT_LENGTH", "1024")
+        os.environ.get("PIVOTRL_TMS_VLLM_PROMPT_LENGTH", "1024")
     )
     reward_config.rollout.response_length = int(
-        os.environ.get("PSRL_TMS_VLLM_MAX_TOKENS", "32")
+        os.environ.get("PIVOTRL_TMS_VLLM_MAX_TOKENS", "32")
     )
     reward_config.rollout.max_model_len = max_model_len
     reward_config.rollout.max_num_batched_tokens = int(
-        os.environ.get("PSRL_TMS_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
+        os.environ.get("PIVOTRL_TMS_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
     )
     reward_config.rollout.max_num_seqs = int(
-        os.environ.get("PSRL_TMS_VLLM_MAX_NUM_SEQS", "64")
+        os.environ.get("PIVOTRL_TMS_VLLM_MAX_NUM_SEQS", "64")
     )
     reward_config.rollout.gpu_memory_utilization = float(
-        os.environ.get("PSRL_TMS_VLLM_GPU_MEMORY_UTILIZATION", "0.7")
+        os.environ.get("PIVOTRL_TMS_VLLM_GPU_MEMORY_UTILIZATION", "0.7")
     )
     reward_config.rollout.enforce_eager = _env_bool(
-        "PSRL_TMS_VLLM_ENFORCE_EAGER", False
+        "PIVOTRL_TMS_VLLM_ENFORCE_EAGER", False
     )
     reward_config.rollout.enable_chunked_prefill = True
     reward_config.rollout.enable_prefix_caching = False
     reward_config.rollout.disable_kv_cache = False
-    reward_config.rollout.use_psrl_scheduler = False
+    reward_config.rollout.use_pivotrl_scheduler = False
     return reward_config
 
 
@@ -829,31 +829,31 @@ def _tms_generation_summary(output: DataProto) -> dict[str, object]:
 
 
 def _tms_stress_generation_config(reward_config) -> dict[str, int]:
-    batch_size = int(os.environ.get("PSRL_TMS_VLLM_STRESS_BATCH_SIZE", "0"))
-    cycles = int(os.environ.get("PSRL_TMS_VLLM_STRESS_CYCLES", "2"))
+    batch_size = int(os.environ.get("PIVOTRL_TMS_VLLM_STRESS_BATCH_SIZE", "0"))
+    cycles = int(os.environ.get("PIVOTRL_TMS_VLLM_STRESS_CYCLES", "2"))
     max_tokens = int(
         os.environ.get(
-            "PSRL_TMS_VLLM_STRESS_MAX_TOKENS",
+            "PIVOTRL_TMS_VLLM_STRESS_MAX_TOKENS",
             str(reward_config.rollout.response_length),
         )
     )
-    min_tokens = int(os.environ.get("PSRL_TMS_VLLM_STRESS_MIN_TOKENS", str(max_tokens)))
+    min_tokens = int(os.environ.get("PIVOTRL_TMS_VLLM_STRESS_MIN_TOKENS", str(max_tokens)))
     sleep_growth_limit_mib = int(
-        os.environ.get("PSRL_TMS_VLLM_SLEEP_GROWTH_LIMIT_MIB", "1024")
+        os.environ.get("PIVOTRL_TMS_VLLM_SLEEP_GROWTH_LIMIT_MIB", "1024")
     )
     if batch_size < 0:
-        raise ValueError(f"PSRL_TMS_VLLM_STRESS_BATCH_SIZE must be non-negative, got {batch_size}")
+        raise ValueError(f"PIVOTRL_TMS_VLLM_STRESS_BATCH_SIZE must be non-negative, got {batch_size}")
     if batch_size > int(reward_config.rollout.max_num_seqs):
         raise ValueError(
-            "PSRL_TMS_VLLM_STRESS_BATCH_SIZE exceeds rollout.max_num_seqs: "
+            "PIVOTRL_TMS_VLLM_STRESS_BATCH_SIZE exceeds rollout.max_num_seqs: "
             f"batch_size={batch_size} max_num_seqs={reward_config.rollout.max_num_seqs}"
         )
     if cycles <= 0:
-        raise ValueError(f"PSRL_TMS_VLLM_STRESS_CYCLES must be positive, got {cycles}")
+        raise ValueError(f"PIVOTRL_TMS_VLLM_STRESS_CYCLES must be positive, got {cycles}")
     if max_tokens > int(reward_config.rollout.response_length):
         raise ValueError(
-            "PSRL_TMS_VLLM_STRESS_MAX_TOKENS exceeds rollout.response_length; "
-            "set PSRL_TMS_VLLM_MAX_TOKENS to the same or a larger value: "
+            "PIVOTRL_TMS_VLLM_STRESS_MAX_TOKENS exceeds rollout.response_length; "
+            "set PIVOTRL_TMS_VLLM_MAX_TOKENS to the same or a larger value: "
             f"stress_max_tokens={max_tokens} response_length={reward_config.rollout.response_length}"
         )
     if not 0 <= min_tokens <= max_tokens:
@@ -862,7 +862,7 @@ def _tms_stress_generation_config(reward_config) -> dict[str, int]:
         )
     if sleep_growth_limit_mib < 0:
         raise ValueError(
-            "PSRL_TMS_VLLM_SLEEP_GROWTH_LIMIT_MIB must be non-negative, "
+            "PIVOTRL_TMS_VLLM_SLEEP_GROWTH_LIMIT_MIB must be non-negative, "
             f"got {sleep_growth_limit_mib}"
         )
     return {
@@ -975,7 +975,7 @@ def _validate_reward_arena_cache_infos(
     [
         pytest.param(
             "qwen2_5_1p5b_tp1",
-            "PSRL_TMS_VLLM_1P5B_MODEL",
+            "PIVOTRL_TMS_VLLM_1P5B_MODEL",
             "models/Qwen2.5-1.5B",
             1,
             1,
@@ -983,7 +983,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen2_5_7b_tp1",
-            "PSRL_TMS_VLLM_7B_MODEL",
+            "PIVOTRL_TMS_VLLM_7B_MODEL",
             "models/Qwen2.5-7B",
             1,
             1,
@@ -991,7 +991,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen2_5_32b_tp4",
-            "PSRL_TMS_VLLM_32B_MODEL",
+            "PIVOTRL_TMS_VLLM_32B_MODEL",
             "models/Qwen2.5-32B",
             4,
             1,
@@ -999,7 +999,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen2_5_72b_tp8",
-            "PSRL_TMS_VLLM_72B_MODEL",
+            "PIVOTRL_TMS_VLLM_72B_MODEL",
             "models/Qwen2.5-72B",
             8,
             1,
@@ -1007,7 +1007,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "glm_z1_9b_tp1",
-            "PSRL_TMS_VLLM_GLM_9B_MODEL",
+            "PIVOTRL_TMS_VLLM_GLM_9B_MODEL",
             "models/GLM-Z1-9B-0414",
             1,
             1,
@@ -1015,7 +1015,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen3_30b_a3b_tp4",
-            "PSRL_TMS_VLLM_MOE_MODEL",
+            "PIVOTRL_TMS_VLLM_MOE_MODEL",
             "models/Qwen3-30B-A3B-Thinking-2507",
             4,
             1,
@@ -1023,7 +1023,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen3_30b_a3b_tp4_ep4",
-            "PSRL_TMS_VLLM_MOE_MODEL",
+            "PIVOTRL_TMS_VLLM_MOE_MODEL",
             "models/Qwen3-30B-A3B-Thinking-2507",
             4,
             4,
@@ -1031,7 +1031,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen3_5_122b_a10b_tp8_ep8",
-            "PSRL_TMS_VLLM_QWEN3_5_122B_MODEL",
+            "PIVOTRL_TMS_VLLM_QWEN3_5_122B_MODEL",
             "models/Qwen3.5-122B-A10B",
             8,
             8,
@@ -1039,7 +1039,7 @@ def _validate_reward_arena_cache_infos(
         ),
         pytest.param(
             "qwen3_next_80b_a3b_tp8_ep8",
-            "PSRL_TMS_VLLM_QWEN3_NEXT_80B_MODEL",
+            "PIVOTRL_TMS_VLLM_QWEN3_NEXT_80B_MODEL",
             "models/Qwen3-Next-80B-A3B-Thinking",
             8,
             8,
@@ -1056,15 +1056,15 @@ def test_tms_vllm_level2_sleep_memory(
     ep_size: int,
 ):
     """Measure TMS-managed vLLM sleep over two wake cycles."""
-    if os.environ.get("PSRL_RUN_TMS_VLLM_SLEEP_SMOKE") != "1":
+    if os.environ.get("PIVOTRL_RUN_TMS_VLLM_SLEEP_SMOKE") != "1":
         pytest.skip(
-            "Set PSRL_RUN_TMS_VLLM_SLEEP_SMOKE=1 to run TMS vLLM sleep probes."
+            "Set PIVOTRL_RUN_TMS_VLLM_SLEEP_SMOKE=1 to run TMS vLLM sleep probes."
         )
 
     model_path = _tms_vllm_model_path(model_env, relative_model_path)
     if not (Path(model_path) / "config.json").exists():
         pytest.skip(f"TMS vLLM sleep model is unavailable: {model_path}")
-    tp_size = int(os.environ.get("PSRL_TMS_VLLM_TP_SIZE", str(tp_size)))
+    tp_size = int(os.environ.get("PIVOTRL_TMS_VLLM_TP_SIZE", str(tp_size)))
 
     started_ray = False
     if not ray.is_initialized():
@@ -1076,31 +1076,31 @@ def test_tms_vllm_level2_sleep_memory(
             ray.shutdown()
         pytest.skip(f"{case_name} needs {tp_size} GPUs, but Ray sees {available_gpus}")
 
-    probe_role = os.environ.get("PSRL_TMS_VLLM_PROBE_ROLE", "reward").strip().lower()
+    probe_role = os.environ.get("PIVOTRL_TMS_VLLM_PROBE_ROLE", "reward").strip().lower()
     if probe_role not in {"reward", "rollout"}:
-        raise ValueError(f"PSRL_TMS_VLLM_PROBE_ROLE must be reward or rollout, got {probe_role!r}")
+        raise ValueError(f"PIVOTRL_TMS_VLLM_PROBE_ROLE must be reward or rollout, got {probe_role!r}")
 
-    load_real_weights_at_init = _env_bool("PSRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", False)
-    psrl_config = _build_psrl_config(
+    load_real_weights_at_init = _env_bool("PIVOTRL_RM_SMOKE_LOAD_REAL_WEIGHTS_AT_INIT", False)
+    pivotrl_config = _build_pivotrl_config(
         tmp_path,
         load_real_weights_at_init=load_real_weights_at_init,
     )
-    psrl_config.tms.enable_cuda_graph = probe_role == "rollout"
+    pivotrl_config.tms.enable_cuda_graph = probe_role == "rollout"
     if probe_role == "rollout":
-        psrl_config.ps_mode = "nixl_cpu"
-        psrl_config.tms.enable_nixl = True
-    weight_arena_enabled = _env_bool("PSRL_TMS_VLLM_WEIGHT_ARENA", False)
+        pivotrl_config.ps_mode = "nixl_cpu"
+        pivotrl_config.tms.enable_nixl = True
+    weight_arena_enabled = _env_bool("PIVOTRL_TMS_VLLM_WEIGHT_ARENA", False)
     if weight_arena_enabled:
-        psrl_config.nixl.weight_arena = _build_tms_weight_arena_config(probe_role)
-    local_node_only = _env_bool("PSRL_TMS_VLLM_LOCAL_NODE_ONLY", False)
+        pivotrl_config.nixl.weight_arena = _build_tms_weight_arena_config(probe_role)
+    local_node_only = _env_bool("PIVOTRL_TMS_VLLM_LOCAL_NODE_ONLY", False)
     verify_generation = probe_role == "rollout" and _env_bool(
-        "PSRL_TMS_VLLM_VERIFY_GENERATION", False
+        "PIVOTRL_TMS_VLLM_VERIFY_GENERATION", False
     )
     reward_config = _build_tms_comparison_reward_config(model_path, tp_size, ep_size)
     stress_config = _tms_stress_generation_config(reward_config)
-    init_timeout_s = int(os.environ.get("PSRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
+    init_timeout_s = int(os.environ.get("PIVOTRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
     operation_timeout_s = int(
-        os.environ.get("PSRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
+        os.environ.get("PIVOTRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
     )
     timings: dict[str, float] = {}
     generations: dict[str, object] = {}
@@ -1115,7 +1115,7 @@ def test_tms_vllm_level2_sleep_memory(
         "tp_size": tp_size,
         "ep_size": ep_size,
         "weight_arena_enabled": weight_arena_enabled,
-        "elastic_rm_enabled": bool(psrl_config.deployment.elastic_rm.enable),
+        "elastic_rm_enabled": bool(pivotrl_config.deployment.elastic_rm.enable),
         "local_node_only": local_node_only,
         "verify_generation": verify_generation,
         "stress_generation": stress_config,
@@ -1124,15 +1124,15 @@ def test_tms_vllm_level2_sleep_memory(
         "generations": generations,
     }
 
-    output_dir_raw = os.environ.get("PSRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir_raw = os.environ.get("PIVOTRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
     output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
     output_dir.mkdir(parents=True, exist_ok=True)
     report_name = case_name if probe_role == "reward" else f"{probe_role}_{case_name}"
     report_path = output_dir / f"tms_vllm_sleep_{report_name}.json"
 
-    resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+    resources, env_vars, init_kwargs = PivotRL_GenWorker.configure_worker(
         config=reward_config,
-        psrl_config=psrl_config,
+        pivotrl_config=pivotrl_config,
         num_gpus=1,
         dp_idx=0,
         bundle_indices=list(range(tp_size)),
@@ -1152,9 +1152,9 @@ def test_tms_vllm_level2_sleep_memory(
         "TOKENIZERS_PARALLELISM": "false",
     }
     tms_info = {
-        "psrl_vllm_patches": actor_env.get("PSRL_VLLM_PATCHES", ""),
-        "psrl_vllm_weight_arena": actor_env.get("PSRL_VLLM_WEIGHT_ARENA", ""),
-        "vllm_psrl_weight_arena": actor_env.get("VLLM_PSRL_WEIGHT_ARENA", ""),
+        "pivotrl_vllm_patches": actor_env.get("PIVOTRL_VLLM_PATCHES", ""),
+        "pivotrl_vllm_weight_arena": actor_env.get("PIVOTRL_VLLM_WEIGHT_ARENA", ""),
+        "vllm_pivotrl_weight_arena": actor_env.get("VLLM_PIVOTRL_WEIGHT_ARENA", ""),
         "ld_preload": actor_env.get("LD_PRELOAD", ""),
         "tms_init_enable": actor_env.get("TMS_INIT_ENABLE", ""),
         "tms_init_enable_cpu_backup": actor_env.get(
@@ -1162,7 +1162,7 @@ def test_tms_vllm_level2_sleep_memory(
         ),
     }
     expected_patch = "TMS:GRAPH" if probe_role == "rollout" else "TMS"
-    if tms_info["psrl_vllm_patches"] != expected_patch:
+    if tms_info["pivotrl_vllm_patches"] != expected_patch:
         raise RuntimeError(f"TMS patch is not configured: {tms_info}")
     if "torch_memory_saver_hook_mode_preload" not in tms_info["ld_preload"]:
         raise RuntimeError(f"TMS LD_PRELOAD hook is not configured: {tms_info}")
@@ -1212,8 +1212,8 @@ def test_tms_vllm_level2_sleep_memory(
                 f"Probe placement escaped the local node: expected {local_node['NodeID']}, got {identity['node_id']}."
             )
         if probe_role == "rollout":
-            from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
-            from psrl.workers.ps import PSStoragePlan, PSStorageWorker
+            from pivotrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+            from pivotrl.workers.ps import PSStoragePlan, PSStorageWorker
 
             server_port = ray.get(
                 GLOBAL_PORT_SCANNER.find_free_port.remote(host=identity["node_ip"]),
@@ -1227,10 +1227,10 @@ def test_tms_vllm_level2_sleep_memory(
             }
             if weight_arena_enabled:
                 nixl_runtime_config["weight_arena"] = OmegaConf.to_container(
-                    psrl_config.nixl.weight_arena,
+                    pivotrl_config.nixl.weight_arena,
                     resolve=True,
                 )
-            psrl_config.nixl = OmegaConf.create(nixl_runtime_config)
+            pivotrl_config.nixl = OmegaConf.create(nixl_runtime_config)
             nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
             node_affinity = NodeAffinitySchedulingStrategy(
                 node_id=identity["node_id"],
@@ -1238,7 +1238,7 @@ def test_tms_vllm_level2_sleep_memory(
             )
             meta_server = _NIXLProbeMetaServer.options(
                 scheduling_strategy=node_affinity,
-            ).remote(psrl_config.nixl, tp_size + 1)
+            ).remote(pivotrl_config.nixl, tp_size + 1)
             ray.get(meta_server.ready.remote(), timeout=60)
             ps_control = _NIXLProbePSControl.options(
                 scheduling_strategy=node_affinity,
@@ -1260,7 +1260,7 @@ def test_tms_vllm_level2_sleep_memory(
                     gen_model_dtype=torch.bfloat16,
                 ),
                 reward_config.model,
-                psrl_config,
+                pivotrl_config,
                 nixl_interface,
             )
             ps_init_start = time.perf_counter()
@@ -1279,7 +1279,7 @@ def test_tms_vllm_level2_sleep_memory(
             num_gpus=resources.get("num_gpus", 1),
             num_cpus=resources.get("num_cpus", 1),
             runtime_env={"env_vars": actor_env},
-        )(PSRL_GenWorker)
+        )(PivotRL_GenWorker)
         actor = RewardWorker.options(
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 probe_pg,
@@ -1289,7 +1289,7 @@ def test_tms_vllm_level2_sleep_memory(
         ).remote(
             config=reward_config,
             role=probe_role,
-            psrl_config=psrl_config,
+            pivotrl_config=pivotrl_config,
             gen_interface=GenInterface(
                 rollout_instance_id=0,
                 status_queue=ray.util.queue.Queue(),
@@ -1562,7 +1562,7 @@ def test_tms_vllm_level2_sleep_memory(
                     raise AssertionError(f"Reward wake restored incomplete arena bytes: {worker_timing}")
                 reward_restore_samples.append(float(timing["gpu_copy_elapsed_s"]))
             restore_p95 = float(np.percentile(reward_restore_samples, 95))
-            restore_limit_s = float(os.environ.get("PSRL_TMS_VLLM_REWARD_RESTORE_P95_LIMIT_S", "2.0"))
+            restore_limit_s = float(os.environ.get("PIVOTRL_TMS_VLLM_REWARD_RESTORE_P95_LIMIT_S", "2.0"))
             if restore_p95 > restore_limit_s:
                 raise AssertionError(
                     "Reward arena H2D restore p95 exceeded the configured limit: "
@@ -1775,14 +1775,14 @@ def test_tms_vllm_level2_sleep_memory(
     [
         pytest.param(
             "qwen2_5_7b_tp1",
-            "PSRL_TMS_VLLM_7B_MODEL",
+            "PIVOTRL_TMS_VLLM_7B_MODEL",
             "models/Qwen2.5-7B",
             1,
             id="qwen2.5-7b-tp1",
         ),
         pytest.param(
             "qwen2_5_32b_tp4",
-            "PSRL_TMS_VLLM_32B_MODEL",
+            "PIVOTRL_TMS_VLLM_32B_MODEL",
             "models/Qwen2.5-32B",
             4,
             id="qwen2.5-32b-tp4",
@@ -1797,28 +1797,28 @@ def test_tms_rollout_concurrent_sleep_wake(
     tp_size: int,
 ) -> None:
     """Run coordinator-shaped concurrent sleep/wake/sync waves."""
-    if os.environ.get("PSRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE") != "1":
-        pytest.skip("Set PSRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE=1 to run this probe.")
+    if os.environ.get("PIVOTRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE") != "1":
+        pytest.skip("Set PIVOTRL_RUN_TMS_ROLLOUT_CONCURRENT_PROBE=1 to run this probe.")
 
     model_path = _tms_vllm_model_path(model_env, relative_model_path)
     if not (Path(model_path) / "config.json").exists():
         pytest.skip(f"TMS vLLM sleep model is unavailable: {model_path}")
 
-    num_instances = int(os.environ.get("PSRL_TMS_VLLM_NUM_INSTANCES", "4"))
+    num_instances = int(os.environ.get("PIVOTRL_TMS_VLLM_NUM_INSTANCES", "4"))
     if num_instances < 2:
         raise ValueError("Concurrent rollout probe needs at least two instances.")
-    cycles = int(os.environ.get("PSRL_TMS_VLLM_CYCLES", "2"))
+    cycles = int(os.environ.get("PIVOTRL_TMS_VLLM_CYCLES", "2"))
     if cycles < 1:
-        raise ValueError("PSRL_TMS_VLLM_CYCLES must be a positive integer.")
+        raise ValueError("PIVOTRL_TMS_VLLM_CYCLES must be a positive integer.")
     wake_schedule = os.environ.get(
-        "PSRL_TMS_VLLM_WAKE_SCHEDULE", "concurrent"
+        "PIVOTRL_TMS_VLLM_WAKE_SCHEDULE", "concurrent"
     )
     if wake_schedule not in {"concurrent", "node_serial"}:
         raise ValueError(
-            "PSRL_TMS_VLLM_WAKE_SCHEDULE must be concurrent or node_serial."
+            "PIVOTRL_TMS_VLLM_WAKE_SCHEDULE must be concurrent or node_serial."
         )
     ucx_device_groups_raw = os.environ.get(
-        "PSRL_TMS_VLLM_UCX_DEVICE_GROUPS", ""
+        "PIVOTRL_TMS_VLLM_UCX_DEVICE_GROUPS", ""
     ).strip()
     ucx_device_groups = [
         group.strip()
@@ -1826,11 +1826,11 @@ def test_tms_rollout_concurrent_sleep_wake(
         if group.strip()
     ]
     probe_variant = os.environ.get(
-        "PSRL_TMS_VLLM_PROBE_VARIANT",
+        "PIVOTRL_TMS_VLLM_PROBE_VARIANT",
         f"{wake_schedule}_hca_split" if ucx_device_groups else wake_schedule,
     ).strip()
     if not probe_variant:
-        raise ValueError("PSRL_TMS_VLLM_PROBE_VARIANT must not be empty.")
+        raise ValueError("PIVOTRL_TMS_VLLM_PROBE_VARIANT must not be empty.")
 
     started_ray = False
     if not ray.is_initialized():
@@ -1846,17 +1846,17 @@ def test_tms_rollout_concurrent_sleep_wake(
             f"but Ray sees {available_gpus}"
         )
 
-    psrl_config = _build_psrl_config(tmp_path, load_real_weights_at_init=True)
-    psrl_config.ps_mode = "nixl_cpu"
-    psrl_config.tms.enable_nixl = True
-    psrl_config.tms.enable_cuda_graph = True
-    weight_arena_enabled = _env_bool("PSRL_TMS_VLLM_WEIGHT_ARENA", False)
+    pivotrl_config = _build_pivotrl_config(tmp_path, load_real_weights_at_init=True)
+    pivotrl_config.ps_mode = "nixl_cpu"
+    pivotrl_config.tms.enable_nixl = True
+    pivotrl_config.tms.enable_cuda_graph = True
+    weight_arena_enabled = _env_bool("PIVOTRL_TMS_VLLM_WEIGHT_ARENA", False)
     if weight_arena_enabled:
-        psrl_config.nixl.weight_arena = _build_tms_weight_arena_config("rollout")
+        pivotrl_config.nixl.weight_arena = _build_tms_weight_arena_config("rollout")
     rollout_config = _build_tms_comparison_reward_config(model_path, tp_size)
-    init_timeout_s = int(os.environ.get("PSRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
+    init_timeout_s = int(os.environ.get("PIVOTRL_TMS_VLLM_INIT_TIMEOUT_S", "1800"))
     operation_timeout_s = int(
-        os.environ.get("PSRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
+        os.environ.get("PIVOTRL_TMS_VLLM_OPERATION_TIMEOUT_S", "900")
     )
     report: dict[str, object] = {
         "case": case_name,
@@ -1874,7 +1874,7 @@ def test_tms_rollout_concurrent_sleep_wake(
         "setup_timings_s": {},
         "waves": [],
     }
-    output_dir_raw = os.environ.get("PSRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir_raw = os.environ.get("PIVOTRL_TMS_VLLM_SLEEP_OUTPUT_DIR")
     output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / (
@@ -1955,7 +1955,7 @@ def test_tms_rollout_concurrent_sleep_wake(
             max_instances_per_node = max(map(len, node_instance_ids.values()))
             if len(ucx_device_groups) < max_instances_per_node:
                 raise ValueError(
-                    "PSRL_TMS_VLLM_UCX_DEVICE_GROUPS must provide at least "
+                    "PIVOTRL_TMS_VLLM_UCX_DEVICE_GROUPS must provide at least "
                     f"{max_instances_per_node} groups separated by '|', got "
                     f"{len(ucx_device_groups)}."
                 )
@@ -1975,8 +1975,8 @@ def test_tms_rollout_concurrent_sleep_wake(
         report["node_instance_ids"] = node_instance_ids
         report["node_serial_rounds"] = node_serial_rounds
 
-        from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
-        from psrl.workers.ps import PSStoragePlan, PSStorageWorker
+        from pivotrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
+        from pivotrl.workers.ps import PSStoragePlan, PSStorageWorker
 
         server_port = ray.get(
             GLOBAL_PORT_SCANNER.find_free_port.remote(host=identities[0]["node_ip"]),
@@ -1990,10 +1990,10 @@ def test_tms_rollout_concurrent_sleep_wake(
         }
         if weight_arena_enabled:
             nixl_runtime_config["weight_arena"] = OmegaConf.to_container(
-                psrl_config.nixl.weight_arena,
+                pivotrl_config.nixl.weight_arena,
                 resolve=True,
             )
-        psrl_config.nixl = OmegaConf.create(nixl_runtime_config)
+        pivotrl_config.nixl = OmegaConf.create(nixl_runtime_config)
         nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
         ps_node_affinity = NodeAffinitySchedulingStrategy(
             node_id=identities[0]["node_id"],
@@ -2001,7 +2001,7 @@ def test_tms_rollout_concurrent_sleep_wake(
         )
         meta_server = _NIXLProbeMetaServer.options(
             scheduling_strategy=ps_node_affinity,
-        ).remote(psrl_config.nixl, required_gpus + 1)
+        ).remote(pivotrl_config.nixl, required_gpus + 1)
         ray.get(meta_server.ready.remote(), timeout=60)
         ps_control = _NIXLProbePSControl.options(
             scheduling_strategy=ps_node_affinity,
@@ -2022,7 +2022,7 @@ def test_tms_rollout_concurrent_sleep_wake(
                 gen_model_dtype=torch.bfloat16,
             ),
             rollout_config.model,
-            psrl_config,
+            pivotrl_config,
             nixl_interface,
         )
         setup_timings = report["setup_timings_s"]
@@ -2031,11 +2031,11 @@ def test_tms_rollout_concurrent_sleep_wake(
         ps_actor.init_model.remote()
         ps_preload_ref = ps_actor.preload_checkpoint_to_cpu.remote()
 
-        GenActor = ray.remote(max_concurrency=10000)(PSRL_GenWorker)
+        GenActor = ray.remote(max_concurrency=10000)(PivotRL_GenWorker)
         for instance_id, (pg, identity) in enumerate(zip(probe_pgs, identities)):
-            resources, env_vars, init_kwargs = PSRL_GenWorker.configure_worker(
+            resources, env_vars, init_kwargs = PivotRL_GenWorker.configure_worker(
                 config=rollout_config,
-                psrl_config=psrl_config,
+                pivotrl_config=pivotrl_config,
                 num_gpus=1,
                 dp_idx=instance_id,
                 bundle_indices=list(range(tp_size)),
@@ -2080,7 +2080,7 @@ def test_tms_rollout_concurrent_sleep_wake(
                 ).remote(
                     config=rollout_config,
                     role="rollout",
-                    psrl_config=psrl_config,
+                    pivotrl_config=pivotrl_config,
                     gen_interface=GenInterface(
                         rollout_instance_id=instance_id,
                         status_queue=ray.util.queue.Queue(),
@@ -2288,7 +2288,7 @@ def test_tms_rollout_concurrent_sleep_wake(
 _NATIVE_VLLM_ACTOR_ENV = {
     # The plugin is installed in this checkout, so explicitly keep the native
     # vLLM CuMemAllocator implementation active for this probe.
-    "PSRL_VLLM_PATCHES": "",
+    "PIVOTRL_VLLM_PATCHES": "",
     "TMS_INIT_ENABLE": "0",
     "TMS_INIT_ENABLE_CPU_BACKUP": "0",
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
@@ -2306,10 +2306,10 @@ class _NativeVLLMSleepProbe:
         self.llm = None
 
     def initialize(self, engine_config: dict) -> dict[str, str]:
-        if os.environ.get("PSRL_VLLM_PATCHES"):
+        if os.environ.get("PIVOTRL_VLLM_PATCHES"):
             raise RuntimeError(
-                "Native vLLM sleep probe must run without PSRL_VLLM_PATCHES; "
-                f"got {os.environ['PSRL_VLLM_PATCHES']!r}."
+                "Native vLLM sleep probe must run without PIVOTRL_VLLM_PATCHES; "
+                f"got {os.environ['PIVOTRL_VLLM_PATCHES']!r}."
             )
 
         import vllm
@@ -2371,9 +2371,9 @@ def _native_vllm_model_path(env_name: str, relative_path: str) -> str:
 
 
 def _native_vllm_engine_config(model_path: str, tp_size: int) -> dict[str, object]:
-    max_model_len = int(os.environ.get("PSRL_NATIVE_VLLM_MAX_MODEL_LEN", "16384"))
+    max_model_len = int(os.environ.get("PIVOTRL_NATIVE_VLLM_MAX_MODEL_LEN", "16384"))
     max_num_batched_tokens = int(
-        os.environ.get("PSRL_NATIVE_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
+        os.environ.get("PIVOTRL_NATIVE_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_model_len))
     )
     return {
         "model": model_path,
@@ -2382,11 +2382,11 @@ def _native_vllm_engine_config(model_path: str, tp_size: int) -> dict[str, objec
         "pipeline_parallel_size": 1,
         "distributed_executor_backend": "ray",
         "dtype": "bfloat16",
-        "gpu_memory_utilization": float(os.environ.get("PSRL_NATIVE_VLLM_GPU_MEMORY_UTILIZATION", "0.7")),
-        "enforce_eager": _env_bool("PSRL_NATIVE_VLLM_ENFORCE_EAGER", False),
+        "gpu_memory_utilization": float(os.environ.get("PIVOTRL_NATIVE_VLLM_GPU_MEMORY_UTILIZATION", "0.7")),
+        "enforce_eager": _env_bool("PIVOTRL_NATIVE_VLLM_ENFORCE_EAGER", False),
         "max_model_len": max_model_len,
         "max_num_batched_tokens": max_num_batched_tokens,
-        "max_num_seqs": int(os.environ.get("PSRL_NATIVE_VLLM_MAX_NUM_SEQS", "64")),
+        "max_num_seqs": int(os.environ.get("PIVOTRL_NATIVE_VLLM_MAX_NUM_SEQS", "64")),
         "enable_chunked_prefill": True,
         "enable_prefix_caching": False,
         "disable_custom_all_reduce": True,
@@ -2410,14 +2410,14 @@ def _record_native_vllm_memory(
     [
         pytest.param(
             "qwen2_5_7b_tp1",
-            "PSRL_NATIVE_VLLM_7B_MODEL",
+            "PIVOTRL_NATIVE_VLLM_7B_MODEL",
             "models/Qwen2.5-7B",
             1,
             id="qwen2.5-7b-tp1",
         ),
         pytest.param(
             "qwen2_5_32b_tp4",
-            "PSRL_NATIVE_VLLM_32B_MODEL",
+            "PIVOTRL_NATIVE_VLLM_32B_MODEL",
             "models/Qwen2.5-32B",
             4,
             id="qwen2.5-32b-tp4",
@@ -2437,9 +2437,9 @@ def test_native_vllm_level2_sleep_memory(
     native level-2 contract: allocate weights, reload them from disk, then
     allocate KV cache before inference.
     """
-    if os.environ.get("PSRL_RUN_NATIVE_VLLM_SLEEP_SMOKE") != "1":
+    if os.environ.get("PIVOTRL_RUN_NATIVE_VLLM_SLEEP_SMOKE") != "1":
         pytest.skip(
-            "Set PSRL_RUN_NATIVE_VLLM_SLEEP_SMOKE=1 to run native vLLM sleep probes."
+            "Set PIVOTRL_RUN_NATIVE_VLLM_SLEEP_SMOKE=1 to run native vLLM sleep probes."
         )
 
     model_path = _native_vllm_model_path(model_env, relative_model_path)
@@ -2457,9 +2457,9 @@ def test_native_vllm_level2_sleep_memory(
         pytest.skip(f"{case_name} needs {tp_size} GPUs, but Ray sees {available_gpus}")
 
     engine_config = _native_vllm_engine_config(model_path, tp_size)
-    max_tokens = int(os.environ.get("PSRL_NATIVE_VLLM_MAX_TOKENS", "32"))
-    init_timeout_s = int(os.environ.get("PSRL_NATIVE_VLLM_INIT_TIMEOUT_S", "1800"))
-    operation_timeout_s = int(os.environ.get("PSRL_NATIVE_VLLM_OPERATION_TIMEOUT_S", "900"))
+    max_tokens = int(os.environ.get("PIVOTRL_NATIVE_VLLM_MAX_TOKENS", "32"))
+    init_timeout_s = int(os.environ.get("PIVOTRL_NATIVE_VLLM_INIT_TIMEOUT_S", "1800"))
+    operation_timeout_s = int(os.environ.get("PIVOTRL_NATIVE_VLLM_OPERATION_TIMEOUT_S", "900"))
     report: dict[str, object] = {
         "case": case_name,
         "model_path": model_path,
@@ -2469,7 +2469,7 @@ def test_native_vllm_level2_sleep_memory(
         "generations": {},
     }
 
-    output_dir_raw = os.environ.get("PSRL_NATIVE_VLLM_SLEEP_OUTPUT_DIR")
+    output_dir_raw = os.environ.get("PIVOTRL_NATIVE_VLLM_SLEEP_OUTPUT_DIR")
     output_dir = Path(output_dir_raw).expanduser() if output_dir_raw else tmp_path
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / f"native_vllm_sleep_{case_name}.json"

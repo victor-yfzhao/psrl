@@ -1,6 +1,6 @@
 import pytest
 import torch
-from psrl.utils.weight_arena import (
+from pivotrl.utils.weight_arena import (
     gb_to_bytes,
     get_fsdp_param_groups,
     materialize_module_weights_in_arena,

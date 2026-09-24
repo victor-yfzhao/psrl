@@ -1,6 +1,6 @@
 import ray
 import torch
-from psrl.utils.nixl.server_client import NIXLMetaServer, NIXLStorageClient
+from pivotrl.utils.nixl.server_client import NIXLMetaServer, NIXLStorageClient
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 

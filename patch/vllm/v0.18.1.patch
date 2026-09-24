@@ -327,7 +327,7 @@ index 45f002e01..0df2835d7 100644
  @dataclass
  class SchedulerStats:
      """Stats associated with the scheduler."""
-+    # NOTE(lhy): we need to add this field to the scheduler stats for PSRL.
++    # NOTE(lhy): we need to add this field to the scheduler stats for PivotRL.
 +    need_to_abort_reqs: list[str] = field(default_factory=list)
 +    req_id_to_prompt_token_num: dict[str, int] | None = None
 +    req_id_to_response_token_num: dict[str, int] | None = None

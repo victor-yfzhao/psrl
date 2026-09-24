@@ -1,6 +1,6 @@
-import psrl.utils.elastic_rm.request_level_candidate_evaluator as evaluator_module
-from psrl.utils.elastic_rm.candidate_routing import resolve_candidate_model_versions
-from psrl.utils.elastic_rm.request_level_candidate_evaluator import (
+import pivotrl.utils.elastic_rm.request_level_candidate_evaluator as evaluator_module
+from pivotrl.utils.elastic_rm.candidate_routing import resolve_candidate_model_versions
+from pivotrl.utils.elastic_rm.request_level_candidate_evaluator import (
     RoleCandidatePlan,
     RoleSnapshot,
     evaluate_role_candidate,

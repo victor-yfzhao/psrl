@@ -32,9 +32,9 @@ if "ray" not in sys.modules:
     sys.modules["ray"] = ray_stub
     sys.modules["ray.actor"] = ray_actor_stub
 
-from psrl.utils.nixl.comm_plan import NIXLCommPlan  # noqa: E402
-from psrl.utils.nixl.nixl_spec import NIXLClientType  # noqa: E402
-from psrl.utils.nixl.server import NIXLMetaServer  # noqa: E402
+from pivotrl.utils.nixl.comm_plan import NIXLCommPlan  # noqa: E402
+from pivotrl.utils.nixl.nixl_spec import NIXLClientType  # noqa: E402
+from pivotrl.utils.nixl.server import NIXLMetaServer  # noqa: E402
 
 
 class _ClientInfo:

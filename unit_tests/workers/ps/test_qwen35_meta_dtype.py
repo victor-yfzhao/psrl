@@ -1,5 +1,5 @@
 import torch
-from psrl.utils.converter.model_dtypes import fix_meta_model_dtypes
+from pivotrl.utils.converter.model_dtypes import fix_meta_model_dtypes
 from torch import nn
 
 

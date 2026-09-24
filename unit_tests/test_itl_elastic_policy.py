@@ -6,18 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.elastic_rm.itl_harmonic_scaling_policy import ITLHarmonicScalingPolicy
-from psrl.utils.elastic_rm.itl_scaling_policy import (
+from pivotrl.trainer.ppo.utils import PivotRL_Role
+from pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy import ITLHarmonicScalingPolicy
+from pivotrl.utils.elastic_rm.itl_scaling_policy import (
     ITLModelParams,
     ITLScalingPolicy,
     compute_itl,
     resolve_itl_model_params,
 )
-from psrl.utils.elastic_rm.scaling_policy import InstanceSignal
-from psrl.workers.reward.reward_model.router import (
+from pivotrl.utils.elastic_rm.scaling_policy import InstanceSignal
+from pivotrl.workers.reward.reward_model.router import (
     ITLBalanceRewardModelRouteStrategy,
-    PSRL_RewardModelRouter,
+    PivotRL_RewardModelRouter,
     ThroughputOptimalRewardModelRouteStrategy,
 )
 
@@ -41,7 +41,7 @@ class _Worker:
 
 
 def _config():
-    return SimpleNamespace(psrl=SimpleNamespace(logging_path="/tmp"))
+    return SimpleNamespace(pivotrl=SimpleNamespace(logging_path="/tmp"))
 
 
 def _policy(
@@ -84,7 +84,7 @@ def _policy(
 
 
 def _signal(
-    role: PSRL_Role,
+    role: PivotRL_Role,
     instance_id: int,
     *,
     awake: bool,
@@ -113,9 +113,9 @@ def _signal(
 
 
 def test_resolve_itl_model_params_reads_tp_pp_cost_model_json():
-    cost_path = "psrl/trainer/config/cost_model"
+    cost_path = "pivotrl/trainer/config/cost_model"
     rollout_params = resolve_itl_model_params(
-        role_name=PSRL_Role.Rollout,
+        role_name=PivotRL_Role.Rollout,
         model_name="Qwen2.5-7B",
         itl_config={"cost_model_path": cost_path},
         tp_pp="TP1_PP1",
@@ -126,7 +126,7 @@ def test_resolve_itl_model_params_reads_tp_pp_cost_model_json():
     assert rollout_params.D == pytest.approx(0.0005060241)
 
     rm_params = resolve_itl_model_params(
-        role_name=PSRL_Role.RewardModel,
+        role_name=PivotRL_Role.RewardModel,
         model_name="Qwen3-8B",
         itl_config={"cost_model_path": cost_path},
         tp_pp="TP1_PP1",
@@ -138,9 +138,9 @@ def test_resolve_itl_model_params_reads_tp_pp_cost_model_json():
 
 
 def test_resolve_itl_model_params_auto_selects_single_tp_pp_bucket():
-    cost_path = "psrl/trainer/config/cost_model"
+    cost_path = "pivotrl/trainer/config/cost_model"
     params = resolve_itl_model_params(
-        role_name=PSRL_Role.Rollout,
+        role_name=PivotRL_Role.Rollout,
         model_name="Qwen2.5-7B",
         itl_config={"cost_model_path": cost_path},
     )
@@ -148,7 +148,7 @@ def test_resolve_itl_model_params_auto_selects_single_tp_pp_bucket():
 
 
 def test_resolve_itl_model_params_uses_config_parallelism_for_tp_pp():
-    cost_path = "psrl/trainer/config/cost_model"
+    cost_path = "pivotrl/trainer/config/cost_model"
     config = SimpleNamespace(
         gen_actor_rollout_ref=SimpleNamespace(
             rollout=SimpleNamespace(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
@@ -163,13 +163,13 @@ def test_resolve_itl_model_params_uses_config_parallelism_for_tp_pp():
         ),
     )
     rollout_params = resolve_itl_model_params(
-        role_name=PSRL_Role.Rollout,
+        role_name=PivotRL_Role.Rollout,
         model_name="Qwen2.5-7B",
         itl_config={"cost_model_path": cost_path},
         config=config,
     )
     rm_params = resolve_itl_model_params(
-        role_name=PSRL_Role.RewardModel,
+        role_name=PivotRL_Role.RewardModel,
         model_name="Qwen3-8B",
         itl_config={"cost_model_path": cost_path},
         config=config,
@@ -180,11 +180,11 @@ def test_resolve_itl_model_params_uses_config_parallelism_for_tp_pp():
 
 def test_current_state_router_waiting_switch_controls_current_throughput():
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=True, running=3, tokens=30, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=True, running=3, tokens=30, bundle=1),
     ]
-    grouped = {PSRL_Role.Rollout: rollout}
-    router_backlog = {PSRL_Role.Rollout: {"count": 14, "total_tokens": 0}}
+    grouped = {PivotRL_Role.Rollout: rollout}
+    router_backlog = {PivotRL_Role.Rollout: {"count": 14, "total_tokens": 0}}
 
     enabled = _policy(throughput_objective="sum", current_state_include_router_waiting=True)
     enabled_tps = enabled._current_role_throughputs(
@@ -193,7 +193,7 @@ def test_current_state_router_waiting_switch_controls_current_throughput():
         rm_n=0,
         router_backlog_by_role=router_backlog,
     )
-    enabled_waiting = enabled._current_router_waiting_load(router_backlog[PSRL_Role.Rollout])
+    enabled_waiting = enabled._current_router_waiting_load(router_backlog[PivotRL_Role.Rollout])
     enabled_snapshot = enabled._current_role_load_snapshot(rollout, 2, enabled_waiting)
 
     disabled = _policy(throughput_objective="sum", current_state_include_router_waiting=False)
@@ -203,20 +203,20 @@ def test_current_state_router_waiting_switch_controls_current_throughput():
         rm_n=0,
         router_backlog_by_role=router_backlog,
     )
-    disabled_waiting = disabled._current_router_waiting_load(router_backlog[PSRL_Role.Rollout])
+    disabled_waiting = disabled._current_router_waiting_load(router_backlog[PivotRL_Role.Rollout])
     disabled_snapshot = disabled._current_role_load_snapshot(rollout, 2, disabled_waiting)
 
-    assert enabled_tps[PSRL_Role.Rollout] == pytest.approx(2.0)
+    assert enabled_tps[PivotRL_Role.Rollout] == pytest.approx(2.0)
     assert [row[1] for row in enabled_snapshot.instance_rows] == pytest.approx([10.0, 10.0])
-    assert disabled_tps[PSRL_Role.Rollout] == pytest.approx(0.6)
+    assert disabled_tps[PivotRL_Role.Rollout] == pytest.approx(0.6)
     assert [row[1] for row in disabled_snapshot.instance_rows] == pytest.approx([3.0, 3.0])
 
 
 def test_itl_role_throughput_uses_balanced_average_state():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
     ]
 
     assert policy._role_throughput(signals, 2) == 0.6
@@ -224,7 +224,7 @@ def test_itl_role_throughput_uses_balanced_average_state():
 
 def test_itl_role_throughput_can_ignore_vllm_waiting_load():
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=4, waiting=8, tokens=0, bundle=0),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=4, waiting=8, tokens=0, bundle=0),
     ]
 
     legacy_policy = _policy()
@@ -237,8 +237,8 @@ def test_itl_role_throughput_can_ignore_vllm_waiting_load():
 def test_itl_role_throughput_includes_router_waiting_prefix_load():
     policy = _policy({"default": {"A": 0.1, "B": 10.0, "C": 1.0, "D": 0.0}})
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
     ]
     waiting = policy._normalize_router_waiting_load({"count": 4, "total_tokens": 40})
 
@@ -248,8 +248,8 @@ def test_itl_role_throughput_includes_router_waiting_prefix_load():
 def test_itl_role_throughput_idle_role_is_not_bottleneck_even_with_zero_instances():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
     ]
 
     assert math.isinf(policy._role_throughput(signals, 0))
@@ -258,7 +258,7 @@ def test_itl_role_throughput_idle_role_is_not_bottleneck_even_with_zero_instance
 def test_itl_role_throughput_waiting_role_without_instances_is_bottleneck():
     policy = _policy()
     signals = [
-        _signal(PSRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=0),
+        _signal(PivotRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=0),
     ]
     waiting = policy._normalize_router_waiting_load({"count": 1, "total_tokens": 10})
 
@@ -268,21 +268,21 @@ def test_itl_role_throughput_waiting_role_without_instances_is_bottleneck():
 def test_itl_sum_objective_adds_instance_throughputs_with_idle_as_inf():
     policy = _policy(throughput_objective="sum")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=True, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=True, running=0, tokens=0, bundle=1),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2),
     ]
 
     assert math.isinf(policy._role_throughput_sum(rollout, 2))
-    assert policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 2, 1) == 0.5
+    assert policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 2, 1) == 0.5
 
 
 def test_role_throughput_weights_share_pressure_across_both_roles():
     policy = _policy(role_throughput_weight_enable=True, role_throughput_weight_basis="request_count")
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
     rollout_waiting = policy._normalize_router_waiting_load({"count": 8, "total_tokens": 80})
     rm_waiting = policy._normalize_router_waiting_load({"count": 2, "total_tokens": 20})
 
@@ -295,8 +295,8 @@ def test_role_throughput_weights_share_pressure_across_both_roles():
 
 def test_role_throughput_weights_use_token_basis_when_configured():
     policy = _policy(role_throughput_weight_enable=True, role_throughput_weight_basis="token_count")
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
     rollout_waiting = policy._normalize_router_waiting_load({"count": 8, "total_tokens": 80})
     rm_waiting = policy._normalize_router_waiting_load({"count": 2, "total_tokens": 20})
 
@@ -308,8 +308,8 @@ def test_role_throughput_weights_use_token_basis_when_configured():
 
 def test_role_throughput_weights_uniform_when_disabled():
     policy = _policy(role_throughput_weight_enable=False)
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
     rollout_waiting = policy._normalize_router_waiting_load({"count": 8, "total_tokens": 80})
     rm_waiting = policy._normalize_router_waiting_load({"count": 2, "total_tokens": 20})
 
@@ -321,8 +321,8 @@ def test_role_throughput_weights_uniform_when_disabled():
 
 def test_role_throughput_weights_uniform_when_both_sides_idle():
     policy = _policy(role_throughput_weight_enable=True, role_throughput_weight_basis="request_count")
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=2)]
 
     w_rollout, w_rm = policy._role_throughput_weights(rollout, rm, None, None)
 
@@ -339,10 +339,10 @@ def test_system_throughput_weighted_divides_by_role_pressure_share():
         role_throughput_weight_enable=True,
         role_throughput_weight_basis="request_count",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=10, tokens=100, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=10, tokens=100, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == pytest.approx(1.5)
 
@@ -356,10 +356,10 @@ def test_system_throughput_high_pressure_side_becomes_bottleneck():
         role_throughput_weight_enable=True,
         role_throughput_weight_basis="request_count",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == pytest.approx(1.25)
 
@@ -383,13 +383,13 @@ def test_system_throughput_weight_uses_router_backlog_pressure():
         throughput_objective="sum",
         role_throughput_weight_enable=False,
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
     backlog = {
-        PSRL_Role.Rollout: {"count": 10, "total_tokens": 100},
-        PSRL_Role.RewardModel: {"count": 0, "total_tokens": 0},
+        PivotRL_Role.Rollout: {"count": 10, "total_tokens": 100},
+        PivotRL_Role.RewardModel: {"count": 0, "total_tokens": 0},
     }
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     tp = weighted_policy._system_throughput(grouped, 1, 1, router_backlog_by_role=backlog)
     unweighted = unweighted_policy._system_throughput(grouped, 1, 1, router_backlog_by_role=backlog)
@@ -400,10 +400,10 @@ def test_system_throughput_weight_uses_router_backlog_pressure():
 
 def test_system_throughput_unweighted_when_disabled_matches_legacy_min():
     policy = _policy(throughput_objective="sum", role_throughput_weight_enable=False)
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == 0.5
 
@@ -415,8 +415,8 @@ def test_role_throughput_weights_raw_mode_returns_raw_pressure_values():
         role_throughput_weight_basis="request_count",
         role_throughput_weight_mode="raw",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
     rollout_waiting = policy._normalize_router_waiting_load({"count": 8, "total_tokens": 80})
     rm_waiting = policy._normalize_router_waiting_load({"count": 2, "total_tokens": 20})
 
@@ -433,8 +433,8 @@ def test_role_throughput_weights_raw_mode_zero_pressure_falls_back_to_one():
         role_throughput_weight_basis="request_count",
         role_throughput_weight_mode="raw",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=7, tokens=70, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=7, tokens=70, bundle=2)]
 
     w_rollout, w_rm = policy._role_throughput_weights(rollout, rm, None, None)
 
@@ -448,8 +448,8 @@ def test_role_throughput_weights_raw_mode_token_basis_uses_token_totals():
         role_throughput_weight_basis="token_count",
         role_throughput_weight_mode="raw",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
     rollout_waiting = policy._normalize_router_waiting_load({"count": 8, "total_tokens": 80})
     rm_waiting = policy._normalize_router_waiting_load({"count": 2, "total_tokens": 20})
 
@@ -469,10 +469,10 @@ def test_system_throughput_raw_mode_divides_by_raw_pressure():
         role_throughput_weight_basis="request_count",
         role_throughput_weight_mode="raw",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=10, tokens=100, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=10, tokens=100, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == pytest.approx(0.1)
 
@@ -487,10 +487,10 @@ def test_system_throughput_raw_mode_high_pressure_side_becomes_bottleneck():
         role_throughput_weight_basis="request_count",
         role_throughput_weight_mode="raw",
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=3, tokens=30, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == pytest.approx(1.0 / 12.0)
 
@@ -507,10 +507,10 @@ def test_harmonic_system_throughput_unweighted_is_standard_harmonic_mean():
     # ITL = max(10, running). rollout running=12 -> tp=1.0, rm running=5 -> tp=0.5.
     # Unweighted harmonic mean = 2*1.0*0.5 / (1.0 + 0.5) = 0.6667.
     policy = _policy(throughput_objective="sum", policy_cls=ITLHarmonicScalingPolicy)
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == pytest.approx(2.0 * 1.0 * 0.5 / (1.0 + 0.5))
 
@@ -539,10 +539,10 @@ def test_harmonic_idle_instance_contributes_zero_not_infinite():
     # ITL = max(10, running); busy instance running=12 -> tp=1.0.
     harmonic = _policy(throughput_objective="sum", policy_cls=ITLHarmonicScalingPolicy)
     bottleneck = _policy(throughput_objective="sum", policy_cls=ITLScalingPolicy)
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm_busy = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
-    rm_idle = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2),
-               _signal(PSRL_Role.RewardModel, 1, awake=True, running=0, tokens=0, bundle=3)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm_busy = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rm_idle = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2),
+               _signal(PivotRL_Role.RewardModel, 1, awake=True, running=0, tokens=0, bundle=3)]
 
     # Role throughput: harmonic keeps the busy instance's 0.5 (idle adds 0);
     # bottleneck sums inf from the idle instance -> inf.
@@ -551,10 +551,10 @@ def test_harmonic_idle_instance_contributes_zero_not_infinite():
 
     # System throughput stays finite for harmonic; it does not blow up to inf.
     tp_one = harmonic._system_throughput(
-        {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm_busy}, 1, 1
+        {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm_busy}, 1, 1
     )
     tp_two = harmonic._system_throughput(
-        {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm_idle}, 1, 2
+        {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm_idle}, 1, 2
     )
     assert not math.isinf(tp_two)
     # Adding an idle RM instance (no backlog to redistribute) does not raise the
@@ -571,10 +571,10 @@ def test_harmonic_system_throughput_weighted_request_basis():
         role_throughput_weight_basis="request_count",
         policy_cls=ITLHarmonicScalingPolicy,
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     w_r, w_m = 12.0 / 17.0, 5.0 / 17.0
     assert tp == pytest.approx((w_r + w_m) / (w_r / 1.0 + w_m / 0.5))
@@ -589,10 +589,10 @@ def test_harmonic_system_throughput_weighted_token_basis():
         role_throughput_weight_basis="token_count",
         policy_cls=ITLHarmonicScalingPolicy,
     )
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=12, tokens=120, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     w_r, w_m = 120.0 / 170.0, 50.0 / 170.0
     assert tp == pytest.approx((w_r + w_m) / (w_r / 1.0 + w_m / 0.5))
@@ -613,10 +613,10 @@ def test_harmonic_system_throughput_both_idle_collapses_to_zero():
     # idle instance contributes 0 (not inf), so each role throughput is 0 and
     # the harmonic mean collapses to 0 instead of being inflated to inf.
     policy = _policy(policy_cls=ITLHarmonicScalingPolicy)
-    rollout = [_signal(PSRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=2)]
+    rollout = [_signal(PivotRL_Role.Rollout, 0, awake=True, running=0, tokens=0, bundle=0)]
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=2)]
 
-    tp = policy._system_throughput({PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}, 1, 1)
+    tp = policy._system_throughput({PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}, 1, 1)
 
     assert tp == 0.0
 
@@ -625,12 +625,12 @@ def test_harmonic_policy_picks_same_scale_up_side_as_bottleneck_policy():
     # Rollout is the bottleneck (low load -> low tp). Both policies must select
     # Rollout as the side to scale up; only the objective value differs.
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     harmonic = _policy(
         max_scale_instances_per_action=2,
@@ -666,26 +666,26 @@ def test_itl_transfer_candidate_sets_pre_sleep_before_wake():
     # first and record it in pre_sleep_other_preferred.
     policy = _policy(throughput_objective="sum")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=1),
-        _signal(PSRL_Role.RewardModel, 1, awake=True, running=5, tokens=50, bundle=2),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 1, awake=True, running=5, tokens=50, bundle=2),
     ]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
     rollout_scale_ups = [
         c for c in candidates
-        if c.action.action_type == "scale_up" and c.action.role_name == PSRL_Role.Rollout
+        if c.action.action_type == "scale_up" and c.action.role_name == PivotRL_Role.Rollout
     ]
 
     assert rollout_scale_ups, "expected at least one rollout scale-up candidate"
     candidate = rollout_scale_ups[0]
     assert candidate.action.preferred_instance_ids == [1]
     assert candidate.action.pre_sleep_other_preferred == [
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 0}
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 0}
     ]
     assert candidate.rollout_n == 2
     assert candidate.rm_n == 1
@@ -698,20 +698,20 @@ def test_itl_sum_objective_prunes_conflict_scale_up_when_free_bundle_exists():
     # wake (rollout[2]) and skip the conflicting one, so no pre_sleep is needed.
     policy = _policy(throughput_objective="sum")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=1),
-        _signal(PSRL_Role.RewardModel, 1, awake=True, running=12, tokens=120, bundle=3),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 1, awake=True, running=12, tokens=120, bundle=3),
     ]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     rollout_scale_ups = [
         candidate
         for candidate in policy._enumerate_candidates(grouped, router_backlog_by_role={})
-        if candidate.action.action_type == "scale_up" and candidate.action.role_name == PSRL_Role.Rollout
+        if candidate.action.action_type == "scale_up" and candidate.action.role_name == PivotRL_Role.Rollout
     ]
 
     assert len(rollout_scale_ups) == 1
@@ -726,19 +726,19 @@ def test_itl_balanced_objective_rejects_eviction_below_min_awake():
     # cross-role eviction must be rejected and no rollout scale-up is produced.
     policy = _policy(throughput_objective="balanced_min")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=1),
-        _signal(PSRL_Role.RewardModel, 1, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 1, awake=False, running=0, tokens=0, bundle=2),
     ]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     rollout_scale_ups = [
         candidate
         for candidate in policy._enumerate_candidates(grouped, router_backlog_by_role={})
-        if candidate.action.action_type == "scale_up" and candidate.action.role_name == PSRL_Role.Rollout
+        if candidate.action.action_type == "scale_up" and candidate.action.role_name == PivotRL_Role.Rollout
     ]
 
     assert rollout_scale_ups == []
@@ -750,19 +750,19 @@ def test_itl_enumerates_batch_scale_up_candidates_when_enabled():
     # rollout[1] and rollout[2] (both conflict-free against the rm on bundle 3).
     policy = _policy(max_scale_instances_per_action=2)
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
     batch = [
         c
         for c in candidates
         if c.action.action_type == "scale_up"
-        and c.action.role_name == PSRL_Role.Rollout
+        and c.action.role_name == PivotRL_Role.Rollout
         and c.action.num_instances == 2
     ]
 
@@ -777,13 +777,13 @@ def test_itl_unlimited_max_scale_instances_enumerates_all_wakeable():
     # rollout_n=4, producing a batch wake of all three sleepers.
     policy = _policy(max_scale_instances_per_action=-1)
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
-        _signal(PSRL_Role.Rollout, 3, awake=False, running=0, tokens=0, bundle=3),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.Rollout, 3, awake=False, running=0, tokens=0, bundle=3),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=4)]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=4)]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     assert policy.max_scale_instances_per_action == -1
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
@@ -791,14 +791,14 @@ def test_itl_unlimited_max_scale_instances_enumerates_all_wakeable():
         c
         for c in candidates
         if c.action.action_type == "scale_up"
-        and c.action.role_name == PSRL_Role.Rollout
+        and c.action.role_name == PivotRL_Role.Rollout
         and c.action.num_instances == 3
     ]
 
     assert len(batch) == 1
     assert batch[0].action.preferred_instance_ids == [1, 2, 3]
     assert batch[0].rollout_n == 4
-    assert {c.action.num_instances for c in candidates if c.action.role_name == PSRL_Role.Rollout} == {1, 2, 3}
+    assert {c.action.num_instances for c in candidates if c.action.role_name == PivotRL_Role.Rollout} == {1, 2, 3}
 
 
 def test_itl_keeps_single_step_candidates_by_default():
@@ -807,12 +807,12 @@ def test_itl_keeps_single_step_candidates_by_default():
     # reach rollout_n=2, so every candidate is a single-step action.
     policy = _policy()
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=5, tokens=50, bundle=3)]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
 
@@ -827,12 +827,12 @@ def test_heterogeneous_switch_preserves_equal_parallel_log_fixture():
     running_loads = (39, 38, 39, 38, 39, 38, 39, 38)
     token_loads = (167963, 163713, 158012, 159014, 145643, 166654, 159014, 163713)
     rollout = [
-        _signal(PSRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
+        _signal(PivotRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
         for instance_id in wake_ids
     ]
     rm = [
         _signal(
-            PSRL_Role.RewardModel,
+            PivotRL_Role.RewardModel,
             instance_id,
             awake=True,
             running=running,
@@ -841,7 +841,7 @@ def test_heterogeneous_switch_preserves_equal_parallel_log_fixture():
         )
         for instance_id, running, tokens in zip(wake_ids, running_loads, token_loads)
     ]
-    rm.append(_signal(PSRL_Role.RewardModel, 99, awake=True, running=38, tokens=159014, bundle=99))
+    rm.append(_signal(PivotRL_Role.RewardModel, 99, awake=True, running=38, tokens=159014, bundle=99))
 
     legacy = _policy(max_scale_instances_per_action=8, throughput_objective="sum")
     enabled = _policy(
@@ -886,36 +886,36 @@ def test_heterogeneous_large_wake_migrates_small_conflicts_and_preserves_load(po
         policy_cls=policy_cls,
     )
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=(12, 13, 14, 15)),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=3, tokens=30, bundle=(12, 13, 14, 15)),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
-        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=1),
-        _signal(PSRL_Role.RewardModel, 2, awake=False, running=0, tokens=0, bundle=8),
-        _signal(PSRL_Role.RewardModel, 3, awake=False, running=0, tokens=0, bundle=9),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
+        _signal(PivotRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=1),
+        _signal(PivotRL_Role.RewardModel, 2, awake=False, running=0, tokens=0, bundle=8),
+        _signal(PivotRL_Role.RewardModel, 3, awake=False, running=0, tokens=0, bundle=9),
     ]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
     candidate = next(
         item
         for item in candidates
-        if item.action.action_type == "scale_up" and item.action.role_name == PSRL_Role.Rollout
+        if item.action.action_type == "scale_up" and item.action.role_name == PivotRL_Role.Rollout
     )
 
     assert candidate.action.preferred_instance_ids == [1]
     assert candidate.action.pre_sleep_other_preferred == [
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 0},
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 1},
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 0},
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 1},
     ]
     assert candidate.action.pre_wake_other_preferred == [
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 2},
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 3},
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 2},
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 3},
     ]
     assert candidate.rollout_n == 2
     assert candidate.rm_n == 2
-    assert candidate.load_overrides_by_role == {PSRL_Role.RewardModel: {2: (39.0, 167963.0), 3: (38.0, 163713.0)}}
+    assert candidate.load_overrides_by_role == {PivotRL_Role.RewardModel: {2: (39.0, 167963.0), 3: (38.0, 163713.0)}}
     assert candidate.next_throughput > 0.0
 
     disabled = _policy(throughput_objective="sum")
@@ -931,12 +931,12 @@ def test_heterogeneous_large_wake_migrates_small_conflicts_and_preserves_load(po
 def test_heterogeneous_wake_cost_treats_conflict_free_as_zero_phi():
     policy = _policy(enable_heterogeneous_parallelism_candidates=True)
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(4, 5, 6, 7)),
+        _signal(PivotRL_Role.Rollout, 0, awake=False, running=0, tokens=0, bundle=(0, 1, 2, 3)),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=(4, 5, 6, 7)),
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
-        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=8),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=0),
+        _signal(PivotRL_Role.RewardModel, 1, awake=True, running=38, tokens=163713, bundle=8),
     ]
 
     plans = policy._wake_prefix_plans_for_role(
@@ -959,30 +959,30 @@ def test_heterogeneous_small_wakes_charge_large_victim_phi_once():
         enable_heterogeneous_parallelism_candidates=True,
     )
     rollout = [
-        _signal(PSRL_Role.Rollout, 8, awake=True, running=3, tokens=30, bundle=8),
+        _signal(PivotRL_Role.Rollout, 8, awake=True, running=3, tokens=30, bundle=8),
         *[
-            _signal(PSRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
+            _signal(PivotRL_Role.Rollout, instance_id, awake=False, running=0, tokens=0, bundle=instance_id)
             for instance_id in range(8)
         ],
     ]
     rm = [
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=(0, 1, 2, 3)),
-        _signal(PSRL_Role.RewardModel, 1, awake=True, running=38, tokens=159014, bundle=(4, 5, 6, 7)),
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=39, tokens=167963, bundle=(0, 1, 2, 3)),
+        _signal(PivotRL_Role.RewardModel, 1, awake=True, running=38, tokens=159014, bundle=(4, 5, 6, 7)),
     ]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(grouped, router_backlog_by_role={})
     candidate = next(
         item
         for item in candidates
         if item.action.action_type == "scale_up"
-        and item.action.role_name == PSRL_Role.Rollout
+        and item.action.role_name == PivotRL_Role.Rollout
         and item.action.num_instances == 4
     )
 
     assert candidate.action.preferred_instance_ids == [0, 1, 2, 3]
     assert candidate.action.pre_sleep_other_preferred == [
-        {"role_name": PSRL_Role.RewardModel, "model_name": "model", "instance_id": 0}
+        {"role_name": PivotRL_Role.RewardModel, "model_name": "model", "instance_id": 0}
     ]
     assert candidate.action.pre_wake_other_preferred is None
     assert candidate.rm_n == 1
@@ -997,19 +997,19 @@ def test_itl_scale_up_prefers_share_pool_over_train_pool():
     # pool has a free device, so the wake must pick the share-pool instance.
     policy = _policy(throughput_objective="sum")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1, pool_id="shared_rollout_pool"),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2, pool_id="train_pool"),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1, pool_id="shared_rollout_pool"),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2, pool_id="train_pool"),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=3)]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=3)]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(
         grouped, router_backlog_by_role={}, trainer_waiting_hint={"trainer_busy": False}
     )
     rollout_scale_ups = [
         c for c in candidates
-        if c.action.action_type == "scale_up" and c.action.role_name == PSRL_Role.Rollout
+        if c.action.action_type == "scale_up" and c.action.role_name == PivotRL_Role.Rollout
     ]
 
     assert rollout_scale_ups
@@ -1023,19 +1023,19 @@ def test_itl_scale_up_falls_back_to_train_pool_when_share_pool_full():
     # fall back to it.
     policy = _policy(throughput_objective="sum")
     rollout = [
-        _signal(PSRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
-        _signal(PSRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1, pool_id="shared_rollout_pool"),
-        _signal(PSRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2, pool_id="train_pool"),
+        _signal(PivotRL_Role.Rollout, 0, awake=True, running=5, tokens=50, bundle=0),
+        _signal(PivotRL_Role.Rollout, 1, awake=False, running=0, tokens=0, bundle=1, pool_id="shared_rollout_pool"),
+        _signal(PivotRL_Role.Rollout, 2, awake=False, running=0, tokens=0, bundle=2, pool_id="train_pool"),
     ]
-    rm = [_signal(PSRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=1, pool_id="shared_rollout_pool")]
-    grouped = {PSRL_Role.Rollout: rollout, PSRL_Role.RewardModel: rm}
+    rm = [_signal(PivotRL_Role.RewardModel, 0, awake=True, running=12, tokens=120, bundle=1, pool_id="shared_rollout_pool")]
+    grouped = {PivotRL_Role.Rollout: rollout, PivotRL_Role.RewardModel: rm}
 
     candidates = policy._enumerate_candidates(
         grouped, router_backlog_by_role={}, trainer_waiting_hint={"trainer_busy": False}
     )
     rollout_scale_ups = [
         c for c in candidates
-        if c.action.action_type == "scale_up" and c.action.role_name == PSRL_Role.Rollout
+        if c.action.action_type == "scale_up" and c.action.role_name == PivotRL_Role.Rollout
     ]
 
     assert rollout_scale_ups
@@ -1043,7 +1043,7 @@ def test_itl_scale_up_falls_back_to_train_pool_when_share_pool_full():
 
 
 def _router():
-    router_cls = PSRL_RewardModelRouter.__ray_metadata__.modified_class
+    router_cls = PivotRL_RewardModelRouter.__ray_metadata__.modified_class
     router = router_cls.__new__(router_cls)
     router.request_counts = {0: 0, 1: 2, 2: 4}
     router.worker_handles = [_Worker(0), _Worker(2), _Worker(4)]
@@ -1062,7 +1062,7 @@ def _router():
     router._itl_router_enable = True
     router._itl_router_max_itl = None
     router._itl_router_params = policy_params = _policy()._params_for_signal(
-        _signal(PSRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=0)
+        _signal(PivotRL_Role.RewardModel, 0, awake=True, running=0, tokens=0, bundle=0)
     )
     assert policy_params.B == 10.0
     router.route_strategy = ITLBalanceRewardModelRouteStrategy(
@@ -1196,7 +1196,7 @@ def test_rm_router_routing_update_signal_is_sticky():
 
 
 _QWEN3_8B_COST_MODEL = (
-    "/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/psrl/trainer/config/cost_model/qwen3_8b.json"
+    "/apdcephfs_zwfy10/share_303541817/yfzhao/pivotrl/pivotrl/trainer/config/cost_model/qwen3_8b.json"
 )
 
 

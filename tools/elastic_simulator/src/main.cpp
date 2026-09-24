@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-namespace psrl::elastic_simulator {
+namespace pivotrl::elastic_simulator {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -709,10 +709,10 @@ void write_benchmark(Writer &writer, const CycleInput &cycle,
 }
 
 } // namespace
-} // namespace psrl::elastic_simulator
+} // namespace pivotrl::elastic_simulator
 
 int main(int argc, char **argv) {
-  using namespace psrl::elastic_simulator;
+  using namespace pivotrl::elastic_simulator;
   try {
     const Options options = parse_options(argc, argv);
     std::ifstream input_file;

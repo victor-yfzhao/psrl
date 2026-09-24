@@ -10,15 +10,15 @@ from pathlib import Path
 def _install_stubs():
     stub_names = (
         "ray",
-        "psrl.trainer.ppo.utils",
-        "psrl.utils.elastic_rm.diagnostics",
-        "psrl.utils.elastic_rm.dummy_scaling_policy",
-        "psrl.utils.elastic_rm.itl_scaling_policy",
-        "psrl.utils.elastic_rm.itl_harmonic_scaling_policy",
-        "psrl.utils.elastic_rm.rule_based_scaling_policy",
-        "psrl.utils.elastic_rm.scaling_policy",
-        "psrl.utils.logger",
-        "psrl.utils.server.command",
+        "pivotrl.trainer.ppo.utils",
+        "pivotrl.utils.elastic_rm.diagnostics",
+        "pivotrl.utils.elastic_rm.dummy_scaling_policy",
+        "pivotrl.utils.elastic_rm.itl_scaling_policy",
+        "pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy",
+        "pivotrl.utils.elastic_rm.rule_based_scaling_policy",
+        "pivotrl.utils.elastic_rm.scaling_policy",
+        "pivotrl.utils.logger",
+        "pivotrl.utils.server.command",
     )
     previous_modules = {name: sys.modules.get(name) for name in stub_names}
     ray_stub = types.ModuleType("ray")
@@ -32,41 +32,41 @@ def _install_stubs():
     ray_stub.actor = types.SimpleNamespace(ActorHandle=object)
     sys.modules["ray"] = ray_stub
 
-    utils_mod = types.ModuleType("psrl.trainer.ppo.utils")
-    utils_mod.PSRL_Role = types.SimpleNamespace(Rollout="Rollout", RewardModel="RewardModel")
-    sys.modules["psrl.trainer.ppo.utils"] = utils_mod
+    utils_mod = types.ModuleType("pivotrl.trainer.ppo.utils")
+    utils_mod.PivotRL_Role = types.SimpleNamespace(Rollout="Rollout", RewardModel="RewardModel")
+    sys.modules["pivotrl.trainer.ppo.utils"] = utils_mod
 
-    diag_mod = types.ModuleType("psrl.utils.elastic_rm.diagnostics")
+    diag_mod = types.ModuleType("pivotrl.utils.elastic_rm.diagnostics")
     diag_mod.log_elastic_rm_backlog_diag = lambda *args, **kwargs: None
-    sys.modules["psrl.utils.elastic_rm.diagnostics"] = diag_mod
+    sys.modules["pivotrl.utils.elastic_rm.diagnostics"] = diag_mod
 
-    dummy_mod = types.ModuleType("psrl.utils.elastic_rm.dummy_scaling_policy")
+    dummy_mod = types.ModuleType("pivotrl.utils.elastic_rm.dummy_scaling_policy")
     dummy_mod.DummyScalingPolicy = object
-    sys.modules["psrl.utils.elastic_rm.dummy_scaling_policy"] = dummy_mod
+    sys.modules["pivotrl.utils.elastic_rm.dummy_scaling_policy"] = dummy_mod
 
-    itl_mod = types.ModuleType("psrl.utils.elastic_rm.itl_scaling_policy")
+    itl_mod = types.ModuleType("pivotrl.utils.elastic_rm.itl_scaling_policy")
     itl_mod.ITLScalingPolicy = object
-    sys.modules["psrl.utils.elastic_rm.itl_scaling_policy"] = itl_mod
+    sys.modules["pivotrl.utils.elastic_rm.itl_scaling_policy"] = itl_mod
 
-    harmonic_mod = types.ModuleType("psrl.utils.elastic_rm.itl_harmonic_scaling_policy")
+    harmonic_mod = types.ModuleType("pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy")
     harmonic_mod.ITLHarmonicScalingPolicy = object
-    sys.modules["psrl.utils.elastic_rm.itl_harmonic_scaling_policy"] = harmonic_mod
+    sys.modules["pivotrl.utils.elastic_rm.itl_harmonic_scaling_policy"] = harmonic_mod
 
-    rule_based_mod = types.ModuleType("psrl.utils.elastic_rm.rule_based_scaling_policy")
+    rule_based_mod = types.ModuleType("pivotrl.utils.elastic_rm.rule_based_scaling_policy")
     rule_based_mod.RuleBasedScalingPolicy = object
-    sys.modules["psrl.utils.elastic_rm.rule_based_scaling_policy"] = rule_based_mod
+    sys.modules["pivotrl.utils.elastic_rm.rule_based_scaling_policy"] = rule_based_mod
 
-    scaling_mod = types.ModuleType("psrl.utils.elastic_rm.scaling_policy")
+    scaling_mod = types.ModuleType("pivotrl.utils.elastic_rm.scaling_policy")
     scaling_mod.InstanceSignal = type("InstanceSignal", (), {})
     scaling_mod.ScalingPolicy = type("ScalingPolicy", (), {})
-    sys.modules["psrl.utils.elastic_rm.scaling_policy"] = scaling_mod
+    sys.modules["pivotrl.utils.elastic_rm.scaling_policy"] = scaling_mod
 
-    logger_mod = types.ModuleType("psrl.utils.logger")
+    logger_mod = types.ModuleType("pivotrl.utils.logger")
     logger_mod.DualOutputHandler = type("H", (), {"__init__": lambda self, *a, **k: None})
     logger_mod.FileOnlyHandler = logger_mod.DualOutputHandler
-    sys.modules["psrl.utils.logger"] = logger_mod
+    sys.modules["pivotrl.utils.logger"] = logger_mod
 
-    cmd_mod = types.ModuleType("psrl.utils.server.command")
+    cmd_mod = types.ModuleType("pivotrl.utils.server.command")
 
     class _CommandType:
         ABORT = "ABORT"
@@ -75,14 +75,14 @@ def _install_stubs():
 
     cmd_mod.CommandType = _CommandType
     cmd_mod.Command = type("Command", (), {})
-    sys.modules["psrl.utils.server.command"] = cmd_mod
+    sys.modules["pivotrl.utils.server.command"] = cmd_mod
     return previous_modules
 
 
 def _load_module():
     previous_modules = _install_stubs()
-    module_name = "psrl.utils.elastic_rm.elastic_executor_for_test"
-    module_path = Path(__file__).resolve().parents[2] / "psrl" / "utils" / "elastic_rm" / "elastic_executor.py"
+    module_name = "pivotrl.utils.elastic_rm.elastic_executor_for_test"
+    module_path = Path(__file__).resolve().parents[2] / "pivotrl" / "utils" / "elastic_rm" / "elastic_executor.py"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None

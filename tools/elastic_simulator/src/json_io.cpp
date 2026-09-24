@@ -14,7 +14,7 @@
 #include <string>
 #include <utility>
 
-namespace psrl::elastic_simulator {
+namespace pivotrl::elastic_simulator {
 namespace {
 
 using rapidjson::Value;
@@ -171,7 +171,7 @@ PriorityValue parse_priority(const Value &value, std::size_t line_number,
     return PriorityValue::array_value(std::move(items));
   }
   if (value.IsObject()) {
-    const Value *tag = member(value, "__psrl_float__");
+    const Value *tag = member(value, "__pivotrl_float__");
     if (tag == nullptr || !tag->IsString() || value.MemberCount() != 1) {
       fail(line_number, path, "invalid tagged priority value");
     }
@@ -596,4 +596,4 @@ CycleInput parse_cycle_json(const std::string &line, std::size_t line_number) {
   return cycle;
 }
 
-} // namespace psrl::elastic_simulator
+} // namespace pivotrl::elastic_simulator
