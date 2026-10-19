@@ -35,6 +35,7 @@ tensorflow/my_graph/*
 # Documentation figures are source assets, not runtime artifacts, so they are
 # re-included after the broad file-type rules above.
 !docs/_static/img/*.png
+!docs/_static/img/resource_elasticity_overview.pdf
 !assets/*.png
 
 # AIRS-Bench pinned parquet dataset files (small metadata, not training data).

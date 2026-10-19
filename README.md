@@ -135,7 +135,7 @@ Production-ready training recipes demonstrating PSRL's capabilities across diffe
 | [SWE-agent](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/index.html) | Software Engineering | Test execution (F2P/P2P) | FSDP / Megatron | [`examples/mini_swe/`](examples/mini_swe/) | ✅ Ready |
 | SciAccel-RL | Scientific Computing (LAPS / MITgcm / Athena++) | Numerical equivalence vs reference | FSDP | [`examples/sciaccel_rl/`](examples/sciaccel_rl/) | ✅ Ready |
 | MemAgent | Long-context QA | Exact-match answer | Megatron | [`examples/mem_agent/`](examples/mem_agent/) | ✅ Ready |
-| [LLM-as-a-Judge](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | Open-ended | Judge LLM score | — | — | 🚧 TBD |
+| [LLM-as-a-Judge](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | Math / Custom | Judge LLM score | FSDP / Megatron | [`examples/elastic/`](examples/elastic/) | ✅ Available |
 | [On-Policy Distillation](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/on_policy_distillation.html) | Open-ended | Teacher token-level supervision | — | — | 🚧 TBD |
 
 ## 📖 Documentation
