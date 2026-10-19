@@ -69,8 +69,8 @@ sysctl vm.watermark_scale_factor=1000
 sysctl vm.compaction_proactiveness=20
 sysctl vm.min_free_kbytes=9437184
 
-python3 -m psrl.trainer.main_ppo --config-path="${PSRL_PATH}/psrl/trainer/config" \
-    --config-name='ppo_megatron_trainer' \
+python3 -m psrl.trainer.main_ppo --config-path=./config \
+    --config-name='ppo_trainer' model_engine=megatron \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${rollout_N} \
     psrl.staleness=0 \

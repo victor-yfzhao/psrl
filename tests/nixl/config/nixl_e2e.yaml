@@ -38,7 +38,7 @@ model:
 
 # Logging configuration
 logging:
-  path: logs/test_nixl_e2e
+  path: ${oc.env:PSRL_WORKSPACE}/psrl/tests/nixl/log
   level: INFO
 
 # Network configuration

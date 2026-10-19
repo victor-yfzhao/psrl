@@ -69,8 +69,13 @@ val_top_k=-1
 val_do_sample=False
 
 
+<<<<<<< HEAD
 python3 -m psrl.trainer.main_ppo --config-path="${PSRL_PATH}/psrl/trainer/config" \
     --config-name='ppo_megatron_trainer' \
+=======
+python3 -m psrl.trainer.main_ppo --config-path=./config \
+    --config-name='ppo_trainer' model_engine=megatron \
+>>>>>>> origin/main
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${rollout_N} \
     psrl.staleness=${staleness} \

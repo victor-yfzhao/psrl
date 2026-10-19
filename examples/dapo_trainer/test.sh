@@ -45,8 +45,13 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs pe
 
 # Requires vLLM 0.11 or newer, Megatron-LM 0.13 or newer, and the `qwen3vl_cp` MBridge branch.
 
+<<<<<<< HEAD
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path="${PSRL_PATH}/psrl/trainer/config" \
     --config-name='ppo_megatron_trainer' \
+=======
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
+    --config-name='ppo_trainer' model_engine=megatron \
+>>>>>>> origin/main
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.reward_service_ip=${LOCAL_IP} \
     psrl.rollout_n=${rollout_N} \
