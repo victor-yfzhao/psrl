@@ -281,7 +281,6 @@ outputs
 
 /models/
 /data/
-docs/
 
 vllm_bench_results/
 

@@ -318,11 +318,11 @@ launch_elastic() {
 
     case "${PSRL_DEPLOY_TRAIN_BACKEND}" in
         fsdp|fsdp2)
-            TRAINER_CONFIG_NAME=ppo_trainer
+            TRAIN_MODEL_ENGINE=dp
             train_backend_suffix=""
             ;;
         megatron)
-            TRAINER_CONFIG_NAME=ppo_megatron_trainer
+            TRAIN_MODEL_ENGINE=megatron
             train_backend_suffix="_megatron"
             export CUDA_DEVICE_MAX_CONNECTIONS=1
             for value in \
@@ -482,6 +482,7 @@ launch_elastic() {
             TRAIN_BACKEND_ARGS=(
                 train_actor_rollout_ref.model.use_remove_padding=False
                 train_actor_rollout_ref.model.use_shm=False
+                train_actor_rollout_ref.actor.strategy=megatron
                 train_actor_rollout_ref.actor.use_dynamic_bsz=False
                 train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PSRL_DEPLOY_MEGATRON_MICRO_BSZ_PER_GPU}
                 train_actor_rollout_ref.actor.megatron.param_offload=${PSRL_DEPLOY_MEGATRON_PARAM_OFFLOAD}
@@ -624,7 +625,7 @@ launch_elastic() {
     )
 
     PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
-        --config-name="${TRAINER_CONFIG_NAME}" \
+        --config-name=ppo_trainer model_engine="${TRAIN_MODEL_ENGINE}" \
         psrl.ps_manager_ip=${LOCAL_IP} \
         psrl.reward_service_ip=${LOCAL_IP} \
         psrl.rollout_n=${n_resp_per_prompt} \
