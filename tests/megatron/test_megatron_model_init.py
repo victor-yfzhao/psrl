@@ -67,19 +67,21 @@ def _run_model_check(model_path, tensor_parallel_size, pipeline_parallel_size, v
         distributed.destroy_process_group()
 
 
-def test_megatron():
-    """Test Megatron client"""
-    log_dir = os.environ.get("PSRL_WORKSPACE") + "/psrl/tests/megatron/log"
-    os.makedirs(log_dir, exist_ok=True)
-    ray.init(ignore_reinit_error=True)
-
-    num_workers = 8
-    print(f"Testing MegatronClient with {num_workers} workers")
-
-    # Create clients
-    clients = [
-        MegatronClient.options(num_gpus=1).remote(rank=rank, world_size=num_workers, log_dir=log_dir)
-        for rank in range(num_workers)
+@pytest.mark.parametrize("pipeline_parallel_size,virtual_pipeline_size", [(1, None), (2, None), (2, 2)])
+def test_megatron(gpu_model_path, gpu_tensor_parallel_size, pipeline_parallel_size, virtual_pipeline_size):
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc-per-node={gpu_tensor_parallel_size * pipeline_parallel_size}",
+        str(Path(__file__).resolve()),
+        "--model",
+        gpu_model_path,
+        "--tp",
+        str(gpu_tensor_parallel_size),
+        "--pp",
+        str(pipeline_parallel_size),
     ]
     if virtual_pipeline_size is not None:
         command.extend(["--vp", str(virtual_pipeline_size)])
