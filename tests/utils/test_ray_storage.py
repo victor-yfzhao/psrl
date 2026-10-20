@@ -1,5 +1,5 @@
 import pytest
-from psrl.utils.ray_storage import plasma_backing_error
+from psrl.utils.ray.storage import plasma_backing_error
 
 pytestmark = pytest.mark.cpu_test
 

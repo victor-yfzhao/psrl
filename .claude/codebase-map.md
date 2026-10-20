@@ -107,10 +107,10 @@ psrl/
 │   ├── global_coordination/     # Shared inference coordination
 │   │   ├── coordinator.py       # GlobalCoordinator actor and model registry
 │   │   ├── client.py            # Scoped CoordinatorClient actor proxy
-│   │   ├── state.py             # ModelState and ReplicaState
+│   │   ├── model_state.py       # Replica membership, weight versions, and coordination primitives
 │   │   ├── lifecycle.py         # Gateway eligibility and replica sleep/wake
 │   │   ├── commands.py          # Model scoped command execution and request migration
-│   │   ├── status.py            # Status collection, routing snapshots, and recording
+│   │   ├── telemetry.py         # Engine observations, gateway demand, snapshots, and recording
 │   │   ├── synchronization.py   # Policy weight synchronization
 │   │   └── auxiliary.py         # Session scheduling and LMCache setup
 │   │
@@ -188,9 +188,15 @@ psrl/
 │   └── mini_swe_env.py           # MiniSWEEnvironment (SWE-bench task parsing + config merging)
 │
 ├── utils/                        # ★ Shared utilities
-│   ├── config.py                 # validate_config() (cross-group config checks) +
-│   │                             #   resolve_fine_grain_chunk_size()
-│   ├── transferqueue_utils.py    # ★ NEW: TransferQueue field read/write helpers
+│   ├── config/                   # Configuration validation and deployment resolution
+│   │   ├── validation.py         # Cross-group checks and fine-grain chunk sizing
+│   │   └── deployment_mode.py    # Deployment modes and per-node GPU counts
+│   ├── transfer_queue/payload.py # TransferQueue payload lifecycle and metadata helpers
+│   ├── memory/                   # Weight storage and optimizer offload checks
+│   │   ├── weight_arena.py       # Packed model allocations and CPU snapshots
+│   │   ├── node_shared_weight_cache.py  # Node-local shared weight arenas
+│   │   ├── node_shared_memfd_broker.py  # Cross-process memfd sharing
+│   │   └── optimizer_state.py    # Optimizer tensor placement checks
 │   │
 │   ├── kv_cache/                 # ★ NEW: LMCache integration
 │   │   ├── manager.py            # KVCacheManager (offload / prefix retrieval / cross-instance xfer)
@@ -199,6 +205,7 @@ psrl/
 │   │
 │   ├── elastic/                  # Shared elasticity utilities
 │   │   ├── cost_model.py
+│   │   ├── cost_model_path.py    # Resolve model-specific cost-model JSON files
 │   │   └── diagnostics.py, logging.py, overhead.py
 │   │
 │   ├── concurrency/              # ★ NEW: cross-process limiters
@@ -226,8 +233,8 @@ psrl/
 │   ├── common/                   # chat_template, docker_utils, http_utils (+ distributed POST
 │   │                             #   actor pool), http_io_thread, memory_utils, nixl_names,
 │   │                             #   patch_utils, serialization, worker_naming, dynamic_import
-│   ├── ray/                      # lazy_primitives, lock_context
-│   ├── reward_score/             # sandbox_fusion.py + default async scorer
+│   ├── ray/                      # lock_context and Plasma storage diagnostics
+│   ├── reward_score/             # Scoring helpers and reward-model token metrics
 │   ├── rollout/                  # loop_timer, overflow, rollout_trace, trajectory_writer, vision_utils
 │   ├── server/command.py         # Command / CommandType / CommandExtension (coordinator commands)
 │   └── visualization/            # event_type, log_stats, log_visualizer (+ static/templates)
@@ -318,7 +325,7 @@ Scalars still in `psrl.yaml`: `ps_manager_ip`, `reward_service_ip`, `staleness`,
 | `rollout_coordination/proactive_filter_strategy.yaml` | proactive filtering of samples (`retry`/`truncate`) |
 | `rollout_coordination/session_strategy.yaml` | session hang/continue (ThunderAgent) params |
 
-There is also a top-level `transfer_queue.*` group, force-enabled in `main_ppo.py`. Cross-group consistency is checked by `psrl/utils/config.py::validate_config()`.
+There is also a top-level `transfer_queue.*` group, force-enabled in `main_ppo.py`. Cross-group consistency is checked by `psrl/utils/config/validation.py::validate_config()`.
 
 ### Launch Command
 
@@ -593,7 +600,7 @@ CPU-only tests are marked `pytest.mark.cpu_test`. Run with pytest under the psrl
 | `workers/train/engine_train_worker.py` | ~592 | Unified FSDP/Megatron update worker |
 | `workers/gen/session_router.py` | ~571 | Session/TITO hang-continue routing |
 | `trainer/ppo/strategies/` | ~510 | Step orchestration: `base.py` (StepStrategy ABC + `STAGE_META`), `full_batch.py` (default), `fine_grain_overlap.py` (chunk-pipelined) |
-| `utils/config.py` | ~394 | `validate_config()` cross-group checks + fine-grain chunk sizing |
+| `utils/config/validation.py` | ~394 | `validate_config()` cross-group checks + fine-grain chunk sizing |
 
 ---
 
@@ -612,7 +619,7 @@ main_ppo.py (TaskRunner, TransferQueue init)
     → workers/reward/reward_manager.py → reward_loop/*, reward_model/manager.py
     → workers/agent_loop/manager.py → loops/* (incl. session_agent_loop, mini_swe_*)
         → tools/*, environments/*
-    → utils/dataset/data_processor.py, utils/transferqueue_utils.py
+    → utils/dataset/data_processor.py, utils/transfer_queue/payload.py
     → utils/kv_cache/manager.py, workers/elastic/executor.py
 ```
 
@@ -633,7 +640,7 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | Change session hang/continue | `workers/global_coordination/auxiliary.py` + `workers/gen/session_scheduler.py` + `session_strategy.yaml`, `session_router.py` |
 | Debug model version issues | `workers/ps/staleness_controller.py`, `workers/ps/ps_manager.py` |
 | Debug model transfer failures | `utils/nixl/client.py`, `workers/train/base_train_worker.py` |
-| Work with sample data plane | `utils/transferqueue_utils.py`, `docs/design/transfer_queue.md` |
+| Work with sample data plane | `utils/transfer_queue/payload.py`, `docs/design/transfer_queue.md` |
 | Tune KV cache / LMCache | `utils/kv_cache/`, `psrl.lmcache.*` (`lmcache.yaml`), `docs/design/kv_cache.md` |
 | Configure resource elasticity | `workers/elastic/`, **`psrl.deployment.elastic.*`** (`deployment/elastic/*.yaml`), `docs/design/resource_elasticity.md` |
 | Add/modify training backend | `workers/train/engine_train_worker.py` (unified FSDP/Megatron) |

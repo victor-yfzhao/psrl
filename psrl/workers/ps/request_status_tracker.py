@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, get_ps_logger
 from psrl.utils.server.command import Command, CommandType
-from psrl.utils.transferqueue_utils import PayloadState, clear_payload, request_payload_keys
+from psrl.utils.transfer_queue.payload import PayloadState, clear_payload, request_payload_keys
 from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
 

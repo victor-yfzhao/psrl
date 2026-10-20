@@ -4,7 +4,7 @@ Plan elastic replicas within the physical boundaries of each resource pool.
 
 from dataclasses import dataclass
 
-from psrl.utils.deployment_mode import expand_ngpus_per_node
+from psrl.utils.config.deployment_mode import expand_ngpus_per_node
 
 
 @dataclass(frozen=True)

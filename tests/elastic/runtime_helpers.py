@@ -75,7 +75,10 @@ def modules(monkeypatch):
         "topology": ("psrl.workers.elastic.cluster_topology", "psrl/workers/elastic/cluster_topology.py"),
         "policy": ("psrl.workers.elastic.scaling_policy.base", "psrl/workers/elastic/scaling_policy/base.py"),
         "executor": ("elastic_executor_runtime_test", "psrl/workers/elastic/executor.py"),
-        "state": ("psrl.workers.global_coordination.state", "psrl/workers/global_coordination/state.py"),
+        "model_state": (
+            "psrl.workers.global_coordination.model_state",
+            "psrl/workers/global_coordination/model_state.py",
+        ),
         "lifecycle": ("psrl.workers.global_coordination.lifecycle", "psrl/workers/global_coordination/lifecycle.py"),
         "commands": ("psrl.workers.global_coordination.commands", "psrl/workers/global_coordination/commands.py"),
     }
@@ -88,7 +91,7 @@ def _coordinator(modules):
 
 
 def _model_services(modules):
-    model = modules.state.ModelState(("rollout", ""), "http://rollout", True, "", None)
+    model = modules.model_state.ModelState(("rollout", ""), "http://rollout", True, "", None)
     gateway = SimpleNamespace(
         pause_replicas=AsyncMock(),
         eligibility=AsyncMock(),

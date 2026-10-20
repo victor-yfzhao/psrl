@@ -1,5 +1,5 @@
 """
-Store model and replica state independently of coordinator implementations.
+Own model replica membership, weight versions, and coordination primitives.
 """
 
 from __future__ import annotations
@@ -19,6 +19,10 @@ ROLLOUT_SCOPE: CoordinatorScope = ("rollout", "")
 
 @dataclass
 class ReplicaState:
+    """
+    Hold replica worker handles and serialize lifecycle operations.
+    """
+
     replica: Any
     server: Any
     tag: str
@@ -29,6 +33,10 @@ class ReplicaState:
 
 @dataclass
 class ModelState:
+    """
+    Hold one model's replicas, weight versions, and background task lifecycle.
+    """
+
     scope: CoordinatorScope
     gateway_url: str
     dynamic_weights: bool

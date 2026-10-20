@@ -19,7 +19,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
-from psrl.utils.reward_token_metrics import build_rm_length_metrics
+from psrl.utils.reward_score.token_metrics import build_rm_length_metrics
 from psrl.workers.elastic.pool_layout import ReplicaPlacement
 
 psrl_logger = logging.getLogger(__file__)

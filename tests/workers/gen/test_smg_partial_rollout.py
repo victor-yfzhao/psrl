@@ -19,7 +19,7 @@ import pytest
 from omegaconf import OmegaConf
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload
 from psrl.workers.global_coordination.commands import CommandService
-from psrl.workers.global_coordination.state import ModelState
+from psrl.workers.global_coordination.model_state import ModelState
 from psrl_state_grpc_proto import psrl_manager_pb2 as state_pb
 from psrl_state_grpc_proto import psrl_manager_pb2_grpc as state_rpc
 from smg_grpc_proto import vllm_engine_pb2 as pb

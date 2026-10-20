@@ -10,15 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from psrl.utils import node_shared_weight_cache as cache_module
-from psrl.utils.node_shared_weight_cache import (
+from psrl.utils.memory import node_shared_weight_cache as cache_module
+from psrl.utils.memory.node_shared_weight_cache import (
     WeightCacheTopology,
     fingerprint_safetensors_checkpoint,
     publish_or_map_weight_arena,
     validate_node_cache_directory,
     validate_reward_cache_config,
 )
-from psrl.utils.weight_arena import pack_module_weights
+from psrl.utils.memory.weight_arena import pack_module_weights
 from torch import nn
 
 pytestmark = pytest.mark.cpu_test
@@ -342,7 +342,7 @@ def test_auto_recovers_from_publish_enospc_without_repopulating_checkpoint(
 
 
 def test_memfd_broker_transfers_same_descriptor_to_subprocess() -> None:
-    from psrl.utils.node_shared_memfd_broker import process_start_time, request
+    from psrl.utils.memory.node_shared_memfd_broker import process_start_time, request
 
     token = f"test-{uuid.uuid4().hex}"
     cache_module._ensure_broker(token, 10)
@@ -370,7 +370,7 @@ def test_memfd_broker_transfers_same_descriptor_to_subprocess() -> None:
     os.close(fd)
     code = """
 import json, os, uuid
-from psrl.utils.node_shared_memfd_broker import process_start_time, request
+from psrl.utils.memory.node_shared_memfd_broker import process_start_time, request
 token, expected = os.environ['TOKEN'], int(os.environ['EXPECTED_INODE'])
 identity = {'client_id': uuid.uuid4().hex, 'pid': os.getpid(), 'start_time': process_start_time()}
 response, fd = request(token, {'command': 'get', 'key': 'rank-0', **identity})

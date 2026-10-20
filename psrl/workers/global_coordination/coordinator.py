@@ -23,9 +23,9 @@ from psrl.workers.gen.zmq_queue import ZMQPullQueue
 from psrl.workers.global_coordination.auxiliary import PolicyAuxiliary
 from psrl.workers.global_coordination.commands import CommandService
 from psrl.workers.global_coordination.lifecycle import GatewayClient, ReplicaLifecycle
-from psrl.workers.global_coordination.state import ROLLOUT_SCOPE, CoordinatorScope, ModelState
-from psrl.workers.global_coordination.status import StatusService
+from psrl.workers.global_coordination.model_state import ROLLOUT_SCOPE, CoordinatorScope, ModelState
 from psrl.workers.global_coordination.synchronization import WeightSynchronization
+from psrl.workers.global_coordination.telemetry import TelemetryService
 
 psrl_logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ class GlobalCoordinator:
         self.gateway = GatewayClient()
         self.lifecycle = ReplicaLifecycle(self.gateway)
         self.commands = CommandService(config, self.gateway, self.lifecycle)
-        self.status = StatusService(config, self.gateway, ps_manager)
+        self.telemetry = TelemetryService(config, self.gateway, ps_manager)
         self.weights = WeightSynchronization(config, ps_manager, self.gateway, self.lifecycle, self.commands)
         self.auxiliary = PolicyAuxiliary(config, self.gateway, session_router_url)
         self.models: dict[CoordinatorScope, ModelState] = {}
@@ -97,10 +97,10 @@ class GlobalCoordinator:
             "get_instance_engine_status_snapshot": lambda: {
                 iid: stats.snapshot for iid, stats in model.engine_status.items()
             },
-            "get_instance_runtime_snapshot": partial(self.status.runtime_snapshot, model),
-            "get_router_backlog_size": partial(self.status.backlog, model),
-            "get_router_backlog_summary": partial(self.status.backlog_summary, model),
-            "get_router_request_snapshot": partial(self.status.requests, model),
+            "get_instance_runtime_snapshot": partial(self.telemetry.runtime_snapshot, model),
+            "get_router_backlog_size": partial(self.telemetry.backlog, model),
+            "get_router_backlog_summary": partial(self.telemetry.backlog_summary, model),
+            "get_router_request_snapshot": partial(self.telemetry.requests, model),
             "execute_request_migrations": partial(self.commands.migrate_requests, model),
         }
         if model.dynamic_weights:
@@ -156,9 +156,9 @@ class GlobalCoordinator:
                 raise ValueError("Request migration requires partial rollout.")
         model.track("commands", self.commands.run(model))
         if self.config.psrl.status_collection.enable:
-            model.track("status", self.status.collect(model))
+            model.track("telemetry", self.telemetry.collect(model))
         if model.dynamic_weights or self.config.psrl.status_collection.enable:
-            model.track("broadcast", self.status.broadcast(model))
+            model.track("broadcast", self.telemetry.broadcast(model))
         if model.dynamic_weights:
             model.track("weights", self.weights.run(model))
             if (
@@ -175,7 +175,7 @@ class GlobalCoordinator:
                 self.config.psrl.rollout_coordination.routing_strategy.method,
                 self.config.psrl.rollout_coordination.partial_rollout.enable,
             )
-            model.track("record", self.status.record(model))
+            model.track("record", self.telemetry.record(model))
 
     def _check_running(self) -> None:
         if self._shutdown_task is not None:

@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from psrl.utils.cost_model_path import load_cost_model_json
+from psrl.utils.elastic.cost_model_path import load_cost_model_json
 
 
 @dataclass(frozen=True)

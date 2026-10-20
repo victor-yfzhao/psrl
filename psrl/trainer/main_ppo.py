@@ -15,8 +15,8 @@ from verl.utils.device import auto_set_device, is_cuda_available
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.config import validate_config
-from psrl.utils.deployment_mode import expand_ngpus_per_node
+from psrl.utils.config.deployment_mode import expand_ngpus_per_node
+from psrl.utils.config.validation import validate_config
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.elastic.pool_layout import elastic_pool_specs, plan_replicas
 

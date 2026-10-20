@@ -155,7 +155,7 @@ def test_ep_metadata_uses_cpu_inside_meta_model_construction() -> None:
 
 
 def test_direct_runtime_buffer_is_initialized_in_place() -> None:
-    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+    from psrl.utils.memory.weight_arena import materialize_module_weights_in_arena
 
     model = _RuntimeBufferProbe()
     handle = materialize_module_weights_in_arena(
@@ -182,7 +182,7 @@ def test_direct_runtime_buffer_is_initialized_in_place() -> None:
 
 
 def test_direct_runtime_buffer_rejects_unknown_non_persistent_buffer() -> None:
-    from psrl.utils.weight_arena import materialize_module_weights_in_arena
+    from psrl.utils.memory.weight_arena import materialize_module_weights_in_arena
 
     model = _RuntimeBufferProbe(supported=False)
     materialize_module_weights_in_arena(

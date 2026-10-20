@@ -18,7 +18,7 @@ def _run_offload_check(
     from megatron.core import parallel_state
     from nixl._api import nixl_agent, nixl_agent_config
     from psrl.utils.common.patch_utils import apply_tms_patch
-    from psrl.utils.optimizer_state import assert_optimizer_state_offloaded
+    from psrl.utils.memory.optimizer_state import assert_optimizer_state_offloaded
     from torch_memory_saver import torch_memory_saver
     from verl.utils.megatron_utils import load_megatron_optimizer, offload_megatron_optimizer
 

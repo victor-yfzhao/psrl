@@ -152,7 +152,7 @@ class vLLMWorkerExtension:
 
             arena_config = (self.model_runner.vllm_config.additional_config or {}).get("psrl_nixl_weight_arena", {})
             if arena_config.get("reward_enabled", False):
-                from psrl.utils.node_shared_weight_cache import validate_reward_cache_config
+                from psrl.utils.memory.node_shared_weight_cache import validate_reward_cache_config
 
                 cache_mode = validate_reward_cache_config(arena_config)
             else:
@@ -160,7 +160,7 @@ class vLLMWorkerExtension:
             if cache_mode == "node_shared":
                 if not hasattr(self.model_runner, "_psrl_weight_arena_handle"):
                     raise RuntimeError("Node-shared reward CPU cache requires an initialized reward weight arena.")
-                from psrl.utils.node_shared_weight_cache import fingerprint_safetensors_checkpoint
+                from psrl.utils.memory.node_shared_weight_cache import fingerprint_safetensors_checkpoint
 
                 checkpoint_fingerprint = fingerprint_safetensors_checkpoint(model_config.model)
                 checkpoint_load_format = str(load_config.load_format).lower()
@@ -227,11 +227,11 @@ class vLLMWorkerExtension:
         """Publish or map this worker's topology-specific reward arena."""
         from vllm.distributed.parallel_state import get_ep_group, get_pp_group, get_tp_group
 
-        from psrl.utils.node_shared_weight_cache import (
+        from psrl.utils.memory.node_shared_weight_cache import (
             WeightCacheTopology,
             publish_or_map_weight_arena,
         )
-        from psrl.utils.weight_arena import gb_to_bytes
+        from psrl.utils.memory.weight_arena import gb_to_bytes
 
         tp_group = get_tp_group()
         pp_group = get_pp_group()
@@ -345,7 +345,7 @@ class vLLMWorkerExtension:
                     or cache_state.get("source") not in ("arena", "node_shared_arena")
                 ):
                     raise RuntimeError(f"Reward arena CPU cache has invalid state: {cache_state!r}.")
-                from psrl.utils.weight_arena import restore_weight_arena_from_cpu
+                from psrl.utils.memory.weight_arena import restore_weight_arena_from_cpu
 
                 cache_source = cache_state["source"]
                 torch.cuda.synchronize()
@@ -390,7 +390,7 @@ class vLLMWorkerExtension:
                     "psrl_nixl_weight_arena", {}
                 )
                 if arena_config.get("reward_enabled", False):
-                    from psrl.utils.node_shared_weight_cache import validate_reward_cache_config
+                    from psrl.utils.memory.node_shared_weight_cache import validate_reward_cache_config
 
                     cache_mode = validate_reward_cache_config(arena_config)
                 else:
@@ -439,7 +439,7 @@ class vLLMWorkerExtension:
                         empty_cache_elapsed_s = builder_timings.get("empty_cache_s", 0.0)
                         model_validation_elapsed_s += builder_timings.get("validation_s", 0.0)
                     else:
-                        from psrl.utils.weight_arena import restore_weight_arena_from_cpu
+                        from psrl.utils.memory.weight_arena import restore_weight_arena_from_cpu
 
                         cache_source = "node_shared_arena_consumer"
                         torch.cuda.synchronize()
@@ -512,7 +512,7 @@ class vLLMWorkerExtension:
                         self._psrl_node_shared_arena_cache = shared_cache
                         self._psrl_weight_arena_cpu_cache = shared_cache.arenas
                     else:
-                        from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
+                        from psrl.utils.memory.weight_arena import snapshot_weight_arena_to_cpu
 
                         self._psrl_weight_arena_cpu_cache = snapshot_weight_arena_to_cpu(
                             arena_handle,

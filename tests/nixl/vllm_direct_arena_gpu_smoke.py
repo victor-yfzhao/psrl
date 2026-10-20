@@ -10,7 +10,7 @@ from vllm import LLM, SamplingParams
 
 
 def _snapshot_arena(worker) -> int:
-    from psrl.utils.weight_arena import snapshot_weight_arena_to_cpu
+    from psrl.utils.memory.weight_arena import snapshot_weight_arena_to_cpu
 
     handle = worker.model_runner._psrl_weight_arena_handle
     worker._weight_arena_smoke_cpu_cache = snapshot_weight_arena_to_cpu(
@@ -21,7 +21,7 @@ def _snapshot_arena(worker) -> int:
 
 
 def _restore_arena(worker) -> int:
-    from psrl.utils.weight_arena import restore_weight_arena_from_cpu
+    from psrl.utils.memory.weight_arena import restore_weight_arena_from_cpu
 
     return restore_weight_arena_from_cpu(
         worker.model_runner._psrl_weight_arena_handle,

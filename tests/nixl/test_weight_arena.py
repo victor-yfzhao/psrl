@@ -1,6 +1,6 @@
 import pytest
 import torch
-from psrl.utils.weight_arena import (
+from psrl.utils.memory.weight_arena import (
     _install_packed_tms_pool,
     _weight_tms_pool_key,
     gb_to_bytes,

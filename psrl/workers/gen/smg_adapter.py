@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from psrl.utils.cost_model_path import require_cost_model_json_path
+from psrl.utils.elastic.cost_model_path import require_cost_model_json_path
 
 psrl_logger = logging.getLogger(__name__)
 

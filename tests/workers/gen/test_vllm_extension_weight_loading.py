@@ -96,7 +96,7 @@ def test_node_shared_preload_uses_lazy_safetensors(monkeypatch, tmp_path: Path) 
         observed_load_configs.append(load_config)
         return Loader()
 
-    from psrl.utils import node_shared_weight_cache
+    from psrl.utils.memory import node_shared_weight_cache
 
     monkeypatch.setattr(module, "get_model_loader", get_model_loader)
     monkeypatch.setattr(

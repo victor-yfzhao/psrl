@@ -22,7 +22,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
-from psrl.utils.transferqueue_utils import (
+from psrl.utils.transfer_queue.payload import (
     PayloadState,
     async_clear_payload,
     clear_payload,

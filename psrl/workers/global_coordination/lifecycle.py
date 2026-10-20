@@ -18,7 +18,7 @@ from psrl.workers.gen.smg_adapter import (
 )
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT
 
-from .state import ModelState
+from .model_state import ModelState
 
 
 class GatewayClient:

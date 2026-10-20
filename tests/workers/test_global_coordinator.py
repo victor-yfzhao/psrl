@@ -19,7 +19,7 @@ from psrl.workers.global_coordination import coordinator as global_module
 from psrl.workers.global_coordination.client import CoordinatorClient
 from psrl.workers.global_coordination.coordinator import GlobalCoordinator
 from psrl.workers.global_coordination.lifecycle import GatewayClient
-from psrl.workers.global_coordination.state import ROLLOUT_SCOPE
+from psrl.workers.global_coordination.model_state import ROLLOUT_SCOPE
 from ray import cloudpickle
 
 pytestmark = pytest.mark.cpu_test
@@ -227,7 +227,7 @@ def test_repeated_replica_ranks_and_gateway_ids_are_model_scoped(config):
         try:
             for version, (scope, model) in enumerate(coordinator.models.items(), start=1):
                 await _add(coordinator, scope, "worker-0")
-                model.track("status", coordinator.status.collect(model))
+                model.track("telemetry", coordinator.telemetry.collect(model))
                 model.status_queue.queue.put_nowait(
                     EngineStats(
                         replica_idx=0,
@@ -789,7 +789,7 @@ async def test_request_snapshot_checks_versions_without_consuming_validation(con
         coordinator.gateway.get = AsyncMock(return_value=queued)
         reserve = AsyncMock(return_value=[[True, False], [False, True]])
         indicator = AsyncMock(return_value=[-1.0, -2.0])
-        coordinator.status.ps_manager = SimpleNamespace(
+        coordinator.telemetry.ps_manager = SimpleNamespace(
             can_reserve_request=SimpleNamespace(remote=reserve),
             get_reserve_indicator=SimpleNamespace(remote=indicator),
         )
@@ -814,7 +814,7 @@ async def test_status_broadcast_retries_after_gateway_failure(config):
         model.engine_status[("worker", 0)].snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
         model.wait_interval = AsyncMock(side_effect=[True, True, False])
         coordinator.gateway.post = AsyncMock(side_effect=[RuntimeError("Gateway failed."), {"updated": 1}])
-        await coordinator.status.broadcast(model)
+        await coordinator.telemetry.broadcast(model)
         assert coordinator.gateway.post.await_count == 2, "A transient gateway error must not stop status updates."
     finally:
         await coordinator.stop_busy_loop()

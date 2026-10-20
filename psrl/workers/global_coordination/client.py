@@ -7,7 +7,7 @@ from typing import Any
 
 from ray.actor import ActorHandle
 
-from psrl.workers.global_coordination.state import ROLLOUT_SCOPE, CoordinatorScope
+from psrl.workers.global_coordination.model_state import ROLLOUT_SCOPE, CoordinatorScope
 
 
 @dataclass(frozen=True)

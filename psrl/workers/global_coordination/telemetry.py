@@ -1,5 +1,5 @@
 """
-Collect model scoped engine telemetry and gateway demand.
+Collect engine observations and expose gateway demand and runtime snapshots.
 """
 
 from __future__ import annotations
@@ -11,12 +11,16 @@ from psrl.workers.gen.smg_adapter import WORKERS_UPDATE_STATS_PATH, build_worker
 from psrl.workers.gen.stats_collector import EngineStats
 
 from .lifecycle import GatewayClient
-from .state import ModelState
+from .model_state import ModelState
 
 psrl_logger = logging.getLogger(__name__)
 
 
-class StatusService:
+class TelemetryService:
+    """
+    Collect, publish, and query live engine and gateway observations.
+    """
+
     def __init__(self, config, gateway: GatewayClient, ps_manager) -> None:
         self.config = config
         self.gateway = gateway

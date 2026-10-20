@@ -92,7 +92,7 @@ def test_actor_weight_arena_config_validates_active_worker_requirements():
 
 
 def test_actor_weight_arena_materialization_uses_fresh_tms_pool(monkeypatch):
-    from psrl.utils import weight_arena
+    from psrl.utils.memory import weight_arena
 
     _, worker = _arena_worker()
     worker.psrl_config.nixl.weight_arena.max_chunk_gb = 2
@@ -141,7 +141,7 @@ def test_actor_weight_arena_materialization_uses_fresh_tms_pool(monkeypatch):
 
 
 def test_weight_arena_uses_model_pool_when_optimizer_pool_exists():
-    from psrl.utils.weight_arena import _install_packed_tms_pool, _weight_tms_pool_key
+    from psrl.utils.memory.weight_arena import _install_packed_tms_pool, _weight_tms_pool_key
 
     optimizer_pool = object()
     packed_pool = object()
@@ -158,7 +158,7 @@ def test_weight_arena_uses_model_pool_when_optimizer_pool_exists():
 
 
 def test_weight_arena_selects_cpu_backup_pool_when_requested():
-    from psrl.utils.weight_arena import _weight_tms_pool_key
+    from psrl.utils.memory.weight_arena import _weight_tms_pool_key
 
     mem_pools = {
         ("weights", False): object(),
@@ -171,7 +171,7 @@ def test_weight_arena_selects_cpu_backup_pool_when_requested():
 def test_fsdp2_arena_handle_retains_binding_metadata():
     from types import SimpleNamespace
 
-    from psrl.utils.weight_arena import (
+    from psrl.utils.memory.weight_arena import (
         FSDP2WeightArenaHandle,
         _pack_named_tensors,
     )
@@ -201,7 +201,7 @@ def test_fsdp2_arena_handle_retains_binding_metadata():
 
 
 def test_fsdp2_arena_metadata_uses_unique_names_when_fqn_is_unset():
-    from psrl.utils.weight_arena import _fsdp_param_name, _pack_named_tensors
+    from psrl.utils.memory.weight_arena import _fsdp_param_name, _pack_named_tensors
 
     padded_a = torch.arange(4, dtype=torch.float32)
     padded_b = torch.arange(4, dtype=torch.float32) + 10

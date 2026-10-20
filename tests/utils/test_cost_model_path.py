@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from psrl.utils.cost_model_path import (
+from psrl.utils.elastic.cost_model_path import (
     model_name_to_cost_model_stems,
     require_cost_model_json_path,
     resolve_cost_model_json_path,

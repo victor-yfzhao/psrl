@@ -31,7 +31,7 @@ def _role_materialization(arena_config: dict[str, Any], role: str) -> str:
 
 
 def _max_chunk_bytes(arena_config: dict[str, Any]) -> int:
-    from psrl.utils.weight_arena import gb_to_bytes
+    from psrl.utils.memory.weight_arena import gb_to_bytes
 
     return gb_to_bytes(arena_config["max_chunk_gb"], field_name="max_chunk_gb")
 
@@ -185,7 +185,7 @@ class DirectWeightArenaDummyLoader(DummyModelLoader):
                 vllm_config.parallel_config,
             )
 
-            from psrl.utils.weight_arena import materialize_module_weights_in_arena
+            from psrl.utils.memory.weight_arena import materialize_module_weights_in_arena
 
             handle = materialize_module_weights_in_arena(
                 model,
@@ -288,7 +288,7 @@ def _pack_loaded_model(
     if hasattr(model_runner, "_psrl_weight_arena_handle"):
         raise RuntimeError("Rollout weight arena cannot repack a model after initialization.")
 
-    from psrl.utils.weight_arena import (
+    from psrl.utils.memory.weight_arena import (
         pack_module_weights,
         pack_module_weights_in_fresh_tms_pool,
     )

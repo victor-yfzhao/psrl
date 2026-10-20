@@ -14,12 +14,12 @@ import ray
 from omegaconf import DictConfig
 from verl import DataProto
 
-from psrl.utils.cost_model_path import require_cost_model_json_path
 from psrl.utils.elastic.cost_model import (
     ITLModelParams,
     compute_itl,
     resolve_cost_model_params,
 )
+from psrl.utils.elastic.cost_model_path import require_cost_model_json_path
 from psrl.utils.elastic.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.elastic.overhead import RequestMigrationOverheadTracker
 from psrl.utils.logger import DualOutputHandler

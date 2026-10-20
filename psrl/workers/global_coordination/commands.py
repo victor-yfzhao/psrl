@@ -10,7 +10,7 @@ import time
 from psrl.utils.server.command import Command, CommandType
 
 from .lifecycle import GatewayClient, ReplicaLifecycle
-from .state import ModelState
+from .model_state import ModelState
 
 
 class CommandService:

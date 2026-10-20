@@ -6,7 +6,7 @@ Verifies that each `psrl.deployment.mode` value resolves to the expected
 
 import pytest
 from omegaconf import OmegaConf
-from psrl.utils.deployment_mode import (
+from psrl.utils.config.deployment_mode import (
     expand_ngpus_per_node,
     resolve_deployment_mode,
     validate_trainer_sleep_optimizer_offload,

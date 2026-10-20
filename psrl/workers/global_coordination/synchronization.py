@@ -10,7 +10,7 @@ from psrl.workers.gen.smg_adapter import build_weight_version_updates
 
 from .commands import CommandService
 from .lifecycle import GatewayClient, ReplicaLifecycle
-from .state import ModelState
+from .model_state import ModelState
 
 
 class WeightSynchronization:

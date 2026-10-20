@@ -4,7 +4,7 @@ Translate native router queues and scheduler observations into solver inputs.
 
 from functools import lru_cache
 
-from psrl.utils.cost_model_path import load_cost_model_json
+from psrl.utils.elastic.cost_model_path import load_cost_model_json
 from psrl.workers.elastic.scaling_policy.evaluation.request_level_candidate_evaluator import (
     InstanceSnapshot,
     RequestSnapshot,

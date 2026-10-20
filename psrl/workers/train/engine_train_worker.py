@@ -280,7 +280,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         if hasattr(self, "_nixl_weight_arena_handle"):
             raise RuntimeError("Actor weight arena cannot be materialized more than once.")
 
-        from psrl.utils.weight_arena import gb_to_bytes, pack_fsdp2_model_weights_in_fresh_tms_pool
+        from psrl.utils.memory.weight_arena import gb_to_bytes, pack_fsdp2_model_weights_in_fresh_tms_pool
 
         self._nixl_weight_arena_handle = pack_fsdp2_model_weights_in_fresh_tms_pool(
             self.actor.engine.module,

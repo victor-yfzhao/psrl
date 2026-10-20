@@ -16,7 +16,7 @@ from psrl.utils.common.http_utils import find_available_port, get_host_info
 from psrl.workers.gen.session_scheduler import InstanceCapacity, SessionInfo, ThunderAgentScheduler
 
 from .lifecycle import GatewayClient
-from .state import ModelState
+from .model_state import ModelState
 
 
 class PolicyAuxiliary:

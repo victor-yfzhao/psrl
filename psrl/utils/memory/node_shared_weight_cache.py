@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from psrl.utils.weight_arena import WeightArenaHandle, gb_to_bytes
+from psrl.utils.memory.weight_arena import WeightArenaHandle, gb_to_bytes
 
 _NETWORK_FILESYSTEMS = {
     "9p",
@@ -545,14 +545,14 @@ def _try_map_memfd(
         _ensure_broker(token, timeout_s)
     else:
         # Do not start an idle broker merely to probe an auto backend.
-        from psrl.utils.node_shared_memfd_broker import request
+        from psrl.utils.memory.node_shared_memfd_broker import request
 
         try:
             request(token, {"command": "ping"}, timeout_s=min(timeout_s, 0.5))
         except (ConnectionError, FileNotFoundError, OSError, RuntimeError, TimeoutError):
             return None
     identity = _broker_client_identity()
-    from psrl.utils.node_shared_memfd_broker import request
+    from psrl.utils.memory.node_shared_memfd_broker import request
 
     response, fd = request(
         token,
@@ -632,7 +632,7 @@ def _publish_memfd(
         _seal_memfd(fd)
         manifest = _arena_manifest(cache_key, key_payload, arena_layout, total_bytes, backend="memfd")
         identity = _broker_client_identity()
-        from psrl.utils.node_shared_memfd_broker import request
+        from psrl.utils.memory.node_shared_memfd_broker import request
 
         response, mapped_fd = request(
             token,
@@ -671,7 +671,7 @@ def _broker_token(lease: CacheNamespaceLease, node_id: str) -> str:
 
 
 def _ensure_broker(token: str, timeout_s: float) -> None:
-    from psrl.utils.node_shared_memfd_broker import request
+    from psrl.utils.memory.node_shared_memfd_broker import request
 
     try:
         request(token, {"command": "ping"}, timeout_s=min(timeout_s, 1.0))
@@ -679,7 +679,7 @@ def _ensure_broker(token: str, timeout_s: float) -> None:
     except (ConnectionError, FileNotFoundError, OSError, RuntimeError):
         pass
     subprocess.Popen(
-        [sys.executable, "-m", "psrl.utils.node_shared_memfd_broker", token],
+        [sys.executable, "-m", "psrl.utils.memory.node_shared_memfd_broker", token],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -697,7 +697,7 @@ def _ensure_broker(token: str, timeout_s: float) -> None:
 
 
 def _broker_client_identity() -> dict[str, Any]:
-    from psrl.utils.node_shared_memfd_broker import process_start_time
+    from psrl.utils.memory.node_shared_memfd_broker import process_start_time
 
     return {
         "client_id": uuid.uuid4().hex,
@@ -709,7 +709,7 @@ def _broker_client_identity() -> dict[str, Any]:
 def _broker_total_bytes(token: str) -> int:
     try:
         _ensure_broker(token, 10.0)
-        from psrl.utils.node_shared_memfd_broker import request
+        from psrl.utils.memory.node_shared_memfd_broker import request
 
         response, fd = request(token, {"command": "ping"}, timeout_s=1.0)
         if fd is not None:
@@ -726,7 +726,7 @@ def _memfd_release_callback(
     timeout_s: float,
 ) -> Callable[[], None]:
     def release() -> None:
-        from psrl.utils.node_shared_memfd_broker import request
+        from psrl.utils.memory.node_shared_memfd_broker import request
 
         try:
             _, fd = request(

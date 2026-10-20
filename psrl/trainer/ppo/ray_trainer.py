@@ -93,7 +93,7 @@ from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
 )
-from psrl.utils.transferqueue_utils import PayloadState, clear_payload
+from psrl.utils.transfer_queue.payload import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker

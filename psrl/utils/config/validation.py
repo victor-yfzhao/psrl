@@ -14,7 +14,7 @@ from psrl.utils.agent.thinking import (
     wants_thinking_disabled,
 )
 from psrl.utils.common.chat_template import resolve_chat_template_value
-from psrl.utils.deployment_mode import validate_trainer_sleep_optimizer_offload
+from psrl.utils.config.deployment_mode import validate_trainer_sleep_optimizer_offload
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:

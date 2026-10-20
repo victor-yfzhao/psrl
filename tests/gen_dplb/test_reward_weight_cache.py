@@ -94,7 +94,7 @@ def test_publish_node_shared_reward_arena_uses_ray_runtime_context(monkeypatch):
             "pss_bytes": 128,
         }
     )
-    from psrl.utils import node_shared_weight_cache
+    from psrl.utils.memory import node_shared_weight_cache
 
     publish_kwargs = {}
 

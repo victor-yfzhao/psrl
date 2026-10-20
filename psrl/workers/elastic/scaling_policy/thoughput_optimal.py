@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.deployment_mode import expand_ngpus_per_node
+from psrl.utils.config.deployment_mode import expand_ngpus_per_node
 from psrl.utils.elastic.cost_model import (
     ITLModelParams,
     _read_config_value,

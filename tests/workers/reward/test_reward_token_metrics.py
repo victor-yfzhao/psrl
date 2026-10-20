@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from psrl.utils.reward_token_metrics import (
+from psrl.utils.reward_score.token_metrics import (
     collect_reward_model_token_lengths,
     extract_reward_model_token_counts,
 )

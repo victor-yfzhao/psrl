@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from omegaconf import OmegaConf
-from psrl.utils.deployment_mode import expand_ngpus_per_node
+from psrl.utils.config.deployment_mode import expand_ngpus_per_node
 from psrl.workers.elastic.pool_layout import ReplicaPlacement, elastic_pool_specs, plan_replicas
 
 pytestmark = pytest.mark.cpu_test
