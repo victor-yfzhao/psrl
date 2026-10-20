@@ -44,6 +44,7 @@ tensorflow/my_graph/*
 
 # Common artifact directories
 **/checkpoints
+**/checkpoint
 **/ckpts
 **/wget-log
 **/_build/

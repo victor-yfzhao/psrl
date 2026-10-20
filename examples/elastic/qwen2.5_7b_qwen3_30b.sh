@@ -53,7 +53,6 @@ export PSRL_EXCLUSIVE_REBALANCE_MIGRATION_QUEUE=True
 shift || true
 
 export PSRL_DEPLOY_EXTRA="\
-psrl.global_coordinator.enable=true \
 +psrl.nixl.weight_verification.enable=${PSRL_WEIGHT_VERIFY} \
 +psrl.nixl.weight_verification.transfer_chain=True \
 +psrl.nixl.weight_verification.trainer_sleep_wake=True \

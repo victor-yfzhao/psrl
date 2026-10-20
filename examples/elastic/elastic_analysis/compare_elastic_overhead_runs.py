@@ -57,8 +57,7 @@ LOG_FILES = (
     "ElasticExecutor.log",
     "RolloutRouter.log",
     "RewardModelRouter.log",
-    "RolloutCoordinator.log",
-    "RewardModelCoordinator.log",
+    "GlobalCoordinator.log",
 )
 TIME_METRICS = {
     "planner_s",
