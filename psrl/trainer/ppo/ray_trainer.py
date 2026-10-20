@@ -1441,6 +1441,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         tag: str = "rollout",
         sleep_after_init: bool = False,
     ):
+        """
+        Initialize model and NIXL state before exposing replicas for lifecycle operations.
+        """
         status_sink_endpoint = ray.get(self.rollout_coordinator.get_status_sink_endpoint.remote())
         if tag == "validate":
             rollout_world_size = (
@@ -1495,6 +1498,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rollout_replicas.extend(new_rollout_replicas)
             init_tasks.extend([replica.init_model(worker_group) for replica in new_rollout_replicas])
         self._run_all(init_tasks)
+        # The first sleep requires NIXL clients and parameter views while model memory is still mapped.
+        servers = [replica._server_handle for replica in rollout_replicas]
+        ray.get([server.init_nixl_client.remote() for server in servers])
+        ray.get([server.nixl_convert_params.remote() for server in servers])
         if tag not in self.tag_to_server_handles:
             self.tag_to_server_handles[tag] = []
         self.tag_to_server_handles[tag].extend([replica._server_handle for replica in rollout_replicas])
@@ -1511,9 +1518,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if sleep_after_init:
             worker_ids = [replica.gateway_replica_id for replica in rollout_replicas]
             self._post_gateway_worker_routing_control("pause", worker_ids)
-            servers = [replica._server_handle for replica in rollout_replicas]
-            ray.get([server.init_nixl_client.remote() for server in servers])
-            ray.get([server.nixl_convert_params.remote() for server in servers])
             ray.get([server.sleep.remote(level=2) for server in servers])
 
     def init_workers(self):
@@ -2009,9 +2013,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rollout_init_executor.shutdown(wait=False)
             if self.validate_wg_list:
                 self.init_rollout_servers(self.validate_wg_list, tag="validate")
-                validate_servers = self.tag_to_server_handles["validate"]
-                ray.get([server.init_nixl_client.remote() for server in validate_servers])
-                ray.get([server.nixl_convert_params.remote() for server in validate_servers])
                 validation_ids = [
                     (replica.gateway_replica_id, rank)
                     for replica in self.rollout_replicas
@@ -2047,7 +2048,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rollout_init_executor.shutdown(wait=False)
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
-            ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             # Start the shared LMCache Controller and broadcast its URL to all instances,
             # enabling cross-instance KV cache migration for partial rollout re-routes.
             if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
@@ -2057,17 +2057,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("Initializing validation model")
             self.init_rollout_servers(self.validate_wg_list, tag="validate")
             ray.get(self.rollout_coordinator.sleep.remote("validate"))
-            # Pause validate instances in the router before sleeping them, so that the router
-            # does not route rollout requests to validate instances that are in sleep state.
-            paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-            psrl_logger.warning(f"[INIT-PAUSE] Paused base worker IDs: {paused_base_worker_ids!r}.")
-            if paused_base_worker_ids:
-                psrl_logger.warning(
-                    f"[INIT-PAUSE] Pausing {len(paused_base_worker_ids)} validate instances "
-                    f"in the gateway after sleep: {paused_base_worker_ids!r}."
-                )
-                self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
-                psrl_logger.warning("[INIT-PAUSE] Pause call completed successfully.")
 
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
@@ -2083,7 +2072,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
-            ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             # Start the shared LMCache Controller and broadcast its URL to all instances,
             # enabling cross-instance KV cache migration for partial rollout re-routes.
             if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
@@ -2179,7 +2167,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         Give colocated GPUs to validation replicas.
 
         Elastic mode delegates to `ElasticExecutor.begin_validation`.
-        The colocated validate path sleeps the actor and wakes validation replicas.
+        The colocated validate path sleeps the actor and delegates validation
+        memory, weights and routing to the rollout coordinator.
         Deployments that do not colocate validation return immediately.
         """
         psrl_logger.warning(
@@ -2192,7 +2181,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.elastic_mode:
             ray.get(self.elastic_executor.begin_validation.remote())
             return
-        if not self.config.psrl.colocate_validate_and_train or self.is_rollout_mode_in_actor:
+        if self.is_rollout_mode_in_actor:
             return
         psrl_logger.warning("Switching to rollout mode...")
 
@@ -2204,44 +2193,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # A partially failed wake still requires validation cleanup.
         self.is_rollout_mode_in_actor = True
 
-        psrl_logger.info("Step 2: Waking up validation instances...")
-        # Allocate rollout space and register
-        ray.get(
-            [self.tag_to_server_handles["validate"][i].nixl_wake_up.remote() for i in range(self.n_validate_instances)]
-        )
-
-        psrl_logger.info("Step 3: Collecting validation NIXL descriptors...")
-        updated_client_names = []
-        futures = []
-        for i in range(self.n_validate_instances):
-            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
-            for rank in range(tp_size):
-                updated_client_names.append(
-                    WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
-                )
-            futures.append(self.tag_to_server_handles["validate"][i].nixl_get_local_client_info.remote())
-        groups = [group for worker_groups in ray.get(futures) for group in worker_groups]
-        updates = merge_client_updates(groups, updated_client_names)
-
-        psrl_logger.info("Step 4: Installing updated validation NIXL descriptors...")
-        self._broadcast_updated_client_infos(updates)
-
-        psrl_logger.info("Step 5: Syncing validation instances' model weights and status with PS...")
-        # sync validation instances with ps
-        # the generation will be resumed in the rollout coordinator
-        resumed_instance_ids = []
-        validate_dp_size = self.config.train_actor_rollout_ref.rollout.data_parallel_size
-        for base_worker_id in self.tag_to_base_worker_ids.get("validate", []):
-            resumed_instance_ids.extend((base_worker_id, i) for i in range(validate_dp_size))
-
-        ray.get(self.rollout_coordinator.sync_with_ps.remote(resumed_instance_ids))
-
-        psrl_logger.info("Step 6: Resuming validation instances...")
-        # resume validation instances in router and coordinator
-        resumed_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-        self._post_gateway_worker_routing_control("resume", resumed_base_worker_ids)
-
-        self.is_rollout_mode_in_actor = True
+        psrl_logger.info("Step 2: Restoring validation memory, weights and routing through the coordinator...")
+        ray.get(self.rollout_coordinator.wake_up.remote("validate"))
 
     def switch_to_trainer_mode(self, *, restore_trainer: bool = True):
         """
@@ -2249,8 +2202,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         Elastic mode delegates to `ElasticExecutor`: acquire and
         restore when `restore_trainer` is True, otherwise only release the pool.
-        The colocated validate path sleeps validation replicas and wakes the
-        actor. Other deployments return immediately.
+        The colocated validate path delegates validation sleep to the rollout
+        coordinator and wakes the actor. Other deployments return immediately.
 
         Args:
             restore_trainer (bool): Wake and synchronize the actor after taking
@@ -2275,41 +2228,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         psrl_logger.info("Switching to trainer mode...")
 
-        psrl_logger.info("Step 1: Pausing validation instances...")
-        # pause validation instances in router and coordinator
-        paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-        self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
+        psrl_logger.info("Step 1: Putting validation instances to sleep through the coordinator...")
+        ray.get(self.rollout_coordinator.sleep.remote("validate"))
 
-        psrl_logger.info("Step 2: Interrupting generation of validation instances...")
-        # interrupt generation and sleep
-        ray.get(
-            [
-                self.tag_to_server_handles["validate"][i].pause_generation.remote(clear_cache=False)
-                for i in range(self.n_validate_instances)
-            ]
-        )
-
-        psrl_logger.info("Step 3: Putting validation instances to sleep...")
-        # sleep validation instances and deregister from NIXL
-        ray.get(
-            [
-                self.tag_to_server_handles["validate"][i].nixl_sleep.remote(level=2)
-                for i in range(self.n_validate_instances)
-            ]
-        )
-
-        psrl_logger.info("Step 4: Waking up training actor...")
+        psrl_logger.info("Step 2: Waking up training actor...")
         # Allocate trainer space and register
         ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
 
-        psrl_logger.info("Step 5: Collecting trainer NIXL descriptors...")
+        psrl_logger.info("Step 3: Collecting trainer NIXL descriptors...")
         groups = ray.get(self.actor_wg.execute_all_async("nixl_get_local_client_info"))
         updates = merge_client_updates(groups, (train_client_name(rank) for rank in range(self.actor_wg.world_size)))
 
-        psrl_logger.info("Step 6: Installing updated trainer NIXL descriptors...")
+        psrl_logger.info("Step 4: Installing updated trainer NIXL descriptors...")
         self._broadcast_updated_client_infos(updates)
 
-        psrl_logger.info("Step 7: Pulling actor model from PS...")
+        psrl_logger.info("Step 5: Pulling actor model from PS...")
         # pull actor model
         ray.get(self.actor_wg.execute_all_async("pull_model"))
 
@@ -2323,12 +2256,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
             self._deferred_actor_ckpt_path = None
             psrl_logger.info("Resume (NIXL): deferred actor checkpoint loaded.")
-
-        # Worker property replacement clears paused state, so restore it after version synchronization.
-        psrl_logger.info("Step 7.5: Re-pausing validation instances in gateway after version sync...")
-        paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-        if paused_base_worker_ids:
-            self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
 
         self.is_rollout_mode_in_actor = False
 

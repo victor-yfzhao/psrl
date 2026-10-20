@@ -93,8 +93,14 @@ MIRRORS_ENC=$(printf '%s\n' "${MIRRORS_ARR[@]}")
 export MIRRORS_ENC
 
 if [[ -n "$IMAGE_DIR" ]]; then
+    if ! command -v skopeo >/dev/null 2>&1; then
+        echo "ERROR: --image-dir writes docker-archive tars and needs skopeo on PATH." >&2
+        echo "Install with: dnf -y install skopeo --nobest" >&2
+        echo "Use --nobest if Docker CE containerd.io is installed." >&2
+        exit 1
+    fi
     if [[ "$METHOD" != "skopeo" ]]; then
-        echo "ERROR: --image-dir requires --method skopeo." >&2
+        echo "ERROR: --image-dir requires --method skopeo (got ${METHOD})." >&2
         exit 1
     fi
     mkdir -p "$IMAGE_DIR"

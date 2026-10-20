@@ -1,5 +1,5 @@
 """
-Verify that disjoint replicas of one elastic role initialize concurrently.
+Verify that inference replicas initialize concurrently before memory lifecycle operations.
 """
 
 import asyncio
@@ -52,7 +52,13 @@ def _rollout_config():
     )
 
 
-def test_rollout_role_initializes_every_replica_before_sleeping(monkeypatch):
+@pytest.mark.parametrize("tag", ["rollout", "validate"])
+@pytest.mark.parametrize("sleep_after_init", [False, True])
+def test_rollout_role_initializes_every_replica_before_sleeping(
+    monkeypatch,
+    tag,
+    sleep_after_init,
+):
     events = []
     count = 4
     monkeypatch.setattr(ray_trainer, "PSRL_vLLMReplica", _replica_class(events, count))
@@ -64,10 +70,19 @@ def test_rollout_role_initializes_every_replica_before_sleeping(monkeypatch):
     )
     trainer.ps_manager_handle = None
     trainer.config = SimpleNamespace(
-        psrl=SimpleNamespace(deployment=SimpleNamespace(rollout_ngpus_per_node_per_instance=1)),
+        psrl=SimpleNamespace(
+            deployment=SimpleNamespace(
+                rollout_ngpus_per_node_per_instance=1,
+                validate_ngpus_per_node_per_instance=1,
+            ),
+        ),
         gen_actor_rollout_ref=SimpleNamespace(rollout=_rollout_config()),
-        train_actor_rollout_ref=SimpleNamespace(model=SimpleNamespace(path="rollout-model")),
+        train_actor_rollout_ref=SimpleNamespace(
+            model=SimpleNamespace(path="rollout-model"),
+            rollout=_rollout_config(),
+        ),
     )
+    trainer.n_rollout_instances = count
     trainer._rollout_replica_alloc_lock = threading.Lock()
     trainer.rollout_replicas = []
     trainer.tag_to_server_handles = {}
@@ -77,25 +92,34 @@ def test_rollout_role_initializes_every_replica_before_sleeping(monkeypatch):
     trainer.register_rollout_servers = Mock(side_effect=lambda *args: events.append(("register", None)))
     groups = [SimpleNamespace(world_size=1) for _ in range(count)]
 
-    trainer.init_rollout_servers(groups, sleep_after_init=True)
+    trainer.init_rollout_servers(groups, tag=tag, sleep_after_init=sleep_after_init)
 
-    assert events[:count] == [("start", index) for index in range(count)]
+    offset = count if tag == "validate" else 0
+    assert events[:count] == [("start", offset + index) for index in range(count)], (
+        "Every replica must start before waiting for model initialization."
+    )
     operations = [event[0] for event in events]
-    assert operations.count("ready") == count
-    assert operations.index("register") > max(index for index, name in enumerate(operations) if name == "ready")
-    assert operations.index("pause") < operations.index("init_nixl_client")
+    assert operations.count("ready") == count, "All models must finish loading."
+    assert operations.index("register") > max(index for index, name in enumerate(operations) if name == "ready"), (
+        "Only initialized models can register with the coordinator."
+    )
+    assert operations.count("init_nixl_client") == count, "Every returned server must have a NIXL client."
+    assert operations.count("nixl_convert_params") == count, "Parameter conversion must finish once before sleep."
     assert max(index for index, name in enumerate(operations) if name == "init_nixl_client") < (
         operations.index("nixl_convert_params")
-    )
-    assert max(index for index, name in enumerate(operations) if name == "nixl_convert_params") < operations.index(
-        "sleep"
-    )
-    assert operations.count("sleep") == count
-    assert len(trainer.rollout_replicas) == count
-    assert len(trainer.tag_to_server_handles["rollout"]) == count
-    trainer._post_gateway_worker_routing_control.assert_called_once_with(
-        "pause", [f"worker-{i}" for i in range(count)]
-    )
+    ), "NIXL clients must exist before parameter conversion."
+    if sleep_after_init:
+        assert max(index for index, name in enumerate(operations) if name == "nixl_convert_params") < operations.index(
+            "sleep"
+        ), "Initial sleep requires completed NIXL setup."
+        trainer._post_gateway_worker_routing_control.assert_called_once_with(
+            "pause", [f"worker-{offset + i}" for i in range(count)]
+        )
+    else:
+        trainer._post_gateway_worker_routing_control.assert_not_called()
+    assert operations.count("sleep") == (count if sleep_after_init else 0), "Only requested replicas should sleep."
+    assert len(trainer.rollout_replicas) == count, "Every replica must be tracked."
+    assert len(trainer.tag_to_server_handles[tag]) == count, "Every server must be available for lifecycle operations."
 
 
 @pytest.mark.parametrize("elastic", [True, False])

@@ -14,6 +14,7 @@ from psrl.utils.agent.thinking import (
     wants_thinking_disabled,
 )
 from psrl.utils.common.chat_template import resolve_chat_template_value
+from psrl.utils.deployment_mode import validate_trainer_sleep_optimizer_offload
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
@@ -317,13 +318,7 @@ def validate_config(
     # Check TMS configuration
     if config.psrl.tms.enable_cuda_graph:
         assert config.psrl.tms.range == "all", "TMS CUDA graph can only be enabled when TMS range is 'all'"
-    if config.psrl.tms.range not in ["train", "all"]:
-        assert (
-            config.train_actor_rollout_ref.actor.strategy == "megatron"
-            and config.train_actor_rollout_ref.actor.megatron.optimizer_offload
-            or config.train_actor_rollout_ref.actor.strategy == "fsdp2"
-            and config.train_actor_rollout_ref.actor.fsdp_config.optimizer_offload
-        ), "Optimizer offload must be enabled when TMS is not enabled for training workers"
+    validate_trainer_sleep_optimizer_offload(config)
 
     # Check LMCache and KV transfer configuration
     lmcache_cfg = config.psrl.get("lmcache", {})

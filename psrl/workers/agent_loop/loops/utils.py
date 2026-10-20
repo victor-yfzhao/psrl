@@ -45,10 +45,10 @@ def get_agent_loop_config(agent_name: str) -> dict:
         agent_name (str): Registered agent loop name.
 
     Returns:
-        dict: Hydra config containing `_target_` and any YAML overlays.
+        dict: Registered class defaults containing `_target_`.
 
     Raises:
-        ValueError: If the name is not a built-in loop and was not loaded from YAML.
+        ValueError: If the name is not a built-in loop and has not been registered.
     """
     if agent_name not in AGENT_LOOP_REGISTRY:
         module_name = _BUILTIN_AGENT_LOOP_MODULES.get(agent_name)

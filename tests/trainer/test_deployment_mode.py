@@ -24,6 +24,7 @@ def _make_config(
     colocate_validate_and_train=None,
     optimizer_offload=False,
     strategy="fsdp2",
+    tms_range=None,
 ):
     if colocate_validate_and_train is None:
         colocate_validate_and_train = elastic_enable or mode in ("elastic_rl", "colocated", "rollout_rm_colocated")
@@ -34,6 +35,7 @@ def _make_config(
                 "colocate": colocate,
                 "colocate_validate_and_train": colocate_validate_and_train,
                 "fuse_rollout_with_validate": not colocate_validate_and_train,
+                "tms": {"range": tms_range},
                 "deployment": {
                     "mode": mode,
                     "n_validate_instances": 1,
@@ -172,6 +174,7 @@ def test_elastic_trainer_pool_requires_optimizer_offload():
         elastic_enable=True,
         enable_trainer_pool=True,
         optimizer_offload=False,
+        tms_range="train",
     )
     mode, _ = _resolved(cfg)
 
@@ -185,6 +188,7 @@ def test_elastic_trainer_pool_accepts_optimizer_offload():
         elastic_enable=True,
         enable_trainer_pool=True,
         optimizer_offload=True,
+        tms_range="all",
     )
     mode, _ = _resolved(cfg)
 
@@ -192,7 +196,7 @@ def test_elastic_trainer_pool_accepts_optimizer_offload():
 
 
 def test_trainer_pool_only_also_requires_optimizer_offload():
-    cfg = _make_config("trainer_pool_only", optimizer_offload=False)
+    cfg = _make_config("trainer_pool_only", optimizer_offload=False, tms_range="train")
     mode, _ = _resolved(cfg)
 
     with pytest.raises(ValueError, match="trainer_pool_only"):
@@ -204,6 +208,7 @@ def test_colocated_validation_requires_optimizer_offload_without_elastic_pool():
         "disaggregated",
         colocate_validate_and_train=True,
         optimizer_offload=False,
+        tms_range="train",
     )
     mode, _ = _resolved(cfg)
 
@@ -218,11 +223,36 @@ def test_megatron_sleep_uses_megatron_optimizer_offload_setting():
         enable_trainer_pool=True,
         optimizer_offload=False,
         strategy="megatron",
+        tms_range="train",
     )
     mode, _ = _resolved(cfg)
 
     with pytest.raises(ValueError, match=r"actor\.megatron\.optimizer_offload=True"):
         validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_sleep_without_tms_does_not_require_optimizer_offload():
+    cfg = _make_config(
+        "disaggregated",
+        colocate_validate_and_train=True,
+        optimizer_offload=False,
+        tms_range=None,
+    )
+    mode, _ = _resolved(cfg)
+
+    validate_trainer_sleep_optimizer_offload(cfg, mode)
+
+
+def test_tms_without_trainer_sleep_does_not_require_optimizer_offload():
+    cfg = _make_config(
+        "disaggregated",
+        colocate_validate_and_train=False,
+        optimizer_offload=False,
+        tms_range="train",
+    )
+    mode, _ = _resolved(cfg)
+
+    validate_trainer_sleep_optimizer_offload(cfg, mode)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ def _trainer(elastic=True):
     trainer.tag_to_server_handles = {"validate": [server]}
     trainer.rollout_coordinator = SimpleNamespace(
         sleep=_remote_handle(),
+        wake_up=_remote_handle(),
         sync_with_ps=_remote_handle(),
         exec_command=_remote_handle(),
     )
@@ -171,12 +172,50 @@ def test_elastic_runtime_hands_off_registration_without_sleeping_workers():
     trainer.actor_wg.execute_all_async.assert_not_called()
 
 
+def test_non_elastic_validation_wakes_through_coordinator_before_returning():
+    trainer = _trainer(elastic=False)
+    trainer.is_rollout_mode_in_actor = False
+    events = []
+    client_name = ray_trainer.WorkerKey("validate", 0, 0).to_nixl_client_name(trainer.n_rollout_instances)
+    groups = [[{client_name: {"info": b"validation", "temp_mapping": {}}}]]
+
+    def get(refs):
+        if refs is trainer.rollout_coordinator.wake_up.remote.return_value:
+            assert events == ["actor_sleep"], "The actor must release memory before validation wakes."
+            events.append("validation_ready")
+        elif refs is trainer.actor_wg.execute_all_async.return_value:
+            events.append("actor_sleep")
+        return groups
+
+    with patch.object(ray_trainer.ray, "get", side_effect=get):
+        trainer.switch_to_rollout_mode()
+
+    assert events == ["actor_sleep", "validation_ready"], "Validation must wait for coordinated weight restoration."
+    trainer.rollout_coordinator.wake_up.remote.assert_called_once_with("validate")
+    trainer.rollout_coordinator.sync_with_ps.remote.assert_not_called()
+    trainer.actor_wg.execute_all_async.assert_called_once_with("nixl_sleep", "full")
+    trainer.tag_to_server_handles["validate"][0].nixl_wake_up.remote.assert_not_called()
+    trainer._post_gateway_worker_routing_control.assert_not_called()
+    trainer._broadcast_updated_client_infos.assert_not_called()
+    assert trainer.is_rollout_mode_in_actor is True, "Validation must own the colocated GPUs after wake."
+
+
 def test_non_elastic_validation_restores_trainer_after_validation_sleep():
     trainer = _trainer(elastic=False)
     groups = [{ray_trainer.train_client_name(rank): {"info": bytes([rank]), "temp_mapping": {}}} for rank in range(2)]
-    with patch.object(ray_trainer.ray, "get", return_value=groups):
+    events = []
+
+    def get(refs):
+        if refs is trainer.rollout_coordinator.sleep.remote.return_value:
+            events.append("validation_asleep")
+        elif refs is trainer.actor_wg.execute_all_async.return_value:
+            assert events, "Validation must release memory before the actor wakes."
+        return groups
+
+    with patch.object(ray_trainer.ray, "get", side_effect=get):
         trainer.switch_to_trainer_mode()
-    trainer.tag_to_server_handles["validate"][0].nixl_sleep.remote.assert_called_once_with(level=2)
+    trainer.rollout_coordinator.sleep.remote.assert_called_once_with("validate")
+    trainer.tag_to_server_handles["validate"][0].nixl_sleep.remote.assert_not_called()
     trainer.actor_wg.execute_all_async.assert_has_calls(
         [
             call("nixl_wake_up"),
@@ -184,8 +223,29 @@ def test_non_elastic_validation_restores_trainer_after_validation_sleep():
             call("pull_model"),
         ]
     )
+    trainer._post_gateway_worker_routing_control.assert_not_called()
     trainer.elastic_executor.release_trainer_pool.remote.assert_not_called()
-    assert trainer.is_rollout_mode_in_actor is False
+    assert trainer.is_rollout_mode_in_actor is False, "The actor must own the colocated GPUs after restoration."
+
+
+def test_non_elastic_validation_wake_failure_runs_coordinated_cleanup():
+    trainer = _trainer(elastic=False)
+    trainer.is_rollout_mode_in_actor = False
+    trainer._run_validation = MagicMock()
+    groups = [{ray_trainer.train_client_name(rank): {"info": bytes([rank]), "temp_mapping": {}}} for rank in range(2)]
+
+    def get(refs):
+        if refs is trainer.rollout_coordinator.wake_up.remote.return_value:
+            raise RuntimeError("Weight restoration failed.")
+        return groups
+
+    with patch.object(ray_trainer.ray, "get", side_effect=get):
+        with pytest.raises(RuntimeError, match="Weight restoration failed"):
+            trainer._validate()
+
+    trainer._run_validation.assert_not_called()
+    trainer.rollout_coordinator.sleep.remote.assert_called_once_with("validate")
+    assert trainer.is_rollout_mode_in_actor is False, "Wake failures must return the GPUs to training."
 
 
 @pytest.mark.parametrize("merged", [False, True])

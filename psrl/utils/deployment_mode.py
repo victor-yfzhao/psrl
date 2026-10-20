@@ -121,13 +121,17 @@ def validate_elastic_validation(config) -> None:
 
 
 def validate_trainer_sleep_optimizer_offload(config, mode: str | None = None) -> None:
-    """Require optimizer offload whenever a deployment can sleep the trainer.
-
-    Trainer sleep releases process-wide TMS allocations. Model weights are
-    restored from the parameter server after wake-up, but optimizer state is
-    not. Keeping optimizer tensors on CPU while the trainer is idle is therefore
-    a correctness requirement, not only a memory optimization.
     """
+    Require optimizer offload when trainer sleep uses TMS.
+
+    TMS pause releases CUDA allocations that `pull_model()` does not restore for
+    optimizer state. Without TMS, `nixl_sleep` already moves the optimizer to CPU.
+    """
+    tms_cfg = config.psrl.get("tms")
+    tms_range = tms_cfg.get("range") if tms_cfg else None
+    if tms_range not in ("train", "all"):
+        return
+
     deployment = config.psrl.deployment
     resolved_mode = str(mode if mode is not None else deployment.get("mode", "disaggregated"))
     sleep_reasons = []
@@ -150,12 +154,12 @@ def validate_trainer_sleep_optimizer_offload(config, mode: str | None = None) ->
         optimizer_offload = bool(actor.megatron.get("optimizer_offload", False))
     else:
         raise ValueError(
-            f"Trainer sleep is enabled by {', '.join(sleep_reasons)}, but actor strategy {strategy!r} "
+            f"Trainer sleep uses TMS via {', '.join(sleep_reasons)}, but actor strategy {strategy!r} "
             "does not define a supported optimizer-offload path."
         )
 
     if not optimizer_offload:
         raise ValueError(
-            f"Trainer sleep is enabled by {', '.join(sleep_reasons)}; set {config_path}=True. "
-            "Without optimizer offload, TMS sleep can discard optimizer state that is not restored by pull_model()."
+            f"Trainer sleep uses TMS via {', '.join(sleep_reasons)}. Set {config_path}=True. "
+            "Without optimizer offload, TMS pause can discard optimizer state that pull_model() does not restore."
         )

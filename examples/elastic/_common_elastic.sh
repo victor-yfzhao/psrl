@@ -494,6 +494,7 @@ launch_elastic() {
                 train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${PSRL_DEPLOY_MEGATRON_EP}
                 train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${PSRL_DEPLOY_MEGATRON_ETP}
                 train_actor_rollout_ref.actor.megatron.use_mbridge=${PSRL_DEPLOY_MEGATRON_USE_MBRIDGE}
+                train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False
                 train_actor_rollout_ref.actor.megatron.use_remove_padding=False
                 train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
                 train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
@@ -661,7 +662,6 @@ launch_elastic() {
         train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
         "${TRAIN_BACKEND_ARGS[@]}" \
         train_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
-        train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
         train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
         train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_num_batched_tokens} \
         train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \

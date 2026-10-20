@@ -4,6 +4,20 @@ from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("value", [None, "1", "2"])
+def test_cuda_connection_limit_reaches_ray_workers(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", value)
+
+    env_vars = get_ppo_ray_runtime_env()["env_vars"]
+
+    assert env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] == (value or "1"), (
+        "CUDA connection settings must be explicit because Ray workers run outside the driver environment."
+    )
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

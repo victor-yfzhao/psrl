@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
+from psrl.workers.gen.smg_adapter import ReplicaRoutingStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -171,6 +172,69 @@ def test_sleeping_rollout_pulls_latest_weights_when_woken():
         server.pull_model_for_sync.remote.assert_awaited_once_with(7)
         coordinator.set_rollout_instance_model_version.assert_called_once_with(("rollout-1", 0), 7)
         assert coordinator.instance_to_version_after_sync[("rollout-1", 0)] == 7
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_validation_cycles_restore_weights_before_routing_and_clear_sleep_state(dp_size):
+    async def scenario():
+        coordinator = _make_coordinator()
+        validation_ids = {("validate-0", rank) for rank in range(dp_size)}
+        coordinator.instance_ids.update(validation_ids)
+        coordinator.tag_to_replica_ids = {"validate": {"validate-0"}}
+        coordinator.replica_ids = {instance_id[0] for instance_id in coordinator.instance_ids}
+        coordinator._set_replica_routing_status = AsyncMock()
+        state = {"sleeping": False, "version": -1, "routing": ReplicaRoutingStatus.ACTIVE}
+        validation = coordinator.server_handles["validate-0"]
+        validation.is_sleeping.remote.side_effect = lambda: state["sleeping"]
+
+        async def sleep(level):
+            assert level == 2, "Validation must fully release its colocated GPU memory."
+            assert state["routing"] is ReplicaRoutingStatus.PAUSED, "Routing must stop before memory is released."
+            state.update(sleeping=True, version=-1)
+
+        async def wake():
+            assert state["routing"] is ReplicaRoutingStatus.PAUSED, "Routing must remain paused during memory restore."
+            state["sleeping"] = False
+
+        async def pull(version):
+            assert not state["sleeping"], "Memory must be allocated before loading weights."
+            assert state["routing"] is ReplicaRoutingStatus.PAUSED, "Routing must wait for committed weights."
+            await asyncio.sleep(0)
+            state["version"] = version
+            return version
+
+        async def set_routing(replica_ids, status):
+            assert replica_ids == ["validate-0"], "Validation transitions must leave training replicas alone."
+            if status is ReplicaRoutingStatus.ACTIVE:
+                assert state["version"] == coordinator.ps_model_version, "Routing must use the restored PS version."
+            state["routing"] = status
+
+        validation.nixl_sleep.remote = AsyncMock(side_effect=sleep)
+        validation.nixl_wake_up.remote.side_effect = wake
+        validation.pull_model_for_sync.remote.side_effect = pull
+        coordinator._set_replica_routing_status.side_effect = set_routing
+
+        await coordinator.sleep("validate")
+        assert coordinator.sleeping_replica_ids == {"validate-0"}, "Initial sleep must be recorded."
+        for version in (5, 10):
+            coordinator.ps_model_version = version
+            await coordinator.wake_up("validate")
+            assert not coordinator.sleeping_replica_ids, "Wake must clear the recorded sleep state."
+            assert state["routing"] is ReplicaRoutingStatus.ACTIVE, "Restored validation must accept requests."
+            updates = coordinator._publish_weight_version_updates.await_args.args[0]
+            assert {update["dp_rank"] for update in updates} == set(range(dp_size)), (
+                "Every validation DP rank must advertise the restored model."
+            )
+            assert all(coordinator.instance_to_version_after_sync[iid] == version for iid in validation_ids), (
+                "Validation versions must follow each completed PS update."
+            )
+            await coordinator.sleep("validate")
+            assert state["sleeping"], "Validation must release memory before training resumes."
+            assert coordinator.sleeping_replica_ids == {"validate-0"}, "Each sleep must restore coordinator state."
+        coordinator.server_handles["rollout-0"].nixl_wake_up.remote.assert_not_awaited()
+        coordinator.server_handles["rollout-1"].pull_model_for_sync.remote.assert_not_awaited()
 
     asyncio.run(scenario())
 

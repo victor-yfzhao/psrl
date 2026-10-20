@@ -396,6 +396,16 @@ class RolloutCoordinator(
         replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
         await self._sleep_replicas([iid for iid in self.instance_ids if iid[0] in replica_ids])
 
+    async def wake_up(self, tag: str = "all") -> None:
+        """
+        Restore selected replicas and their PS weights before routing resumes.
+
+        Args:
+            tag (str): Replica group to restore, either 'rollout', 'validate' or 'all'.
+        """
+        replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
+        await self._wake_up_replicas([iid for iid in self.instance_ids if iid[0] in replica_ids])
+
     async def start_busy_loop(self):
         """
         Start the background event loops for command handling and status synchronization.

@@ -708,7 +708,7 @@ index 08139661..f2af2f08 100644
  def save_dist_checkpointing(
      sharded_state_dict,
 diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
-index ae91290f..fdbb149f 100644
+index ae91290f..0bdc96d8 100644
 --- a/verl/utils/megatron_utils.py
 +++ b/verl/utils/megatron_utils.py
 @@ -47,6 +47,9 @@ from verl.utils.model import normalize_model_name
@@ -741,6 +741,33 @@ index ae91290f..fdbb149f 100644
              if mpu.get_pipeline_model_parallel_world_size() > 1:
                  assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
                      "Split rank needs to be specified for model with both encoder and decoder"
+@@ -640,7 +643,8 @@
+     def offload_tensor_to_cpu(tensor):
+         if tensor is None:
+             return
+-        tensor.data = tensor.data.to("cpu", non_blocking=True)
++        # CPU master parameters must be ready before their CUDA storage is released.
++        tensor.data = tensor.data.to("cpu")
+
+     def offload_group_to_cpu(group):
+         if group is None:
+@@ -730,13 +734,13 @@
+                 opt_state_dict_values = _opt.optimizer.state.values()
+                 for v in opt_state_dict_values:
+                     if "exp_avg" in v:
+-                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
++                        v["exp_avg"] = v["exp_avg"].to("cpu")
+                     if "exp_avg_sq" in v:
+-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
++                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu")
+                     # Offload additional optimizer state that is stored under
+                     # "master_param" when use_precision_aware_optimizer=True.
+                     if "master_param" in v:
+-                        v["master_param"] = v["master_param"].to("cpu", non_blocking=True)
++                        v["master_param"] = v["master_param"].to("cpu")
+
+         try:
+             # Free TransformerEngine's dummy weight gradients cache
 diff --git a/verl/utils/tokenizer.py b/verl/utils/tokenizer.py
 index 812b1f0e..158eda11 100644
 --- a/verl/utils/tokenizer.py

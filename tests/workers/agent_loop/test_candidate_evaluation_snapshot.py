@@ -147,7 +147,7 @@ def _migration_coordinator(modules):
     source = coordinator.server_handles["replica-1"]
     source.get_external_request_id = SimpleNamespace(remote=AsyncMock(return_value="external-1"))
     source.abort_requests = SimpleNamespace(remote=AsyncMock(return_value=True))
-    coordinator._gateway_get_json = AsyncMock(return_value={"dispatched": True})
+    coordinator._gateway_get_json = AsyncMock(return_value={"dispatched": True, "completed": False})
     move = {
         "request_id": "opaque-engine-1",
         "source_instance_id": ("replica-1", 0),
@@ -205,7 +205,7 @@ def test_failed_redispatch_settlement_clears_reservation_and_stops_next_migratio
             coordinator._gateway_get_json.side_effect = RuntimeError("Gateway unavailable.")
             error_type = RuntimeError
         else:
-            coordinator._gateway_get_json.return_value = {"dispatched": False}
+            coordinator._gateway_get_json.return_value = {"dispatched": False, "completed": False}
             error_type = TimeoutError
         second = dict(move, request_id="opaque-engine-2")
         with pytest.raises(error_type):

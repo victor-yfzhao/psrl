@@ -35,7 +35,6 @@ from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import (
-    AGENT_LOOP_REGISTRY,
     DictConfigWrap,
     TerminateReason,
     get_agent_loop_config,
@@ -155,14 +154,15 @@ class PSRL_AgentLoopWorker:
         self.busy_loop_task = None
         self.stop_busy_loop_task = False
 
-        # Register agent loop configs from file
+        # Runtime options belong to this worker, so class registration cannot replace them.
+        self.agent_loop_configs: dict[str, DictConfig] = {}
         agent_loop_config_path = config.gen_actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
-                AGENT_LOOP_REGISTRY[agent_loop_config.name] = agent_loop_config
+                self.agent_loop_configs[agent_loop_config.name] = agent_loop_config
         # Fail at worker start if the default loop is neither built-in nor listed in YAML.
-        get_agent_loop_config(config.gen_actor_rollout_ref.rollout.agent.default_agent_loop)
+        self._get_agent_loop_config(config.gen_actor_rollout_ref.rollout.agent.default_agent_loop)
         custom_template_value = config.gen_actor_rollout_ref.model.get("custom_chat_template", None)
         resolved_template = resolve_chat_template_value(custom_template_value)
         if resolved_template is not None:
@@ -186,6 +186,17 @@ class PSRL_AgentLoopWorker:
         handler = DualOutputHandler(self.config.psrl.logging_path, self.log_prefix)
         logging.getLogger("psrl").addHandler(handler)
         psrl_logger.addHandler(handler)
+
+    def _get_agent_loop_config(
+        self,
+        agent_name: str,
+    ) -> dict | DictConfig:
+        """
+        Resolve worker configuration before registered class defaults.
+        """
+        if agent_name in self.agent_loop_configs:
+            return self.agent_loop_configs[agent_name]
+        return get_agent_loop_config(agent_name)
 
     def _terminate_reaper(self) -> None:
         """Belt-and-suspenders cleanup on graceful actor shutdown.
@@ -382,25 +393,33 @@ class PSRL_AgentLoopWorker:
             name=agent_name,
             validate=validate,
         ):
-            agent_loop_config = get_agent_loop_config(agent_name)
-
-            context = AgentLoopContext(
-                config=self.config,
-                rollout_gateway_url=self.rollout_gateway_url,
-                session_router_url=self.session_router_url,
-                reward_manager=self.reward_manager,
-                ps_manager_handle=self.ps_manager_handle,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-            )
-            # Keep framework objects out of Hydra's dataclass conversion path.
-            agent_loop_factory = hydra.utils.instantiate(
-                config=agent_loop_config,
-                _partial_=True,
-            )
-            agent_loop = agent_loop_factory(context=context)
+            try:
+                agent_loop_config = self._get_agent_loop_config(agent_name)
+                context = AgentLoopContext(
+                    config=self.config,
+                    rollout_gateway_url=self.rollout_gateway_url,
+                    session_router_url=self.session_router_url,
+                    reward_manager=self.reward_manager,
+                    ps_manager_handle=self.ps_manager_handle,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    dataset_cls=self.dataset_cls,
+                    data_config=DictConfigWrap(self.config.data),
+                )
+                # Keep framework objects out of Hydra's dataclass conversion path.
+                agent_loop_factory = hydra.utils.instantiate(
+                    config=agent_loop_config,
+                    _partial_=True,
+                )
+                agent_loop = agent_loop_factory(context=context)
+            except Exception as error:
+                # Initialization failures cannot be repaired by replacing the prompt.
+                await self.agent_loop_manager.fail_pipeline.remote(
+                    f"Agent loop initialization failed: name={agent_name!r}, request_id={request_index!r}, "
+                    f"prompt_id={prompt_index!r}, error={error!r}."
+                )
+                await self.ps_manager_handle.abort_requests.remote(request_ids)
+                raise
 
             with log_dual_events(
                 f"Agent loop with requests {request_ids}",

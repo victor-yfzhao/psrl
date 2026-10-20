@@ -294,3 +294,5 @@ examples/bench/rollout/exp/
 
 *.csv
 analysis/
+
+*.tar
