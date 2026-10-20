@@ -56,7 +56,11 @@ def modules(monkeypatch):
             "EventType": SimpleNamespace(OTHER="OTHER"),
             "log_dual_events": lambda *args, **kwargs: nullcontext(),
         },
-        "psrl.workers.gen.utils": {"RolloutInstanceId": tuple[str, int]},
+        "psrl.workers.gen.utils": {
+            "RolloutInstanceId": tuple[str, int],
+            "DEFAULT_MAX_CONNECTIONS": 10000,
+            "DEFAULT_TIMEOUT": 3600,
+        },
         "psrl.workers.gen.stats_collector": {
             "EngineStats": EngineStats,
         },
@@ -71,62 +75,28 @@ def modules(monkeypatch):
         "topology": ("psrl.workers.elastic.cluster_topology", "psrl/workers/elastic/cluster_topology.py"),
         "policy": ("psrl.workers.elastic.scaling_policy.base", "psrl/workers/elastic/scaling_policy/base.py"),
         "executor": ("elastic_executor_runtime_test", "psrl/workers/elastic/executor.py"),
-        "handler": ("elastic_command_handler_test", "psrl/workers/gen/rollout_coordination/command_loop.py"),
-        "base": ("elastic_coordinator_base_test", "psrl/workers/gen/rollout_coordination/base.py"),
-        "sync": (
-            "elastic_sync_mixin_test",
-            "psrl/workers/gen/rollout_coordination/sync_and_migrate/sync_and_migrate_mixin.py",
-        ),
-        "status": ("elastic_status_loop_test", "psrl/workers/gen/rollout_coordination/status_loop.py"),
+        "state": ("psrl.workers.global_coordination.state", "psrl/workers/global_coordination/state.py"),
+        "lifecycle": ("psrl.workers.global_coordination.lifecycle", "psrl/workers/global_coordination/lifecycle.py"),
+        "commands": ("psrl.workers.global_coordination.commands", "psrl/workers/global_coordination/commands.py"),
     }
     loaded = {key: _load(monkeypatch, name, path) for key, (name, path) in paths.items()}
     return SimpleNamespace(role=Role, **loaded)
 
 
 def _coordinator(modules):
-    class Coordinator(
-        modules.handler.CommandHandlerMixin,
-        modules.sync.SyncAndMigrateMixin,
-        modules.base.CoordinatorBase,
-        modules.command.CommandExtension,
-    ):
-        pass
+    return SimpleNamespace()
 
-    coord = Coordinator()
-    coord.stop_command_handler = False
-    coord.sleeping_replica_ids = set()
-    coord.replica_operation_locks = {}
-    coord.routing_operation_lock = asyncio.Lock()
-    coord.server_handles = {
-        "replica-1": SimpleNamespace(
-            is_sleeping=SimpleNamespace(remote=AsyncMock(return_value=True)),
-            pause_for_sync=SimpleNamespace(remote=AsyncMock()),
-            resume_after_sync=SimpleNamespace(remote=AsyncMock()),
-            fail_sync=SimpleNamespace(remote=AsyncMock()),
-            sync_with_ps=SimpleNamespace(remote=AsyncMock(return_value=3)),
-        ),
-    }
-    coord._do_sleep_instance = AsyncMock()
-    coord._do_wake_up_instance = AsyncMock()
-    coord._set_replica_routing_status = AsyncMock()
-    coord._set_routing_loop_running = AsyncMock()
-    coord._gateway_post_json = AsyncMock()
-    coord._publish_weight_version_updates = AsyncMock()
-    coord.instance_ids = {("replica-1", 0)}
-    coord.instance_to_model_version = {("replica-1", 0): 1}
-    coord.instance_to_version_after_sync = {}
-    coord.model_sync_tasks = set()
-    coord.replica_sync_tasks = {}
-    coord.ps_model_version = 3
 
-    def set_version(iid, version):
-        coord.instance_to_model_version[iid] = version
-
-    coord.set_rollout_instance_model_version = set_version
-    coord.config = SimpleNamespace(
-        psrl=SimpleNamespace(rollout_coordination=SimpleNamespace(partial_rollout=SimpleNamespace(enable=False))),
+def _model_services(modules):
+    model = modules.state.ModelState(("rollout", ""), "http://rollout", True, "", None)
+    gateway = SimpleNamespace(
+        pause_replicas=AsyncMock(),
+        eligibility=AsyncMock(),
+        publish_versions=AsyncMock(),
     )
-    return coord
+    lifecycle = modules.lifecycle.ReplicaLifecycle(gateway)
+    commands = modules.commands.CommandService(SimpleNamespace(), gateway, lifecycle)
+    return model, gateway, commands
 
 
 def _executor(modules, coord):

@@ -100,11 +100,11 @@ from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
 from psrl.workers.config import DistillationConfig
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.elastic.executor import ElasticExecutor, ReplicaRegistration
-from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.workers.gen.smg_adapter import build_pause_resume_payload
 from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
-from psrl.workers.global_coordinator import CoordinatorClient, GlobalCoordinator
+from psrl.workers.global_coordination.client import CoordinatorClient
+from psrl.workers.global_coordination.coordinator import GlobalCoordinator
 from psrl.workers.ps.ps_manager import PSManager
 from psrl.workers.ps.ps_storage_worker import PSStoragePlan, PSStorageWorker
 from psrl.workers.ps.ps_worker_group import (
@@ -311,8 +311,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # CPU workers for Streaming Rollout
         self.data_processor = None
         self.agent_loop_manager = None
-        self.rollout_coordinator = None
-        self.global_coordinator = None
+        self.rollout_coordinator: CoordinatorClient | None = None
+        self.global_coordinator: ray.actor.ActorHandle | None = None
         self.reward_manager = None
         self.reward_loop_workers = []
         self.validation_reward_manager = None
@@ -728,14 +728,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.ps_manager_grpc_port,
         )
 
-    def init_rollout_coordinator(self):
+    def init_global_coordinator(self):
         assert self.rollout_gateway_url is not None, (
-            "Rollout gateway URL must be initialized before initializing rollout coordinator."
+            "Rollout gateway URL must be initialized before initializing global coordinator."
         )
-        use_global = self.config.psrl.global_coordinator.enable
-        coordinator_cls = GlobalCoordinator if use_global else RolloutCoordinator
-        coordinator = (
-            ray.remote(coordinator_cls)
+        self.global_coordinator = (
+            ray.remote(GlobalCoordinator)
             .options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=self.ip_to_node_id[self.config.psrl.ps_manager_ip], soft=False
@@ -748,11 +746,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.session_router_url,
             )
         )
-        if use_global:
-            self.global_coordinator = coordinator
-            self.rollout_coordinator = CoordinatorClient(coordinator)
-        else:
-            self.rollout_coordinator = coordinator
+        self.rollout_coordinator = CoordinatorClient(self.global_coordinator)
 
     def init_reward_gateways(self):
         """Launch one smg gateway per named generative reward model."""
@@ -783,10 +777,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 all_wg[f"reward_model_{reward_model_name}_{i}"] for i in range(rm_cfg.num_replicas)
             ]
             gateway_url = self.reward_gateway_urls[reward_model_name]
-            coordinator = None
-            if self.global_coordinator is not None:
-                ray.get(self.global_coordinator.register_reward_model.remote(rm_cfg, gateway_url))
-                coordinator = CoordinatorClient(self.global_coordinator, ("reward", reward_model_name))
+            assert self.global_coordinator is not None, "Global coordinator must be initialized before reward models."
+            ray.get(self.global_coordinator.register_reward_model.remote(rm_cfg, gateway_url))
+            coordinator = CoordinatorClient(self.global_coordinator, ("reward", reward_model_name))
             self.reward_model_to_manager[reward_model_name] = RewardModelManager(
                 reward_model_name=reward_model_name,
                 config=self.config,
@@ -846,27 +839,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         ray.get(self.rollout_coordinator.start_busy_loop.remote())
 
-    def stop_rollout_coordinator(self):
+    def stop_global_coordinator(self):
         """
         Stop the owning actor and all model controllers it contains.
         """
-        if self.rollout_coordinator is not None:
-            coordinator = self.global_coordinator if self.global_coordinator is not None else self.rollout_coordinator
-            psrl_logger.debug("Stopping rollout coordinator...")
+        if self.global_coordinator is not None:
+            coordinator = self.global_coordinator
+            psrl_logger.debug("Stopping global coordinator...")
             try:
                 ray.get(coordinator.stop_busy_loop.remote(), timeout=60)
-                psrl_logger.debug("Rollout coordinator stopped successfully.")
+                psrl_logger.debug("Global coordinator stopped successfully.")
             except ray.exceptions.GetTimeoutError:
-                psrl_logger.error("Timeout stopping rollout coordinator (60s), force killing.")
+                psrl_logger.error("Timeout stopping global coordinator (60s), force killing.")
                 ray.kill(coordinator, no_restart=True)
             except Exception as e:
-                psrl_logger.error(f"Error stopping rollout coordinator: {e!r}.", exc_info=True)
+                psrl_logger.error(f"Error stopping global coordinator: {e!r}.", exc_info=True)
                 ray.kill(coordinator, no_restart=True)
             finally:
                 self.rollout_coordinator = None
                 self.global_coordinator = None
         else:
-            psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
+            psrl_logger.warning("Global coordinator is not initialized, skipping stop operation.")
 
     def create_elastic_executor(self):
         """
@@ -1845,8 +1838,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
             psrl_logger.info(f"Agent loop worker {i} scheduled on node {node_id} (soft=True).")
 
-        # start rollout coordinator
-        self.init_rollout_coordinator()
+        # Model scopes share one coordinator owner.
+        self.init_global_coordinator()
         # Bind rollout coordinator to elastic executor
         if self.elastic_mode:
             rollout_model = self.config.gen_actor_rollout_ref.model.path.split("/")[-1]
@@ -3324,8 +3317,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.elastic_executor is not None:
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
-        self.shutdown_reward_model_managers()
-        self.stop_rollout_coordinator()
+        self.stop_global_coordinator()
         self.stop_reward_manager()
         if self.env_worker_manager is not None:
             self.env_worker_manager.shutdown()

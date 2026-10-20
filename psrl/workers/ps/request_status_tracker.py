@@ -2,6 +2,7 @@ import enum
 import threading
 from enum import Enum
 from functools import wraps
+from typing import TYPE_CHECKING
 
 import ray
 from omegaconf import DictConfig
@@ -11,6 +12,9 @@ from psrl.utils.server.command import Command, CommandType
 from psrl.utils.transferqueue_utils import PayloadState, clear_payload, request_payload_keys
 from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
+
+if TYPE_CHECKING:
+    from psrl.workers.global_coordination.client import CoordinatorClient
 
 psrl_logger = get_ps_logger()
 
@@ -95,7 +99,7 @@ class RequestStatusTracker:
             self.alg_rollout_n = self.rollout_n
         self.val_rollout_n = self.psrl_config.val_rollout_n
 
-        self.rollout_coordinator: ray.actor.ActorHandle | None = None
+        self.rollout_coordinator: CoordinatorClient | None = None
 
         self.reward_manager: ray.actor.ActorHandle | None = None
 
@@ -103,8 +107,10 @@ class RequestStatusTracker:
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info("Initialized RequestStatusTracker.")
 
-    def set_rollout_coordinator(self, rollout_coordinator: ray.actor.ActorHandle):
-        """Set the reference to the rollout coordinator."""
+    def set_rollout_coordinator(self, rollout_coordinator: "CoordinatorClient"):
+        """
+        Set the rollout scope client for the global coordinator.
+        """
         self.rollout_coordinator = rollout_coordinator
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):

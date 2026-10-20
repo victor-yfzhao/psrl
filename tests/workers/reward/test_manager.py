@@ -59,10 +59,9 @@ def test_manager_and_gateway_use_same_tokenizer_source(monkeypatch, tokenizer_pa
     monkeypatch.setattr(RewardModelManager, "_initialize_reward_replicas", lambda self: None)
     monkeypatch.setattr(RewardModelManager, "_register_reward_servers", lambda self, replicas: None)
 
-    monkeypatch.setattr(_manager_mod.ray, "remote", MagicMock())
     monkeypatch.setattr(_manager_mod.ray, "get", MagicMock())
 
-    RewardModelManager("TestRM", OmegaConf.create({}), rm_config, [], "http://localhost:8300")
+    RewardModelManager("TestRM", OmegaConf.create({}), rm_config, [], "http://localhost:8300", MagicMock())
 
     copier.assert_called_once_with(tokenizer_path or rm_config.model.path, use_shm=False)
     tokenizer_loader.assert_called_once_with("local_tokenizer", trust_remote_code=False)

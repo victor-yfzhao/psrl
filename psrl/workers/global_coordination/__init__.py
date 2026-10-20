@@ -1,3 +1,3 @@
 """
-Independent services for global inference coordination.
+Global inference coordination and scoped actor clients.
 """

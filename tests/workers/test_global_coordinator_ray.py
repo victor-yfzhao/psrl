@@ -8,7 +8,8 @@ import pytest
 import ray
 from omegaconf import OmegaConf
 from psrl.utils.server.command import Command, CommandType
-from psrl.workers.global_coordinator import CoordinatorClient, GlobalCoordinator
+from psrl.workers.global_coordination.client import CoordinatorClient
+from psrl.workers.global_coordination.coordinator import GlobalCoordinator
 
 pytestmark = pytest.mark.integration
 

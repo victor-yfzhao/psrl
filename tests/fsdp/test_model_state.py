@@ -1,5 +1,5 @@
 """
-Verify checkpoint loading and NIXL parameter conversion for both FSDP backends.
+Verify checkpoint loading and NIXL parameter conversion for FSDP2.
 """
 
 import argparse
@@ -31,7 +31,7 @@ def _assert_converted_shards(state, shardings, reference):
             torch.testing.assert_close(local.detach().cpu(), expected[tuple(slices)])
 
 
-def _run_model_check(model_path, strategy):
+def _run_model_check(model_path):
     import torch
     import torch.distributed as distributed
     from psrl.utils.converter import create_parameter_mapping
@@ -39,12 +39,10 @@ def _run_model_check(model_path, strategy):
     from psrl.utils.converter.hf_converter import convert_hf_inplace
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
     from transformers import AutoModelForCausalLM
     from verl.utils.fsdp_utils import (
         apply_fsdp2,
         fsdp2_load_full_state_dict,
-        get_fsdp_wrap_policy,
         get_init_weight_context_manager,
     )
 
@@ -55,25 +53,12 @@ def _run_model_check(model_path, strategy):
         reference = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32, local_files_only=True)
         config = reference.config
         full_state = reference.state_dict() if distributed.get_rank() == 0 else {}
-        if strategy == "fsdp":
+        with get_init_weight_context_manager(use_meta_tensor=True, mesh=mesh)():
             model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
-            if distributed.get_rank() == 0:
-                model.load_state_dict(full_state)
-            model = FullyShardedDataParallel(
-                model,
-                auto_wrap_policy=get_fsdp_wrap_policy(model),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                device_id=torch.cuda.current_device(),
-                device_mesh=mesh,
-                sync_module_states=True,
-            )
-        else:
-            with get_init_weight_context_manager(use_meta_tensor=True, mesh=mesh)():
-                model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
-            apply_fsdp2(model, {"mesh": mesh}, {})
-            fsdp2_load_full_state_dict(model, full_state, device_mesh=mesh)
+        apply_fsdp2(model, {"mesh": mesh}, {})
+        fsdp2_load_full_state_dict(model, full_state, device_mesh=mesh)
 
-        state, shardings = convert_fsdp_inplace(create_parameter_mapping("FSDP", config), model, strategy)
+        state, shardings = convert_fsdp_inplace(create_parameter_mapping("FSDP", config), model)
         expected, _ = convert_hf_inplace(create_parameter_mapping("HF", config), reference)
         _assert_converted_shards(state, shardings, expected)
 
@@ -88,8 +73,7 @@ def _run_model_check(model_path, strategy):
         distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
-def test_checkpoint_and_converter(gpu_model_path, gpu_tensor_parallel_size, strategy):
+def test_checkpoint_and_converter(gpu_model_path, gpu_tensor_parallel_size):
     result = subprocess.run(
         [
             sys.executable,
@@ -100,19 +84,16 @@ def test_checkpoint_and_converter(gpu_model_path, gpu_tensor_parallel_size, stra
             str(Path(__file__).resolve()),
             "--model",
             gpu_model_path,
-            "--strategy",
-            strategy,
         ],
         capture_output=True,
         text=True,
         timeout=600,
     )
-    assert result.returncode == 0, f"FSDP loading or conversion failed. {result.stdout} {result.stderr}"
+    assert result.returncode == 0, f"FSDP2 loading or conversion failed. {result.stdout} {result.stderr}"
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--strategy", choices=("fsdp", "fsdp2"), required=True)
     arguments = parser.parse_args()
-    _run_model_check(arguments.model, arguments.strategy)
+    _run_model_check(arguments.model)

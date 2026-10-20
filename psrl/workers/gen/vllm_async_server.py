@@ -1502,7 +1502,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
-        """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""
+        """Receive the shared LMCache Controller URL from `GlobalCoordinator`."""
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
         from psrl.utils.common.http_utils import init_http_client
 

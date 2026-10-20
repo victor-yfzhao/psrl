@@ -3,6 +3,7 @@ Verify post scale up ordering through native coordinator command interfaces.
 """
 
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -241,14 +242,14 @@ def test_failed_migration_reports_failure_and_cancels_next_decision(modules):
 
 @pytest.mark.parametrize("direction", ["sleep", "wake"])
 def test_role_batch_runs_replicas_concurrently_through_serial_command_queue(modules, direction):
-    from tests.elastic.runtime_helpers import _coordinator
+    from tests.elastic.runtime_helpers import _model_services
 
     async def scenario():
-        coordinator = _coordinator(modules)
+        model, gateway, commands = _model_services(modules)
         role = modules.role.Rollout
         executor = _executor(modules, None)
         executor._coordinator_command_timeout_s = 1.0
-        method = AsyncMock(side_effect=coordinator.exec_command)
+        method = AsyncMock(side_effect=model.commands.exec_command)
         executor.coordinators[role]["model"] = SimpleNamespace(exec_command=SimpleNamespace(remote=method))
         ids = [("replica-1", 0), ("replica-2", 0)]
         initial = (
@@ -257,10 +258,11 @@ def test_role_batch_runs_replicas_concurrently_through_serial_command_queue(modu
         targets = []
         for index, iid in enumerate(ids):
             targets.append({"role_name": role, "model_name": "model", "instance_id": iid})
-            coordinator.server_handles[iid[0]] = SimpleNamespace(
+            server = SimpleNamespace(
                 is_sleeping=SimpleNamespace(remote=AsyncMock(return_value=direction == "wake")),
+                pull_model_for_sync=SimpleNamespace(remote=AsyncMock(return_value=3)),
             )
-            coordinator.instance_ids.add(iid)
+            model.add_worker(SimpleNamespace(replica_rank=index), server, iid[0], 1)
             executor.instances_status_flags[role]["model"][iid] = initial
             executor.instances_engine_stats[role]["model"][iid] = {}
             executor.topology.register(
@@ -270,15 +272,16 @@ def test_role_batch_runs_replicas_concurrently_through_serial_command_queue(modu
         all_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def operation(replica_id):
+        async def operation(replica_id, **kwargs):
             started.add(replica_id)
             if len(started) == len(ids):
                 all_started.set()
             await release.wait()
 
-        coordinator._do_sleep_instance = operation
-        coordinator._do_wake_up_instance = operation
-        handler = asyncio.create_task(coordinator._command_handler_loop())
+        for rid, replica in model.replicas.items():
+            replica.server.nixl_sleep = SimpleNamespace(remote=partial(operation, rid))
+            replica.server.nixl_wake_up = SimpleNamespace(remote=partial(operation, rid))
+        handler = asyncio.create_task(commands.run(model))
         transition = asyncio.create_task(
             executor._apply_instance_actions(
                 executor._scale_up_instances if direction == "wake" else executor._sleep_planned_instances,
@@ -300,7 +303,7 @@ def test_role_batch_runs_replicas_concurrently_through_serial_command_queue(modu
             assert all(executor.instances_status_flags[role]["model"][iid] is expected for iid in ids)
         finally:
             release.set()
-            coordinator.stop_command_handler = True
+            model.closing.set()
             await asyncio.wait_for(asyncio.gather(transition, handler, return_exceptions=True), timeout=2.0)
 
     asyncio.run(scenario())
@@ -337,13 +340,10 @@ def test_batch_sleep_checks_minimum_before_any_replica_sleeps(modules):
 
 
 def test_failed_batch_wake_waits_for_siblings_and_opens_only_successful_replica(modules):
-    from tests.elastic.runtime_helpers import _coordinator
+    from tests.elastic.runtime_helpers import _model_services
 
     async def scenario():
-        coordinator = _coordinator(modules)
-        coordinator.server_handles["replica-2"] = SimpleNamespace(
-            is_sleeping=SimpleNamespace(remote=AsyncMock(return_value=True)),
-        )
+        model, gateway, commands = _model_services(modules)
         release = asyncio.Event()
         successful_started = asyncio.Event()
 
@@ -353,23 +353,23 @@ def test_failed_batch_wake_waits_for_siblings_and_opens_only_successful_replica(
             successful_started.set()
             await release.wait()
 
-        coordinator._do_wake_up_instance = wake
-        transition = asyncio.create_task(coordinator._wake_up_replicas([("replica-1", 0), ("replica-2", 0)]))
+        for index, rid in enumerate(("replica-1", "replica-2")):
+            server = SimpleNamespace(
+                is_sleeping=SimpleNamespace(remote=AsyncMock(return_value=True)),
+                nixl_wake_up=SimpleNamespace(remote=lambda rid=rid: wake(rid)),
+                pull_model_for_sync=SimpleNamespace(remote=AsyncMock(return_value=3)),
+            )
+            model.add_worker(SimpleNamespace(replica_rank=index), server, rid, 1)
+        transition = asyncio.create_task(commands.lifecycle.wake(model, [("replica-1", 0), ("replica-2", 0)]))
         try:
             await asyncio.wait_for(successful_started.wait(), timeout=0.5)
             assert not transition.done(), "A failed wake must not release in flight siblings."
-            coordinator._set_replica_routing_status.assert_awaited_once()
-            assert (
-                coordinator._set_replica_routing_status.call_args.args[1]
-                is modules.adapter.ReplicaRoutingStatus.PAUSED
-            )
+            gateway.pause_replicas.assert_awaited_once_with(model, ["replica-1", "replica-2"])
+            gateway.eligibility.assert_not_awaited()
             release.set()
             with pytest.raises(RuntimeError, match="Weight restoration failed"):
                 await asyncio.wait_for(transition, timeout=0.5)
-            assert coordinator._set_replica_routing_status.call_args.args == (
-                ["replica-2"],
-                modules.adapter.ReplicaRoutingStatus.ACTIVE,
-            )
+            gateway.eligibility.assert_awaited_once_with(model, ["replica-2"], True)
         finally:
             release.set()
             await asyncio.gather(transition, return_exceptions=True)

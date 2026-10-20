@@ -1,19 +1,8 @@
 """
-Phased sleep/wake orchestrator for colocated deployment modes.
+Gate colocated rollout and reward phases through scoped global coordinator clients.
 
-The SleepWakeOrchestrator drives time-multiplexed sleep/wake of rollout and
-reward-model roles on a shared pool, used by deployment modes `colocated`
-(mode 2) and `rollout_rm_colocated` (mode 3).
-
-It exposes a small phase state machine (ROLLOUT | REWARD | TRAIN) and gates the
-existing async pipeline (AgentLoopManager rollout dispatch, RewardManager rm
-dispatch) via ``wait_phase``. Role-level SLEEP/WAKE_UP is issued through the
-existing RolloutCoordinator / RewardModelCoordinator ``exec_command`` API with
-``instance_ids=[-1]`` (all instances of the role).
-
-Actor (trainer) sleep/wake for mode 2 is performed by the trainer driver
-(``ray_trainer``) directly via NIXL, since the actor worker group is owned by
-the driver process. the orchestrator only manages rollout/rm.
+Inference roles release their shared GPU memory before the next role wakes.
+The trainer driver owns training worker sleep and wake operations.
 """
 
 import asyncio
@@ -22,8 +11,6 @@ import logging
 import os
 
 import ray
-
-from psrl.utils.server.command import Command, CommandType
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -42,9 +29,8 @@ class SleepWakeOrchestrator:
 
     Args:
         mode: deployment mode string ("colocated" or "rollout_rm_colocated").
-        rollout_coordinator: Ray actor handle for the RolloutCoordinator.
-        reward_model_coordinators: dict mapping reward_model_name -> RM
-            coordinator Ray actor handle.
+        rollout_coordinator: Rollout scope client for the global coordinator.
+        reward_model_coordinators: Map from reward model names to scoped clients.
         rollout_model_name: model name string for the rollout role.
     """
 
@@ -73,10 +59,7 @@ class SleepWakeOrchestrator:
     async def _sleep_rollout(self):
         if not self._rollout_awake or self.rollout_coordinator is None:
             return
-        result = await self.rollout_coordinator.exec_command.remote(
-            Command(type=CommandType.SLEEP, instance_ids=[-1]),
-            blocking=True,
-        )
+        result = await self.rollout_coordinator.sleep.remote("rollout")
         if result is not True:
             raise RuntimeError(f"Failed to sleep rollout instances: {result!r}")
         self._rollout_awake = False
@@ -84,10 +67,7 @@ class SleepWakeOrchestrator:
     async def _wake_rollout(self):
         if self._rollout_awake or self.rollout_coordinator is None:
             return
-        result = await self.rollout_coordinator.exec_command.remote(
-            Command(type=CommandType.WAKE_UP, instance_ids=[-1]),
-            blocking=True,
-        )
+        result = await self.rollout_coordinator.wake_up.remote("rollout")
         if result is not True:
             raise RuntimeError(f"Failed to wake rollout instances: {result!r}")
         self._rollout_awake = True
@@ -97,15 +77,10 @@ class SleepWakeOrchestrator:
             return
         slept = []
         for rm_name, coord in self.reward_model_coordinators.items():
-            result = await coord.exec_command.remote(
-                Command(type=CommandType.SLEEP, instance_ids=[-1]),
-                blocking=True,
-            )
+            result = await coord.sleep.remote()
             if result is not True:
                 for _, slept_coord in reversed(slept):
-                    await slept_coord.exec_command.remote(
-                        Command(type=CommandType.WAKE_UP, instance_ids=[-1]), blocking=True
-                    )
+                    await slept_coord.wake_up.remote()
                 raise RuntimeError(f"Failed to sleep reward model {rm_name}: {result!r}")
             slept.append((rm_name, coord))
         self._rm_awake = False
@@ -115,15 +90,10 @@ class SleepWakeOrchestrator:
             return
         woken = []
         for rm_name, coord in self.reward_model_coordinators.items():
-            result = await coord.exec_command.remote(
-                Command(type=CommandType.WAKE_UP, instance_ids=[-1]),
-                blocking=True,
-            )
+            result = await coord.wake_up.remote()
             if result is not True:
                 for _, woken_coord in reversed(woken):
-                    await woken_coord.exec_command.remote(
-                        Command(type=CommandType.SLEEP, instance_ids=[-1]), blocking=True
-                    )
+                    await woken_coord.sleep.remote()
                 raise RuntimeError(f"Failed to wake reward model {rm_name}: {result!r}")
             woken.append((rm_name, coord))
         self._rm_awake = True

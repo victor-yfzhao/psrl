@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 import ray
 
@@ -21,6 +22,9 @@ from psrl.workers.elastic.scaling_policy.base import InstanceSignal, ScalingPoli
 from psrl.workers.elastic.scaling_policy.factory import create_scaling_policy
 from psrl.workers.gen.stats_collector import EngineStats
 from psrl.workers.gen.utils import RolloutInstanceId
+
+if TYPE_CHECKING:
+    from psrl.workers.global_coordination.client import CoordinatorClient
 
 psrl_logger = logging.getLogger(__file__)
 monitor_logger = logging.getLogger("ElasticMonitor")
@@ -66,7 +70,7 @@ class ElasticExecutor:
         self,
         config,
         roles: list[tuple[PSRL_Role, str]],
-        coordinators: dict[PSRL_Role, dict[str, ray.actor.ActorHandle]],
+        coordinators: dict[PSRL_Role, dict[str, "CoordinatorClient"]],
         agent_loop_manager: ray.actor.ActorHandle | None = None,
         elastic_config: dict | None = None,
     ):
@@ -1041,7 +1045,7 @@ class ElasticExecutor:
 
     async def _await_elastic_coordinator_command(
         self,
-        coordinator: ray.actor.ActorHandle,
+        coordinator: "CoordinatorClient",
         command: Command,
         *,
         stage: str,

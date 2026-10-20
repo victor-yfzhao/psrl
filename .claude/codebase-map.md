@@ -1,11 +1,8 @@
 # PSRL Codebase Map
 
 > **Purpose**: Fast-lookup reference for the entire PSRL project. Read this file first to orient yourself in any module.
-> **Last updated**: 2026-07-26 | **Total**: 213 Python files in `psrl/`, ~100 test files in `tests/`, config-as-code via veRL re-export
->
-> **Major shifts since 2026-05**: rollout now runs through the vendored **SMG** gateway (Rust router) with **SessionRouter + TITO** session capture; sample data moves over **TransferQueue** instead of Ray-serialized batches; KV cache offload/reuse via **LMCache**; **RolloutCoordinator** (mixin-composed) replaces the old `rollout_coordinator.py`; a unified **engine train worker** supersedes the separate FSDP/Megatron workers; a standalone **reward-model service** and **gen reward functions** were added; **resource elasticity** (`elastic`) and a **gRPC PSManager** service landed. See §15 for the terminology glossary.
->
-> **Latest changes (2026-07-25/26, commit `11b6d65`)**: the monolithic `psrl.yaml` was **split into 16 per-topic group files** plus the 6 existing `rollout_coordination/` ones (§4). Elastic keys live under `psrl.deployment.elastic`. **Fine-grained rollout/train overlap** landed as a `StepStrategy` (`psrl.fine_grain_overlap`); pre-SMG dead code (gen worker, FSDP/Megatron train workers, Python router/route-strategy/request-queue, mini-SWE loop v0) moved to top-level `deprecated/`; the real test suite is `tests/` (pytest `testpaths`), not `unit_tests/`.
+> **Coordination**: `GlobalCoordinator` owns rollout, validation, and reward model state.
+> `CoordinatorClient` selects a model scope on that shared actor.
 
 ---
 
@@ -41,7 +38,7 @@ PSRL (Post-training Streaming RL) is a distributed LLM post-training framework. 
         │        ┌──────┼───────┴───┬────┘        │                │
         ▼        ▼      ▼           ▼             ▼                ▼
    ┌────────┐ ┌────────┐  ┌──────────────┐  ┌───────────────────────────┐
-   │GenWorker│ │GenWorker│ │ EngineTrain  │  │ RolloutCoordinator         │
+   │GenWorker│ │GenWorker│ │ EngineTrain  │  │ GlobalCoordinator         │
    │(vLLM)  │ │(vLLM)  │  │ Worker(FSDP/ │  │ (stats/pause/weight-version│
    └────────┘ └────────┘  │  Megatron)   │  │  loops driving SMG)        │
         │          │      └──────┬───────┘  └───────────────────────────┘
@@ -49,7 +46,7 @@ PSRL (Post-training Streaming RL) is a distributed LLM post-training framework. 
         └─────── TransferQueue ───────── sample fields (prompt/response/reward/logp) ──────┘
 ```
 
-**Loop**: EngineTrainWorker pushes model → PSManager bumps version → RolloutCoordinator gates SMG on the new version → GenWorkers pull weights via NIXL → SMG dispatches requests → GenWorkers generate → RewardManager/Worker scores → fields land in TransferQueue + staleness buffer fills → DataProcessor batches → Trainer calls update → repeat
+**Loop**: EngineTrainWorker pushes model → PSManager bumps version → GlobalCoordinator gates SMG on the new version → GenWorkers pull weights via NIXL → SMG dispatches requests → GenWorkers generate → RewardManager/Worker scores → fields land in TransferQueue + staleness buffer fills → DataProcessor batches → Trainer calls update → repeat
 
 ---
 
@@ -105,18 +102,17 @@ psrl/
 │   │   ├── stats_recorder.py     # StatsRecorder: periodic per-replica stats JSONL dump
 │   │   ├── zmq_queue.py          # ZMQPush/PullQueue: cross-process stats/command transport
 │   │   ├── utils.py              # RolloutInstanceId + shared gen constants
-│   │   └── rollout_coordination/ # ★ NEW: RolloutCoordinator (mixin composition)
-│   │       ├── coordinator.py    # RolloutCoordinator: composes all mixins, public API (~838 lines)
-│   │       ├── base.py           # CoordinatorBase: HTTP gateway helpers + routing-loop control
-│   │       ├── command_loop.py   # CommandHandlerMixin: consumes command queue
-│   │       ├── status_loop.py    # StatusMixin: polls SMG stats / routing-loop status
-│   │       ├── sync_and_migrate/ # weight-sync + request-migration strategies
-│   │       │   ├── sync_and_migrate_mixin.py  # shared sync/migrate helpers
-│   │       │   ├── greedy.py     # GreedySyncMixin (sync all instances ASAP)
-│   │       │   └── status_based.py # StatusBasedSyncMixin (sync gated on instance status)
-│   │       └── session/          # session hang/continue scheduling
-│   │           ├── base.py       # SessionScheduler ABC + InstanceCapacity/SessionInfo dataclasses
-│   │           └── thunder_agent.py # ThunderAgentScheduler: KV-capacity hang/continue (ThunderAgent port)
+│   │   └── session_scheduler.py  # Capacity based session hang/continue scheduling
+│   │
+│   ├── global_coordination/     # Shared inference coordination
+│   │   ├── coordinator.py       # GlobalCoordinator actor and model registry
+│   │   ├── client.py            # Scoped CoordinatorClient actor proxy
+│   │   ├── state.py             # ModelState and ReplicaState
+│   │   ├── lifecycle.py         # Gateway eligibility and replica sleep/wake
+│   │   ├── commands.py          # Model scoped command execution and request migration
+│   │   ├── status.py            # Status collection, routing snapshots, and recording
+│   │   ├── synchronization.py   # Policy weight synchronization
+│   │   └── auxiliary.py         # Session scheduling and LMCache setup
 │   │
 │   ├── train/                    # --- Training ---
 │   │   ├── engine_train_worker.py # ★ NEW unified worker (replaces the separate fsdp/megatron workers)
@@ -143,8 +139,7 @@ psrl/
 │   │   │   ├── base.py, registry.py  # GenRewardFunctionBase + @gen_reward_func decorator
 │   │   │   ├── default_gen_rm.py, skywork_rm.py  # concrete reward functions
 │   │   └── reward_model/         # ★ NEW: reward-model inference service
-│   │       ├── manager.py        # RewardModelManager (owns replicas + coordinator)
-│   │       ├── coordinator.py    # RewardModelCoordinator (weight sync / routing)
+│   │       ├── manager.py        # RewardModelManager (replicas + scoped client)
 │   │       ├── replica.py        # RewardModelReplica (vLLM-backed RM instance)
 │   │       └── gateway.py        # RM gateway wiring
 │   │
@@ -355,14 +350,15 @@ Templates: `ppo_trainer.yaml`. `model_engine` (default `dp`) selects the actor/r
 |-------|------|------|
 | `PSRL_vLLMHttpServer` / `PSRL_vLLMReplica` | `workers/gen/vllm_async_server.py` | gRPC vLLM engine server registered with SMG |
 | `RolloutGateway` | `workers/gen/rollout_gateway.py` | Ray actor launching SMG Router + SessionRouter subprocesses |
-| `RolloutCoordinator` | `workers/gen/rollout_coordination/coordinator.py` | Drives SMG: stats, pause/resume, weight-version, sync/migrate (mixin-composed) |
+| `GlobalCoordinator` | `workers/global_coordination/coordinator.py` | Owns rollout, validation, and reward model control services |
+| `CoordinatorClient` | `workers/global_coordination/client.py` | Routes control calls to one model scope on the shared actor |
 | `SessionRouter` | `workers/gen/session_router.py` | Session-scoped OpenAI API, hang/continue state (separate uvicorn proc) |
 | `EngineTrainWorker` | `workers/train/engine_train_worker.py` | Unified FSDP/Megatron PPO update worker |
 | `PSRL_BaseTrainWorker` | `workers/train/base_train_worker.py` | Shared train logic: NIXL push, version mgmt |
 | `PSManager` | `workers/ps/ps_manager.py` | Model version store + staleness inventory (also served over gRPC) |
 | `PSStorageWorker` | `workers/ps/ps_storage_worker.py` | Holds model shards on GPU |
 | `RewardManager` | `workers/reward/reward_manager.py` | Reward scoring pipeline over TransferQueue |
-| `RewardModelManager` | `workers/reward/reward_model/manager.py` | Owns RM replicas + coordinator (RM inference service) |
+| `RewardModelManager` | `workers/reward/reward_model/manager.py` | Owns RM replicas and a scoped global coordinator client |
 | `GenRewardLoop` | `workers/reward/reward_loop/gen.py` | Routes reward requests to SMG reward-model gateway |
 | `KVCacheManager` | `utils/kv_cache/manager.py` | LMCache offload / prefix retrieval / cross-instance transfer |
 | `ElasticExecutor` | `workers/elastic/executor.py` | Pause/resume workloads for GPU re-sharing |
@@ -437,7 +433,7 @@ before rollout finishes. `overlap_scope: pre_step` additionally runs advantage+u
 EngineTrainWorker completes update
   → nixl_push_model() [async background, GPU-direct] → PSManager.push(version=N)
   → PSManager creates StalenessBuffer(version=N)
-  → RolloutCoordinator gates SMG: pause dispatch → publish weight-version update → resume
+  → GlobalCoordinator gates SMG: pause dispatch → publish weight-version update → resume
 
 GenWorker: pulls weights via NIXL → generates. Entries EMPTY→RESERVED→OCCUPIED;
 buffer PENDING→READY. DataProcessor consumes READY buffers → EMPTY; old buffers freed.
@@ -450,7 +446,7 @@ AgentLoopWorker ──HTTP generate/chat──► SMG RolloutGateway
 Session AgentLoop ──session OpenAI API──► SessionRouter ──► SMG
 SMG ◄──gRPC admission + Reserve──► PSManager
 SMG ──gRPC──► PSRL vLLM replicas (PSRL_vLLMReplica)
-RolloutCoordinator ──stats / pause-resume / weight-version──► SMG
+GlobalCoordinator ──stats / pause-resume / weight-version──► SMG
 
 PSRL worker-selection ("psrl" strategy): filter by servable version_tag →
 honor partial/sticky hint → prompt-group affinity → PSManager admission/reserve →
@@ -498,7 +494,7 @@ MiniSWEAgentLoopV1.run(request)
 | `GenRewardLoop` | `reward_loop/gen.py` | Generative/pooling RM via SMG reward gateway |
 
 - **Registry**: `reward_loop/registry.py` (rule/score) + `gen_reward_function/registry.py` (`@gen_reward_func` generative RMs: `default_gen_rm`, `skywork_rm`).
-- **Reward-model service**: `reward/reward_model/` (manager → coordinator → replicas → gateway) serves RM inference; `RewardWorker` produces/consumes reward fields over TransferQueue.
+- **Reward-model service**: `reward/reward_model/` (manager → scoped global coordinator client → replicas → gateway) serves RM inference; `RewardWorker` produces/consumes reward fields over TransferQueue.
 - **Sources**: rule-based, LLM/RM-as-judge (via SMG model gateway: `/v1/completions`, `/v1/classify`, `/v1/embeddings`), SandboxFusion.
 
 ---
@@ -556,7 +552,7 @@ tests/
 ├── nixl/             → comm planner, sharding, send/recv, e2e (+ config/nixl_e2e.yaml, scripts/)
 ├── parameter_server/ → PSManager, request status tracker
 ├── staleness/        → staleness controller
-├── workers/reward/   → RM manager / coordinator (incl. elastic) / gateway / gen reward manager
+├── workers/reward/   → RM manager / gateway / gen reward manager
 ├── workers/train/    → EngineTrainWorker init, load-weight flag
 ├── gen_dplb/         → SMG adapter cache-aware routing, stats recorder
 ├── tito/, e2e/tito/  → SessionRouter + TITO training-data build (+ test_tito_e2e.sh)
@@ -593,7 +589,7 @@ CPU-only tests are marked `pytest.mark.cpu_test`. Run with pytest under the psrl
 | `workers/ps/ps_manager.py` | ~1373 | Central coordination point for all workers (also gRPC-served) |
 | `workers/ps/staleness_controller.py` | ~1365 | THE staleness system — core async innovation |
 | `workers/reward/reward_manager.py` | ~1138 | Reward pipeline over TransferQueue |
-| `workers/gen/rollout_coordination/coordinator.py` | ~838 | SMG-driving coordinator (mixin composition) |
+| `workers/global_coordination/coordinator.py` | ~210 | Model registry and control service dispatch |
 | `workers/train/engine_train_worker.py` | ~592 | Unified FSDP/Megatron update worker |
 | `workers/gen/session_router.py` | ~571 | Session/TITO hang-continue routing |
 | `trainer/ppo/strategies/` | ~510 | Step orchestration: `base.py` (StepStrategy ABC + `STAGE_META`), `full_batch.py` (default), `fine_grain_overlap.py` (chunk-pipelined) |
@@ -608,8 +604,8 @@ main_ppo.py (TaskRunner, TransferQueue init)
   → ray_trainer.py (PSRL_RayPPOTrainer)
     → workers/gen/vllm_async_server.py (PSRL_vLLMReplica) → utils/nixl/client.py, vllm_rollout.py
     → workers/gen/rollout_gateway.py (RolloutGateway) → smg_adapter.py → third_party/smg
-    → workers/gen/rollout_coordination/coordinator.py (RolloutCoordinator)
-        → session/thunder_agent.py, sync_and_migrate/*, smg_adapter.py, utils/elastic/diagnostics
+    → workers/global_coordination/coordinator.py (GlobalCoordinator)
+        → global_coordination/*, gen/session_scheduler.py, gen/smg_adapter.py
     → workers/train/engine_train_worker.py → base_train_worker.py → nixl/client.py, converter/*
     → workers/ps/ps_manager.py → staleness_controller.py, request_status_tracker.py
         → grpc/ps_manager_service.py (gRPC surface)
@@ -633,8 +629,8 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | Enable rollout/train overlap | `psrl/trainer/config/psrl/fine_grain_overlap.yaml` + `trainer/ppo/strategies/fine_grain_overlap.py` |
 | Change node/GPU layout | `psrl/trainer/config/psrl/deployment.yaml` (`psrl.deployment.*`) |
 | Understand rollout routing / SMG | `docs/design/router_tito.md`, `workers/gen/smg_adapter.py`, `rollout_gateway.py` |
-| Change weight-sync / request migration | `workers/gen/rollout_coordination/sync_and_migrate/` + `sync_and_mig_strategy.yaml` |
-| Change session hang/continue | `rollout_coordination/session/thunder_agent.py` + `session_strategy.yaml`, `session_router.py` |
+| Change weight-sync / request migration | `workers/global_coordination/synchronization.py` + `sync_and_mig_strategy.yaml` |
+| Change session hang/continue | `workers/global_coordination/auxiliary.py` + `workers/gen/session_scheduler.py` + `session_strategy.yaml`, `session_router.py` |
 | Debug model version issues | `workers/ps/staleness_controller.py`, `workers/ps/ps_manager.py` |
 | Debug model transfer failures | `utils/nixl/client.py`, `workers/train/base_train_worker.py` |
 | Work with sample data plane | `utils/transferqueue_utils.py`, `docs/design/transfer_queue.md` |
@@ -665,7 +661,7 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | Term | Meaning |
 |------|---------|
 | **SMG** | Vendored Rust rollout/model **gateway** (`third_party/smg`), PSRL's default router; dispatches live inference requests to vLLM replicas with a PSRL-aware worker-selection strategy |
-| **RolloutCoordinator** | Ray-side controller that keeps SMG state current (worker stats, weight versions, routing-loop pause/resume, sync & migrate) — composed from mixins |
+| **GlobalCoordinator** | Shared Ray actor owning model state and control services for rollout, validation, and reward replicas |
 | **SessionRouter** | Separate uvicorn process exposing a session-scoped OpenAI API; tracks per-session hang/continue state, pins sessions to one instance |
 | **TITO** | "Token-In-Token-Out" session capture in SMG; `GET /tito/sessions` returns accumulated token IDs + per-turn records used to build training arrays |
 | **ThunderAgent** | Capacity-based session hang/continue scheduler (ported); "program→session, reasoning→generate, acting→env, pause/resume→hang/continue" |

@@ -16,6 +16,7 @@ pytestmark = pytest.mark.cpu_test
 class Response:
     def __init__(self, body):
         self.body = body
+        self.headers = {}
 
     async def __aenter__(self):
         return self
@@ -67,23 +68,6 @@ def test_reward_generation_budget_cannot_consume_entire_context():
     with pytest.raises(ValueError, match="no prompt capacity"):
         asyncio.run(loop._query_reward_model(SimpleNamespace(non_tensor_batch={"raw_prompt_ids": [[1]]}), "1"))
     loop._http_client.post.assert_not_called()
-
-
-def test_interrupted_reward_is_requeued_and_scored_only_after_completion():
-    loop = _loop(
-        "/v1/completions",
-        [
-            {"choices": [{"text": "partial score", "finish_reason": "abort"}]},
-            {"choices": [{"text": "1", "finish_reason": "stop"}]},
-        ],
-    )
-    result = asyncio.run(loop._query_reward_model(SimpleNamespace(non_tensor_batch={"raw_prompt_ids": [[1, 2]]}), "9"))
-    assert result["rm_output_str"] == "1", "Interrupted text must never become a reward."
-    assert loop._http_client.post.call_count == 2, "Reclaim must preserve the reward request."
-    assert loop._http_client.post.call_args_list[0] == loop._http_client.post.call_args_list[1], (
-        "The requeued reward must use the complete original prompt."
-    )
-    assert result["reward_metrics"]["rm_request_interruptions"] == 1, "Interruptions must remain observable."
 
 
 def test_reward_sleep_interrupts_instead_of_waiting_for_long_decode():

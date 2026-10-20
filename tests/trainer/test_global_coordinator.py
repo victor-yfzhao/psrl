@@ -1,5 +1,5 @@
 """
-Verify the coordinator switch selects one shared owner or independent actors.
+Verify rollout and reward clients share one coordinator owner.
 """
 
 from pathlib import Path
@@ -9,22 +9,20 @@ import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from psrl.trainer.ppo import ray_trainer
-from psrl.workers.global_coordinator import CoordinatorClient, GlobalCoordinator
+from psrl.workers.global_coordination.client import CoordinatorClient
+from psrl.workers.global_coordination.coordinator import GlobalCoordinator
 
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_global_coordinator_switch_composes_without_additive_overrides(enabled):
+def test_default_config_uses_global_coordination_without_a_switch():
     config_dir = str(Path(__file__).resolve().parents[2] / "psrl/trainer/config")
-    overrides = ["psrl.global_coordinator.enable=true"] if enabled else []
     with initialize_config_dir(config_dir=config_dir, version_base=None):
-        config = compose(config_name="ppo_trainer", overrides=overrides)
-    assert config.psrl.global_coordinator.enable is enabled, "Global coordination must be opt-in through Hydra."
+        config = compose(config_name="ppo_trainer")
+    assert "global_coordinator" not in config.psrl, "Global coordination must not require a configuration switch."
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_trainer_selects_actor_and_passes_the_scoped_reward_client(monkeypatch, enabled):
+def test_trainer_creates_one_actor_and_passes_scoped_clients(monkeypatch):
     actor_type = Mock()
     actor_type.options.return_value = actor_type
     remote = Mock(return_value=actor_type)
@@ -33,7 +31,7 @@ def test_trainer_selects_actor_and_passes_the_scoped_reward_client(monkeypatch, 
     trainer = object.__new__(ray_trainer.PSRL_RayPPOTrainer)
     trainer.config = OmegaConf.create(
         {
-            "psrl": {"global_coordinator": {"enable": enabled}, "ps_manager_ip": "127.0.0.1"},
+            "psrl": {"ps_manager_ip": "127.0.0.1"},
             "reward": {
                 "active_managers": ["judge"],
                 "managers": {
@@ -58,49 +56,39 @@ def test_trainer_selects_actor_and_passes_the_scoped_reward_client(monkeypatch, 
     manager = Mock()
     monkeypatch.setattr(ray_trainer, "RewardModelManager", manager)
 
-    trainer.init_rollout_coordinator()
+    trainer.init_global_coordinator()
     owner = actor_type.remote.return_value
-    remote.assert_called_once_with(GlobalCoordinator if enabled else ray_trainer.RolloutCoordinator)
+    remote.assert_called_once_with(GlobalCoordinator)
     actor_type.remote.assert_called_once_with(
         trainer.config, trainer.ps_manager_handle, trainer.rollout_gateway_url, trainer.session_router_url
     )
-    if enabled:
-        assert trainer.global_coordinator is owner, "Global mode must retain the owning actor handle."
-        assert trainer.rollout_coordinator == CoordinatorClient(owner), "Policy calls must use the shared actor."
-    else:
-        assert trainer.global_coordinator is None, "Independent mode must not create a global owner."
-        assert trainer.rollout_coordinator is owner, "Independent mode must use the rollout actor directly."
+    assert trainer.global_coordinator is owner, "The trainer must retain the owning actor handle."
+    assert trainer.rollout_coordinator == CoordinatorClient(owner), "Policy calls must use the shared actor."
 
     trainer.init_reward_model_servers({"reward_model_judge_0": Mock()})
     reward_client = manager.call_args.kwargs["coordinator"]
-    if enabled:
-        owner.register_reward_model.remote.assert_called_once_with(
-            trainer.config.reward.managers.judge, "http://reward"
-        )
-        assert reward_client == CoordinatorClient(owner, ("reward", "judge")), (
-            "The reward manager must use its own scope on the shared actor."
-        )
-    else:
-        assert reward_client is None, "Independent mode must leave reward actor ownership with its manager."
+    owner.register_reward_model.remote.assert_called_once_with(trainer.config.reward.managers.judge, "http://reward")
+    assert reward_client == CoordinatorClient(owner, ("reward", "judge")), (
+        "The reward manager must use its own scope on the shared actor."
+    )
+    remote.assert_called_once_with(GlobalCoordinator)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("timeout", [False, True])
-def test_shutdown_targets_the_owning_actor(monkeypatch, enabled, timeout):
+def test_shutdown_targets_the_owning_actor(monkeypatch, timeout):
     trainer = object.__new__(ray_trainer.PSRL_RayPPOTrainer)
     owner = Mock()
-    trainer.global_coordinator = owner if enabled else None
-    trainer.rollout_coordinator = CoordinatorClient(owner) if enabled else owner
+    trainer.global_coordinator = owner
+    trainer.rollout_coordinator = CoordinatorClient(owner)
     get = Mock(side_effect=ray_trainer.ray.exceptions.GetTimeoutError() if timeout else None)
     kill = Mock()
     monkeypatch.setattr(ray_trainer.ray, "get", get)
     monkeypatch.setattr(ray_trainer.ray, "kill", kill)
 
-    trainer.stop_rollout_coordinator()
+    trainer.stop_global_coordinator()
 
     owner.stop_busy_loop.remote.assert_called_once_with()
-    if enabled:
-        owner.invoke.remote.assert_not_called()
+    owner.invoke.remote.assert_not_called()
     if timeout:
         kill.assert_called_once_with(owner, no_restart=True)
     else:

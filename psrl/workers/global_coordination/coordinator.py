@@ -8,7 +8,6 @@ import asyncio
 import inspect
 import logging
 import os
-from dataclasses import dataclass
 from functools import partial
 from typing import Any
 from urllib.parse import quote
@@ -29,34 +28,6 @@ from psrl.workers.global_coordination.status import StatusService
 from psrl.workers.global_coordination.synchronization import WeightSynchronization
 
 psrl_logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _CoordinatorMethod:
-    actor: ActorHandle
-    scope: CoordinatorScope
-    method: str
-
-    def remote(self, *args: Any, **kwargs: Any):
-        return self.actor.invoke.remote(self.scope, self.method, args, kwargs)
-
-
-@dataclass(frozen=True)
-class CoordinatorClient:
-    """
-    Address one model scope inside a shared `GlobalCoordinator` actor.
-
-    Clients carry only the actor handle and scope, so they can be passed to the
-    parameter server and elastic executor without serializing model state.
-    """
-
-    actor: ActorHandle
-    scope: CoordinatorScope = ROLLOUT_SCOPE
-
-    def __getattr__(self, method: str) -> _CoordinatorMethod:
-        if method.startswith("_"):
-            raise AttributeError(method)
-        return _CoordinatorMethod(self.actor, self.scope, method)
 
 
 class GlobalCoordinator:
@@ -121,6 +92,7 @@ class GlobalCoordinator:
             "get_command_status": model.commands.get_command_status,
             "synchronize_command": model.commands.synchronize_command,
             "sleep": partial(self._sleep_tag, model),
+            "wake_up": partial(self._wake_tag, model),
             "start_busy_loop": partial(self._start_model, model),
             "get_instance_engine_status_snapshot": lambda: {
                 iid: stats.snapshot for iid, stats in model.engine_status.items()
@@ -159,6 +131,9 @@ class GlobalCoordinator:
 
     async def _sleep_tag(self, model: ModelState, tag: str = "all") -> bool:
         return await self.lifecycle.sleep(model, model.instances(tag))
+
+    async def _wake_tag(self, model: ModelState, tag: str = "all") -> bool:
+        return await self.lifecycle.wake(model, model.instances(tag))
 
     @staticmethod
     def _init_version(model: ModelState, version: int) -> None:

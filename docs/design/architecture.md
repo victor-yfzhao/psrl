@@ -107,7 +107,7 @@ sequenceDiagram
 5. **Occupy**: The scored trajectory occupies its reserved slot in the staleness buffer, and trajectory fields are written to TransferQueue.
 6. **Training**: When a buffer is full (Ready state), the Train Worker reads the batch metadata from TransferQueue and consumes it for one gradient step.
 7. **Weight Push**: Updated weights are pushed to PS via RDMA.
-8. **Sync**: The RolloutCoordinator gates SMG on the new version, pausing dispatch, letting instances pull new weights, then resuming routing.
+8. **Sync**: The GlobalCoordinator gates SMG on the new version, pausing dispatch, letting instances pull new weights, then resuming routing.
 
 :::{tip}
 Steps 1-5 (generation) and steps 6-8 (training) run **concurrently**: this is the core advantage of PSRL's decoupled design. The staleness system (see {doc}`staleness_control`) ensures bounded off-policy error.

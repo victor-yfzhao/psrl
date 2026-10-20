@@ -17,8 +17,9 @@ import httpx
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
-from psrl.workers.gen.rollout_coordination.command_loop import CommandHandlerMixin
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload
+from psrl.workers.global_coordination.commands import CommandService
+from psrl.workers.global_coordination.state import ModelState
 from psrl_state_grpc_proto import psrl_manager_pb2 as state_pb
 from psrl_state_grpc_proto import psrl_manager_pb2_grpc as state_rpc
 from smg_grpc_proto import vllm_engine_pb2 as pb
@@ -397,17 +398,13 @@ async def test_reward_migration_uses_destination_and_settles_completion_race(gat
         destination = Engine(gateway.tokenizer_path, [([6], "stop")], dp_size=2)
         await gateway.register(destination, "destination")
 
-        @contextlib.asynccontextmanager
-        async def acquire(_):
-            yield
-
-        async def post(path, payload):
+        async def post(model, path, payload):
             result = await gateway.client.post(path, json=payload)
             result.raise_for_status()
             return result.json()
 
-        async def get(path, **kwargs):
-            result = await gateway.client.get(path, **kwargs)
+        async def get(model, path, params=None):
+            result = await gateway.client.get(path, params=params)
             result.raise_for_status()
             return result.json()
 
@@ -415,27 +412,24 @@ async def test_reward_migration_uses_destination_and_settles_completion_race(gat
             source.aborted.set()
             return [source.requests[0].request_id]
 
-        coordinator = object.__new__(CommandHandlerMixin)
-        coordinator.config = OmegaConf.create(
-            {"psrl": {"deployment": {"elastic": {"request_migration_timeout_s": 5}}}}
+        config = OmegaConf.create({"psrl": {"deployment": {"elastic": {"request_migration_timeout_s": 5}}}})
+        model = ModelState(("reward", "judge"), "http://reward", False, "", None)
+        server = SimpleNamespace(
+            get_external_request_id=SimpleNamespace(remote=AsyncMock(return_value=source.requests[0].request_id)),
+            abort_requests=SimpleNamespace(remote=abort),
         )
-        coordinator._acquire_replica_operations = AsyncMock(return_value=acquire(None))
-        coordinator.server_handles = {
-            "source": SimpleNamespace(
-                get_external_request_id=SimpleNamespace(remote=AsyncMock(return_value=source.requests[0].request_id)),
-                abort_requests=SimpleNamespace(remote=abort),
-            )
-        }
-        coordinator._gateway_post_json = post
-        coordinator._gateway_get_json = get
-        await coordinator.execute_request_migrations(
+        model.add_worker(SimpleNamespace(replica_rank=0), server, "source", 1)
+        model.add_worker(SimpleNamespace(replica_rank=1), None, "destination", 2)
+        commands = CommandService(config, SimpleNamespace(post=post, get=get), None)
+        await commands.migrate_requests(
+            model,
             [
                 {
                     "request_id": "scheduler-id",
                     "source_instance_id": ("source", 0),
                     "destination_instance_id": ("destination", 1),
                 }
-            ]
+            ],
         )
         response = await response_task
         response.raise_for_status()
@@ -446,7 +440,7 @@ async def test_reward_migration_uses_destination_and_settles_completion_race(gat
             assert list(request.tokenized.input_ids) == [1, 2, 3, 4, 5], "Migration lost its prefix."
             assert request.sampling_params.max_tokens == 6, "Migration reset its budget."
             assert request.data_parallel_rank == 1, "Migration ignored the destination DP rank."
-        status = await get("/routing_loop/migration", params={"request_id": source.requests[0].request_id})
+        status = await get(model, "/routing_loop/migration", params={"request_id": source.requests[0].request_id})
         assert status is None, "The coordinator must release its migration reservation."
     finally:
         response_task.cancel()

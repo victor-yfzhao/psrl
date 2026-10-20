@@ -15,10 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${1:-python:3.11-slim}"
 CONTAINER_NAME="bake_simple_repos_$$"
 
-# export http_proxy=http://your-proxy-host:port
-# export https_proxy=http://your-proxy-host:port
-# Optional Debian mirror when deb.debian.org is unreachable.
-# Example: APT_MIRROR=http://mirrors.example.com
+# export http_proxy=http://your-proxy-host:port https_proxy=http://your-proxy-host:port
+# Set `APT_MIRROR` to `http://mirrors.example.com` if `deb.debian.org` is unreachable.
 
 DOCKER_PROXY_ARGS=()
 # NOTE(lhy): Uncomment and replace the proxy exports above if needed.

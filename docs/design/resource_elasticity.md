@@ -102,7 +102,7 @@ await coordinator.exec_command.remote(
 )
 ```
 
-Here `coordinator` is the initialized coordinator handle or scoped client for one
+Here `coordinator` is a scoped `CoordinatorClient` on the shared `GlobalCoordinator` for one
 role/model, and `instance_ids` selects its registered instances. This is the
 runtime protocol used by the executor. Direct worker calls do not perform the
 executor's GPU ownership checks.
@@ -218,7 +218,7 @@ waiting. Runtime failures surface to later executor operations.
 
 Implementation entry points are `psrl/workers/elastic/executor.py`,
 `cluster_topology.py`, and `scaling_policy/factory.py`. Coordinator lifecycle
-implementations live in `psrl/workers/gen/rollout_coordination/command_loop.py`
+implementations live in `psrl/workers/global_coordination/commands.py`
 and `psrl/workers/global_coordination/lifecycle.py`.
 
 ## Migration
