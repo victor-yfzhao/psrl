@@ -195,7 +195,6 @@ These fields use the same `throughput_optimal` prefix.
 | `candidate_evaluation_cpp_binary` | `null` | Resolve to `build/elastic_simulator/elastic_simulator` under the repository |
 | `candidate_evaluation_cpp_timeout_s` | `30.0` | C++ evaluator response timeout, must be positive |
 | `rebalance_after_scale_up` | `true` | Allow post-scale-up interruption and redispatch |
-| `exclusive_rebalance_migration_queue` | `false` | Pause normal dispatch while applying selected migrations |
 | `rm_router_enable` | `true` | Enable shared ITL reward routing |
 | `rm_router_max_itl` | `null` | Optional ITL threshold for queueing reward requests |
 

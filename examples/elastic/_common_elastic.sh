@@ -227,7 +227,6 @@ launch_elastic() {
     PSRL_CANDIDATE_EVALUATION_CPP_BINARY=${PSRL_CANDIDATE_EVALUATION_CPP_BINARY:-null}
     PSRL_CANDIDATE_EVALUATION_CPP_TIMEOUT_S=${PSRL_CANDIDATE_EVALUATION_CPP_TIMEOUT_S:-30.0}
     PSRL_ENABLE_HETEROGENEOUS_PARALLELISM_CANDIDATES=${PSRL_ENABLE_HETEROGENEOUS_PARALLELISM_CANDIDATES:-false}
-    PSRL_EXCLUSIVE_REBALANCE_MIGRATION_QUEUE=${PSRL_EXCLUSIVE_REBALANCE_MIGRATION_QUEUE:-False}
     PSRL_DEPLOY_EXTRA=${PSRL_DEPLOY_EXTRA:-}
     PSRL_DEPLOY_TRAIN_BACKEND=${PSRL_DEPLOY_TRAIN_BACKEND:-fsdp2}
     PSRL_DEPLOY_MEGATRON_TP=${PSRL_DEPLOY_MEGATRON_TP:-2}
@@ -600,7 +599,6 @@ launch_elastic() {
         psrl.deployment.elastic.throughput_optimal.candidate_evaluation_cpp_binary=${PSRL_CANDIDATE_EVALUATION_CPP_BINARY}
         psrl.deployment.elastic.throughput_optimal.candidate_evaluation_cpp_timeout_s=${PSRL_CANDIDATE_EVALUATION_CPP_TIMEOUT_S}
         psrl.deployment.elastic.throughput_optimal.enable_heterogeneous_parallelism_candidates=${PSRL_ENABLE_HETEROGENEOUS_PARALLELISM_CANDIDATES}
-        psrl.deployment.elastic.throughput_optimal.exclusive_rebalance_migration_queue=${PSRL_EXCLUSIVE_REBALANCE_MIGRATION_QUEUE}
         +reward.managers.gen_qwen3_8b.routing_strategy.method=itl
         +reward.managers.gen_qwen3_8b.routing_strategy.cost_model_path=${RM_COST_MODEL}
         +reward.managers.gen_qwen3_8b.routing_strategy.delta_throughput_threshold=0.005

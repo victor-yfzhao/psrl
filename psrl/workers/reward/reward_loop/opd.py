@@ -24,7 +24,7 @@ class OPDRewardLoop(RewardLoopBase):
 
     This manager handles:
     1. Preprocessing `input_ids` and `attention_mask` for teacher models
-    2. Sending prompts to RewardModelManager (via router or direct replica access)
+    2. Sending prompts to RewardModelManager replica servers
     3. Returning logprobs from teacher models
     """
 
@@ -41,7 +41,7 @@ class OPDRewardLoop(RewardLoopBase):
         Args:
             config: PSRL config.
             tokenizer: Policy tokenizer (for decoding agent responses).
-            reward_model_manager: RewardModelManager instance (provides gateway URL or replica handles).
+            reward_model_manager: RewardModelManager instance (provides replica handles).
             reward_kwargs: Additional keyword arguments for compute_score.
         """
         super().__init__(config, tokenizer)
@@ -49,9 +49,6 @@ class OPDRewardLoop(RewardLoopBase):
 
         self.reward_model_manager = reward_model_manager
         self.reward_model_tokenizer = self.reward_model_manager.get_reward_model_tokenizer()
-        self.gateway_url = self.reward_model_manager.get_gateway_url()
-        # SMG replaced the old RM router process. Prefer replica servers when present.
-        self.router_process = None
         self.replica_handles = [
             replica.servers[0]
             for replica in getattr(reward_model_manager, "replicas", [])
@@ -230,16 +227,12 @@ class OPDRewardLoop(RewardLoopBase):
         )
 
         request_start_time = time.monotonic()
-        if self.router_process is not None:
-            psrl_logger.info("Routing OPD teacher request uid=%s through router.", request_uid)
-            teacher_outputs = await self.router_process.generate_async.remote(teacher_data_proto)
+        replica_idx, replica_handle = self._get_next_replica_handle()
+        psrl_logger.info("Sending OPD teacher request uid=%s to replica_%d.", request_uid, replica_idx)
+        if hasattr(replica_handle.generate_async, "remote"):
+            teacher_outputs = await replica_handle.generate_async.remote(teacher_data_proto)
         else:
-            replica_idx, replica_handle = self._get_next_replica_handle()
-            psrl_logger.info("Sending OPD teacher request uid=%s to replica_%d.", request_uid, replica_idx)
-            if hasattr(replica_handle.generate_async, "remote"):
-                teacher_outputs = await replica_handle.generate_async.remote(teacher_data_proto)
-            else:
-                teacher_outputs = await replica_handle.generate_async(teacher_data_proto)
+            teacher_outputs = await replica_handle.generate_async(teacher_data_proto)
         teacher_prefill_elapsed_s = time.monotonic() - request_start_time
 
         result = {

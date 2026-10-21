@@ -64,7 +64,6 @@ psrl.deployment.elastic.throughput_optimal.candidate_evaluation_backend=${PSRL_C
 psrl.deployment.elastic.throughput_optimal.candidate_evaluation_max_workers=${PSRL_CANDIDATE_EVALUATION_MAX_WORKERS} \
 psrl.deployment.elastic.throughput_optimal.candidate_evaluation_cpp_binary=${PSRL_CANDIDATE_EVALUATION_CPP_BINARY} \
 psrl.deployment.elastic.throughput_optimal.candidate_evaluation_cpp_timeout_s=${PSRL_CANDIDATE_EVALUATION_CPP_TIMEOUT_S} \
-psrl.deployment.elastic.throughput_optimal.exclusive_rebalance_migration_queue=True \
 +reward.managers.gen_qwen3_8b.routing_strategy.method=itl \
 +reward.managers.gen_qwen3_8b.routing_strategy.cost_model_path=/apdcephfs_zwfy10/share_303541817/yfzhao/psrl/psrl/trainer/config/cost_model/glm_z1_9b_0414.json \
 +reward.managers.gen_qwen3_8b.routing_strategy.delta_throughput_threshold=0.005 \

@@ -99,7 +99,7 @@ asyncio_mode = "auto"
 addopts = "--verbose --durations=0 --strict-markers"
 testpaths = ["tests"]
 norecursedirs = [
-    "external", "examples", "docs", "scripts", "tools",
+    "deprecated", "external", "examples", "docs", "scripts", "tools",
     "tutorials", "*.egg", ".*", "_darcs", "build",
     "CVS", "dist", "venv", "{arch}",
 ]

@@ -9,8 +9,6 @@ enable_request_level_candidate_evaluation: true
 # Skip all post-scale-up ABORT when false, including the older ratio-based
 # waiting-queue interrupt used when request-level evaluation is off.
 rebalance_after_scale_up: true
-# Pause normal dispatch during rebalance. Redispatch interrupted requests FIFO to their simulated destinations.
-exclusive_rebalance_migration_queue: false
 candidate_evaluation_max_workers: 64
 # Candidate simulation implementation: python or cpp. The C++ backend
 # keeps one JSONL evaluator process alive for the policy lifetime.

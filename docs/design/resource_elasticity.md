@@ -259,9 +259,8 @@ For each explicit migration, the coordinator:
 4. Waits for destination dispatch or request completion, then finishes the
    migration record.
 
-`exclusive_rebalance_migration_queue=true` pauses ordinary dispatch while
-selected migrations are applied. Model-version eligibility still constrains
-destinations. Requests that have already finished need no move.
+Model-version eligibility still constrains destinations. Requests that have
+already finished need no move.
 
 **The live snapshot adapter marks existing reward requests as non-movable.**
 The paper describes a general shift-aware scheduler, but the current request-level
