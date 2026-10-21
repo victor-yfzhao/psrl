@@ -4,6 +4,7 @@
 
 - Apply first-principles thinking. Do not assume that I always have a clear understanding of what I want or how to achieve it. Stay cautious and start from the fundamental needs and problem. If the motivation or objective is unclear, pause and discuss it with me. 
 - When running scripts or inspecting the environment, please activate the conda environment by executing `source env/psrl.sh`. All dependencies and packages are installed within this environment.
+- After completing each change, run `pre-commit run --all-files` in the activated environment and report the result.
 - Make architectural decisions for the long term. Do not accept a stopgap that only works for now and is meant to be replaced later.
 - Do not preserve backward compatibility. Remove obsolete paths instead of adding compatibility layers, fallbacks, or migrations.
 - Keep components modular and concerns clearly separated.
