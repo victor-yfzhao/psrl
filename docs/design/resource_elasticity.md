@@ -1,6 +1,6 @@
 # Resource Elasticity
 
-Resource elasticity shifts GPUs between policy rollout, generative reward model
+Resource elasticity reallocates GPUs between policy rollout, generative reward model
 (GenRM) inference, and training as their workloads change. This page explains the
 runtime and control flow. For launch recipes, see {doc}`../examples/elastic`.
 For configuration fields and defaults, see {doc}`resource_elasticity_configuration`.
@@ -29,34 +29,36 @@ and role context**, followed by redistributing requests onto the new allocation.
 
 The design is described in
 [Efficient Resource-Shiftable RL Post-training with Generative Rewards](https://arxiv.org/abs/2610.16866),
-which calls the system **PivotRL**. The sections below connect its runtime,
-planner, and shift-aware scheduling design to the PSRL implementation.
+which calls the system **PivotRL**. The sections below describe the PSRL runtime,
+scaling policies, routers, and executor using their implementation names.
 
 ## Architecture
 
 ```{figure} /_static/img/resource_elasticity_overview.svg
-:alt: Resource elasticity architecture with parameter storage, role shifting, schedulers, monitor, planner, and executor
+:alt: Resource elasticity architecture with Parameter Server, routers, ScalingPolicy, and ElasticExecutor sleep and wake operations
 :width: 100%
 :align: center
 :target: ../_static/img/resource_elasticity_overview.pdf
 
-Resource-shiftable runtime, shift-aware schedulers, and the monitor-planner-executor loop.
+ScalingPolicy selects GPU allocations. ElasticExecutor monitors runtime snapshots
+and applies the Role-shifting Mechanism through sleep and wake operations.
 ```
 
-Global Parameter Storage (GPS) keeps model parameters available across role
-shifts. In PSRL, the {doc}`parameter_server` implements policy parameter storage
-through NIXL. Frozen reward models restore checkpoint-backed CPU-cached weights
-through their own worker path.
+The {doc}`parameter_server`, implemented by `PSManager` and `PSStorageWorker`,
+keeps policy parameters available through NIXL while replicas sleep and wake.
+Frozen reward models restore checkpoint-backed CPU-cached weights through their
+own worker path. Each inference role uses an SMG router to dispatch requests to
+eligible awake replicas.
 
 `main_ppo.py` builds two physical pools. `shared_rollout_pool` holds overlapping
 rollout and reward placements. `train_pool` holds training and dedicated
 validation replicas. With `enable_trainer_pool=true`, inference replicas may also
 borrow training GPUs while the trainer sleeps.
 
-| Role | Shift granularity | Ownership |
+| Role | Transition granularity | Ownership |
 |------|-------------------|-----------|
-| Policy rollout | Inference replica | Scaling policy and executor |
-| GenRM inference | Inference replica | Scaling policy and executor |
+| Policy rollout | Inference replica | `ScalingPolicy` and `ElasticExecutor` |
+| GenRM inference (`RewardModel`) | Inference replica | `ScalingPolicy` and `ElasticExecutor` |
 | Training | Entire training pool | Training batch lifecycle |
 | Validation | Dedicated replicas on training GPUs | Validation lifecycle |
 
@@ -69,12 +71,16 @@ configured replica count includes sleeping replicas that cannot all run together
 pre-initialized role owns devices, without repartitioning a live trainer's
 optimizer state or adding Ray nodes.
 
-## Elastic Runtime: Sleep and Wakeup
+## Elastic Runtime: Sleep and Wake Up
 
-The runtime decomposes a role shift into two operations: `sleep` releases the
-donor's GPU storage, then `wakeup` restores the receiving role. In Python, the
-worker methods spell the second operation `wake_up`. Actor processes, model
-structure, and placement metadata survive the transition.
+The runtime reallocates GPU storage with two operations: `sleep` releases the
+donor's storage, then `wake_up` restores the receiving role. Actor processes,
+model structure, and placement metadata survive the transition.
+
+`ScalingAction.action_type` uses `scale_up` and `scale_down` for allocation
+decisions. `ElasticExecutor` executes scale-up by sleeping conflicting donors,
+then waking the selected replicas. Scale-down sleeps the selected replicas.
+The lifecycle commands are `CommandType.SLEEP` and `CommandType.WAKE_UP`.
 
 ### API and Completion Contract
 
@@ -83,7 +89,7 @@ The inference control API is a coordinator command:
 | Operation | Coordinator API | Completion means |
 |-----------|-----------------|------------------|
 | Sleep | `Command(type=CommandType.SLEEP, instance_ids=...)` | Routing is disabled for the selected replicas and their sleep operations have finished |
-| Wakeup | `Command(type=CommandType.WAKE_UP, instance_ids=...)` | Storage and weights are restored, policy versions are published where needed, and routing is enabled |
+| Wake up | `Command(type=CommandType.WAKE_UP, instance_ids=...)` | Storage and weights are restored, policy versions are published where needed, and routing is enabled |
 
 `instance_ids` contains `(replica_id, dp_rank)` identifiers. The coordinator
 expands them to whole replicas for memory transitions. The executor uses this
@@ -107,26 +113,29 @@ role/model, and `instance_ids` selects its registered instances. This is the
 runtime protocol used by the executor. Direct worker calls do not perform the
 executor's GPU ownership checks.
 
+`GlobalCoordinator` delegates inference sleep and wake operations to
+`ReplicaLifecycle`. Training uses `ElasticExecutor`'s training-pool lifecycle.
+
 The worker APIs beneath this protocol are:
 
-| Role | Sleep path | Wakeup path |
+| Role | Sleep path | Wake up path |
 |------|------------|-------------|
 | Policy rollout | `server.nixl_sleep(level=2)` | `server.nixl_wake_up()`, then `pull_model_for_sync(ps_model_version)` |
 | Frozen GenRM | `server.sleep(level=2)` | `server.wake_up()`, including restoration from its CPU weight cache |
 | Training | `actor_wg.execute_all_async("nixl_sleep", "full")` | `nixl_wake_up` on all workers, refresh client metadata, then `pull_model` |
 
 Level-2 inference sleep releases GPU weight storage. A policy server deregisters
-NIXL tensors **before their physical pages are released**. Its wakeup reallocates
-and registers storage, then the coordinator pulls committed policy weights and
-publishes the actual loaded version before enabling dispatch.
+NIXL tensors **before their physical pages are released**. Its `nixl_wake_up`
+reallocates and registers storage, then the coordinator pulls committed policy
+weights and publishes the actual loaded version before enabling dispatch.
 
-For a GenRM, wakeup restores weight storage first, loads CPU-cached weights, then
+For a GenRM, `wake_up` restores weight storage first, loads CPU-cached weights, then
 restores KV/cache allocations and supported graph allocations before reopening
 generation admission. Frozen reward weights do not use policy version updates.
 
 ### What Happens to Role Context?
 
-| State | Sleep | Wakeup |
+| State | Sleep | Wake up |
 |-------|-------|--------|
 | Policy parameters | Release GPU storage after NIXL deregistration | Allocate/register storage and pull committed parameters |
 | Frozen reward parameters | Release GPU storage, retain CPU weight cache | Load the cached checkpoint weights |
@@ -135,23 +144,22 @@ generation admission. Frozen reward weights do not use policy version updates.
 | CUDA graph allocations | Handle through the selected backend and TMS graph support | Restore or reconstruct through that backend's wake path |
 | Processes, model layout, and communication metadata | Retain the role's initialized structure | Reuse the initialized role |
 
-The paper's Figure 6 motivates separating disposable state from state that must
-survive a shift. In PSRL, TMS manages supported allocations through pause/resume
-and tagged regions. **TMS alone does not allocate GPUs to roles**. The executor
-and coordinators establish ownership. Keep optimizer offload enabled whenever
+TMS manages supported allocations through pause/resume and tagged regions.
+**TMS alone does not allocate GPUs to roles**. The executor and coordinators
+establish ownership. Keep optimizer offload enabled whenever
 training can sleep. See {doc}`resource_elasticity_configuration` for the backend
 and TMS settings.
 
-### Inference Role Shift
+### Inference Sleep and Wake Up
 
 ```{mermaid}
 :config: {"sequence": {"wrap": false, "width": 100, "height": 35, "actorMargin": 20, "messageMargin": 12, "boxMargin": 5, "diagramMarginY": 5, "mirrorActors": false}}
 
 sequenceDiagram
-    participant E as Executor
-    participant D as Donor
-    participant W as Worker
-    participant R as Receiver
+    participant E as ElasticExecutor
+    participant D as GlobalCoordinator<br/>(donor scope)
+    participant W as Inference worker
+    participant R as GlobalCoordinator<br/>(receiver scope)
     E->>D: SLEEP(instance_ids)
     D->>D: Pause dispatch
     D->>W: Deregister (policy),<br/>abort and release storage
@@ -166,7 +174,7 @@ sequenceDiagram
 ```
 
 Replicas within a lifecycle batch may transition concurrently. Conflicting donor
-and receiver batches are ordered: donor sleep completes before receiver wakeup.
+and receiver batches are ordered: donor sleep completes before receiver `wake_up`.
 Coordinators reserve the affected replicas against concurrent lifecycle, weight
 synchronization, and migration operations. Failed restores remain outside routing.
 
@@ -188,16 +196,19 @@ borrowers, sleeps the trainer, then wakes the dedicated validation replicas.
 Initialization also orders overlapping roles through sleep before another role
 allocates its storage.
 
-## Monitor, Planner, and Executor
+## ElasticExecutor and ScalingPolicy
 
-`ElasticExecutor` runs the monitor and execution loops. Its scaling policy
-implements the planner.
+`ElasticExecutor` owns both the monitor and execution loops. The configured
+`ScalingPolicy` selects allocations through `decide()` and returns a
+`ScalingDecision`. The overview's candidate-selection steps describe
+`ThroughputOptimalScalingPolicy`. `RuleBasedScalingPolicy` uses thresholds
+instead of candidate simulation.
 
 | Component | Input | Responsibility |
 |-----------|-------|----------------|
-| Monitor | Engine snapshots, router queues, placements, trainer readiness | Build a consistent view of load and available devices |
-| Planner | Instance signals and, when enabled, immutable request snapshots | Return a `ScalingDecision` containing exact wake/sleep targets and optional request migrations |
-| Executor | Accepted decision and physical topology | Sleep conflicting donors, wake receivers, apply migrations, and update ownership |
+| `ElasticExecutor._monitor_loop()` | Engine snapshots, router queues, placements, trainer readiness | Build `InstanceSignal` observations and invoke `ScalingPolicy.decide()` |
+| `ScalingPolicy` | Instance signals and, when enabled, immutable request snapshots | Return a `ScalingDecision` containing exact wake/sleep targets and optional request migrations |
+| `ElasticExecutor` execution loops | Accepted decision and physical topology | Sleep conflicting donors, wake receivers, apply migrations, and update ownership |
 
 The monitor polls coordinators every `monitor_interval_ms`. Observations include
 KV utilization, running/waiting counts, token occupancy, and throughput. The
@@ -206,13 +217,13 @@ and routing constraints. Failed snapshot collection skips that planning cycle.
 Pool and instance epochs prevent a plan from using observations collected across
 an ownership transition.
 
-The planner is selected with `scaling_policy_variant`. The two main
+The scaling policy is selected with `scaling_policy_variant`. The two main
 implementations, `rule-based` and `throughput-optimal`, are explained in
 {doc}`resource_elasticity_scaling_policies`. Training reclamation remains a
 training-loop operation, outside the inference throughput objective.
 
 The executor keeps **one policy decision in flight** until all its actions
-settle. A command acknowledgement timeout does not cancel sleep or wakeup. The
+settle. A command acknowledgement timeout does not cancel `sleep` or `wake_up`. The
 executor follows the command's completion record and retains ownership while
 waiting. Runtime failures surface to later executor operations.
 
@@ -237,8 +248,8 @@ flowchart TB
     Q["Shared routing queue<br/>Preserve continuation state"]
     D["Eligible destination<br/>Recompute prefix and continue"]
     A --> B --> Q --> D
-    DOWN["Scale down<br/>Remove source from routing"] --> B
-    UP["Scale up<br/>Restore receiver, then rebalance"] --> B
+    DOWN["Sleep source replica<br/>Remove source from routing"] --> B
+    UP["Wake up receiver<br/>Then rebalance when enabled"] --> B
 ```
 
 **Scale down** removes the donor from routing before the engine sleeps in abort
@@ -263,9 +274,9 @@ Model-version eligibility still constrains destinations. Requests that have
 already finished need no move.
 
 **The live snapshot adapter marks existing reward requests as non-movable.**
-The paper describes a general shift-aware scheduler, but the current request-level
-GenRM path does not provide the same active-request migration contract as policy
-rollout. Added GenRM capacity can accept queued and future requests.
+The request-level GenRM path does not provide the same active-request migration
+contract as policy rollout. Added GenRM capacity can accept queued and future
+requests.
 
 Snapshot construction is in `psrl/workers/elastic/request_snapshot.py`.
 Simulation is in `scaling_policy/evaluation/request_level_candidate_evaluator.py`.

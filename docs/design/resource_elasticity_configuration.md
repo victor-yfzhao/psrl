@@ -72,7 +72,7 @@ using interruption and redispatch. The supplied recipes configure these together
 | `elastic.shared_ngpus_per_node` | `8` | GPU count per shared node, or a per-node list |
 | `elastic.enable_trainer_pool` | `false` | Allow inference replicas to borrow sleeping trainer GPUs |
 | `elastic.enable_policy` | `true` | Enable automatic scaling decisions |
-| `elastic.scaling_policy_variant` | `throughput-optimal` | Planner implementation |
+| `elastic.scaling_policy_variant` | `throughput-optimal` | `ScalingPolicy` implementation |
 
 Fields in this table are relative to `psrl.deployment`. Training pool size comes
 from `train_nnodes` and `train_ngpus_per_node`. `total_nnodes` optionally restricts
@@ -106,7 +106,7 @@ These fields are relative to `psrl.deployment.elastic`.
 The executor keeps waiting for completion after a command acknowledgement timeout.
 Increasing or reducing that timeout does not cancel the underlying operation.
 The YAML includes `wakeup_immunity_ms=10000`, but the executor and scaling policies
-do not consume it. Use cooldown to control repeated shifts.
+do not consume it. Use cooldown to control repeated sleep and wake transitions.
 
 TMS settings live under a separate prefix, `psrl.tms`:
 
@@ -117,7 +117,7 @@ TMS settings live under a separate prefix, `psrl.tms`:
 | `enable_nixl` | `false` | Include NIXL temporary buffers in TMS management |
 
 Select TMS scope together with pool configuration. TMS does not enable colocation
-or the planner by itself.
+or the scaling policy by itself.
 
 ## Scaling Policies
 
@@ -126,7 +126,7 @@ For the decision algorithms and a comparison of the two main policies, see
 
 | `scaling_policy_variant` | Behavior |
 |--------------------------|----------|
-| `throughput-optimal` | Compare throughput gain against shift penalty, including physical GPU conflicts |
+| `throughput-optimal` | Compare throughput gain against transition penalty, including physical GPU conflicts |
 | `rule-based` | Expand onto free placements under KV pressure or router backlog, shrink under low KV usage |
 | `none` | Select `DummyScalingPolicy`, which still expands demand onto free GPUs and shrinks empty replicas |
 
@@ -159,9 +159,9 @@ Select `scaling_policy_variant=throughput-optimal`. Fields below are relative to
 
 | Field | YAML default | Effect |
 |-------|--------------|--------|
-| `decision_window_s` | `60.0` | Horizon over which estimated throughput gain pays for a shift |
-| `migrate_time_s_initial` | `5.0` | Initial sleep-plus-wake duration estimate |
-| `migrate_time_ewma_alpha` | `0.2` | Weight of a new shift-duration observation |
+| `decision_window_s` | `60.0` | Horizon over which estimated throughput gain pays for a sleep and wake transition |
+| `migrate_time_s_initial` | `5.0` | Initial sleep and wake duration estimate |
+| `migrate_time_ewma_alpha` | `0.2` | Weight of a new transition-duration observation |
 | `min_gain` | `0.05` | Minimum absolute net benefit `L`, not a percentage |
 | `max_scale_instances_per_action` | `-1` | Cap on same-role changes, `-1` removes the cap |
 | `enable_heterogeneous_parallelism_candidates` | `false` | Enable bundle planning for different power-of-two replica sizes |
@@ -179,8 +179,8 @@ their router snapshots directly. `current_state_include_router_waiting` controls
 the aggregate estimator and should not be used to hide requests from the simulator.
 
 Start tuning by checking cost-model accuracy and snapshot freshness. A longer
-decision window makes predicted gains more likely to cover shift cost. A larger
-`min_gain` or cooldown makes shifting more conservative. Enable heterogeneous
+decision window makes predicted gains more likely to cover transition cost. A larger
+`min_gain` or cooldown makes scaling more conservative. Enable heterogeneous
 candidates for the 7B/30B pair's TP1/TP4 layout.
 
 #### Candidate Evaluation and Redispatch
@@ -205,7 +205,7 @@ rebalancing, so keep the default when matching planned and executed migrations.
 
 #### Cost Models
 
-The planner's `throughput_optimal.cost_model_path` defaults to
+The scaling policy's `throughput_optimal.cost_model_path` defaults to
 `psrl/trainer/config/cost_model`. It accepts a directory of model-named JSON files
 or one JSON file. `model_params={}` accepts inline coefficient overrides.
 The matching inference TP/PP bucket is selected from the model settings.
@@ -218,7 +218,7 @@ Configure routing cost models independently:
 The supplied JSON files contain `TP1_PP1`, `TP4_PP1`, or other fitted buckets. The
 request-snapshot adapter requires the exact bucket and the routing fields
 `other_threshold`, `other_latency_b`, `other_latency_k`, `attn_latency_b`, and
-`attn_latency_k`. The planner maps these to its ITL coefficients. Refit for a new
+`attn_latency_k`. The scaling policy maps these to its ITL coefficients. Refit for a new
 hardware or parallelism setup rather than reusing coefficients blindly.
 
 ## Recipe Overrides

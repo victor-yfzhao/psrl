@@ -7,7 +7,7 @@ GPU ownership. This page describes the two main policies:
 
 | Property | `rule-based` | `throughput-optimal` |
 |----------|--------------|----------------------|
-| Decision signal | KV utilization and router backlog | Modeled throughput gain minus shift cost |
+| Decision signal | KV utilization and router backlog | Modeled throughput gain minus transition cost |
 | Scale-up placement | Already free GPUs | Free GPUs or GPUs released by another role |
 | Decision size | At most one instance | Placement-feasible batches |
 | Cost model | Not required | Fitted per-model and parallelism coefficients |
@@ -19,7 +19,7 @@ count. Training reclaims its entire pool through its batch lifecycle.
 
 ## Shared Decision Contract
 
-The planner receives `InstanceSignal` observations containing role, model,
+`ScalingPolicy.decide()` receives `InstanceSignal` observations containing role, model,
 instance ID, awake state, KV utilization, request counts, token occupancy,
 throughput, timestamp, and physical GPU keys. Router backlog is supplied
 separately. The throughput policy can additionally receive immutable per-request
@@ -27,8 +27,12 @@ snapshots and a trainer-pool availability hint.
 
 The result is a `ScalingDecision`. Each `ScalingAction` identifies its role/model,
 action type, target count, and preferred instance IDs. A throughput decision can
-also include exact conflicting donors, companion wakeups, and planned request
+also include exact conflicting donors, companion wake targets, and planned request
 migrations. These are transitions between initialized placements.
+
+`ScalingAction.action_type` is `scale_up` or `scale_down`. `ElasticExecutor`
+applies these decisions through `CommandType.SLEEP` and `CommandType.WAKE_UP`.
+Scale-up may first sleep conflicting donors before waking the selected replicas.
 
 Both policies skip decisions while disabled, during cooldown, or while a
 previous decision is executing. The executor excludes unavailable training-pool
@@ -94,10 +98,10 @@ Source: `psrl/workers/elastic/scaling_policy/rule_based.py`.
 
 `ThroughputOptimalScalingPolicy` compares placement-feasible allocations using
 a fitted decoding cost model. Its candidate construction and benefit evaluation
-implement the planner design discussed in
+follow the allocation design discussed in
 [Section 7 of the paper](https://arxiv.org/html/2610.16866#S7).
 
-### Throughput and Shift Cost
+### Throughput and Transition Cost
 
 For instance $i$, the fitted inter-token latency and throughput are:
 
@@ -131,10 +135,10 @@ $$
 L = H \left(F_{\mathrm{candidate}} - F_{\mathrm{current}}\right) - \Phi.
 $$
 
-`decision_window_s` supplies horizon $H$. The shift penalty $\Phi$ estimates
+`decision_window_s` supplies horizon $H$. The transition penalty $\Phi$ estimates
 tokens lost while donor requests are interrupted, using donor load and estimated
-sleep-plus-wake duration. Observed shift durations update the estimate through an
-EWMA. The planner accepts the highest-scoring candidate only if
+sleep and wake duration. Observed transition durations update the estimate through an
+EWMA. `ThroughputOptimalScalingPolicy` accepts the highest-scoring candidate only if
 `L > min_gain`. **`min_gain` is an absolute net-benefit threshold**, not a
 percentage or relative speedup.
 
@@ -203,7 +207,7 @@ requests are marked non-movable by the live snapshot adapter, as described in
 
 Start with cost-model accuracy and snapshot completeness before adjusting
 `min_gain`. A longer horizon makes a throughput improvement more likely to repay
-shift cost. A larger threshold or longer cooldown makes decisions more
+transition cost. A larger threshold or longer cooldown makes decisions more
 conservative. Use `ScalingPolicy.log` to inspect `F`, `Phi`, `L`, selected
 placements, and no-action reasons. The complete field reference is in
 {doc}`resource_elasticity_configuration`.

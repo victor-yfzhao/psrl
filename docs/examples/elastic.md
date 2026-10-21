@@ -1,7 +1,7 @@
 # Elastic RL
 
 Use elastic deployment when policy rollout and generative reward inference have
-changing GPU demand. PSRL shifts pre-initialized replicas between shared GPUs and
+changing GPU demand. PSRL sleeps and wakes pre-initialized replicas on shared GPUs and
 can lend idle training GPUs to inference. Choose a launch path:
 
 | Path | Use it when |
@@ -11,7 +11,7 @@ can lend idle training GPUs to inference. Choose a launch path:
 
 ```{seealso}
 See {doc}`../design/resource_elasticity_configuration` for configuration defaults and
-{doc}`../design/resource_elasticity` for the runtime and planner design.
+{doc}`../design/resource_elasticity` for the runtime and scaling policy design.
 ```
 
 ## Run Existing Launch Scripts
@@ -205,10 +205,10 @@ those settings match. For another setup:
    `examples/anaylsis/fit_cost_model_from_jsonl_dir.py`. Its per-model output is
    `<model-name>_cost_model_fit.json`, containing the fitted TP/PP buckets.
 3. Save the per-model result under the intended cost-model filename and set both
-   launcher cost-model exports. Configure the planner's cost-model directory too
+   launcher cost-model exports. Configure the scaling policy's cost-model directory too
    if you store the files outside its default directory.
 
-See {doc}`../design/resource_elasticity_configuration` for the separate planner
+See {doc}`../design/resource_elasticity_configuration` for the separate scaling policy
 and routing paths, the JSON fields, and required elastic settings.
 
 ### Inspect and Launch

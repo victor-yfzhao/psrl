@@ -37,7 +37,7 @@ The judge guide covers the built-in math reward and custom scoring functions.
 :link: elastic
 :link-type: doc
 
-Shift GPUs across policy rollout, generative reward inference, and training.
+Reallocate GPUs across policy rollout, generative reward inference, and training.
 Launch model-pair recipes with FSDP2 or Megatron and tune resource allocation.
 :::
 
