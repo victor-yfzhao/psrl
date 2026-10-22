@@ -11,8 +11,8 @@ UCX_SOURCE_DIR="${BUILD_ROOT}/ucx"
 NIXL_SOURCE_DIR="${BUILD_ROOT}/nixl"
 UCX_PREFIX="${UCX_PREFIX:-${REPO_ROOT}/third_party/ucx_1_20_rkey65535}"
 NIXL_PREFIX="${NIXL_PREFIX:-${REPO_ROOT}/third_party/nixl_ucx_1_20_rkey65535_backlog4096}"
-UCX_PATCH_FILE="${REPO_ROOT}/patch/ucx/ucx-1.20.0-rkey-config-uint16-dynamic.patch"
-NIXL_PATCH_FILE="${REPO_ROOT}/patch/nixl/nixl.patch"
+UCX_PATCH_FILE="${REPO_ROOT}/patch/ucx/v1.20.0.patch"
+NIXL_PATCH_FILE="${REPO_ROOT}/patch/nixl/0.10.1.patch"
 NIXL_WHEEL_DIR="${NIXL_WHEEL_DIR:-${BUILD_ROOT}/wheelhouse}"
 NIXL_BUILD_WHEEL="${NIXL_BUILD_WHEEL:-false}"
 NIXL_SUBPROJECT_CACHE_DIR="${NIXL_SUBPROJECT_CACHE_DIR:-}"
@@ -122,7 +122,7 @@ embed_nixl_python_runtime() {
         cat > "${shim}" <<'EOF'
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Load the source-built NIXL 0.10.1 CUDA 12 bindings instead of pip nixl 1.5.0."""
+"""Expose the source built NIXL CUDA 12 bindings under the public package name."""
 
 import ctypes
 import os
@@ -137,7 +137,7 @@ _PLUGIN_DIR = _LIB64 / "plugins"
 if _PLUGIN_DIR.is_dir():
     os.environ.setdefault("NIXL_PLUGIN_DIR", str(_PLUGIN_DIR))
 
-# Absolute CDLL pins SONAME resolution before pip 1.5.0 libnixl.so can win.
+# Pin SONAME resolution to this prefix before importing the Python bindings.
 for _name in ("libserdes.so", "libnixl_common.so", "libstream.so", "libnixl_build.so", "libnixl.so"):
     _path = _LIB64 / _name
     if _path.is_file():
@@ -157,16 +157,6 @@ EOF
 
 apply_nixl_patch() {
     cd "${NIXL_SOURCE_DIR}"
-    local asio_wrap="subprojects/asio.wrap"
-    if [[ -f "${asio_wrap}" ]]; then
-        sed -i \
-            's#^source_url = https://sourceforge.net/projects/asio/.*#source_url = https://github.com/mesonbuild/wrapdb/releases/download/asio_1.30.2-2/asio-1.30.2.tar.gz#' \
-            "${asio_wrap}"
-        grep -Fxq \
-            'source_url = https://github.com/mesonbuild/wrapdb/releases/download/asio_1.30.2-2/asio-1.30.2.tar.gz' \
-            "${asio_wrap}"
-    fi
-
     if git apply --check "${NIXL_PATCH_FILE}"; then
         git apply "${NIXL_PATCH_FILE}"
     elif ! git apply --reverse --check "${NIXL_PATCH_FILE}"; then

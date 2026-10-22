@@ -31,8 +31,11 @@ def test_fsdp2_direct_arena(gpu_tensor_parallel_size):
 
 
 @pytest.mark.parametrize("cudagraph", [False, True])
-def test_vllm_direct_arena_matches_baseline(gpu_model_path, tmp_path, cudagraph):
+def test_vllm_direct_arena_matches_baseline(gpu_model_path, tmp_path, cudagraph, ray_cluster, monkeypatch):
+    import ray
     from torch_memory_saver import configure_subprocess
+
+    monkeypatch.setenv("RAY_ADDRESS", ray.get_runtime_context().gcs_address)
 
     generations = {}
     for mode in ("baseline", "direct"):

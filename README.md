@@ -99,11 +99,14 @@ bash scripts/install_basic.sh
 
 # Install performance components as needed
 bash scripts/install_nixl.sh
+source scripts/activate_nixl.sh
 bash scripts/install_megatron.sh
 bash scripts/install_lmcache.sh
 
 # Install PSRL
-python -m pip install -e .
+python -m pip install -e '.[test]'
+python scripts/check_environment.py
+python -m pytest tests
 ```
 
 See the [Installation guide](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) for prerequisites, verification steps, and details on each component.

@@ -15,47 +15,39 @@ from psrl.workers.elastic.scaling_policy.evaluation.request_level_candidate_eval
     RoleCandidatePlan,
     evaluate_role_candidate,
 )
-
-from tests.elastic import runtime_helpers
-from tests.elastic.runtime_helpers import _coordinator
-
-elastic_modules = runtime_helpers.modules
+from psrl.workers.global_coordination.commands import CommandService
+from psrl.workers.global_coordination.lifecycle import ReplicaLifecycle
+from psrl.workers.global_coordination.model_state import ROLLOUT_SCOPE, ModelState
+from psrl.workers.global_coordination.telemetry import TelemetryService
 
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.fixture
-def modules(elastic_modules):
-    return elastic_modules
+def _snapshot_services(requests, dynamic_weights=True):
+    model = ModelState(ROLLOUT_SCOPE, "http://rollout", dynamic_weights, "", None)
+    gateway = SimpleNamespace(get=AsyncMock(return_value=requests))
+    return TelemetryService(SimpleNamespace(), gateway, None), model
 
 
-def _snapshot_coordinator(modules, requests):
-    coordinator = object.__new__(modules.status.StatusMixin)
-    coordinator._gateway_get_json = AsyncMock(return_value=requests)
-    coordinator.ps_manager = None
-    return coordinator
-
-
-def test_candidate_snapshot_preserves_training_queue_order(modules):
+def test_candidate_snapshot_preserves_training_queue_order():
     requests = [
         {"request_id": "3", "is_validate": False},
         {"request_id": "1", "is_validate": True},
         {"request_id": "2", "is_validate": False},
     ]
-    coordinator = _snapshot_coordinator(modules, requests)
-    snapshot = asyncio.run(coordinator.get_router_request_snapshot([1, 2, 3]))
+    telemetry, model = _snapshot_services(requests)
+    snapshot = asyncio.run(telemetry.requests(model))
     assert [request["request_id"] for request in snapshot] == ["3", "2"], (
         "Training demand must retain native queue order and exclude dedicated validation."
     )
-    coordinator._gateway_get_json.assert_awaited_once_with("/routing_loop/snapshot")
+    telemetry.gateway.get.assert_awaited_once_with(model, "/routing_loop/snapshot")
 
 
-def test_validation_only_queue_does_not_request_elastic_rollout_capacity(modules):
-    coordinator = _snapshot_coordinator(
-        modules,
+def test_validation_only_queue_does_not_request_elastic_rollout_capacity():
+    telemetry, model = _snapshot_services(
         [{"request_id": "1", "is_validate": True, "seq_len": 50, "route_order": 0, "version_tag": 5}],
     )
-    pending = asyncio.run(coordinator.get_router_request_snapshot([5]))
+    pending = asyncio.run(telemetry.requests(model, [5]))
     identities = PolicyIdentityMap()
     identities.register(PSRL_Role.Rollout, "Qwen2.5-1.5B", [("worker-0", 0)])
     snapshot = build_role_snapshot(
@@ -86,20 +78,20 @@ def test_validation_only_queue_does_not_request_elastic_rollout_capacity(modules
 
 
 @pytest.mark.parametrize("invalid_snapshot", [None, {"pending": 0}])
-def test_candidate_snapshot_rejects_invalid_native_response(modules, invalid_snapshot):
-    coordinator = _snapshot_coordinator(modules, invalid_snapshot)
+def test_candidate_snapshot_rejects_invalid_native_response(invalid_snapshot):
+    telemetry, model = _snapshot_services(invalid_snapshot)
     with pytest.raises(TypeError, match="must be a list"):
-        asyncio.run(coordinator.get_router_request_snapshot([1, 2, 3]))
+        asyncio.run(telemetry.requests(model))
 
 
-def test_candidate_snapshot_fetch_failure_propagates_to_monitor(modules):
-    coordinator = _snapshot_coordinator(modules, [])
-    coordinator._gateway_get_json.side_effect = RuntimeError("Gateway unavailable.")
+def test_candidate_snapshot_fetch_failure_propagates_to_monitor():
+    telemetry, model = _snapshot_services([])
+    telemetry.gateway.get.side_effect = RuntimeError("Gateway unavailable.")
     with pytest.raises(RuntimeError, match="Gateway unavailable"):
-        asyncio.run(coordinator.get_router_request_snapshot([1, 2, 3]))
+        asyncio.run(telemetry.requests(model))
 
 
-def test_static_reward_snapshot_preserves_opaque_request_ids_and_lengths(modules):
+def test_static_reward_snapshot_preserves_opaque_request_ids_and_lengths():
     requests = [
         {
             "request_id": "reward-opaque",
@@ -108,32 +100,34 @@ def test_static_reward_snapshot_preserves_opaque_request_ids_and_lengths(modules
             "version_tag": -1,
         }
     ]
-    coordinator = _snapshot_coordinator(modules, requests)
-    assert asyncio.run(coordinator.get_router_request_snapshot([1, 2, 3])) == requests
+    telemetry, model = _snapshot_services(requests, dynamic_weights=False)
+    assert asyncio.run(telemetry.requests(model, [1, 2, 3])) == requests, (
+        "Static reward requests must retain opaque IDs and prompt lengths."
+    )
 
 
-def test_candidate_snapshot_queries_only_training_inventory(modules):
+def test_candidate_snapshot_queries_only_training_inventory():
     async def scenario():
         requests = [
             {"request_id": "7", "is_validate": False, "version_tag": -1},
             {"request_id": "8", "is_validate": False, "version_tag": 2},
             {"request_id": "9", "is_validate": True, "version_tag": -1},
         ]
-        coordinator = _snapshot_coordinator(modules, requests)
-        coordinator.ps_model_version = 4
-        coordinator.instance_to_model_version = {("worker-1", 0): 1, ("worker-2", 0): 2}
-        coordinator.ps_manager = SimpleNamespace(
+        telemetry, model = _snapshot_services(requests)
+        model.ps_version = 4
+        model.versions = {("worker-1", 0): 1, ("worker-2", 0): 2}
+        telemetry.ps_manager = SimpleNamespace(
             can_reserve_request=SimpleNamespace(remote=AsyncMock(return_value=[[True, False, True]])),
             get_reserve_indicator=SimpleNamespace(remote=AsyncMock(side_effect=[[5, 6, 7], [8, 9, 10]])),
         )
-        snapshot = await coordinator.get_router_request_snapshot([1, 2, 3])
-        coordinator.ps_manager.can_reserve_request.remote.assert_awaited_once_with([7], [1, 2, 3], False, [False])
-        assert snapshot[0]["reservable_versions"] == [1, 3]
-        assert snapshot[0]["reserve_indicators"] == {1: 5, 2: 6, 3: 7}
-        assert snapshot[1]["reserve_indicators"] == {1: 8, 2: 9, 3: 10}
-        assert "reservable_versions" not in snapshot[1]
+        snapshot = await telemetry.requests(model, [1, 2, 3])
+        telemetry.ps_manager.can_reserve_request.remote.assert_awaited_once_with([7], [1, 2, 3], False, [False])
+        assert snapshot[0]["reservable_versions"] == [1, 3], "Admission must retain the reservable versions."
+        assert snapshot[0]["reserve_indicators"] == {1: 5, 2: 6, 3: 7}, "Indicators must retain candidate versions."
+        assert snapshot[1]["reserve_indicators"] == {1: 8, 2: 9, 3: 10}, "Bound requests must retain indicators."
+        assert "reservable_versions" not in snapshot[1], "Bound requests must not query new admission."
         assert len(snapshot) == 2, "Dedicated validation must not query elastic admission inventory."
-        assert [call.args for call in coordinator.ps_manager.get_reserve_indicator.remote.await_args_list] == [
+        assert [call.args for call in telemetry.ps_manager.get_reserve_indicator.remote.await_args_list] == [
             (7, [1, 2, 3], False),
             (8, [1, 2, 3], False),
         ], "Elastic reservations must use only training inventory."
@@ -141,79 +135,92 @@ def test_candidate_snapshot_queries_only_training_inventory(modules):
     asyncio.run(scenario())
 
 
-def _migration_coordinator(modules):
-    coordinator = _coordinator(modules)
-    coordinator.config.psrl.deployment = SimpleNamespace(elastic={"request_migration_timeout_s": 0.01})
-    source = coordinator.server_handles["replica-1"]
+def _migration_services():
+    model = ModelState(ROLLOUT_SCOPE, "http://rollout", True, "", None)
+    config = SimpleNamespace(
+        psrl=SimpleNamespace(deployment=SimpleNamespace(elastic={"request_migration_timeout_s": 0.01}))
+    )
+    source = SimpleNamespace()
     source.get_external_request_id = SimpleNamespace(remote=AsyncMock(return_value="external-1"))
     source.abort_requests = SimpleNamespace(remote=AsyncMock(return_value=True))
-    coordinator._gateway_get_json = AsyncMock(return_value={"dispatched": True, "completed": False})
+    model.add_worker(SimpleNamespace(replica_rank=0), source, "replica-1", 1)
+    model.add_worker(SimpleNamespace(replica_rank=1), SimpleNamespace(), "selected-worker", 2)
+    gateway = SimpleNamespace(
+        get=AsyncMock(return_value={"dispatched": True, "completed": False}),
+        post=AsyncMock(),
+    )
+    commands = CommandService(config, gateway, ReplicaLifecycle(gateway))
     move = {
         "request_id": "opaque-engine-1",
         "source_instance_id": ("replica-1", 0),
         "destination_instance_id": ("selected-worker", 1),
     }
-    return coordinator, source, move
+    return commands, model, source, move
 
 
-def test_migration_preserves_exact_native_destination_and_engine_request_id(modules):
+def test_migration_preserves_exact_native_destination_and_engine_request_id():
     async def scenario():
-        coordinator, source, move = _migration_coordinator(modules)
-        await coordinator.execute_request_migrations([move])
+        commands, model, source, move = _migration_services()
+        await commands.migrate_requests(model, [move])
         source.get_external_request_id.remote.assert_awaited_once_with("opaque-engine-1")
         source.abort_requests.remote.assert_awaited_once_with(["opaque-engine-1"])
-        calls = coordinator._gateway_post_json.await_args_list
+        calls = commands.gateway.post.await_args_list
         assert calls[0].args == (
+            model,
             "/routing_loop/migration",
             {"request_id": "external-1", "destination": ["selected-worker", 1]},
+        ), "Migration must preserve the external ID and selected destination DP rank."
+        assert calls[-1].args == (model, "/routing_loop/migration/finish", {"request_id": "external-1"}), (
+            "Settled migrations must release their gateway reservation."
         )
-        assert calls[-1].args == ("/routing_loop/migration/finish", {"request_id": "external-1"})
 
     asyncio.run(scenario())
 
 
-def test_completed_source_request_is_not_migrated_or_aborted(modules):
+def test_completed_source_request_is_not_migrated_or_aborted():
     async def scenario():
-        coordinator, source, move = _migration_coordinator(modules)
+        commands, model, source, move = _migration_services()
         source.get_external_request_id.remote.return_value = None
-        await coordinator.execute_request_migrations([move])
+        await commands.migrate_requests(model, [move])
         source.abort_requests.remote.assert_not_awaited()
-        coordinator._gateway_post_json.assert_not_awaited()
+        commands.gateway.post.assert_not_awaited()
 
     asyncio.run(scenario())
 
 
-def test_failed_abort_clears_native_migration_reservation(modules):
+def test_failed_abort_clears_native_migration_reservation():
     async def scenario():
-        coordinator, source, move = _migration_coordinator(modules)
+        commands, model, source, move = _migration_services()
         source.abort_requests.remote.return_value = False
-        await coordinator.execute_request_migrations([move])
-        coordinator._gateway_get_json.assert_not_awaited()
-        assert coordinator._gateway_post_json.await_args_list[-1].args == (
+        await commands.migrate_requests(model, [move])
+        commands.gateway.get.assert_not_awaited()
+        assert commands.gateway.post.await_args_list[-1].args == (
+            model,
             "/routing_loop/migration/finish",
             {"request_id": "external-1"},
-        )
+        ), "Failed aborts must release their gateway reservation."
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failure", ["timeout", "http"])
-def test_failed_redispatch_settlement_clears_reservation_and_stops_next_migration(modules, failure):
+def test_failed_redispatch_settlement_clears_reservation_and_stops_next_migration(failure):
     async def scenario():
-        coordinator, source, move = _migration_coordinator(modules)
+        commands, model, source, move = _migration_services()
         if failure == "http":
-            coordinator._gateway_get_json.side_effect = RuntimeError("Gateway unavailable.")
+            commands.gateway.get.side_effect = RuntimeError("Gateway unavailable.")
             error_type = RuntimeError
         else:
-            coordinator._gateway_get_json.return_value = {"dispatched": False, "completed": False}
+            commands.gateway.get.return_value = {"dispatched": False, "completed": False}
             error_type = TimeoutError
         second = dict(move, request_id="opaque-engine-2")
         with pytest.raises(error_type):
-            await coordinator.execute_request_migrations([move, second])
+            await commands.migrate_requests(model, [move, second])
         source.abort_requests.remote.assert_awaited_once_with(["opaque-engine-1"])
-        assert coordinator._gateway_post_json.await_args_list[-1].args == (
+        assert commands.gateway.post.await_args_list[-1].args == (
+            model,
             "/routing_loop/migration/finish",
             {"request_id": "external-1"},
-        )
+        ), "Failed settlement must release the reservation before propagating the error."
 
     asyncio.run(scenario())

@@ -32,7 +32,7 @@ import grpc
 pytestmark = [pytest.mark.cpu_test, pytest.mark.integration]
 
 _ROOT = Path(__file__).resolve().parents[3]
-_BINARY = Path(os.environ.get("PSRL_SMG_BINARY", _ROOT / "third_party/smg/target/debug/smg"))
+_BINARY = Path(os.environ.get("PSRL_SMG_BINARY", _ROOT / "third_party/smg/target/release/smg"))
 
 
 class Engine(rpc.VllmEngineServicer):
