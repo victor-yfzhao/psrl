@@ -11,8 +11,6 @@ if [[ ! -f "${SMG_DIR}/Cargo.toml" ]]; then
     exit 1
 fi
 
-SMG_DIR="${SMG_DIR}" bash "${SCRIPT_DIR}/apply_smg_patch.sh"
-
 python -m uv pip uninstall -y smg smg-grpc-proto smg-grpc-servicer psrl-state-grpc-proto
 
 # Match the protobuf 7 runtime before no-build-isolation generates SMG stubs.

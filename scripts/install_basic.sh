@@ -73,9 +73,6 @@ echo "Building SMG from source..."
 pushd $THIRD_PARTY_PATH
 git clone https://github.com/psrl-project/smg.git -b psrl-dev
 cd smg
-git checkout 0af210c1
-# Comment out the smg-tui workspace dependency (not needed for PSRL build)
-sed -i 's|^smg-tui = { version = "0.1.0", path = "tui" }|# smg-tui = { version = "0.1.0", path = "tui" }|' Cargo.toml
 # Build release binary with PSRL policies
 cargo build --release
 # --no-build-isolation: generate stubs with the ambient grpcio-tools installed above.
