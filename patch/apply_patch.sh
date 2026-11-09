@@ -19,7 +19,6 @@ register_libraries() {
     register_library "lm_cache" "lmcache"
     register_library "megatron_bridge" "megatron-bridge"
     register_library "transfer_queue" "TransferQueue"
-    register_library "transformer_engine" "transformer-engine"
     register_library "verl" "verl"
     register_library "vllm" "vllm"
 }

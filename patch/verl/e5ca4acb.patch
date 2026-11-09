@@ -1912,20 +1912,30 @@ index 081396610bc20f281c5e94dd6e5fef7f8f7ace51..f2af2f0802f655b2578dc808624c43f2
  def save_dist_checkpointing(
      sharded_state_dict,
 diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
-index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd95018c2dfa22 100644
 --- a/verl/utils/megatron_utils.py
 +++ b/verl/utils/megatron_utils.py
-@@ -47,10 +47,44 @@ from verl.utils.model import normalize_model_name
+@@ -36,19 +36,51 @@
+ from megatron.core.transformer.module import Float16Module
+ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+ from megatron.core.utils import get_attr_wrapped_model
+-from tensordict import TensorDict
+ from transformers import PretrainedConfig
+
+ import verl.utils.megatron.tensor_parallel as tp_utils
+-from verl.utils import tensordict_utils as tu
+ from verl.utils.device import get_device_id, get_device_name, get_torch_device
+ from verl.utils.fs import local_mkdir_safe
+ from verl.utils.model import normalize_model_name
  from verl.utils.torch_dtypes import PrecisionType
  from verl.workers.config import HFModelConfig, McoreEngineConfig
- 
+
 +# Megatron-LM@c049020 removed encoder_and_decoder; keep compat with older enum names.
 +_MODEL_TYPE_ENCODER_AND_DECODER = getattr(ModelType, "encoder_and_decoder", None)
 +
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
- 
- 
++
++
 +def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
 +    """Return RoPE base frequency theta.
 +
@@ -1955,12 +1965,10 @@ index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd9501
 +        f"{type(hf_config).__name__} has no rope_theta and no rope_parameters['rope_theta'] — "
 +        "cannot determine RoPE base."
 +    )
-+
-+
+
+
  def get_model_config(model):
-     return get_attr_wrapped_model(model, "config", allow_none=False)
- 
-@@ -69,7 +103,7 @@ def get_model(
+@@ -69,7 +101,7 @@
          mpu.get_pipeline_model_parallel_world_size() > 1
          and mpu.get_virtual_pipeline_model_parallel_world_size() is not None
      ):
@@ -1969,7 +1977,7 @@ index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd9501
              "Interleaved schedule not supported for model with both encoder and decoder"
          )
          model = []
-@@ -89,8 +123,8 @@ def get_model(
+@@ -89,8 +121,8 @@
          post_process = mpu.is_pipeline_last_stage()
          add_encoder = True
          add_decoder = True
@@ -1980,17 +1988,17 @@ index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd9501
              if mpu.get_pipeline_model_parallel_world_size() > 1:
                  assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
                      "Split rank needs to be specified for model with both encoder and decoder"
-@@ -640,7 +674,8 @@ def offload_megatron_copy_params(optimizers):
+@@ -640,7 +672,8 @@
      def offload_tensor_to_cpu(tensor):
          if tensor is None:
              return
 -        tensor.data = tensor.data.to("cpu", non_blocking=True)
 +        # CPU master parameters must be ready before their CUDA storage is released.
 +        tensor.data = tensor.data.to("cpu")
- 
+
      def offload_group_to_cpu(group):
          if group is None:
-@@ -730,13 +765,13 @@ def offload_megatron_optimizer(optimizers):
+@@ -730,13 +763,13 @@
                  opt_state_dict_values = _opt.optimizer.state.values()
                  for v in opt_state_dict_values:
                      if "exp_avg" in v:
@@ -2004,10 +2012,10 @@ index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd9501
                      if "master_param" in v:
 -                        v["master_param"] = v["master_param"].to("cpu", non_blocking=True)
 +                        v["master_param"] = v["master_param"].to("cpu")
- 
+
          try:
              # Free TransformerEngine's dummy weight gradients cache
-@@ -1371,6 +1406,10 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
+@@ -1371,6 +1404,10 @@
          inspect.signature(parallel_state.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
      )
      extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": vp_stage}
@@ -2015,9 +2023,94 @@ index ae91290f24bbc1b4058cc13ad6f43810ce26e3a9..dcb327df75f425ccdaaf0ad80ccd9501
 +        pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
 +        if pp_decoder_start is not None:
 +            pipeline_rank = pipeline_rank - pp_decoder_start
- 
+
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
+@@ -1595,84 +1632,6 @@
+         return get_device_name()
+
+
+-def dynamic_cp_split_batch(
+-    batch: TensorDict, engine_config: McoreEngineConfig, dp_size: int, dp_rank: int
+-) -> TensorDict:
+-    """
+-    Split the batch into sub-batches for dynamic context parallel.
+-
+-    we can spilt a microbatch into several sub-batches with different local_cp_size, but for simplicity now,
+-    we only split the batch into a fixed local_cp_size.
+-
+-    """
+-    input_ids = batch["input_ids"]
+-    assert input_ids.is_nested, "input_ids must be a nested tensor"
+-    seq_len_effective: torch.Tensor = input_ids.offsets().diff()
+-    max_seq_len = max(seq_len_effective)
+-    # if num of sequences is less than dp_size, we don't need to split the batch
+-    local_cp_size = None
+-    if len(seq_len_effective) < dp_size:
+-        local_cp_size = dp_size
+-        return batch
+-    else:
+-        # decide the local_cp_size based on the max_seq_len and dp_size
+-        max_seqlen_per_dp_cp_rank = engine_config.max_seqlen_per_dp_cp_rank
+-        import math
+-
+-        local_cp_size = math.ceil(max_seq_len / max_seqlen_per_dp_cp_rank)
+-        # round up to the nearest power of 2, for [1,2,3,4,5,6,7,8] -> [1,2,4,4,8,8,8,8]
+-        local_cp_size = 1 << (local_cp_size - 1).bit_length()
+-
+-        assert local_cp_size <= dp_size, (
+-            "local_cp_size must be less than or equal to dp_size, try to increase max_seqlen_per_dp_cp_rank"
+-        )
+-        if local_cp_size < dp_size:
+-            # split the batch into local_cp_size sub-batches
+-            local_dp_rank = dp_rank // local_cp_size
+-            local_dp_size = dp_size // local_cp_size
+-            indices = list(range(len(seq_len_effective)))
+-            num_seq_per_local_cp = math.ceil(len(seq_len_effective) / local_dp_size)
+-            start_idx = local_dp_rank * num_seq_per_local_cp
+-            end_idx = min(start_idx + num_seq_per_local_cp, len(seq_len_effective))
+-            selected_indices = indices[start_idx:end_idx]
+-            batch = tu.index_select_tensor_dict(batch, selected_indices)
+-
+-    # print(f"rank={torch.distributed.get_rank()}, local_cp_size={local_cp_size} max_seq_len={max_seq_len}")
+-    tu.assign_non_tensor_data(batch, "local_cp_size", local_cp_size)
+-    return batch
+-
+-
+-def dynamic_cp_merge_output(
+-    outputs: dict[str, torch.Tensor],
+-    dp_size: int,
+-    dp_rank: int,
+-    local_cp_size: int,
+-) -> TensorDict:
+-    """
+-    Merge the outputs from different sub-batches for dynamic context parallel.
+-    """
+-    if local_cp_size == dp_size:
+-        return outputs
+-
+-    merged_output = {}
+-    for k in outputs:
+-        data_local = outputs[k]
+-        object_list = [None for _ in range(dp_size)]
+-        torch.distributed.all_gather_object(
+-            object_list=object_list, obj=data_local, group=mpu.get_data_parallel_group()
+-        )
+-
+-        to_merge = object_list[(dp_rank % local_cp_size) :: local_cp_size]
+-        merged = torch.nested.nested_tensor(
+-            sum([list(x.to(data_local.device).unbind()) for x in to_merge], []), layout=torch.jagged
+-        )
+-        merged_output[k] = merged
+-        # print(f'local_cp_size={local_cp_size}, dp_rank={dp_rank}, key={k},
+-        # data_local shape={data_local.shape}, merged shape={merged_output[k].shape} ')
+-
+-    return merged_output
+-
+-
+ def _get_mtp_num_layers(hf_config):
+     """Get MTP layer count from various config formats.
+
 diff --git a/verl/utils/model.py b/verl/utils/model.py
 index c621eb12eb0b7968a16393ad5587fa11c81a12dd..ab7239e3735503935ed73aea2b0ccb623d497c72 100644
 --- a/verl/utils/model.py
@@ -2965,6 +3058,38 @@ index bf379b49c3dc21ef702d49be1467318692a471f7..882e9f0bacd08fa095bcd5c03983627b
          set_numa_affinity()
  
          self.config = config
+@@ -137,7 +136,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+         self._register_dispatch_collect_info(
+             mesh_name="train",
+             dp_rank=self.engine.get_data_parallel_rank(),
+-            is_collect=self.engine.is_mp_src_rank_with_outputs(),
++            is_collect=self.engine.is_dispatch_collect_rank(),
+         )
+
+         if hasattr(self.model_config, "hf_config"):
+@@ -281,14 +281,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
+                 # add global token num
+                 if "input_ids" in mini_batch_td:
+                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+-                    # allgather from dp rank
+-                    global_token_num_output = [None] * torch.distributed.get_world_size(
+-                        self.engine.get_data_parallel_group()
+-                    )
+-                    torch.distributed.all_gather_object(
+-                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+-                    )
+-                    global_token_num = [x for xs in global_token_num_output for x in xs]
++                    if self.engine.get_data_parallel_size() > 1:
++                        global_token_num_output = [None] * torch.distributed.get_world_size(
++                            self.engine.get_data_parallel_group()
++                        )
++                        torch.distributed.all_gather_object(
++                            global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
++                        )
++                        global_token_num = [x for xs in global_token_num_output for x in xs]
+                 else:
+                     global_token_num = None
+
 @@ -499,6 +497,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
      @register(dispatch_mode=Dispatch.ONE_TO_ALL)
      def init_model(self):
@@ -3061,3 +3186,552 @@ index c865b9dd17052835e7281d8b98c6e9e98d54f5b7..21b0e2e8511b27db24033a19147f4d88
      # compute policy loss
      old_log_prob = data["old_log_probs"]
      advantages = data["advantages"]
+diff --git a/verl/models/mcore/model_forward_fused.py b/verl/models/mcore/model_forward_fused.py
+index f045b7738e275ae9711e0a25c2666c6ccfd74880..5c0abfb48dce868df64f251d4be2949c1544532f 100644
+--- a/verl/models/mcore/model_forward_fused.py
++++ b/verl/models/mcore/model_forward_fused.py
+@@ -146,6 +146,7 @@ def fused_forward_model_engine(vision_model: bool = False):
+         temperature: float,
+         calculate_entropy: bool,
+         pad_token_id: int,
++        local_cp_size: Optional[int] = None,
+     ):
+         pre_process = unwrap_model(model).pre_process
+         post_process = unwrap_model(model).post_process
+@@ -154,7 +155,10 @@ def fused_forward_model_engine(vision_model: bool = False):
+         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
+
+         input_ids_rmpad, packed_seq_params, _ = preprocess_thd_engine(
+-            input_ids, pre_process=pre_process, use_fp8_padding=use_fp8_padding
++            input_ids,
++            pre_process=pre_process,
++            use_fp8_padding=use_fp8_padding,
++            local_cp_size=local_cp_size,
+         )
+         input_ids_rmpad = input_ids_rmpad.contiguous()
+
+@@ -178,7 +182,11 @@ def fused_forward_model_engine(vision_model: bool = False):
+             ) < seqlens_in_batch.unsqueeze(1)
+
+         labels_rmpad, _, _ = preprocess_thd_engine(
+-            labels, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding
++            labels,
++            pre_process=True,
++            need_roll=True,
++            use_fp8_padding=use_fp8_padding,
++            local_cp_size=local_cp_size,
+         )
+         labels_rmpad = labels_rmpad.contiguous()
+         output_orig: CausalLMOutputForPPO = model(
+@@ -198,7 +206,12 @@ def fused_forward_model_engine(vision_model: bool = False):
+         if log_probs.dim() == 1:
+             log_probs = log_probs.unsqueeze(0)
+         log_probs = postprocess_thd_engine(
+-            log_probs, packed_seq_params, input_ids, input_ids.shape[0], post_process=post_process
++            log_probs,
++            packed_seq_params,
++            input_ids,
++            input_ids.shape[0],
++            post_process=post_process,
++            local_cp_size=local_cp_size,
+         )
+
+         output = {"log_probs": log_probs}
+@@ -208,7 +221,12 @@ def fused_forward_model_engine(vision_model: bool = False):
+             if entropy.dim() == 1:
+                 entropy = entropy.unsqueeze(0)
+             entropy = postprocess_thd_engine(
+-                entropy, packed_seq_params, input_ids, input_ids.shape[0], post_process=post_process
++                entropy,
++                packed_seq_params,
++                input_ids,
++                input_ids.shape[0],
++                post_process=post_process,
++                local_cp_size=local_cp_size,
+             )
+             output["entropy"] = entropy
+
+diff --git a/verl/workers/engine/megatron/dynamic_cp.py b/verl/workers/engine/megatron/dynamic_cp.py
+new file mode 100644
+index 0000000..9cd6620
+--- /dev/null
++++ b/verl/workers/engine/megatron/dynamic_cp.py
+@@ -0,0 +1,236 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Adapt Megatron's native packing scheduler to replicated RL minibatches."""
++
++from dataclasses import dataclass
++from math import lcm
++
++import torch
++import torch.distributed as dist
++from tensordict import TensorDict
++
++from verl.utils import tensordict_utils as tu
++from verl.utils.metric import AggregationType, Metric
++from verl.utils.training_diagnostics import annotate_micro_batch_plan, log_training_event
++
++
++@dataclass
++class DynamicCPPlan:
++    """
++    Track the original row IDs and unique output owners for one physical rank.
++    """
++
++    row_ids: list[list[int]]
++    leaders: list[bool]
++    batch_size: int
++    dp_size: int
++
++
++def prepare_dynamic_cp_micro_batches(
++    data: TensorDict,
++    max_tokens_per_rank: int,
++    tp_size: int,
++    dp_size: int,
++    cp_size: int,
++    rank: int,
++    microbatch_group_size: int | None = None,
++    use_fp8_padding: bool = False,
++) -> tuple[list[TensorDict], DynamicCPPlan]:
++    """
++    Select TensorDict rows using the native scheduler's complete minibatch plan.
++    """
++    from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
++
++    pool_size = dp_size * cp_size
++    if pool_size < 1 or pool_size & (pool_size - 1):
++        raise ValueError(f"Dynamic CP requires a power of two DPxCP pool, got {pool_size!r}.")
++    if not 0 <= rank < pool_size or max_tokens_per_rank is None or max_tokens_per_rank < 1:
++        raise ValueError("Dynamic CP requires a valid rank and a positive token budget.")
++    if len(data) == 0:
++        raise ValueError("Dynamic CP requires a nonempty minibatch.")
++    if tu.get_non_tensor_data(data, "force_group_size", default=1) != 1:
++        raise ValueError("Dynamic CP does not support losses requiring indivisible sample groups.")
++
++    # Tail balancing can expand any sample to the full pool. Account for its THD padding upfront.
++    alignment = tp_size * pool_size * 2 if pool_size > 1 else tp_size
++    if use_fp8_padding:
++        from verl.models.mcore.util import _compute_fp8_thd_align_size
++
++        per_sequence, total = _compute_fp8_thd_align_size(alignment)
++        alignment = lcm(per_sequence, total)
++    lengths = data["input_ids"].offsets().diff().tolist()
++    padded_lengths = [((length + alignment - 1) // alignment) * alignment for length in lengths]
++    if min(lengths) <= 0 or max(padded_lengths) > max_tokens_per_rank * pool_size:
++        raise ValueError("A sequence is empty or exceeds the dynamic CP pool token capacity after padding.")
++
++    scheduler = DefaultDynamicCPScheduler(max_tokens_per_rank, cp_size, dp_size, microbatch_group_size, min_cp_size=1)
++    groups = scheduler.get_groups_and_subsamples(list(enumerate(padded_lengths)))
++    micro_batches, row_ids, leaders = [], [], []
++    seen = []
++    for group in groups:
++        selected = group[rank]
++        members = [index for index, rows in enumerate(group) if rows == selected]
++        if not selected or len(members) & (len(members) - 1):
++            raise ValueError("The native scheduler returned an empty or invalid CP group.")
++        local_cp_size = len(members)
++        if members != list(range(members[0], members[0] + local_cp_size)) or members[0] % local_cp_size:
++            raise ValueError("The native scheduler returned a CP group incompatible with the process groups.")
++        for index, rows in enumerate(group):
++            if index == next(j for j, other in enumerate(group) if other == rows):
++                seen.extend(rows)
++                if sum(padded_lengths[row] for row in rows) > max_tokens_per_rank * len(
++                    [other for other in group if other == rows]
++                ):
++                    raise ValueError("The native scheduler exceeded the padded token budget.")
++        micro_batch = tu.index_select_tensor_dict(data, selected)
++        tu.assign_non_tensor(micro_batch, local_cp_size=local_cp_size)
++        micro_batches.append(micro_batch)
++        row_ids.append(selected)
++        leaders.append(rank == members[0])
++    if sorted(seen) != list(range(len(data))):
++        raise ValueError("The native scheduler must assign every sample exactly once.")
++    annotate_micro_batch_plan(
++        micro_batches, lengths, row_ids, dynamic_cp=True, pool_rank=rank, token_budget_per_rank=max_tokens_per_rank
++    )
++    if rank == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
++        rounds = []
++        for round_index, group in enumerate(groups):
++            assignments = []
++            for leader, rows in enumerate(group):
++                members = [index for index, selected in enumerate(group) if selected == rows]
++                if leader == members[0]:
++                    padded_tokens = sum(padded_lengths[row] for row in rows)
++                    assignments.append(
++                        {
++                            "pool_ranks": members,
++                            "cp_size": len(members),
++                            "row_indices": rows,
++                            "input_tokens": sum(lengths[row] for row in rows),
++                            "padded_tokens": padded_tokens,
++                            "tokens_per_rank": padded_tokens / len(members),
++                            "token_budget_fill_fraction": padded_tokens / (len(members) * max_tokens_per_rank),
++                        }
++                    )
++            round_tokens = sum(assignment["padded_tokens"] for assignment in assignments)
++            rounds.append(
++                {
++                    "round_index": round_index,
++                    "dp_groups": len(assignments),
++                    "padded_tokens": round_tokens,
++                    "token_budget_fill_fraction": round_tokens / (pool_size * max_tokens_per_rank),
++                    "assignments": assignments,
++                }
++            )
++        log_training_event(
++            "dynamic_cp_schedule",
++            dp_size=dp_size,
++            cp_size=cp_size,
++            tp_size=tp_size,
++            pool_size=pool_size,
++            token_budget_per_rank=max_tokens_per_rank,
++            row_index_scope="input_minibatch",
++            input_lengths=lengths,
++            padded_lengths=padded_lengths,
++            input_tokens=sum(lengths),
++            padded_tokens=sum(padded_lengths),
++            num_rounds=len(rounds),
++            token_budget_fill_fraction=sum(padded_lengths) / (len(rounds) * pool_size * max_tokens_per_rank),
++            rounds=rounds,
++        )
++    return micro_batches, DynamicCPPlan(row_ids, leaders, len(data), dp_size)
++
++
++def collect_dynamic_cp_results(
++    outputs: list[dict],
++    plan: DynamicCPPlan,
++    data: TensorDict,
++    group: dist.ProcessGroup,
++) -> dict:
++    """
++    Gather unique group outputs and broadcast global statistics to collective participants.
++    """
++    records = []
++    device = data["input_ids"].device
++    for output, rows, leader in zip(outputs, plan.row_ids, plan.leaders, strict=True):
++        if not leader:
++            continue
++        values = {}
++        for key, value in output["model_output"].items():
++            device = value.device
++            values[key] = [row.detach().cpu() for row in value.unbind()]
++        weights = tu.index_select_tensor_dict(data, rows)["loss_mask"].sum().item()
++        records.append((rows, values, output["loss"], output["metrics"], weights))
++    gathered = [None] * dist.get_world_size(group) if dist.get_rank(group) == 0 else None
++    root = dist.get_process_group_ranks(group)[0]
++    dist.gather_object(records, gathered, dst=root, group=group)
++    model_output = {}
++    stats = [None]
++    if gathered is not None:
++        try:
++            model_output, summary = restore_dynamic_cp_results(gathered, plan.batch_size, plan.dp_size, device)
++            stats[0] = (summary, None)
++        except Exception as error:
++            stats[0] = (None, f"{type(error).__name__}: {error}")
++    dist.broadcast_object_list(stats, src=root, group=group)
++    summary, error = stats[0]
++    if error is not None:
++        raise RuntimeError(error)
++    return {"model_output": model_output, **summary}
++
++
++def restore_dynamic_cp_results(
++    gathered: list[list[tuple]],
++    batch_size: int,
++    dp_size: int,
++    device: torch.device,
++) -> tuple[dict, dict]:
++    """
++    Restore unique sample order and aggregate loss metrics without CP replication.
++    """
++    row_outputs, metric_values = {}, {}
++    loss = 0.0
++    for records in gathered:
++        for rows, values, local_loss, metrics, weight in records:
++            loss += local_loss / dp_size
++            for index, row_id in enumerate(rows):
++                if row_id in row_outputs:
++                    raise ValueError(f"Dynamic CP returned duplicate sample {row_id!r}.")
++                row_outputs[row_id] = {key: value[index] for key, value in values.items()}
++            for key, value in metrics.items():
++                metric_values.setdefault(key, []).append((value, weight))
++    if sorted(row_outputs) != list(range(batch_size)):
++        raise ValueError("Dynamic CP output sample IDs do not match the input minibatch.")
++    model_output = {
++        key: torch.nested.as_nested_tensor(
++            [row_outputs[row][key].to(device) for row in range(batch_size)], layout=torch.jagged
++        )
++        for key in row_outputs[0]
++    }
++    metrics = {}
++    for key, entries in metric_values.items():
++        first = entries[0][0]
++        if isinstance(first, Metric):
++            aggregation = first.aggregation
++            if aggregation == AggregationType.SUM:
++                value = sum(metric.aggregate() for metric, _ in entries) / dp_size
++            elif aggregation == AggregationType.MEAN:
++                denominator = sum(weight for _, weight in entries)
++                value = sum(metric.aggregate() * weight for metric, weight in entries) / max(denominator, 1)
++            else:
++                value = Metric(aggregation, [metric.aggregate() for metric, _ in entries]).aggregate()
++            metrics[key] = Metric(aggregation, value)
++        else:
++            denominator = sum(weight for _, weight in entries)
++            metrics[key] = [sum(float(value) * weight for value, weight in entries) / max(denominator, 1)]
++    return model_output, {"loss": [loss], "metrics": metrics}
+diff --git a/verl/utils/training_diagnostics.py b/verl/utils/training_diagnostics.py
+new file mode 100644
+index 0000000..80c8528
+--- /dev/null
++++ b/verl/utils/training_diagnostics.py
+@@ -0,0 +1,219 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++# SPDX-License-Identifier: Apache-2.0
++
++"""
++Observe training phases, packing plans, and compiler activity with host clocks.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import threading
++import time
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++from functools import wraps
++from itertools import chain, count
++from typing import TYPE_CHECKING, Any
++
++import torch
++import torch.distributed as dist
++from tensordict import TensorDict
++
++from verl.utils import tensordict_utils as tu
++
++if TYPE_CHECKING:
++    from torch._dynamo.callback import CallbackArgs
++
++psrl_logger = logging.getLogger(__name__)
++psrl_logger.setLevel(logging.INFO)
++
++_context: ContextVar[dict[str, Any] | None] = ContextVar("training_diagnostics", default=None)
++_phase_ids = count()
++_compile_lock = threading.Lock()
++_compile_observer_installed = False
++_compilations: dict[tuple[int, str, str], tuple[float, dict[str, Any]]] = {}
++
++
++def log_training_event(event: str, **fields: Any) -> None:
++    """
++    Emit one structured event without reading device tensor values.
++    """
++    payload = {
++        **(_context.get() or {}),
++        **fields,
++        "event": event,
++        "pid": os.getpid(),
++        "rank": dist.get_rank() if dist.is_initialized() else None,
++    }
++    psrl_logger.info(
++        f"[TrainingDiagnostics] {json.dumps(payload, sort_keys=True)}.",
++        extra={"training_diagnostics": payload},
++    )
++
++
++@contextmanager
++def training_phase(name: str, *, timings: dict[str, float] | None = None, **fields: Any) -> Iterator[dict[str, Any]]:
++    """
++    Record host wall time and nesting without synchronizing CUDA or process groups.
++    """
++    parent = _context.get() or {}
++    record = {
++        **parent,
++        **fields,
++        "phase": name,
++        "phase_id": f"{os.getpid()}:{next(_phase_ids)}",
++        "parent_phase_id": parent.get("phase_id"),
++    }
++    token = _context.set(record)
++    log_training_event("phase_start")
++    started = time.perf_counter()
++    outcome = "ok"
++    try:
++        yield record
++    except BaseException as error:
++        outcome = "error"
++        record["error_type"] = type(error).__name__
++        raise
++    finally:
++        elapsed = time.perf_counter() - started
++        if timings is not None:
++            timings[name] = timings.get(name, 0.0) + elapsed
++        try:
++            log_training_event("phase_end", wall_s=elapsed, clock="host", outcome=outcome)
++        finally:
++            _context.reset(token)
++
++
++def batch_diagnostic_fields(data: TensorDict) -> dict[str, Any]:
++    """
++    Read correlation fields stored as TensorDict metadata.
++    """
++    fields = dict(tu.get(data, "training_diagnostics", default={}))
++    if "global_steps" in data.keys():
++        fields["global_steps"] = tu.get(data, "global_steps")
++    if "training_mini_batch_index" in data.keys():
++        fields["mini_batch_index"] = tu.get(data, "training_mini_batch_index")
++    fields["rows"] = len(data)
++    return fields
++
++
++def trace_training_call(name: str) -> Callable:
++    """
++    Observe a worker or engine method receiving a TensorDict.
++    """
++
++    def decorate(function: Callable) -> Callable:
++        @wraps(function)
++        def wrapped(self: Any, data: TensorDict, *args: Any, **kwargs: Any) -> Any:
++            with training_phase(name, **batch_diagnostic_fields(data)):
++                return function(self, data, *args, **kwargs)
++
++        return wrapped
++
++    return decorate
++
++
++def trace_micro_batch_forward(function: Callable) -> Callable:
++    """
++    Bind compiler events to the micro batch consumed by one forward call.
++    """
++
++    @wraps(function)
++    def wrapped(self: Any, batch_iter: Iterator[TensorDict], *args: Any, **kwargs: Any) -> Any:
++        batch = next(batch_iter)
++        fields = batch_diagnostic_fields(batch)
++        fields.update(tu.get(batch, "training_micro_batch_shape", default={}))
++        fields["micro_batch_index"] = tu.get(batch, "training_micro_batch_index", default=None)
++        input_ids = batch["input_ids"]
++        fields["input_layout"] = "jagged" if input_ids.is_nested else "padded"
++        fields["input_storage_tokens"] = input_ids.values().numel() if input_ids.is_nested else input_ids.numel()
++        with training_phase("micro_batch_forward", **fields):
++            return function(self, chain((batch,), batch_iter), *args, **kwargs)
++
++    return wrapped
++
++
++def annotate_micro_batch_plan(
++    micro_batches: list[TensorDict], lengths: list[int], partitions: list[list[int]], **fields: Any
++) -> None:
++    """
++    Attach raw input lengths already copied to the host by the packing scheduler.
++    """
++    plan = []
++    for index, (micro_batch, rows) in enumerate(zip(micro_batches, partitions, strict=True)):
++        selected = [lengths[row] for row in rows]
++        shape = {
++            "input_tokens": sum(selected),
++            "max_input_length": max(selected, default=0),
++            "sum_input_length_squared": sum(length * length for length in selected),
++            "input_lengths": selected,
++            "local_cp_size": tu.get(micro_batch, "local_cp_size", default=None),
++        }
++        tu.assign_non_tensor(
++            micro_batch,
++            training_micro_batch_index=index,
++            training_micro_batch_shape=shape,
++        )
++        plan.append({"micro_batch_index": index, "row_indices": rows, **shape})
++    log_training_event("micro_batch_plan", micro_batches=plan, num_micro_batches=len(plan), **fields)
++
++
++def snapshot_tensor_stats(state: Any) -> dict[str, int]:
++    """
++    Count snapshot tensor bytes without copying their values or synchronizing devices.
++    """
++    stats = {"tensor_bytes": 0, "pinned_bytes": 0, "tensor_count": 0}
++    pending = [state]
++    while pending:
++        value = pending.pop()
++        if isinstance(value, torch.Tensor):
++            size = value.numel() * value.element_size()
++            stats["tensor_bytes"] += size
++            stats["tensor_count"] += 1
++            if value.device.type == "cpu" and value.is_pinned():
++                stats["pinned_bytes"] += size
++        elif isinstance(value, dict):
++            pending.extend(value.values())
++        elif isinstance(value, tuple | list):
++            pending.extend(value)
++    return stats
++
++
++def _on_compile_start(args: CallbackArgs) -> None:
++    """
++    Associate a compiler invocation with its current training phase.
++    """
++    fields = {**(_context.get() or {}), "compile_id": args.compile_id, "compile_trigger": args.callback_trigger.name}
++    key = (threading.get_ident(), args.compile_id, args.callback_trigger.name)
++    _compilations[key] = (time.perf_counter(), fields)
++    log_training_event("compile_start", **fields)
++
++
++def _on_compile_end(args: CallbackArgs) -> None:
++    """
++    Finish the matching compiler event using the captured phase context.
++    """
++    key = (threading.get_ident(), args.compile_id, args.callback_trigger.name)
++    active = _compilations.pop(key, None)
++    if active is not None:
++        started, fields = active
++        log_training_event("compile_end", **fields, wall_s=time.perf_counter() - started, clock="host")
++
++
++def install_compile_observer() -> None:
++    """
++    Install process local observers through TorchDynamo's compilation callback API.
++    """
++    global _compile_observer_installed
++    with _compile_lock:
++        if _compile_observer_installed:
++            return
++        from torch._dynamo import on_compile_end, on_compile_start
++
++        on_compile_start(_on_compile_start)
++        on_compile_end(_on_compile_end)
++        _compile_observer_installed = True
+diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
+index 02e4ae01..43d8d71c 100644
+--- a/verl/workers/engine/base.py
++++ b/verl/workers/engine/base.py
+@@ -220,6 +225,12 @@ class BaseEngine:
+         """
+         raise NotImplementedError
+
++    def is_dispatch_collect_rank(self) -> bool:
++        """
++        Return whether this rank contributes results to its dispatched data replica.
++        """
++        return self.is_mp_src_rank_with_outputs()
++
+     def disable_adapter(self) -> ContextManager:
+         """
+         Disable all adapters temporarily under the context in the model for LoRA

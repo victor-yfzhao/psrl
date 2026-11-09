@@ -258,7 +258,7 @@ third_party/
                      # (torch_memory_saver / TMS now installed as a dependency, not vendored here)
 
 patch/               # Git patches applied at install time (see apply_patch.sh)
-├── vllm/  verl/  nixl/  lm_cache/  transfer_queue/  megatron_bridge/  transformer_engine/
+├── vllm/  verl/  nixl/  lm_cache/  transfer_queue/  megatron_bridge/
 
 hydra_plugins/       # Repo-root Hydra plugin package (auto-discovered by Hydra on sys.path);
 └── psrl_searchpath.py   # mirrors psrl/trainer/config/hydra_plugins/psrl_searchpath.py
@@ -539,7 +539,7 @@ Supports newer arches (DeepSeek-V2, Qwen3.5). Per-format loading in `converter/m
 | **Megatron-Bridge** | `third_party/Megatron-Bridge/` | Megatron model bridge | `patch/megatron_bridge/` |
 | **NIXL** | `third_party/nixl/` | GPU-direct RDMA comm | `patch/nixl/` |
 | **torch_memory_saver (TMS)** | installed dep | GPU memory pause/resume (elasticity) | — |
-| **transformer_engine** | installed dep | Megatron FP8/attn kernels | `patch/transformer_engine/` |
+| **transformer_engine** | installed dep | Megatron FP8/attn kernels | `scripts/install_megatron.sh` |
 
 **Patch system**: git patches under `patch/<dep>/` applied at install time (consolidated via `patch/apply_patch.sh`), plus runtime monkey-patches for TMS integration.
 

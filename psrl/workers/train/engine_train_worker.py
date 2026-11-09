@@ -58,6 +58,7 @@ from psrl.utils.logger import (  # noqa: E402
     log_dual_events,
     log_tensor,
 )
+from psrl.utils.logger.dynamic_cp_logger import setup_dynamic_cp_logger  # noqa: E402
 from psrl.utils.nixl import (  # noqa: E402
     NIXLClientType,
     NIXLStorageClient,
@@ -628,6 +629,13 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                             self.config.actor.fsdp_config.load_weight = True
                         elif strategy == "megatron":
                             self.config.actor.megatron.load_weight = True
+            if (
+                strategy == "megatron"
+                and self.config.actor.megatron.get("dynamic_context_parallel", False)
+                and self.rank == 0
+            ):
+                trace_path = setup_dynamic_cp_logger(self.psrl_config.logging_path)
+                psrl_logger.info(f"Dynamic CP schedules will be written to {str(trace_path)!r}.")
             self._materialize_actor_weight_arena()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

@@ -451,6 +451,143 @@ index efa91628..b11742ed 100644
 +
 +    return module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)
 \ No newline at end of file
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index 3ee0309f2559a76f2084b4383c9e8662f0b03bc0..96a3fd4ed1e53499e9bad063affafd8bd27ee3d6 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+
++from copy import copy
+ from typing import Optional
+
+ import torch
+@@ -22,7 +23,7 @@ from megatron.core.extensions.transformer_engine import (
+     TERowParallelLinear,
+ )
+ from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+-from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+ from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer import MegatronModule
+@@ -391,8 +392,11 @@ class Qwen3VLModel(MegatronModule):
+
+         torch.cuda.nvtx.range_push("Qwen3VLModel.forward.pre_process")
+
+-        cp_rank = self.pg_collection.cp.rank()
+-        cp_size = self.pg_collection.cp.size()
++        # Microbatches may use different CP groups, so preserve the model's shared process groups.
++        pg_collection = copy(self.pg_collection)
++        pg_collection.cp = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
++        cp_rank = pg_collection.cp.rank()
++        cp_size = pg_collection.cp.size()
+
+         # input_ids to pass to the language model for MTP (Multi-Token Prediction).
+         # MTP's _get_embeddings rolls input_ids to generate future-token embeddings,
+@@ -443,7 +447,7 @@ class Qwen3VLModel(MegatronModule):
+                                 vision_data,
+                                 vision_grid_thw,
+                                 num_chunks=self.vision_to_llm_dp_ratio,
+-                                dp_rank=self.pg_collection.dp.rank(),
++                                dp_rank=pg_collection.dp.rank(),
+                             )
+                             vision_embeds, deepstack_feature_lists = self.vision_model(
+                                 hidden_states=vision_data,
+@@ -482,13 +486,13 @@ class Qwen3VLModel(MegatronModule):
+                     vision_embeds = AllGatherVisionEmbeddings.apply(
+                         vision_embeds,
+                         seqlen_on_cp_ranks,
+-                        cp_group=self.pg_collection.cp,
++                        cp_group=pg_collection.cp,
+                     )
+                     for i in range(len(deepstack_feature_lists)):
+                         deepstack_feature_lists[i] = AllGatherVisionEmbeddings.apply(
+                             deepstack_feature_lists[i],
+                             seqlen_on_cp_ranks,
+-                            cp_group=self.pg_collection.cp,
++                            cp_group=pg_collection.cp,
+                         )
+
+             combined_embeddings = self.language_model.embedding(
+@@ -507,7 +511,7 @@ class Qwen3VLModel(MegatronModule):
+                 if attention_mask is None:
+                     attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 input_ids_thd, _ = preprocess_packed_seqs(
+-                    input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
++                    input_ids, attention_mask, pre_process=True, pg_collection=pg_collection
+                 )
+                 lm_input_ids = input_ids_thd
+                 _, _, vision_mask_thd = reorganize_inputs(
+@@ -532,7 +536,7 @@ class Qwen3VLModel(MegatronModule):
+                             tmp_embeddings.contiguous(),
+                             attention_mask,
+                             pre_process=True,
+-                            pg_collection=self.pg_collection,
++                            pg_collection=pg_collection,
+                         )[0]
+                         new_deepstack_feature_lists.append(tmp_embeddings_thd[vision_mask_thd].contiguous())
+
+@@ -544,7 +548,7 @@ class Qwen3VLModel(MegatronModule):
+                         combined_embeddings.transpose(0, 1).contiguous(),
+                         attention_mask,
+                         pre_process=True,
+-                        pg_collection=self.pg_collection,
++                        pg_collection=pg_collection,
+                     )[0]
+                     .transpose(0, 1)
+                     .contiguous()
+@@ -563,7 +567,7 @@ class Qwen3VLModel(MegatronModule):
+                 if attention_mask is None:
+                     attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 lm_input_ids, _ = preprocess_packed_seqs(
+-                    input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
++                    input_ids, attention_mask, pre_process=True, pg_collection=pg_collection
+                 )
+
+         visual_pos_masks = vision_mask
+@@ -573,18 +577,18 @@ class Qwen3VLModel(MegatronModule):
+                 visual_pos_masks, deepstack_visual_embeds = split_deepstack_embs(
+                     visual_pos_masks,
+                     deepstack_visual_embeds,
+-                    tp_size=self.pg_collection.tp.size(),
+-                    tp_rank=self.pg_collection.tp.rank(),
++                    tp_size=pg_collection.tp.size(),
++                    tp_rank=pg_collection.tp.rank(),
+                     cp_size=cp_size,
+-                    cp_rank=self.pg_collection.cp.rank(),
++                    cp_rank=pg_collection.cp.rank(),
+                     sequence_parallel=self.config.sequence_parallel,
+                 )
+             elif self.config.sequence_parallel:  # THD and SP
+                 visual_pos_masks, deepstack_visual_embeds = split_deepstack_embs(
+                     visual_pos_masks,
+                     deepstack_visual_embeds,
+-                    tp_size=self.pg_collection.tp.size(),
+-                    tp_rank=self.pg_collection.tp.rank(),
++                    tp_size=pg_collection.tp.size(),
++                    tp_rank=pg_collection.tp.rank(),
+                     cp_size=1,
+                     cp_rank=0,
+                     sequence_parallel=self.config.sequence_parallel,
+@@ -612,7 +616,7 @@ class Qwen3VLModel(MegatronModule):
+                         position_ids.permute(1, 2, 0),
+                         attention_mask,
+                         pre_process=True,
+-                        pg_collection=self.pg_collection,
++                        pg_collection=pg_collection,
+                     )[0]
+                     .permute(2, 0, 1)
+                     .contiguous()
+@@ -640,6 +644,6 @@ class Qwen3VLModel(MegatronModule):
+         )
+         torch.cuda.nvtx.range_pop()
+         if self.use_dist_train:
+-            if not is_pp_last_stage(self.pg_collection.pp):
++            if not is_pp_last_stage(pg_collection.pp):
+                 return {"language_module": output}
+         return output
 diff --git a/src/megatron/bridge/training/utils/log_utils.py b/src/megatron/bridge/training/utils/log_utils.py
 index fabf5409..107cfc57 100644
 --- a/src/megatron/bridge/training/utils/log_utils.py

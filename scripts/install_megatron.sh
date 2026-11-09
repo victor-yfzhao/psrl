@@ -56,7 +56,7 @@ install_cudnn
 
 echo "2. Install TransformerEngine"
 echo "Notice: TransformerEngine installation can take a long time, please be patient"
-NVTE_FRAMEWORK=pytorch python -m uv pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
+NVTE_FRAMEWORK=pytorch python -m uv pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.11
 
 echo "3. Install Megatron"
 python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@c049020 --no-deps --no-build-isolation
@@ -73,9 +73,6 @@ python -m uv pip install -e . --no-build-isolation --no-cache-dir --no-deps
 popd
 
 bash "$PSRL_PATH/patch/apply_patch.sh" megatron_bridge
-
-echo "5. Apply TransformerEngine patch (flash-attn-3 + context parallel compat)"
-bash "$PSRL_PATH/patch/apply_patch.sh" transformer_engine --force
 
 python -m uv pip install "nvidia-nccl-cu12==2.29.7"
 python "${SCRIPT_DIR}/check_environment.py"
