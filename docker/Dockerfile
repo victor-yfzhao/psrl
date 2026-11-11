@@ -13,6 +13,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.12
 ARG UV_VERSION=0.8.22
 ARG TORCH_CUDA_WHEEL_TAG=cu130
+ARG NCCL_VERSION=2.30.7
 ARG MAX_JOBS=32
 ARG TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0;10.0;12.0+PTX"
 ARG FLASH_ATTN_CUDA_ARCHS="80;90;100;120"
@@ -31,7 +32,6 @@ ARG MEGATRON_REF=c049020
 ARG MEGATRON_BRIDGE_REF=94d1870
 ARG TMS_REF=d64a6394d1e09c613fab90260054cecc2684586d
 ARG SMG_REF=psrl-dev
-ARG PSRL_COMMIT=main
 ARG APEX_REF=10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 ARG TRANSFORMER_ENGINE_REF=v2.17
 ARG DEEPEP_REF=73b6ea4
@@ -46,6 +46,7 @@ ARG FLASH_ATTN_3_REF=df61ab6c4a0fb1f94f1f43b2a23479a0ab92b8ab
 ARG FLASHINFER_VERSION=0.6.11.post3
 
 ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
+    BASH_ENV=/run/secrets/psrl_build_env \
     CUDA_HOME=/usr/local/cuda \
     NVSHMEM_DIR=/root/deepep/nvshmem \
     PSRL_HOME=/home/psrl \
@@ -61,6 +62,7 @@ ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     UV_INDEX_STRATEGY=unsafe-best-match \
     UV_LINK_MODE=copy \
     UV_CONSTRAINT=/root/constraints.txt \
+    UV_OVERRIDE=/root/overrides.txt \
     PIP_CONSTRAINT=/root/constraints.txt \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -74,13 +76,16 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /root
 
 COPY docker/constraints.txt /root/constraints.txt
-RUN printf 'torch==2.11.0+%s\ntorchvision==0.26.0+%s\ntorchaudio==2.11.0+%s\n' \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    printf 'torch==2.11.0+%s\ntorchvision==0.26.0+%s\ntorchaudio==2.11.0+%s\n' \
         "${TORCH_CUDA_WHEEL_TAG}" "${TORCH_CUDA_WHEEL_TAG}" "${TORCH_CUDA_WHEEL_TAG}" \
-        >> /root/constraints.txt
+        >> /root/constraints.txt && \
+    printf 'nvidia-nccl-cu%s==%s\n' "${CUDA_VERSION%%.*}" "${NCCL_VERSION}" > /root/overrides.txt
 
 # Keep the devel toolchain in the published image: PSRL dependencies are
 # editable source checkouts and several runtime paths JIT-compile CUDA kernels.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -137,7 +142,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python -m pip install "uv==${UV_VERSION}"
 
 ARG DOCKER_APT_MIRROR=https://download.docker.com
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" && \
     test -n "${codename}" && \
@@ -163,17 +169,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Install the shared PyTorch/CUDA ABI first. Every native extension below is
 # compiled against this exact environment.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     expected_cuda="$(echo "${CUDA_VERSION}" | cut -d. -f1,2)" && \
     uv pip install \
         "torch==2.11.0+${TORCH_CUDA_WHEEL_TAG}" \
         "torchvision==0.26.0+${TORCH_CUDA_WHEEL_TAG}" \
         "torchaudio==2.11.0+${TORCH_CUDA_WHEEL_TAG}" \
-        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_WHEEL_TAG}" && \
-    python -c \
-        "from importlib.metadata import requires; \
-        print(next(req for req in requires('torch') if req.startswith('nvidia-nccl-')))" \
-        >> /root/constraints.txt && \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_WHEEL_TAG}" \
+        --extra-index-url https://pypi.org/simple && \
     uv pip install torchdata && \
     uv pip install "tensordict==0.12.4" && \
     uv pip install triton && \
@@ -181,7 +185,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'"
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     uv pip install \
         accelerate \
         aiohttp \
@@ -236,25 +241,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Rust is needed for the SMG gateway and its Python binding. SMG may carry a
 # rust-toolchain file; rustup will honor it when Cargo enters the checkout.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --profile minimal --default-toolchain stable && \
     rustup component add rustfmt clippy
 
-# Copy only immutable patch inputs before cloning large repositories. This is
-# the same source-first patch pattern used by vime and fails during build when
-# a revision drifts away from its PSRL patch.
-COPY patch/vllm/v0.22.0.patch ${PSRL_PATCH_DIR}/vllm.patch
-COPY patch/verl/e5ca4acb.patch ${PSRL_PATCH_DIR}/verl.patch
-COPY patch/ucx/v1.20.0.patch ${PSRL_PATCH_DIR}/ucx.patch
-COPY patch/nixl/1.2.0.patch ${PSRL_PATCH_DIR}/nixl.patch
-COPY patch/megatron_bridge/94d1870.patch ${PSRL_PATCH_DIR}/megatron_bridge.patch
-COPY patch/megatron_bridge/dependencies.patch ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch
-COPY patch/lm_cache/a7f22be7.patch ${PSRL_PATCH_DIR}/lm_cache.patch
-COPY patch/lm_cache/dependencies.patch ${PSRL_PATCH_DIR}/lm_cache_dependencies.patch
-COPY patch/transfer_queue/434f8c47.patch ${PSRL_PATCH_DIR}/transfer_queue.patch
 
 # Keep the PSRL UCX capacity and NIXL connection settings in both native builds.
-RUN --mount=type=cache,target=/root/.cache/uv \
+# Scope patch inputs to preserve unrelated native build caches.
+COPY patch/ucx/v1.20.0.patch ${PSRL_PATCH_DIR}/ucx.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/openucx/ucx.git /root/ucx-source && \
     git -C /root/ucx-source checkout ${UCX_REF} && \
     git -C /root/ucx-source apply --check ${PSRL_PATCH_DIR}/ucx.patch && \
@@ -280,9 +278,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     make -j${MAX_JOBS} install-strip && \
     rm -rf /root/ucx-source
 
-RUN --mount=type=cache,target=/root/.cache/uv uv pip install meson-python meson tomlkit
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv uv pip install meson-python meson tomlkit
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+COPY patch/nixl/1.2.0.patch ${PSRL_PATCH_DIR}/nixl.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/ai-dynamo/nixl.git ${PSRL_THIRD_PARTY}/nixl && \
     git -C ${PSRL_THIRD_PARTY}/nixl checkout ${NIXL_REF} && \
     git -C ${PSRL_THIRD_PARTY}/nixl apply --check ${PSRL_PATCH_DIR}/nixl.patch && \
@@ -294,6 +296,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     ./contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml && \
     uv pip install --no-deps --no-build-isolation \
         --config-settings=setup-args="-Ducx_path=${UCX_HOME}" \
+        --config-settings=compile-args="-j${MAX_JOBS}" \
         --config-settings=setup-args="-Dbuild_tests=false" \
         --config-settings=setup-args="-Dbuild_examples=false" . && \
     meson setup build \
@@ -312,25 +315,35 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # vLLM is installed from a patched editable checkout so PSRL can access the
 # patched scheduler, gRPC, memory-suspension, and weight-layout behavior.
-RUN --mount=type=cache,target=/root/.cache/uv \
+COPY patch/vllm/v0.22.0.patch ${PSRL_PATCH_DIR}/vllm.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=secret,id=cargo_config,target=/root/.cargo/config.toml \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true && \
     git clone https://github.com/vllm-project/vllm.git ${PSRL_THIRD_PARTY}/vllm && \
     git -C ${PSRL_THIRD_PARTY}/vllm checkout ${VLLM_REF} && \
     git -C ${PSRL_THIRD_PARTY}/vllm apply --check ${PSRL_PATCH_DIR}/vllm.patch && \
     git -C ${PSRL_THIRD_PARTY}/vllm apply ${PSRL_PATCH_DIR}/vllm.patch && \
     cd ${PSRL_THIRD_PARTY}/vllm && \
+    cargo fetch --locked --manifest-path rust/src/cmd/Cargo.toml && \
     python use_existing_torch.py && \
     uv pip install -r requirements/build/cuda.txt && \
     uv pip install --no-build-isolation -e .
 
 # Match vLLM's DeepEP v2 installation path. The helper installs the pinned
 # DeepEP revision and its legacy NVSHMEM backend for workloads that still use it.
-RUN git clone --depth 1 --branch ${GDRCOPY_REF} \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    git clone --depth 1 --branch ${GDRCOPY_REF} \
         https://github.com/NVIDIA/gdrcopy.git /root/gdrcopy && \
     make -C /root/gdrcopy -j${MAX_JOBS} prefix=/usr/local lib_install && \
     ldconfig && \
     rm -rf /root/gdrcopy
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     cd ${PSRL_THIRD_PARTY}/vllm && \
     NVSHMEM_VER=${NVSHMEM_VERSION} \
     TORCH_CUDA_ARCH_LIST="9.0a 10.0a" \
@@ -342,7 +355,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Mooncake TransferEngine is shared by the vLLM connector and TransferQueue's
 # MooncakeStore backend. CUDA 13 uses the dedicated CUDA 13 wheel.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [[ "${CUDA_MAJOR}" -ge 13 ]]; then \
         MOONCAKE_PACKAGE=mooncake-transfer-engine-cuda13; \
@@ -355,7 +369,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Build the CUDA extension stack after torch and vLLM so every extension sees
 # one torch ABI. FlashAttention 3 remains optional because it targets Hopper.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     FLASH_ATTN_CUDA_ARCHS=${FLASH_ATTN_CUDA_ARCHS} \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
     FLASH_ATTENTION_FORCE_CXX11_ABI=FALSE \
@@ -388,7 +403,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --index-url "https://flashinfer.ai/whl" && \
     uv pip install "flash-linear-attention==0.4.2"
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     NVCC_APPEND_FLAGS="--threads 4" \
         pip install --no-build-isolation --no-cache-dir \
             --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
@@ -406,7 +422,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Megatron-LM and MegatronBridge are retained as editable source trees because
 # PSRL's training backend imports internal provider and checkpoint utilities.
-RUN --mount=type=cache,target=/root/.cache/uv \
+COPY patch/megatron_bridge/94d1870.patch ${PSRL_PATCH_DIR}/megatron_bridge.patch
+COPY patch/megatron_bridge/dependencies.patch ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/NVIDIA/Megatron-LM.git ${PSRL_THIRD_PARTY}/Megatron-LM && \
     git -C ${PSRL_THIRD_PARTY}/Megatron-LM checkout ${MEGATRON_REF} && \
     uv pip install --no-deps --no-build-isolation -e ${PSRL_THIRD_PARTY}/Megatron-LM && \
@@ -421,14 +441,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_THIRD_PARTY}/Megatron-Bridge apply ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch && \
     uv pip install --no-deps --no-build-isolation -e ${PSRL_THIRD_PARTY}/Megatron-Bridge
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/fzyzcjy/torch_memory_saver.git ${PSRL_THIRD_PARTY}/torch_memory_saver && \
     git -C ${PSRL_THIRD_PARTY}/torch_memory_saver checkout ${TMS_REF} && \
     TMS_CUDA_MAJOR="${CUDA_VERSION%%.*}" \
         uv pip install --no-build-isolation -e ${PSRL_THIRD_PARTY}/torch_memory_saver
 
 # Install the two patched data/control-plane dependencies before PSRL.
-RUN --mount=type=cache,target=/root/.cache/uv \
+COPY patch/verl/e5ca4acb.patch ${PSRL_PATCH_DIR}/verl.patch
+COPY patch/transfer_queue/434f8c47.patch ${PSRL_PATCH_DIR}/transfer_queue.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/volcengine/verl.git ${PSRL_THIRD_PARTY}/verl && \
     git -C ${PSRL_THIRD_PARTY}/verl checkout ${VERL_REF} && \
     git -C ${PSRL_THIRD_PARTY}/verl apply --check ${PSRL_PATCH_DIR}/verl.patch && \
@@ -441,11 +466,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -e ${PSRL_THIRD_PARTY}/TransferQueue
 
 # Install numpy to overwrite verl's numpy version.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     uv pip install "numpy==2.2.6"
 
 # LMCache compiles against CUDA and the already installed torch/vLLM/NIXL stack.
-RUN --mount=type=cache,target=/root/.cache/uv \
+COPY patch/lm_cache/a7f22be7.patch ${PSRL_PATCH_DIR}/lm_cache.patch
+COPY patch/lm_cache/dependencies.patch ${PSRL_PATCH_DIR}/lm_cache_dependencies.patch
+
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/LMCache/LMCache.git ${PSRL_THIRD_PARTY}/LMCache && \
     git -C ${PSRL_THIRD_PARTY}/LMCache checkout ${LMCACHE_REF} && \
     git -C ${PSRL_THIRD_PARTY}/LMCache apply --check ${PSRL_PATCH_DIR}/lm_cache.patch && \
@@ -458,9 +488,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Build SMG with PSRL routing/state support and install all Python protocol
 # packages plus the native binding.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=secret,id=cargo_config,target=/root/.cargo/config.toml \
+    --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true && \
     git clone https://github.com/psrl-project/smg.git ${PSRL_THIRD_PARTY}/smg && \
     git -C ${PSRL_THIRD_PARTY}/smg checkout ${SMG_REF} && \
     cd ${PSRL_THIRD_PARTY}/smg && \
@@ -475,14 +508,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cd bindings/python && \
     maturin develop --features vendored-openssl --release
 
-# Clone PSRL last so changing `PSRL_COMMIT` does not invalidate native
-# dependency layers. The PSRL patch plugin remains reachable by pyproject.toml.
+# Clone PSRL last and resolve Python dependencies against the native stack.
+# Source revision changes preserve native dependency build caches.
 WORKDIR /home
-RUN --mount=type=cache,target=/root/.cache/uv \
-    git clone https://github.com/psrl-project/psrl.git ${PSRL_HOME} && \
+ARG PSRL_REPO_URL=https://github.com/victor-yfzhao/psrl.git
+ARG PSRL_COMMIT=dev/mini-swe
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    --mount=type=cache,target=/root/.cache/uv \
+    git clone "${PSRL_REPO_URL}" ${PSRL_HOME} && \
     git -C ${PSRL_HOME} checkout "${PSRL_COMMIT}" && \
+    git -C ${PSRL_HOME} log -1 --format='PSRL source: %H %D' && \
     cd ${PSRL_HOME} && \
-    uv pip install --no-build-isolation -e . && \
+    uv pip uninstall nvidia-cutlass-dsl-libs-cu12 && \
+    uv pip install --no-build-isolation \
+        -e . -e ${PSRL_THIRD_PARTY}/Megatron-Bridge nvidia-modelopt && \
     python -c \
         "from importlib.metadata import entry_points, version; import vllm_patches; \
         version('vllm-psrl-patches'); assert any( \
@@ -499,26 +538,47 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
     python -c "import lmcache, nixl, torch_memory_saver" && \
     python -c \
+        "from ctypes import CDLL; from importlib.metadata import distribution; \
+        nccl=distribution('nvidia-nccl-cu${CUDA_VERSION%%.*}'); \
+        assert nccl.version == '${NCCL_VERSION}', f'Unexpected NCCL version {nccl.version!r}.'; \
+        library=CDLL(str(nccl.locate_file('nvidia/nccl/lib/libnccl.so.2'))); \
+        library.ncclCommSuspend; library.ncclCommResume" && \
+    python -c \
+        "import subprocess; from importlib.metadata import requires, version; \
+        result=subprocess.run(['python', '-m', 'pip', 'check'], capture_output=True, text=True); \
+        print(result.stdout, end=''); print(result.stderr, end=''); \
+        torch_version=version('torch'); name='nvidia-nccl-cu${CUDA_VERSION%%.*}'; \
+        requirement=next(req for req in requires('torch') if req.startswith(name + '==')); \
+        expected=f'torch {torch_version} has requirement {requirement}, but you have {name} ${NCCL_VERSION}.'; \
+        assert result.returncode == 0 or (result.returncode == 1 and result.stdout.strip() == expected \
+        and not result.stderr.strip()), \
+        f'Package dependency validation failed: {result.stdout!r} {result.stderr!r}.'" && \
+    python -c \
         "from psrl.utils.nixl.agent import create_nixl_agent; \
         create_nixl_agent('psrl-build-check', num_workers=2)"
 
-RUN rm -rf /root/.cache/pip /root/.cache/uv
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    rm -rf /root/.cache/pip /root/.cache/uv
 
 WORKDIR ${PSRL_HOME}
 
-RUN mkdir -p ${PSRL_WORKSPACE}/env ${PSRL_HOME}/env
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    mkdir -p ${PSRL_WORKSPACE}/env ${PSRL_HOME}/env
 COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
-RUN ln -s ${PSRL_WORKSPACE}/env/psrl.sh ${PSRL_HOME}/env/psrl.sh
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    ln -s ${PSRL_WORKSPACE}/env/psrl.sh ${PSRL_HOME}/env/psrl.sh
 
-ENV VIRTUAL_ENV=/root/venv \
+ENV BASH_ENV="" \
+    VIRTUAL_ENV=/root/venv \
     PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-RUN echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
+RUN --mount=type=secret,id=build_env,target=/run/secrets/psrl_build_env \
+    echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
     echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
 
 LABEL org.opencontainers.image.title="PSRL CUDA" \
       org.opencontainers.image.description="PSRL post-training environment with CUDA, vLLM, veRL, SMG, NIXL, LMCache, Megatron, Mooncake, and DeepEP" \
-      org.opencontainers.image.source="https://github.com/psrl-project/psrl"
+      org.opencontainers.image.source="${PSRL_REPO_URL}"
 
 # PSRL jobs are launched through Hydra/Ray and do not have a single fixed
 # service entrypoint. Keeping an empty entrypoint also avoids inheriting a

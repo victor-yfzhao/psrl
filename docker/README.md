@@ -1,7 +1,9 @@
 # PSRL Docker images
 
-The GPU and CPU images clone PSRL from GitHub. `PSRL_COMMIT` selects a branch,
-tag, or commit and defaults to `main`. Build from the repository root.
+The GPU and CPU images clone PSRL from `PSRL_REPO_URL`, which defaults to
+`https://github.com/victor-yfzhao/psrl.git`. `PSRL_COMMIT` selects a branch,
+tag, or commit and defaults to `dev/mini-swe`. Override either with `--build-arg`.
+Build from the repository root.
 No extra `pip install` step is required after building.
 
 ## Prerequisites
@@ -10,6 +12,18 @@ No extra `pip install` step is required after building.
 - For the GPU image: an NVIDIA driver (R580 or newer) and the NVIDIA Container
   Toolkit.
 - Sufficient disk space and build time for the native CUDA dependencies.
+
+For networks requiring a proxy, supply a Bash file exporting proxy variables
+through Docker's optional `build_env` BuildKit secret. The configuration is
+mounted during build steps and is absent from the final image.
+If Rustup downloads fail, supply `RUSTUP_DIST_SERVER` and `RUSTUP_UPDATE_ROOT`
+in the same file. See the
+[Rustup environment variables](https://rust-lang.github.io/rustup/environment-variables.html).
+
+For Cargo registry or HTTP settings, supply a
+[Cargo configuration file](https://doc.rust-lang.org/cargo/reference/config.html)
+with `--secret id=cargo_config,src=cargo-build.toml`. It is mounted during
+Rust dependency builds and is absent from the final image.
 
 ## Build an image
 
@@ -93,6 +107,8 @@ interface selection is needed. The image does not select network devices.
   constraints in `docker/constraints.txt`.
 - Both images build patched UCX 1.20 and NIXL 1.2. The CPU image builds NIXL
   without CUDA support. Its native distribution is named `nixl-cu12` upstream.
+- The GPU image overrides PyTorch's NCCL dependency with NCCL 2.30.7 for
+  communicator suspend and resume. The build checks both native APIs.
 - The selected PSRL revision must include the NIXL 1.2 initialization support.
   Commit and push local changes before selecting them with `PSRL_COMMIT`.
 - When changing a pinned third-party revision, rebase the matching patch in

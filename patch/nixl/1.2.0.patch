@@ -37,3 +37,15 @@ index da33f637edbd31f72b0a890884ddbbe8eb8b41aa..25f41760b5e57c468b322bbf80d03ace
          NIXL_PERROR << "Listening failed for stream Socket: "
                      << socketFd;
          closeStream();
+diff --git a/subprojects/asio.wrap b/subprojects/asio.wrap
+--- a/subprojects/asio.wrap
++++ b/subprojects/asio.wrap
+@@ -2,3 +2,3 @@
+ directory = asio-1.30.2
+-source_url = https://sourceforge.net/projects/asio/files/asio/1.30.2%20%28Stable%29/asio-1.30.2.tar.gz/download
++source_url = https://github.com/mesonbuild/wrapdb/releases/download/asio_1.30.2-2/asio-1.30.2.tar.gz
+ source_filename = asio-1.30.2.tar.gz
+@@ -8,3 +8,2 @@
+ patch_hash = 8bed3693016874b097e4d902c4ca8daf1b6abf1b5a56b0c5c02827d4e0747ddb
+-source_fallback_url = https://github.com/mesonbuild/wrapdb/releases/download/asio_1.30.2-2/asio-1.30.2.tar.gz
+ wrapdb_version = 1.30.2-2

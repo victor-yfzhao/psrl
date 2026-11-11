@@ -37,8 +37,9 @@ The installer pins NCCL 2.29.7 for communicator suspend and resume.
 checks both native symbols, and rejects all other dependency conflicts.
 
 NIXL uses the upstream Python bindings and backend configuration API.
-Its patch sets the metadata listener backlog to 4096 and the default UCX error
-handling mode to `none`. Set `NIXL_INSTALL_PYTHON=false` to build the native prefix
+Its patch sets the metadata listener backlog to 4096, the default UCX error
+handling mode to `none`, and fetches ASIO from GitHub release assets.
+Set `NIXL_INSTALL_PYTHON=false` to build the native prefix
 and wheels without replacing packages in the active Python environment.
 
 ## Apply a patch
