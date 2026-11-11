@@ -3,18 +3,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UCX_VERSION="${UCX_VERSION:-v1.20.0}"
-NIXL_VERSION="${NIXL_VERSION:-0.10.1}"
+NIXL_VERSION="${NIXL_VERSION:-1.2.0}"
 MAX_JOBS="${MAX_JOBS:-64}"
 CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
-BUILD_ROOT="${NIXL_STACK_BUILD_ROOT:-${REPO_ROOT}/third_party/psrl-nixl-stack-ucx-1.20}"
+BUILD_ROOT="${NIXL_STACK_BUILD_ROOT:-${REPO_ROOT}/third_party/psrl-nixl-stack-1.2.0-ucx-1.20}"
 UCX_SOURCE_DIR="${BUILD_ROOT}/ucx"
 NIXL_SOURCE_DIR="${BUILD_ROOT}/nixl"
 UCX_PREFIX="${UCX_PREFIX:-${REPO_ROOT}/third_party/ucx_1_20_rkey65535}"
-NIXL_PREFIX="${NIXL_PREFIX:-${REPO_ROOT}/third_party/nixl_ucx_1_20_rkey65535_backlog4096}"
+NIXL_PREFIX="${NIXL_PREFIX:-${REPO_ROOT}/third_party/nixl_1_2_0_ucx_1_20_rkey65535_backlog4096}"
 UCX_PATCH_FILE="${REPO_ROOT}/patch/ucx/v1.20.0.patch"
-NIXL_PATCH_FILE="${REPO_ROOT}/patch/nixl/0.10.1.patch"
+NIXL_PATCH_FILE="${REPO_ROOT}/patch/nixl/1.2.0.patch"
 NIXL_WHEEL_DIR="${NIXL_WHEEL_DIR:-${BUILD_ROOT}/wheelhouse}"
-NIXL_BUILD_WHEEL="${NIXL_BUILD_WHEEL:-false}"
+NIXL_INSTALL_PYTHON="${NIXL_INSTALL_PYTHON:-true}"
 NIXL_SUBPROJECT_CACHE_DIR="${NIXL_SUBPROJECT_CACHE_DIR:-}"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${BUILD_ROOT}/uv-cache}"
@@ -57,6 +57,10 @@ clone_source() {
 }
 
 build_ucx() {
+    if [[ -f "${UCX_PREFIX}/.psrl-ucx-1.20-worker-config-uint16-complete" ]]; then
+        echo "Using the installed patched UCX ${UCX_VERSION}."
+        return
+    fi
     echo "Building UCX ${UCX_VERSION}."
     clone_source "https://github.com/openucx/ucx.git" "${UCX_VERSION}" "${UCX_SOURCE_DIR}"
     cd "${UCX_SOURCE_DIR}"
@@ -99,15 +103,12 @@ build_ucx() {
     make install-strip
 
     touch "${UCX_PREFIX}/.psrl-ucx-1.20-worker-config-uint16-complete"
-    export PATH="${UCX_PREFIX}/bin:${PATH}"
-    export LD_LIBRARY_PATH="${UCX_PREFIX}/lib:${UCX_PREFIX}/lib/ucx:${LD_LIBRARY_PATH:-}"
-    export PKG_CONFIG_PATH="${UCX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     LD_LIBRARY_PATH="${UCX_PREFIX}/lib:${UCX_PREFIX}/lib/ucx:${LD_LIBRARY_PATH:-}" \
         "${UCX_PREFIX}/bin/ucx_info" -v
 }
 
-embed_nixl_python_runtime() {
-    local site so shim
+install_nixl_meta_package() {
+    local site so python_version
     local rpath="\$ORIGIN/../../../../lib64"
 
     for so in "${NIXL_PREFIX}"/lib/python*/site-packages/nixl_cu12/_bindings*.so; do
@@ -115,49 +116,15 @@ embed_nixl_python_runtime() {
         patchelf --force-rpath --set-rpath "${rpath}" "${so}"
     done
 
-    for site in "${NIXL_PREFIX}"/lib/python*/site-packages; do
-        [[ -d "${site}/nixl_cu12" ]] || continue
-        mkdir -p "${site}/nixl"
-        shim="${site}/nixl/__init__.py"
-        cat > "${shim}" <<'EOF'
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-"""Expose the source built NIXL CUDA 12 bindings under the public package name."""
-
-import ctypes
-import os
-import sys
-from importlib import import_module
-from pathlib import Path
-
-_PREFIX = Path(__file__).resolve().parents[4]
-_LIB64 = _PREFIX / "lib64"
-_PLUGIN_DIR = _LIB64 / "plugins"
-
-if _PLUGIN_DIR.is_dir():
-    os.environ.setdefault("NIXL_PLUGIN_DIR", str(_PLUGIN_DIR))
-
-# Pin SONAME resolution to this prefix before importing the Python bindings.
-for _name in ("libserdes.so", "libnixl_common.so", "libstream.so", "libnixl_build.so", "libnixl.so"):
-    _path = _LIB64 / _name
-    if _path.is_file():
-        ctypes.CDLL(str(_path), mode=ctypes.RTLD_GLOBAL)
-
-_backend = import_module("nixl_cu12")
-for _sub_name in ("_api", "_bindings", "_utils", "logging"):
-    _module = import_module(f"{_backend.__name__}.{_sub_name}")
-    sys.modules[f"nixl.{_sub_name}"] = _module
-    setattr(sys.modules[__name__], _sub_name, _module)
-    for _attr in dir(_module):
-        if not _attr.startswith("_"):
-            setattr(sys.modules[__name__], _attr, getattr(_module, _attr))
-EOF
-    done
+    python_version="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    site="${NIXL_PREFIX}/lib/python${python_version}/site-packages"
+    python -m pip install --no-deps --no-index --upgrade --target "${site}" \
+        "${NIXL_SOURCE_DIR}/build/src/bindings/python/nixl-meta/nixl-${NIXL_VERSION}-py3-none-any.whl"
 }
 
 apply_nixl_patch() {
     cd "${NIXL_SOURCE_DIR}"
-    if git apply --check "${NIXL_PATCH_FILE}"; then
+    if git apply --check "${NIXL_PATCH_FILE}" 2>/dev/null; then
         git apply "${NIXL_PATCH_FILE}"
     elif ! git apply --reverse --check "${NIXL_PATCH_FILE}"; then
         echo "NIXL source does not match the expected ${NIXL_VERSION} patch context." >&2
@@ -168,12 +135,12 @@ apply_nixl_patch() {
     grep -q 'err_handling_mode = UCP_ERR_HANDLING_MODE_NONE' src/plugins/ucx/ucx_backend.cpp
     grep -q 'ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_NONE)' src/plugins/ucx/ucx_utils.cpp
     grep -q 'NIXL_THREAD_SYNC_RW' src/bindings/python/nixl_bindings.cpp
-    grep -q 'init\["num_workers"\] = str(nixl_conf.num_workers)' src/api/python/_api.py
+    grep -q 'sync_mode: Optional\[nixl_thread_sync_t\]' src/api/python/_api.py
 }
 
 build_nixl() {
     echo "Building NIXL ${NIXL_VERSION}."
-    clone_source "https://github.com/ai-dynamo/nixl.git" "${NIXL_VERSION}" "${NIXL_SOURCE_DIR}"
+    clone_source "https://github.com/ai-dynamo/nixl.git" "v${NIXL_VERSION}" "${NIXL_SOURCE_DIR}"
     apply_nixl_patch
     cd "${NIXL_SOURCE_DIR}"
 
@@ -188,37 +155,45 @@ build_nixl() {
         wrap_args+=(--wrap-mode=nodownload)
     fi
 
-    rm -rf build
+    local setup_args=()
+    if [[ -f build/meson-private/coredata.dat ]]; then
+        setup_args+=(--reconfigure)
+    fi
     meson setup build \
+        "${setup_args[@]}" \
         --prefix="${NIXL_PREFIX}" \
         "${wrap_args[@]}" \
         -Dbuild_docs=false \
+        -Dbuild_tests=false \
+        -Dbuild_examples=false \
         -Denable_plugins=UCX,POSIX,GDS,GDS_MT \
         -Ducx_path="${UCX_PREFIX}" \
         -Dinstall_headers=true \
         -Ddisable_gds_backend=false
     meson compile -C build -j "${MAX_JOBS}"
     meson install -C build --no-rebuild
-    embed_nixl_python_runtime
+    install_nixl_meta_package
 
-    if [[ "${NIXL_BUILD_WHEEL}" == "true" ]]; then
-        if ! python -c 'import mesonpy' 2>/dev/null; then
-            echo "NIXL_BUILD_WHEEL=true requires meson-python in the active environment." >&2
-            exit 1
-        fi
-        mkdir -p "${NIXL_WHEEL_DIR}"
-        python -m pip wheel \
-            --no-deps \
-            --no-build-isolation \
-            --wheel-dir "${NIXL_WHEEL_DIR}" \
-            --config-settings=setup-args="-Ducx_path=${UCX_PREFIX}" \
-            --config-settings=setup-args="-Dbuild_docs=false" \
-            --config-settings=setup-args="-Denable_plugins=UCX,POSIX,GDS,GDS_MT" \
-            --config-settings=setup-args="-Ddisable_gds_backend=false" \
-            .
-    elif [[ "${NIXL_BUILD_WHEEL}" != "false" ]]; then
-        echo "NIXL_BUILD_WHEEL must be true or false, got ${NIXL_BUILD_WHEEL}." >&2
-        exit 1
+    mkdir -p "${NIXL_WHEEL_DIR}"
+    python -m pip wheel \
+        --no-deps \
+        --no-build-isolation \
+        --wheel-dir "${NIXL_WHEEL_DIR}" \
+        --config-settings=build-dir="${BUILD_ROOT}/wheel-build" \
+        --config-settings=compile-args="-j${MAX_JOBS}" \
+        --config-settings=setup-args="-Ducx_path=${UCX_PREFIX}" \
+        --config-settings=setup-args="-Dbuild_docs=false" \
+        --config-settings=setup-args="-Dbuild_tests=false" \
+        --config-settings=setup-args="-Dbuild_examples=false" \
+        --config-settings=setup-args="-Denable_plugins=UCX,POSIX,GDS,GDS_MT" \
+        --config-settings=setup-args="-Ddisable_gds_backend=false" \
+        .
+    cp "${NIXL_SOURCE_DIR}/build/src/bindings/python/nixl-meta/nixl-${NIXL_VERSION}-py3-none-any.whl" \
+        "${NIXL_WHEEL_DIR}/"
+    if [[ "${NIXL_INSTALL_PYTHON}" == "true" ]]; then
+        PYTHONPATH= python -m pip install --no-deps --no-index --force-reinstall \
+            "${NIXL_WHEEL_DIR}/nixl_cu12-${NIXL_VERSION}"-*.whl \
+            "${NIXL_WHEEL_DIR}/nixl-${NIXL_VERSION}-py3-none-any.whl"
     fi
 
     touch "${NIXL_PREFIX}/.psrl-nixl-${NIXL_VERSION}-complete"
@@ -229,8 +204,12 @@ main() {
         echo "The PSRL UCX patch is pinned to UCX v1.20.0." >&2
         exit 1
     fi
-    if [[ "${NIXL_VERSION}" != "0.10.1" ]]; then
-        echo "The PSRL compatibility patch is pinned to NIXL 0.10.1." >&2
+    if [[ "${NIXL_VERSION}" != "1.2.0" ]]; then
+        echo "The PSRL patch is pinned to NIXL 1.2.0." >&2
+        exit 1
+    fi
+    if [[ "${NIXL_INSTALL_PYTHON}" != "true" && "${NIXL_INSTALL_PYTHON}" != "false" ]]; then
+        echo "NIXL_INSTALL_PYTHON must be true or false, got ${NIXL_INSTALL_PYTHON}." >&2
         exit 1
     fi
 
@@ -242,13 +221,14 @@ main() {
     mkdir -p "${BUILD_ROOT}"
 
     build_ucx
+    export PATH="${UCX_PREFIX}/bin:${PATH}"
+    export LD_LIBRARY_PATH="${UCX_PREFIX}/lib:${UCX_PREFIX}/lib/ucx:${LD_LIBRARY_PATH:-}"
+    export PKG_CONFIG_PATH="${UCX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     build_nixl
 
     echo "Installed UCX ${UCX_VERSION} at ${UCX_PREFIX}."
     echo "Installed NIXL ${NIXL_VERSION} at ${NIXL_PREFIX}."
-    if [[ "${NIXL_BUILD_WHEEL}" == "true" ]]; then
-        echo "Built the NIXL wheel in ${NIXL_WHEEL_DIR}."
-    fi
+    echo "Built the NIXL wheels in ${NIXL_WHEEL_DIR}."
 }
 
 main "$@"

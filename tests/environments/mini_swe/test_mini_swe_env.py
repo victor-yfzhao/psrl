@@ -5,23 +5,23 @@ Verify simple and benchmark datasets through mini-SWE environment setup and rewa
 import json
 from dataclasses import asdict
 from pathlib import Path
-from unittest.mock import Mock
 
 import pandas as pd
 import pytest
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.prepare.prepare_simple_data import generate_simple_test_data
 from examples.mini_swe.reward import compute_score
-from examples.mini_swe.runner import _build_environment_config, _grade_patch
+from examples.mini_swe.runner import _build_environment_config
 from omegaconf import OmegaConf
 from psrl.environments.mini_swe_env import MiniSWEEnvironment
+from psrl.workers.agent_loop.agent_data.mini_swe_agent_data import MiniSWEAgentData
 
 pytestmark = pytest.mark.cpu_test
 
 
 @pytest.fixture
 def environment():
-    path = Path(__file__).resolve().parents[2] / "examples/mini_swe/config/simple_agent_config.yaml"
+    path = Path(__file__).resolve().parents[3] / "examples/mini_swe/config/simple_agent_config.yaml"
     runtime_config = build_runtime_config(OmegaConf.load(path)[0])
     return MiniSWEEnvironment(OmegaConf.create({}), None, None, runtime_config=runtime_config)
 
@@ -46,7 +46,7 @@ async def test_simple_parquet_reaches_patch_reward_without_benchmark_grader(
     assert observation["problem_statement"] == task["prompt"][0]["content"], "The task text must reach the runner."
     assert sandbox["cwd"] == f"/{repo_name}", "Simple episodes must use the prepared repository."
     assert sandbox["image"] == "python:3.11-slim", "Simple episodes must retain the configured image."
-    assert _grade_patch(payload, expected_patch) is None, "Simple patches must be scored by the reward function."
+    assert "swe_grader" not in observation, "Simple patches must be scored without a benchmark grader."
     reward = compute_score(
         task["data_source"],
         solution_str="",
@@ -72,15 +72,17 @@ def _benchmark_task(data_source):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("data_source", ["swebench_verified", "swe_smith_py", "swe_gym"])
-async def test_benchmark_keeps_fresh_container_grading(environment, monkeypatch, data_source):
-    from examples.mini_swe import swebench_grader
-
+@pytest.mark.parametrize("grader_timeout", [1800, 2400])
+async def test_benchmark_exports_resolved_grading_inputs(environment, data_source, grader_timeout):
     task = _benchmark_task(data_source)
-    if data_source == "swe_gym":
+    grading_overrides = {
+        "grader_timeout": grader_timeout,
+        "grader_command_timeout": 75,
+        "grader_max_attempts": 2,
+    }
+    task["extra_info"]["sandbox_overrides"]["environment"].update(grading_overrides)
+    if data_source in ("swe_gym", "swebench_verified"):
         task["extra_info"]["swe_problem"]["eval_script"] = "pytest"
-    grader_result = {"resolved": True}
-    grade = Mock(return_value=grader_result)
-    monkeypatch.setattr(swebench_grader, "grade_fresh_container", grade)
 
     observation, _ = await environment.reset(task)
     payload = {"runtime_config": asdict(observation["runtime_config"]), "observation": observation}
@@ -88,14 +90,25 @@ async def test_benchmark_keeps_fresh_container_grading(environment, monkeypatch,
 
     assert sandbox["image"] == task["extra_info"]["swe_problem_image"], "Benchmark image overrides must survive."
     assert sandbox["cwd"] == "/testbed", "Benchmark episodes must use the image's testbed."
-    assert _grade_patch(payload, "a patch") is grader_result, "Benchmark patches must reach the harness."
+    for key in grading_overrides:
+        assert key not in sandbox, "Grading settings must not leak into the rollout Docker constructor."
+    data = MiniSWEAgentData.__new__(MiniSWEAgentData)
+    data.set_grading_context(observation)
+    context = data.grading_context
     expected_kind = {"swebench_verified": "verified", "swe_smith_py": "smith", "swe_gym": "gym"}[data_source]
-    assert grade.call_args.args[:4] == (
-        task["extra_info"]["swe_problem"],
-        "a patch",
-        expected_kind,
-        task["extra_info"]["swe_problem_image"],
-    ), "The runner must preserve the benchmark grading inputs."
+    assert context["swe_problem"] == task["extra_info"]["swe_problem"], "The service must receive the complete task."
+    assert context["swe_grader_kind"] == expected_kind, "Each benchmark must select its own harness."
+    assert context["swe_problem_image"] == task["extra_info"]["swe_problem_image"], "The grading image must survive."
+    assert context["swe_task_id"] == observation["swe_task_id"], (
+        "Sibling episodes must retain distinct cleanup labels."
+    )
+    environment_config = payload["runtime_config"]["sandbox_config"]["environment"]
+    for key, value in grading_overrides.items():
+        assert context["environment"][key] == value, "Task grading overrides must reach the reward service."
+    for key in ("run_args", "env", "grader_memory", "grader_shm_size"):
+        assert context["environment"][key] == environment_config[key], (
+            "Effective resource limits must reach the service."
+        )
 
 
 @pytest.mark.asyncio

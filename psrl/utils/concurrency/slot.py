@@ -1,87 +1,61 @@
-"""Limit cross-process concurrency with `fcntl`-locked slot files."""
+"""
+Limit episode concurrency with a fair worker owned permit queue.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import hashlib
-import logging
-import os
-import tempfile
-
-logger = logging.getLogger(__name__)
 
 
 class SlotManager:
-    """Manage a fixed pool of cross-process run slots via file locks."""
+    """
+    Own one episode capacity and its waiting queue for an agent worker.
+    """
 
-    @staticmethod
-    def slot_lock_dir(output_dir: str, prefix: str = "psrl_slots") -> str:
-        """Return the lock directory for a given output directory.
+    def __init__(self) -> None:
+        self._capacity: int | None = None
+        self._semaphore: asyncio.BoundedSemaphore | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-        The directory is placed under the system temp dir, keyed by a hash
-        of *output_dir* so that different output dirs get independent pools.
-        """
-        digest = hashlib.sha1(os.path.abspath(output_dir).encode("utf-8")).hexdigest()[:12]
-        return os.path.join(tempfile.gettempdir(), f"{prefix}_{digest}")
-
-    @classmethod
     async def acquire(
-        cls,
+        self,
         max_slots: int,
-        output_dir: str,
-        *,
-        prefix: str = "psrl_slots",
-        poll_interval: float = 0.2,
-    ) -> tuple[int, int] | None:
-        """Acquire one cross-process run slot via fcntl file lock.
+    ) -> asyncio.BoundedSemaphore | None:
+        """
+        Wait behind existing episodes before taking an execution permit.
 
         Args:
-            max_slots: Maximum number of parallel slots. If <= 0,
-                returns ``None`` immediately (no limiting).
-            output_dir: Directory used to derive the lock file location.
-            prefix: Prefix for the lock directory name.
-            poll_interval: Seconds between retries when all slots are busy.
+            max_slots: Worker capacity. Nonpositive values disable the limit.
+                Every episode on one worker must use the same capacity.
 
         Returns:
-            A ``(fd, slot_index)`` tuple on success, or ``None`` when
-            *max_slots* <= 0 (slot limiting disabled).
+            The acquired permit pool, or `None` when limiting is disabled.
         """
-        if max_slots <= 0:
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif self._loop is not loop:
+            raise RuntimeError("Run slots belong to one worker event loop.")
+        capacity = max(0, max_slots)
+        if self._capacity is None:
+            self._capacity = capacity
+            self._semaphore = asyncio.BoundedSemaphore(capacity) if capacity else None
+        elif capacity != self._capacity:
+            raise ValueError(f"Worker slot capacity cannot change from {self._capacity!r} to {capacity!r}.")
+        if self._semaphore is None:
             return None
+        await self._semaphore.acquire()
+        return self._semaphore
 
-        lock_dir = cls.slot_lock_dir(output_dir, prefix=prefix)
-        logger.info(f"Slot lock dir: {lock_dir!r}, max_slots={max_slots}.")
-        os.makedirs(lock_dir, exist_ok=True)
-
-        while True:
-            for slot_idx in range(max_slots):
-                lock_path = os.path.join(lock_dir, f"slot_{slot_idx}.lock")
-                fd = os.open(
-                    lock_path,
-                    os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
-                    0o666,
-                )
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    os.ftruncate(fd, 0)
-                    os.write(fd, f"pid={os.getpid()}\n".encode())
-                    return fd, slot_idx
-                except BlockingIOError:
-                    os.close(fd)
-
-            await asyncio.sleep(poll_interval)
-
-    @staticmethod
-    def release(run_slot: tuple[int, int] | None) -> None:
-        """Release a previously acquired run slot.
-
-        Safe to call with ``None`` (no-op).
+    def release(
+        self,
+        run_slot: asyncio.BoundedSemaphore | None,
+    ) -> None:
+        """
+        Return one occupied permit to the next waiting episode.
         """
         if run_slot is None:
             return
-        fd, _ = run_slot
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        if run_slot is not self._semaphore:
+            raise ValueError("Run slot belongs to a different worker.")
+        run_slot.release()

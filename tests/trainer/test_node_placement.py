@@ -117,3 +117,28 @@ def test_full_resource_pool_maps_every_local_rank(monkeypatch):
     node_ids = get_node_ids_from_resource_pool(resource_pool)
 
     assert node_ids == ["nid", "nid", "nid", "nid"]
+
+
+def test_heterogeneous_pool_uses_each_placement_groups_bundle_count(monkeypatch):
+    import ray
+
+    pg_eight = _FakePlacementGroup("pg-eight", 8)
+    pg_four = _FakePlacementGroup("pg-four", 4)
+    pool = RayResourcePool(process_on_nodes=[8, 4], name_prefix="train")
+    pool.pgs = [pg_eight, pg_four]
+    monkeypatch.setattr(
+        ray,
+        "nodes",
+        lambda: [
+            {"NodeID": "node-eight", "NodeManagerAddress": "192.0.2.2"},
+            {"NodeID": "node-four", "NodeManagerAddress": "192.0.2.1"},
+        ],
+    )
+    _patch_pg_table(
+        monkeypatch,
+        {"pg-eight": {i: "node-eight" for i in range(8)}, "pg-four": {i: "node-four" for i in range(4)}},
+    )
+
+    assert get_node_ids_from_resource_pool(pool) == ["node-four"] * 4 + ["node-eight"] * 8, (
+        "Rank placement must follow the sorted placement groups and their actual sizes."
+    )

@@ -23,6 +23,8 @@ from typing import Any
 
 import pandas as pd
 
+from examples.mini_swe.config import MiniEnvironmentConfig, MiniModelConfig
+
 # Env vars forwarded to every remote host. NO_PROXY / no_proxy are included
 # to prevent corporate HTTP proxies from intercepting LLM requests.
 _DEFAULT_FORWARD_ENV: tuple[str, ...] = (
@@ -166,7 +168,7 @@ def _build_remote_command(
     model: str,
     config: str,
     subset_spec: str,
-    model_class: str = "litellm_textbased",
+    model_class: str = MiniModelConfig.model_class,
     extra_env: dict[str, str] | None = None,
 ) -> str:
     """
@@ -188,8 +190,7 @@ def _build_remote_command(
         model (str): ``--model`` value (empty string when unused).
         config (str): ``--config`` value.
         subset_spec (str): Optional ``--subset-spec`` value passed through.
-        model_class (str): ``--model-class`` passed through (default:
-            ``'litellm_textbased'``).
+        model_class (str): Model client class forwarded to each evaluator.
         extra_env (dict[str, str] | None): Extra env vars to export before the
             inner eval (e.g. ``PSRL_LOGGING_LEVEL``).
 
@@ -520,7 +521,7 @@ def run_multinode(
     dry_run: bool,
     forward_env: list[str] | None = None,
     set_env: list[str] | None = None,
-    model_class: str = "litellm_textbased",
+    model_class: str = MiniModelConfig.model_class,
 ) -> int:
     """
     Orchestrate the full multi-node evaluation run. Returns the number of
@@ -704,7 +705,7 @@ def main() -> None:
     parser.add_argument(
         "--grader-timeout",
         type=int,
-        default=1800,
+        default=MiniEnvironmentConfig.grader_timeout,
         help="--grader-timeout passed to eval_swebench on each host.",
     )
     parser.add_argument(
@@ -781,12 +782,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-class",
-        default="litellm_textbased",
+        default=MiniModelConfig.model_class,
         help=(
-            "mini-swe-agent model class forwarded to every remote eval_swebench call. "
-            "'litellm_textbased' (default) matches the mswea_bash_command format used "
-            "during PSRL training.  Use 'litellm' for external models that natively "
-            "support OpenAI tool-calling."
+            "Model client class forwarded to every evaluator. "
+            "The default preserves failed assistant turns. Use 'litellm' for native OpenAI tool calling."
         ),
     )
     parser.add_argument(

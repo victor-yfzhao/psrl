@@ -14,7 +14,7 @@ PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dir
 echo "=== Pre-flight checks ==="
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent: OK')"
 python -c "import swebench; print('swebench', swebench.__version__, ': OK')"
-python -c "from examples.mini_swe.swebench_grader import grade_fresh_container, _grade_gym; print('swebench_grader (gym): OK')"
+python -c "from examples.mini_swe.swebench_grader import grade_fresh_container, parse_benchmark_report; print('swebench_grader (gym): OK')"
 python -c "from swebench.harness.log_parsers.python import parse_log_pytest; print('parse_log_pytest: OK')"
 ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
 
@@ -258,18 +258,16 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.name=dynamic_sampling_filter \
     algorithm.filter_groups.metric=reward_score \
     \
-    reward.active_loops='[dapo]' \
-    reward.reward_loops.dapo.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    reward.reward_loops.dapo.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    reward.reward_loops.dapo.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    reward.reward_loops.dapo.reward_kwargs.overlong_buffer_cfg.log=False \
-    reward.reward_loops.dapo.reward_kwargs.max_resp_len=${max_response_length} \
-    reward.reward_loops.dapo.reward_fn.0.path=${PSRL_PATH}/examples/mini_swe/reward.py \
-    reward.reward_loops.dapo.reward_fn.0.name=compute_score \
-    +reward.reward_loops.dapo.reward_fn.0.reward_kwargs.reward_mode=${reward_mode} \
+    reward=mini_swe \
+    reward.reward_loops.mini_swe.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.reward_loops.mini_swe.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.reward_loops.mini_swe.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.reward_loops.mini_swe.reward_kwargs.overlong_buffer_cfg.log=False \
+    reward.reward_loops.mini_swe.reward_kwargs.max_resp_len=${max_response_length} \
+    +reward.reward_loops.mini_swe.reward_fn.0.reward_kwargs.reward_mode=${reward_mode} \
     \
     +data.train_files="$train_files" \
-    data.reward_model_dicts.0.reward_loop_type=dapo \
+    data.reward_model_dicts.0.reward_loop_type=mini_swe \
     data.reward_model_dicts.0.reward_fn=compute_score \
     +data.val_files="$test_files" \
     +data.prompt_key=prompt \

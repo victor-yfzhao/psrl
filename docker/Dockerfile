@@ -60,6 +60,8 @@ ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     UV_HTTP_TIMEOUT=500 \
     UV_INDEX_STRATEGY=unsafe-best-match \
     UV_LINK_MODE=copy \
+    UV_CONSTRAINT=/root/constraints.txt \
+    PIP_CONSTRAINT=/root/constraints.txt \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     MAX_JOBS=${MAX_JOBS} \
@@ -70,6 +72,11 @@ ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /root
+
+COPY docker/constraints.txt /root/constraints.txt
+RUN printf 'torch==2.11.0+%s\ntorchvision==0.26.0+%s\ntorchaudio==2.11.0+%s\n' \
+        "${TORCH_CUDA_WHEEL_TAG}" "${TORCH_CUDA_WHEEL_TAG}" "${TORCH_CUDA_WHEEL_TAG}" \
+        >> /root/constraints.txt
 
 # Keep the devel toolchain in the published image: PSRL dependencies are
 # editable source checkouts and several runtime paths JIT-compile CUDA kernels.
@@ -129,7 +136,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install "uv==${UV_VERSION}"
 
-ARG DOCKER_APT_MIRROR=https://mirrors.tencentyun.com/docker-ce
+ARG DOCKER_APT_MIRROR=https://download.docker.com
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" && \
@@ -157,18 +164,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Install the shared PyTorch/CUDA ABI first. Every native extension below is
 # compiled against this exact environment.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     expected_cuda="$(echo "${CUDA_VERSION}" | cut -d. -f1,2)" && \
     uv pip install \
         "torch==2.11.0+${TORCH_CUDA_WHEEL_TAG}" \
         "torchvision==0.26.0+${TORCH_CUDA_WHEEL_TAG}" \
         "torchaudio==2.11.0+${TORCH_CUDA_WHEEL_TAG}" \
         --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_WHEEL_TAG}" && \
+    python -c \
+        "from importlib.metadata import requires; \
+        print(next(req for req in requires('torch') if req.startswith('nvidia-nccl-')))" \
+        >> /root/constraints.txt && \
     uv pip install torchdata && \
-    uv pip install "tensordict==0.13.0" --no-deps && \
-    uv pip install \
-        triton \
-        "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7" && \
+    uv pip install "tensordict==0.12.4" && \
+    uv pip install triton && \
     python -c \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'"
@@ -208,10 +216,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         pybind11 \
         pylatexenc \
         qwen-vl-utils \
-        ray[default] \
+        "ray[default]==2.49.1" \
         requests \
         sortedcontainers \
-        setuptools \
+        "setuptools>=80.9.0,<81" \
         tomlkit \
         transformers==5.10.1 \
         trl \
@@ -235,15 +243,22 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Copy only immutable patch inputs before cloning large repositories. This is
 # the same source-first patch pattern used by vime and fails during build when
 # a revision drifts away from its PSRL patch.
-COPY docker/patch/ ${PSRL_PATCH_DIR}/
 COPY patch/vllm/v0.22.0.patch ${PSRL_PATCH_DIR}/vllm.patch
 COPY patch/verl/e5ca4acb.patch ${PSRL_PATCH_DIR}/verl.patch
+COPY patch/ucx/v1.20.0.patch ${PSRL_PATCH_DIR}/ucx.patch
+COPY patch/nixl/1.2.0.patch ${PSRL_PATCH_DIR}/nixl.patch
+COPY patch/megatron_bridge/94d1870.patch ${PSRL_PATCH_DIR}/megatron_bridge.patch
+COPY patch/megatron_bridge/dependencies.patch ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch
+COPY patch/lm_cache/a7f22be7.patch ${PSRL_PATCH_DIR}/lm_cache.patch
+COPY patch/lm_cache/dependencies.patch ${PSRL_PATCH_DIR}/lm_cache_dependencies.patch
+COPY patch/transfer_queue/434f8c47.patch ${PSRL_PATCH_DIR}/transfer_queue.patch
 
-# UCX and NIXL provide the PSRL model-transfer data plane. NIXL v1.2.0 follows
-# the upstream CUDA 13 source-packaging flow without the legacy PSRL patch.
+# Keep the PSRL UCX capacity and NIXL connection settings in both native builds.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/openucx/ucx.git /root/ucx-source && \
     git -C /root/ucx-source checkout ${UCX_REF} && \
+    git -C /root/ucx-source apply --check ${PSRL_PATCH_DIR}/ucx.patch && \
+    git -C /root/ucx-source apply ${PSRL_PATCH_DIR}/ucx.patch && \
     cd /root/ucx-source && \
     ./autogen.sh && \
     ./configure \
@@ -270,15 +285,22 @@ RUN --mount=type=cache,target=/root/.cache/uv uv pip install meson-python meson 
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/ai-dynamo/nixl.git ${PSRL_THIRD_PARTY}/nixl && \
     git -C ${PSRL_THIRD_PARTY}/nixl checkout ${NIXL_REF} && \
+    git -C ${PSRL_THIRD_PARTY}/nixl apply --check ${PSRL_PATCH_DIR}/nixl.patch && \
+    git -C ${PSRL_THIRD_PARTY}/nixl apply ${PSRL_PATCH_DIR}/nixl.patch && \
     cd ${PSRL_THIRD_PARTY}/nixl && \
     python -c \
         "import torch; assert torch.version.cuda == '13.0', \
         f'NIXL CUDA 13 requires PyTorch CUDA 13.0, got {torch.version.cuda}.'" && \
     ./contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml && \
-    uv pip install --no-deps . --no-build-isolation && \
+    uv pip install --no-deps --no-build-isolation \
+        --config-settings=setup-args="-Ducx_path=${UCX_HOME}" \
+        --config-settings=setup-args="-Dbuild_tests=false" \
+        --config-settings=setup-args="-Dbuild_examples=false" . && \
     meson setup build \
         --prefix=${NIXL_HOME} \
         -Dbuild_docs=false \
+        -Dbuild_tests=false \
+        -Dbuild_examples=false \
         -Ducx_path=${UCX_HOME} \
         -Dinstall_headers=true \
         -Ddisable_gds_backend=false && \
@@ -367,10 +389,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "flash-linear-attention==0.4.2"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7"
-
-RUN --mount=type=cache,target=/root/.cache/uv \
     NVCC_APPEND_FLAGS="--threads 4" \
         pip install --no-build-isolation --no-cache-dir \
             --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
@@ -399,6 +417,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         ${PSRL_THIRD_PARTY}/Megatron-Bridge/pyproject.toml && \
     git -C ${PSRL_THIRD_PARTY}/Megatron-Bridge apply --check ${PSRL_PATCH_DIR}/megatron_bridge.patch && \
     git -C ${PSRL_THIRD_PARTY}/Megatron-Bridge apply ${PSRL_PATCH_DIR}/megatron_bridge.patch && \
+    git -C ${PSRL_THIRD_PARTY}/Megatron-Bridge apply --check ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch && \
+    git -C ${PSRL_THIRD_PARTY}/Megatron-Bridge apply ${PSRL_PATCH_DIR}/megatron_bridge_dependencies.patch && \
     uv pip install --no-deps --no-build-isolation -e ${PSRL_THIRD_PARTY}/Megatron-Bridge
 
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -430,6 +450,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_THIRD_PARTY}/LMCache checkout ${LMCACHE_REF} && \
     git -C ${PSRL_THIRD_PARTY}/LMCache apply --check ${PSRL_PATCH_DIR}/lm_cache.patch && \
     git -C ${PSRL_THIRD_PARTY}/LMCache apply ${PSRL_PATCH_DIR}/lm_cache.patch && \
+    git -C ${PSRL_THIRD_PARTY}/LMCache apply --check ${PSRL_PATCH_DIR}/lm_cache_dependencies.patch && \
+    git -C ${PSRL_THIRD_PARTY}/LMCache apply ${PSRL_PATCH_DIR}/lm_cache_dependencies.patch && \
     LMCACHE_CUDA_MAJOR="${CUDA_VERSION%%.*}" \
         uv pip install --no-build-isolation -e ${PSRL_THIRD_PARTY}/LMCache && \
     python -c "import lmcache"
@@ -458,7 +480,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 WORKDIR /home
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/psrl-project/psrl.git ${PSRL_HOME} && \
-    git -C ${PSRL_HOME} checkout ${PSRL_COMMIT} && \
+    git -C ${PSRL_HOME} checkout "${PSRL_COMMIT}" && \
     cd ${PSRL_HOME} && \
     uv pip install --no-build-isolation -e . && \
     python -c \
@@ -475,18 +497,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'" && \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
-    python -c "import lmcache, nixl, torch_memory_saver"
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7"
+    python -c "import lmcache, nixl, torch_memory_saver" && \
+    python -c \
+        "from psrl.utils.nixl.agent import create_nixl_agent; \
+        create_nixl_agent('psrl-build-check', num_workers=2)"
 
 RUN rm -rf /root/.cache/pip /root/.cache/uv
 
 WORKDIR ${PSRL_HOME}
 
-RUN mkdir -p ${PSRL_WORKSPACE}/env
+RUN mkdir -p ${PSRL_WORKSPACE}/env ${PSRL_HOME}/env
 COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
+RUN ln -s ${PSRL_WORKSPACE}/env/psrl.sh ${PSRL_HOME}/env/psrl.sh
 
 ENV VIRTUAL_ENV=/root/venv \
     PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

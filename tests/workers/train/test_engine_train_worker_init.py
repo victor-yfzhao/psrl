@@ -52,6 +52,74 @@ def test_engine_train_worker_importable_from_package():
     assert PSRL_EngineTrainWorker is not None
 
 
+@pytest.mark.parametrize("tms_range", [None, "train", "all"])
+@pytest.mark.parametrize("optimizer_offload", [False, True])
+@pytest.mark.parametrize("sleep_mode", ["meta", "full"])
+def test_megatron_wake_restores_memory_before_nixl_registration(monkeypatch, tms_range, optimizer_offload, sleep_mode):
+    from psrl.workers.train import engine_train_worker
+
+    events = []
+    asleep = False
+
+    def sleep(event):
+        nonlocal asleep
+        asleep = True
+        events.append(event)
+
+    def wake(event):
+        nonlocal asleep
+        asleep = False
+        events.append(event)
+
+    def move_optimizer(**kwargs):
+        assert not asleep, "Optimizer movement must only access awake memory."
+        events.append(f"optimizer_{kwargs['device']}")
+
+    def register(*args):
+        assert not asleep, "NIXL registration must follow model memory restoration."
+        events.append("register")
+
+    monkeypatch.setattr(engine_train_worker, "aggressive_empty_cache", lambda **kwargs: events.append("sync_cache"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(
+        engine_train_worker,
+        "torch_memory_saver",
+        SimpleNamespace(pause=lambda: sleep("pause"), resume=lambda: wake("resume")),
+    )
+    worker = object.__new__(engine_train_worker.PSRL_EngineTrainWorker)
+    worker.config = OmegaConf.create({"actor": {"strategy": "megatron"}})
+    worker.psrl_config = OmegaConf.create({"tms": {"range": tms_range}})
+    worker.memory_logger = None
+    worker.actor = SimpleNamespace(
+        engine=SimpleNamespace(module=[], is_optimizer_offload_enabled=optimizer_offload),
+        to=move_optimizer,
+    )
+    worker.nixl_storage_client = SimpleNamespace(
+        deregister_local_tensors=lambda: events.append("deregister"),
+        register_local_tensors=register,
+    )
+    worker.unified_state_dict = {}
+    worker.unified_sharding_dict = {}
+    monkeypatch.setattr(
+        engine_train_worker, "clear_megatron_memory_caches", lambda models: events.append("clear_caches")
+    )
+    worker._sleep_megatron_model = lambda models: sleep("manual_sleep")
+    worker._wake_up_megatron_model = lambda models: wake("manual_wake")
+
+    worker.nixl_sleep(sleep_mode)
+    assert asleep, "Sleeping must release model memory."
+    worker.nixl_wake_up()
+    expected = ["optimizer_cpu"]
+    if sleep_mode == "full":
+        expected.append("deregister")
+    expected.extend(["clear_caches", "sync_cache"])
+    expected.extend(["pause", "resume"] if tms_range else ["manual_sleep", "empty_cache", "manual_wake"])
+    if not optimizer_offload:
+        expected.append("optimizer_device")
+    expected.append("register")
+    assert events == expected, "Wake must restore model and optimizer memory before NIXL registration."
+
+
 def _arena_worker(*, ps_mode="nixl_cpu", tms_range="all", strategy="fsdp2", param_offload=False):
     from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker
 

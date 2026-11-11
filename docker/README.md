@@ -1,8 +1,8 @@
 # PSRL Docker images
 
-PSRL provides reproducible GPU and CPU images. The Docker build context is the
-repository root, and the Dockerfiles install the pinned third-party components
-and PSRL itself. No extra `pip install` step is required after the image is built.
+The GPU and CPU images clone PSRL from GitHub. `PSRL_COMMIT` selects a branch,
+tag, or commit and defaults to `main`. Build from the repository root.
+No extra `pip install` step is required after building.
 
 ## Prerequisites
 
@@ -27,14 +27,19 @@ The GPU image includes CUDA 13.0.3, PyTorch 2.11, vLLM, veRL, NIXL/UCX,
 LMCache, Megatron, SMG, and the PSRL runtime. It is the image to use for
 training and multi-node rollout.
 
-For a release or a reproducible build, pin the PSRL revision explicitly:
+To build the current commit, push it to the PSRL GitHub repository first:
 
 ```bash
 docker build --progress=plain \
-  --build-arg PSRL_COMMIT=<commit-sha> \
+  --build-arg PSRL_COMMIT="$(git rev-parse HEAD)" \
   -f docker/Dockerfile \
   -t psrl:latest .
 ```
+
+The build context contains only Docker build inputs and dependency patches,
+as listed in `.dockerignore`. PSRL source comes from the selected Git revision.
+Local uncommitted changes are not included. Mount datasets and checkpoints
+when starting a container.
 
 ### CPU image
 
@@ -50,20 +55,19 @@ gateway/data-plane development. It does not support PSRL GPU training.
 
 ## Start a container
 
-The image already contains PSRL at `/home/psrl`.
+The shell starts in the installed PSRL checkout.
 
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v "$PWD:/home/psrl" \
   -it psrl:latest
 ```
 
-Inside the container, run the usual PSRL commands from `/home/psrl`:
+Inside the container, activate the runtime environment and check the imports:
 
 ```bash
-bash examples/ray/ray_start.sh ${PSRL_WORKSPACE}/hosts/16GPUs
-bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh
+source env/psrl.sh
+python -c 'import psrl, torch, nixl; print(torch.__version__)'
 ```
 
 For a CPU shell, omit `--gpus all` and use the CPU tag:
@@ -72,11 +76,13 @@ For a CPU shell, omit `--gpus all` and use the CPU tag:
 docker run --rm -it \
   --ipc=host \
   --network=host \
-  -v "$PWD:/home/psrl" \
   psrl:cpu
 ```
 
-For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node, and expose the host's RDMA devices using your cluster's standard Docker configuration (for example, `--device=/dev/infiniband`).
+For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node and
+expose the host's RDMA devices through Docker. Supply `UCX_NET_DEVICES`,
+`NCCL_SOCKET_IFNAME`, and `NCCL_IB_HCA` through the deployment environment when
+interface selection is needed. The image does not select network devices.
 
 ## Notes
 
@@ -84,6 +90,10 @@ For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node, an
   automatically.
 - The GPU image uses a CUDA 13.0 / PyTorch `cu130` stack. If you override
   `CUDA_VERSION` or `BASE_IMAGE`, revalidate the matching PyTorch wheel and
-  constraint settings in `docker/`.
+  constraints in `docker/constraints.txt`.
+- Both images build patched UCX 1.20 and NIXL 1.2. The CPU image builds NIXL
+  without CUDA support. Its native distribution is named `nixl-cu12` upstream.
+- The selected PSRL revision must include the NIXL 1.2 initialization support.
+  Commit and push local changes before selecting them with `PSRL_COMMIT`.
 - When changing a pinned third-party revision, rebase the matching patch in
-  `docker/patch/` and rebuild the image from a clean cache.
+  `patch/` and rebuild the image from a clean cache.

@@ -64,9 +64,8 @@ def get_node_ids_from_resource_pool(resource_pool: RayResourcePool) -> list[str]
             pg_idx, local_rank = _global_bundle_index_to_pg_local_rank(pgs, bundle_idx)
             bundle_slots.append((pgs[pg_idx], local_rank))
     else:
-        local_world_size = resource_pool.store[0]
         bundle_slots = [
-            (pg, local_rank) for pg in sort_placement_group_by_node_ip(pgs) for local_rank in range(local_world_size)
+            (pg, local_rank) for pg in sort_placement_group_by_node_ip(pgs) for local_rank in range(pg.bundle_count)
         ]
 
     node_ids = []

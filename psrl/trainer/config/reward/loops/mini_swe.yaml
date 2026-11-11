@@ -1,0 +1,13 @@
+defaults:
+  - dapo
+  - _self_
+
+reward_loop:
+  source: importlib
+  name: MiniSWERewardLoop
+  module:
+    path: pkg://examples.mini_swe.reward
+reward_loop_type: mini_swe
+reward_fn:
+  - path: pkg://examples.mini_swe.reward
+    name: compute_score

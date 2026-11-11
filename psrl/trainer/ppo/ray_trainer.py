@@ -58,6 +58,7 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.training_diagnostics import training_phase
 from verl.workers.config import EngineConfig
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
@@ -94,6 +95,7 @@ from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
 )
+from psrl.utils.rollout.timing_metrics import compute_rollout_timing_metrics
 from psrl.utils.transfer_queue.payload import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
@@ -1271,7 +1273,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         return self._val_metrics_update(data_sources, sample_parent_ids, reward_extra_infos_dict, sample_turns)
 
     @staticmethod
-    def _write_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{global_steps}.jsonl")
@@ -1951,6 +1953,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         ps_nixl_futures = []
         model_init_futures = []
+        preload_futures = []
 
         # ---- Step 3: Create and init PS WorkerGroup ----
         psrl_logger.info("Create PS WorkerGroup")
@@ -2084,7 +2087,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("All workers' models initialized successfully!")
 
-        # initialize NIXL
+        self._init_nixl_workers(ps_nixl_futures, preload_futures)
+        self.init_elastic_runtime()
+
+        self.replay_buffer.start_polling()
+        psrl_logger.info("ReplayBuffer polling started after init_workers() completed.")
+
+    def _init_nixl_workers(
+        self,
+        ps_nixl_futures: list[ray.ObjectRef],
+        preload_futures: list[ray.ObjectRef],
+    ) -> None:
+        """
+        Exchange NIXL metadata and load initial weights into awake workers.
+        """
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             if ps_nixl_futures:
                 ray.get(ps_nixl_futures)
@@ -2155,11 +2171,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # Pull initial PS weights now. A sleeping colocated actor pulls later in `switch_to_trainer_mode`.
             with log_dual_events("Initial pull: PS → gen/actor workers", psrl_logger, event_type=EventType.INIT):
                 self._pull_initial_policy_weights()
-
-        self.init_elastic_runtime()
-
-        self.replay_buffer.start_polling()
-        psrl_logger.info("ReplayBuffer polling started after init_workers() completed.")
 
     def _pull_initial_policy_weights(self):
         """Populate only the policy workers whose GPU storage is currently mapped."""
@@ -2923,16 +2934,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # 1. compute log probs
         # add meta info
+        diagnostic_context = {"framework": "psrl", "global_steps": self.global_steps, "rows": len(batch)}
         calculate_sum_pi_squared = self.config.train_actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
         batch.extra_info.update(
             {
+                "training_diagnostics": diagnostic_context,
                 "calculate_entropy": True,
                 "compute_loss": False,
                 "calculate_sum_pi_squared": calculate_sum_pi_squared,
                 "temperature": self.config.gen_actor_rollout_ref.rollout.temperature,
             }
         )
-        output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
+        with training_phase("old_log_prob/infer_rpc", **diagnostic_context):
+            output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
         assert len(output) == len(batch), (
             f"Actor log-probability output size {len(output)} does not match batch size {len(batch)}."
         )
@@ -2946,63 +2960,64 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "rollout_log_probs",
             "metrics",
         ]
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        with training_phase("old_log_prob/collect_outputs", **diagnostic_context):
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
-        # Training pads log probabilities to `responses` but slices them by `response_mask`.
-        # Enforce equal row lengths here so drift fails near its source.
-        response_lens = data["responses"].offsets().diff()
-        mask_lens = data["response_mask"].offsets().diff()
-        psrl_logger.info(
-            "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
-            "response_mask[min=%d max=%d] equal=%s",
-            len(response_lens),
-            int(response_lens.min()),
-            int(response_lens.max()),
-            int(mask_lens.min()),
-            int(mask_lens.max()),
-            bool(torch.equal(response_lens, mask_lens)),
-        )
-        if not torch.equal(response_lens, mask_lens):
-            bad = (response_lens != mask_lens).nonzero().flatten().tolist()
-            raise AssertionError(
-                f"responses and response_mask disagree on length for {len(bad)} of "
-                f"{len(response_lens)} rows. First offenders (row, responses, mask): "
-                f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
-                "Both are written per trajectory by the agent loop and must stay in lockstep, "
-                "because old_log_probs is cut to the mask length while the training forward is "
-                "padded to the responses length."
+            # Training pads log probabilities to `responses` but slices them by `response_mask`.
+            # Enforce equal row lengths here so drift fails near its source.
+            response_lens = data["responses"].offsets().diff()
+            mask_lens = data["response_mask"].offsets().diff()
+            psrl_logger.info(
+                "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
+                "response_mask[min=%d max=%d] equal=%s",
+                len(response_lens),
+                int(response_lens.min()),
+                int(response_lens.max()),
+                int(mask_lens.min()),
+                int(mask_lens.max()),
+                bool(torch.equal(response_lens, mask_lens)),
             )
+            if not torch.equal(response_lens, mask_lens):
+                bad = (response_lens != mask_lens).nonzero().flatten().tolist()
+                raise AssertionError(
+                    f"responses and response_mask disagree on length for {len(bad)} of "
+                    f"{len(response_lens)} rows. First offenders (row, responses, mask): "
+                    f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
+                    "Both are written per trajectory by the agent loop and must stay in lockstep, "
+                    "because old_log_probs is cut to the mask length while the training forward is "
+                    "padded to the responses length."
+                )
 
-        # 2. write old_log_probs and entropy back to TransferQueue
-        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
-        if calculate_sum_pi_squared:
-            data["sum_pi_squared"] = response_from_nested(data.pop("sum_pi_squared"), data["response_mask"])
-        # old_log_prob_mfu = tu.get(data, "metrics")["mfu"]
-        fields = ["old_log_probs", "entropy"]
-        if calculate_sum_pi_squared:
-            fields.append("sum_pi_squared")
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*fields))
+            # 2. write old_log_probs and entropy back to TransferQueue
+            data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+            data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+            if calculate_sum_pi_squared:
+                data["sum_pi_squared"] = response_from_nested(data.pop("sum_pi_squared"), data["response_mask"])
+            # old_log_prob_mfu = tu.get(data, "metrics")["mfu"]
+            fields = ["old_log_probs", "entropy"]
+            if calculate_sum_pi_squared:
+                fields.append("sum_pi_squared")
+            tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*fields))
 
-        data = DataProto(batch=data.to_padded_tensor())
+            data = DataProto(batch=data.to_padded_tensor())
 
-        # 3. calculate actor entroy metrics
-        actor_config = self.config.train_actor_rollout_ref.actor
-        entropy_agg = agg_loss(
-            loss_mat=data.batch["entropy"],
-            loss_mask=data.batch["response_mask"],
-            loss_agg_mode=actor_config.loss_agg_mode,
-            loss_scale_factor=actor_config.loss_scale_factor,
-        )
-        old_log_prob_metrics = {
-            "actor/entropy": entropy_agg.detach().item(),
-            # "perf/mfu/actor_infer": old_log_prob_mfu, # TODO(linsh): no global_token_num for mfu
-        }
-        metrics.update(old_log_prob_metrics)
+            # 3. calculate actor entroy metrics
+            actor_config = self.config.train_actor_rollout_ref.actor
+            entropy_agg = agg_loss(
+                loss_mat=data.batch["entropy"],
+                loss_mask=data.batch["response_mask"],
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+            )
+            old_log_prob_metrics = {
+                "actor/entropy": entropy_agg.detach().item(),
+                # "perf/mfu/actor_infer": old_log_prob_mfu, # TODO(linsh): no global_token_num for mfu
+            }
+            metrics.update(old_log_prob_metrics)
 
-        # 4. calculate rollout vs actor logprobs diff
-        if "rollout_log_probs" in data.batch:
-            metrics.update(calculate_debug_metrics(data))
+            # 4. calculate rollout vs actor logprobs diff
+            if "rollout_log_probs" in data.batch:
+                metrics.update(calculate_debug_metrics(data))
 
         return batch
 
@@ -3020,23 +3035,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        diagnostic_context = {"framework": "psrl", "global_steps": self.global_steps, "rows": len(batch)}
         base_extra_info = {
+            "training_diagnostics": diagnostic_context,
             "calculate_entropy": calculate_entropy,
             "multi_turn": self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
             "distillation_use_topk": distillation_use_topk,
             "compute_loss": True,
         }
-        actor_metrics = self._run_scheduled_update(
-            batch,
-            training_config=actor_config,
-            dp_size=self._get_dp_size(self.actor_wg, "actor"),
-            base_extra_info=base_extra_info,
-            update_fn=self.actor_wg.update_actor,
-            metric_prefix="actor/",
-            mfu_key="perf/mfu/actor",
-            finalize_step=finalize_step,
-            push_model=True,
-        )
+        with training_phase("actor_update/dispatch", **diagnostic_context):
+            actor_metrics = self._run_scheduled_update(
+                batch,
+                training_config=actor_config,
+                dp_size=self._get_dp_size(self.actor_wg, "actor"),
+                base_extra_info=base_extra_info,
+                update_fn=self.actor_wg.update_actor,
+                metric_prefix="actor/",
+                mfu_key="perf/mfu/actor",
+                finalize_step=finalize_step,
+                push_model=True,
+            )
         metrics.update(actor_metrics)
         return batch
 
@@ -3070,6 +3088,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Fetch only real samples because schedule-local padding keys can collide after cleanup.
         real_keys = [key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
         fields = [
+            "uid",
+            "loop_timing",
             "prompts",
             "responses",
             "response_mask",
@@ -3088,6 +3108,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
             fields.extend(gdpo_reward_keys)
         data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
+        metrics.update(compute_rollout_timing_metrics(tu.get(data, "uid"), tu.get(data, "loop_timing")))
         num_turns = np.array(data.pop("num_turns").tolist())
         # Read before `to_padded_tensor`, which drops non-tensor columns.
         terminate_reasons = [str(v) for v in tu.get(data, "terminate_reason")]

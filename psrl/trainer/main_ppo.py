@@ -13,7 +13,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
 
-from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from psrl.trainer.constants_ppo import get_ppo_ray_init_kwargs
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.config.deployment_mode import expand_ngpus_per_node, resolve_deployment_mode
 from psrl.utils.config.validation import validate_config
@@ -135,20 +135,11 @@ def run_ppo(config, task_runner_class=None) -> None:
         task_runner_class: For recipe to change TaskRunner.
     """
     if not ray.is_initialized():
-        default_runtime_env = get_ppo_ray_runtime_env()
-        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
-        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
-
-        if config.transfer_queue.enable:
-            # Add runtime environment variables for transfer queue
-            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
-            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
-            runtime_env_kwargs["env_vars"] = runtime_env_vars
-
-        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = get_ppo_ray_init_kwargs(
+            config.ray_kwargs.get("ray_init", {}), transfer_queue_enabled=config.transfer_queue.enable
+        )
         psrl_logger.info(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     # NOTE(claude): Keep the handle list alive for the entire job lifetime so Ray
     # does not garbage-collect the reservation actors before the job finishes.

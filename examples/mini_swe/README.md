@@ -21,13 +21,14 @@ The training loop works as follows:
 
 1. **Data**: Each training sample contains a problem statement and grading metadata.
 2. **Rollout**: For each sample, PSRL dispatches one task to a local black-box
-   runner function. The runner owns mini-SWE-agent, Docker, and grading.
+   runner function. The runner owns mini-swe-agent and its rollout Docker container.
 3. **Model Routing**: PSRL creates one SMG TITO session per episode and gives
    mini-swe-agent the session-scoped OpenAI-compatible URL. mini-swe-agent then
    runs through its normal inference path, while SMG captures training tokens,
    masks, logprobs, and routed experts.
-4. **Grading** (SWE-smith / SWE-Gym path): After the agent submits a patch, a fresh Docker
-   container runs the SWE problem's FAIL_TO_PASS and PASS_TO_PASS tests.
+4. **Grading**: After rollout cleanup releases the episode slot, `MiniSWERewardLoop`
+   runs the SWE problem's FAIL_TO_PASS and PASS_TO_PASS tests in a fresh container
+   owned by a reward worker.
 5. **Reward**: Score is computed from the grading result (or patch-text overlap for
    the toy path) and used for GRPO policy gradient updates.
 
@@ -54,10 +55,11 @@ The training loop works as follows:
                │ vLLM rollout │
                └─────┬────────┘
                       │
-               ┌──────┴────────────────┐
-               │ grade_fresh_container │  ← SWE-smith / SWE-Gym paths
-               │ (fresh Docker, pytest)│
-               └──────┬────────────────┘
+               ┌──────┴────────────────────┐
+               │ RewardLoopWorker          │
+               │ MiniSWERewardLoop          │
+               │ grade_fresh_container     │
+               └──────┬────────────────────┘
                       │
                ┌──────┴───────┐
                │ compute_score│
@@ -72,8 +74,8 @@ The training loop works as follows:
 examples/mini_swe/
 ├── README.md                             # This file
 ├── config.py                             # Runtime config dataclasses
-├── runner.py                             # Black-box mini-swe/Docker/grader runner
-├── reward.py                             # Reward function (patch-overlap + test-execution)
+├── runner.py                             # Mini-SWE rollout and Docker cleanup
+├── reward.py                             # Reward loop, scoring, and grader container lifecycle
 ├── swebench_grader.py                    # Fresh-container grader for SWE-smith / SWE-Gym / Verified (shared by training + eval)
 ├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset (FSDP, 7B)
 ├── fsdp_qwen_14b_dapo.sh                 # Launch script — toy / DAPO path (FSDP, 14B)
@@ -82,7 +84,7 @@ examples/mini_swe/
 ├── megatron_qwen_4b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 4B)
 ├── megatron_qwen_7b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 7B)
 ├── megatron_qwen_8b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 8B)
-├── megatron_qwen_8b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 8B)
+├── megatron_qwen_8b_swe_gym.sh           # Launch script for SkyRL-v0-293-data (Megatron, 8B)
 ├── megatron_qwen_32b_swe_smith.sh        # Launch script — SWE-smith (Megatron, 32B)
 ├── test_perf.sh                          # Performance / throughput probe
 ├── config/
@@ -223,7 +225,7 @@ bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh 3
 
 | Metric | Meaning |
 |--------|---------|
-| `train/score` | Shaped outcome reward: `+1.0` resolved, `-1.0` failed, `0.0` policy violation |
+| `train/score` | Binary outcome reward: `1.0` resolved, `0.0` otherwise |
 | `train/acc` | Binary resolve rate (0 or 1 per sample) — the primary progress indicator |
 
 ---
@@ -237,14 +239,19 @@ SWE-smith, with two key differences: no `git checkout HEAD~1` is needed (standar
 repo layout), and eval scripts are pre-computed in the parquet rather than
 generated at grading time.
 
+Rollout and grading select each task's exact `base_commit`. SWE-Gym executes the
+prepared script with explicit report markers. Verified validation uses its
+repository-specific SWE-bench parser. Missing reports and environment failures
+raise errors rather than producing task rewards.
+
 #### Step 1: Install grading dependencies
 
 ```bash
 python -m pip install swebench==4.1.0
 ```
 
-(The SWE-Bench-Fork is only needed for _preparing_ the full dataset, not for
-training/grading. See `prepare/README.md` Path C.)
+(The SWE-Bench-Fork is needed to prepare the full dataset and SkyRL-v0-293-data.
+Training and grading use the embedded scripts. See `prepare/README.md` Path C.)
 
 #### Step 2: Prepare data and pre-fetch images
 
@@ -252,6 +259,7 @@ Follow `prepare/README.md` Path C. The expected layout when done:
 
 ```
 examples/mini_swe/data/
+  skyrl_v0_293/train.parquet              # 293 official SkyRL training tasks (8B Megatron)
   swe_gym_2438/train.parquet              # 2438 training SWE problems (full)
   swe_gym_subset_100/train.parquet        # 100 training SWE problems (quick start)
 ```
@@ -277,6 +285,17 @@ Or with Megatron parallelism:
 ```bash
 bash examples/mini_swe/megatron_qwen_7b_swe_gym.sh
 ```
+
+For Qwen3-8B with the official SkyRL training set, thinking is enabled and YaRN 4x
+provides a 131072-token context. The initial prompt budget is 16384 tokens, leaving
+114688 tokens for generated reasoning, actions, and environment observations:
+
+```bash
+bash examples/mini_swe/megatron_qwen_8b_swe_gym.sh
+```
+
+Validation is disabled, including validation replicas. Binary rewards are +1 for
+resolved tasks and -1 for unresolved tasks.
 
 ---
 
@@ -423,7 +442,8 @@ which is written by `prepare_swebench.py`.
 4. After mini-swe-agent exits, PSRL fetches the session once and converts the
    captured trajectory into canonical training data.
 5. PSRL deletes the TITO session and removes rollout Docker containers in
-   `finally` cleanup.
+   `finally` cleanup, then submits the patch and resolved grading inputs to the
+   reward service. Training consumes the trajectory after its reward is ready.
 
 ### Runner execution
 
@@ -432,9 +452,30 @@ dedicated worker-thread pool. This keeps Docker rollout distributed with PSRL's
 AgentLoopWorkers, avoids a task-level HTTP hop or centralized agent-server
 bottleneck, and leaves the default executor available for timeout cleanup.
 
+The runner sets `separate_reasoning=false` so action parsing sees the complete
+generated text. Keep this setting when calling SMG directly. Splitting reasoning
+into a separate field can hide bash actions when the model omits `</think>`.
+The Mini-SWE model client uses the OpenAI SDK to preserve response text and
+reasoning tags for action parsing and conversation replay.
+
 ---
 
 ## Reward Function
+
+Recipes select `reward=mini_swe`. Dataset reward specs use `reward_loop_type=mini_swe`
+and `reward_fn=compute_score`. The configured `importlib` module loads both
+`MiniSWERewardLoop` and `compute_score` from `examples/mini_swe/reward.py`.
+The loop runs grading, calls `reward.py`, and applies the configured DAPO length penalty.
+Grader reports and `grading_s` are returned in `reward_extra_info`.
+Keep `reward.launch_reward_fn_async=false` so grading finishes before group admission.
+Grading errors, including test execution timeouts, discard the training group and refill it with a fresh prompt.
+
+**Reward nodes need Docker and the dataset images.** Workers default to
+`psrl.reward_service_ip`. Training and validation have independent pools configured
+by `reward.reward_loop_worker` and `reward.validation_reward_loop_worker`.
+Each worker permits four concurrent graders by default. Total pool capacity is
+`num_workers * max_concurrency_per_worker`. Set each pool's limits for its host resources.
+Cancellation retains capacity until the grader finishes cleanup.
 
 ### Toy path (`data_source = mini_swe_agent_simple` or `mini_swe_agent`)
 
@@ -454,21 +495,23 @@ bottleneck, and leaves the default executor available for timeout cleanup.
 
 ### SWE-smith / SWE-Gym / Verified path (`data_source = swe_smith_py`, `swe_gym`, or `swebench_verified`)
 
-Reward is based on whether the submitted patch resolves the SWE problem (all
-FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
+Reward uses the official F2P/P2P report. In `binary` mode:
 
 | Condition | `score` (→ loss) | `acc` (→ wandb) |
 |-----------|-----------------|-----------------|
 | All F2P pass, no P2P regressions | `+1.0` | `1.0` |
-| Patch modified test or config files | `0.0` (policy violation — not penalised) | `0.0` |
-| Not resolved (patch failed, tests failed) | `-1.0` | `0.0` |
-| No patch submitted / 0 turns (aborted) | `0.0` | `0.0` |
+| Not resolved, including no patch or failed application | `0.0` | `0.0` |
+| 0 turns (aborted) | `0.0` | `0.0` |
 
-The `{-1, 0, +1}` convention. The `score` field drives the
-policy gradient loss; the `acc` field is a separate metric for tracking resolve
-rate. Both are visible in wandb as `train/score` and `train/acc`.
+The SWE-smith Megatron recipe selects `binary`, defined in `reward.py`.
+The `score` drives training and `acc` tracks the binary resolve rate.
 
-**Patch policy rules** (configurable via environment variables):
+SWE-smith evaluates configuration changes normally. After applying a submission,
+the grader restores evaluation tests from the task revision before running the
+suite. An unappliable patch remains a model failure. Container startup, setup,
+execution, cleanup, and report errors raise instead of producing a task reward.
+
+**Verified and SWE-Gym patch policy rules**:
 
 | Env var | Default | Effect |
 |---------|---------|--------|
@@ -537,7 +580,8 @@ def compute_score(
     """Return a float or {"score": float, "acc": float}."""
 ```
 
-Pass `custom_reward_function.path` and `custom_reward_function.name` to `main_ppo`.
+Set `reward.reward_loops.mini_swe.reward_fn.0.path` and `.name` for the reward function.
+The function receives the fresh harness report in `extra_info["grader_result"]`.
 
 ### Custom Prompt Templates
 

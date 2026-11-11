@@ -1,0 +1,17 @@
+defaults:
+  - reward
+  - /reward/loops@reward_loops.mini_swe: mini_swe
+  - _self_
+
+active_loops:
+  - mini_swe
+
+# A grading failure must reach the rollout worker before its group is admitted.
+launch_reward_fn_async: false
+
+# Docker grading concurrency is bounded separately for each worker pool.
+reward_loop_worker:
+  max_concurrency_per_worker: 4
+
+validation_reward_loop_worker:
+  max_concurrency_per_worker: 4

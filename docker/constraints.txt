@@ -1,0 +1,12 @@
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+tensordict==0.12.4
+ray==2.49.1
+setuptools>=80.9.0,<81
+transformers==5.10.1
+numpy==2.2.6
+protobuf>=7.35.1,<8
+nixl==1.2.0
+nixl-cu12==1.2.0
+nixl-cu13==1.2.0

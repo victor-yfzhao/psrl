@@ -68,6 +68,75 @@ def _trainer(elastic=True):
     return trainer
 
 
+@pytest.mark.parametrize("tms_range", [None, "train", "all"])
+@pytest.mark.parametrize("elastic,validation_first", [(False, False), (False, True), (True, False), (True, True)])
+def test_initial_nixl_transfer_only_accesses_awake_actor(tms_range, elastic, validation_first):
+    trainer = _trainer(elastic=elastic)
+    trainer.is_rollout_mode_in_actor = validation_first
+    trainer.config.psrl.ps_mode = "nixl_cpu"
+    trainer.config.psrl.tms = SimpleNamespace(range=tms_range)
+    trainer.config.psrl.broadcast_init = SimpleNamespace(enabled=False)
+    trainer.config.trainer = SimpleNamespace(del_local_ckpt_after_load=False)
+    trainer.ps_wg = MagicMock(world_size=1)
+    trainer.ps_wg.execute_all_async.return_value = [object()]
+    trainer.ps_manager_handle = MagicMock()
+    trainer._resolve_resume_checkpoint_paths = MagicMock(return_value=None)
+    trainer.elastic_executor.configure_trainer_pool_clients = _remote_handle()
+    trainer.rollout_coordinator.world_size = _remote_handle()
+    trainer.rollout_coordinator.world_size.remote.return_value = 4
+    trainer.rollout_coordinator.nixl_protocol = _remote_handle()
+    trainer.rollout_coordinator.initial_pull_from_ps = _remote_handle()
+    asleep = elastic or validation_first
+    events = []
+    groups = [{ray_trainer.train_client_name(rank): {"info": bytes([rank]), "temp_mapping": {}}} for rank in range(2)]
+
+    def execute(method, *args):
+        nonlocal asleep
+        if method == "nixl_protocol":
+            assert args == ("meta" if asleep else "full",), "Sleeping actors must only register metadata."
+        elif method == "nixl_wake_up":
+            asleep = False
+            events.append("wake")
+        elif method == "nixl_get_local_client_info":
+            assert not asleep, "Descriptors must be collected after memory restoration."
+            events.append("collect_descriptors")
+            return groups
+        elif method == "pull_model":
+            assert not asleep, "Weight transfer and optimizer reload must not access sleeping actor memory."
+            events.append("pull")
+        return [object()]
+
+    trainer.actor_wg.execute_all_async.side_effect = execute
+    trainer.rollout_coordinator.sleep.remote.side_effect = lambda tag: events.append("validation_sleep")
+    trainer._broadcast_updated_client_infos.side_effect = lambda updates: events.append("install_descriptors")
+    with (
+        patch.object(ray_trainer.ray, "get", side_effect=lambda refs: refs),
+        patch.object(ray_trainer.ray, "wait", side_effect=lambda refs, **kw: (refs[:1], refs[1:])),
+        patch.object(ray_trainer, "resolve_weight_fingerprint_options", return_value=None),
+    ):
+        trainer._init_nixl_workers([], [])
+        assert events == ([] if asleep else ["pull"]), "Only awake actors may pull initial weights."
+        if elastic:
+            trainer.rollout_coordinator.nixl_protocol.remote.assert_called_once_with("meta")
+            trainer.rollout_coordinator.initial_pull_from_ps.remote.assert_not_called()
+            trainer.elastic_executor.configure_trainer_pool_clients.remote.assert_called_once_with(
+                trainer.ps_wg, trainer.tag_to_server_handles
+            )
+        else:
+            tag = "all" if validation_first else "rollout"
+            trainer.rollout_coordinator.nixl_protocol.remote.assert_called_once_with(tag)
+            trainer.rollout_coordinator.initial_pull_from_ps.remote.assert_called_once_with(tag)
+            if validation_first:
+                trainer.switch_to_trainer_mode()
+                assert events == [
+                    "validation_sleep",
+                    "wake",
+                    "collect_descriptors",
+                    "install_descriptors",
+                    "pull",
+                ], "Actor weights must be restored after wake and descriptor installation."
+
+
 @pytest.mark.parametrize("start_succeeds", [True, False])
 def test_elastic_monitor_binds_manager_after_pipeline_start(start_succeeds):
     trainer = _trainer()
@@ -251,6 +320,23 @@ def test_non_elastic_validation_wake_failure_runs_coordinated_cleanup():
     trainer._run_validation.assert_not_called()
     trainer.rollout_coordinator.sleep.remote.assert_called_once_with("validate")
     assert trainer.is_rollout_mode_in_actor is False, "Wake failures must return the GPUs to training."
+
+
+def test_failed_validation_cleanup_does_not_wake_training_actor():
+    trainer = _trainer(elastic=False)
+    trainer.is_rollout_mode_in_actor = True
+
+    def get(refs):
+        if refs is trainer.rollout_coordinator.sleep.remote.return_value:
+            raise RuntimeError("Validation GPU release was not acknowledged.")
+        return []
+
+    with patch.object(ray_trainer.ray, "get", side_effect=get):
+        with pytest.raises(RuntimeError, match="GPU release was not acknowledged"):
+            trainer.switch_to_trainer_mode()
+
+    trainer.actor_wg.execute_all_async.assert_not_called()
+    assert trainer.is_rollout_mode_in_actor is True, "Failed cleanup must not transfer GPU ownership to training."
 
 
 @pytest.mark.parametrize("merged", [False, True])

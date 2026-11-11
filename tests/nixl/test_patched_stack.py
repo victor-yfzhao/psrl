@@ -10,13 +10,19 @@ import pytest
 
 nixl_api = pytest.importorskip("nixl._api")
 
+from psrl.utils.nixl.agent import create_nixl_agent  # noqa: E402
+
 pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("num_workers", [1, 2, 4])
 @pytest.mark.parametrize(
     "memory_type",
-    [pytest.param("DRAM", marks=pytest.mark.cpu_test), pytest.param("VRAM", marks=pytest.mark.gpu)],
+    [
+        pytest.param("DRAM", marks=pytest.mark.cpu_test),
+        pytest.param("VRAM", marks=pytest.mark.gpu),
+        pytest.param("VRAM_CROSS_DEVICE", marks=pytest.mark.gpu),
+    ],
 )
 def test_ucx_transfer_with_shared_workers(num_workers, memory_type):
     payload = bytes(range(256)) * 1024
@@ -25,32 +31,39 @@ def test_ucx_transfer_with_shared_workers(num_workers, memory_type):
         target_buffer = ctypes.create_string_buffer(len(payload))
         source_address = ctypes.addressof(source_buffer)
         target_address = ctypes.addressof(target_buffer)
-        device_id = 0
+        source_device_id = target_device_id = 0
     else:
         import torch
 
-        source_buffer = torch.frombuffer(bytearray(payload), dtype=torch.uint8).cuda()
-        target_buffer = torch.zeros_like(source_buffer)
-        torch.cuda.synchronize()
+        source_device_id = 0
+        target_device_id = int(memory_type == "VRAM_CROSS_DEVICE")
+        if torch.cuda.device_count() <= target_device_id:
+            pytest.skip("Cross device transfer requires two GPUs.")
+        source_buffer = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(f"cuda:{source_device_id}")
+        target_buffer = torch.zeros_like(source_buffer, device=f"cuda:{target_device_id}")
+        torch.cuda.synchronize(source_device_id)
+        torch.cuda.synchronize(target_device_id)
         source_address = source_buffer.data_ptr()
         target_address = target_buffer.data_ptr()
-        device_id = torch.cuda.current_device()
-    config = nixl_api.nixl_agent_config(
-        enable_prog_thread=True,
-        enable_listen_thread=False,
-        backends=["UCX"],
-        num_workers=num_workers,
+    source = create_nixl_agent(f"source-{uuid4().hex}", num_workers=num_workers)
+    target = create_nixl_agent(f"target-{uuid4().hex}", num_workers=num_workers)
+    for agent in (source, target):
+        parameters = agent.get_backend_params("UCX")
+        assert parameters["num_workers"] == str(num_workers), "UCX worker count differs from the requested count."
+        assert parameters["ucx_error_handling_mode"] == "none", "UCX error handling mode must be none."
+    registration_type = "DRAM" if memory_type == "DRAM" else "VRAM"
+    source_registration = source.register_memory(
+        [(source_address, len(payload), source_device_id, "")], registration_type
     )
-    source = nixl_api.nixl_agent(f"source-{uuid4().hex}", config)
-    target = nixl_api.nixl_agent(f"target-{uuid4().hex}", config)
-    source_registration = source.register_memory([(source_address, len(payload), device_id, "")], memory_type)
-    target_registration = target.register_memory([(target_address, len(payload), device_id, "")], memory_type)
+    target_registration = target.register_memory(
+        [(target_address, len(payload), target_device_id, "")], registration_type
+    )
     handle = None
     try:
         source.add_remote_agent(target.get_agent_metadata())
         target.add_remote_agent(source.get_agent_metadata())
-        local_descs = source.get_xfer_descs([(source_address, len(payload), device_id)], memory_type)
-        remote_descs = source.get_xfer_descs([(target_address, len(payload), device_id)], memory_type)
+        local_descs = source.get_xfer_descs([(source_address, len(payload), source_device_id)], registration_type)
+        remote_descs = source.get_xfer_descs([(target_address, len(payload), target_device_id)], registration_type)
         handle = source.initialize_xfer("WRITE", local_descs, remote_descs, target.name)
         state = source.transfer(handle)
         deadline = time.monotonic() + 10

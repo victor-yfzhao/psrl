@@ -458,6 +458,44 @@ def test_failed_wake_is_retried_before_gateway_eligibility_is_restored(config):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("scope", [ROLLOUT_SCOPE, ("reward", "judge-a")])
+async def test_partial_wake_requires_verified_release_even_when_engine_reports_sleeping(config, scope):
+    coordinator = await _make(config)
+    try:
+        model = coordinator.models[scope]
+        server = await _add(coordinator, scope, "partial")
+        server.is_sleeping.remote.return_value = True
+        wake = server.nixl_wake_up if model.dynamic_weights else server.wake_up
+        release = server.nixl_sleep if model.dynamic_weights else server.sleep
+        wake.remote.side_effect = RuntimeError("A rank failed after allocating GPU memory.")
+
+        with pytest.raises(RuntimeError, match="Wake failed"):
+            await coordinator.lifecycle.wake(model, [("partial", 0)])
+        assert model.replicas["partial"].status is InstanceStatus.UNKNOWN, (
+            "Failed transitions cannot prove that GPU memory was released."
+        )
+        server.is_sleeping.remote.reset_mock()
+        release.remote.side_effect = RuntimeError("GPU release was not acknowledged.")
+        with pytest.raises(RuntimeError, match="Sleep failed"):
+            await coordinator.lifecycle.sleep(model, [("partial", 0)])
+        release.remote.assert_awaited_once_with(level=2, force=True)
+        assert model.replicas["partial"].status is InstanceStatus.UNKNOWN, (
+            "A failed release must remain unavailable and require cleanup."
+        )
+        assert await coordinator.lifecycle.awake(model, [("partial", 0)]) == [], (
+            "Unverified memory transitions must not admit work."
+        )
+
+        release.remote.side_effect = None
+        await coordinator.lifecycle.sleep(model, [("partial", 0)])
+        assert release.remote.await_count == 2, "Cleanup must retry the actual release RPC."
+        assert model.replicas["partial"].status is InstanceStatus.ASLEEP, (
+            "Only a successful release acknowledgement can return the GPU pool."
+        )
+    finally:
+        await coordinator.stop_busy_loop()
+
+
 def test_initial_validation_pull_loads_version_zero_and_excludes_rewards(config):
     async def scenario():
         coordinator = await _make(config)
@@ -818,6 +856,10 @@ async def test_failed_reward_command_notifies_waiter_and_keeps_queue_alive(confi
                 with pytest.raises(RuntimeError, match="Restore failed"):
                     await _call(coordinator, scope, "exec_command", command, timeout=1)
                 assert not model.tasks["commands"].done(), "A failed command must leave its consumer running."
+                cleanup = Command(CommandType.SLEEP, instance_ids=[("worker", 0)])
+                assert await _call(coordinator, scope, "exec_command", cleanup, timeout=1) is True, (
+                    "A failed wake must release GPU memory before the command queue retries it."
+                )
             else:
                 assert await _call(coordinator, scope, "exec_command", command, timeout=1) is True, (
                     "A later command must run after an earlier failure."

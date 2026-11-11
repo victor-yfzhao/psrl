@@ -18,12 +18,16 @@ without `pytest-asyncio`.
 
 import asyncio
 from collections import Counter
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import psrl.workers.agent_loop.worker as worker_module
 import pytest
 from omegaconf import OmegaConf
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.manager import BoundedIdSet, PSRL_AgentLoopManager
+from psrl.workers.gen.utils import TokenOutput
+from verl.utils import tensordict_utils as tu
 
 pytestmark = pytest.mark.cpu_test
 
@@ -492,3 +496,42 @@ def _stub_prompt_batch():
     from tensordict import TensorDict
 
     return TensorDict({"input_ids": torch.zeros(2, 2)}, batch_size=[2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold", [1, 3])
+async def test_worker_packing_failure_reaches_manager_refill_and_pending_consumers(monkeypatch, threshold):
+    manager = FakeManager(threshold=threshold)
+    manager.running_loop = asyncio.get_running_loop()
+    manager.data_processor.sample_train_prompts.remote.return_value = _stub_prompt_batch()
+    waiter = asyncio.create_task(manager.wait_for_training_batch(buffer_id=0))
+    await asyncio.sleep(0)
+
+    cls = worker_module.PSRL_AgentLoopWorker.__ray_metadata__.modified_class
+    worker = object.__new__(cls)
+    worker.ps_manager_handle = manager.ps_manager_handle
+    worker.agent_loop_manager = SimpleNamespace(
+        notify_group_failed=SimpleNamespace(remote=AsyncMock(side_effect=manager.notify_group_failed)),
+        fail_pipeline=SimpleNamespace(remote=AsyncMock(side_effect=manager.fail_pipeline)),
+    )
+    worker._build_output_fields = MagicMock(side_effect=TypeError("Missing visual grid."))
+    monkeypatch.setattr(worker_module, "async_clear_payload", AsyncMock())
+    batch = tu.get_tensordict({"uid": [4], "parent_id": [2], "validate": [False], "version_tag": [0]})
+    output = TokenOutput(prompt_ids=[1], response_ids=[2], response_mask=[1])
+
+    try:
+        with pytest.raises(TypeError, match="Missing visual grid"):
+            await worker.postprocess_output(output, batch)
+
+        assert 2 in manager._failed_train_group_ids, "The failed group must enter the manager's terminal registry."
+        assert manager.dispatched_batches, "Packing failures must dispatch replacement work."
+        if threshold == 1:
+            with pytest.raises(RuntimeError, match="rollout_error"):
+                await asyncio.wait_for(waiter, timeout=1)
+        else:
+            assert manager._pipeline_failure is None, "An isolated packing failure must remain recoverable."
+            assert not waiter.done(), "The consumer must remain available for the replacement group."
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)

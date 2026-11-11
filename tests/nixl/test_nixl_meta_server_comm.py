@@ -1,7 +1,8 @@
 """
-Exercise native NIXL metadata exchange and CPU tensor transfers.
+Exercise native NIXL metadata exchange and CPU and GPU tensor transfers.
 """
 
+import argparse
 import os
 import pickle
 import random
@@ -28,7 +29,7 @@ def _available_port():
     raise RuntimeError("No NIXL metadata port is available outside the ephemeral port range.")
 
 
-def _run_transfer_scenario():
+def _run_transfer_scenario(use_gpu=False):
     import torch
     from nixl._api import nixl_agent, nixl_agent_config
     from omegaconf import OmegaConf
@@ -36,6 +37,12 @@ def _run_transfer_scenario():
     from psrl.utils.nixl.client import NIXLStorageClient
     from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLSharding
     from psrl.utils.nixl.server import NIXLMetaServer
+
+    device = "cuda" if use_gpu else "cpu"
+
+    def synchronize():
+        if use_gpu:
+            torch.cuda.synchronize()
 
     config = OmegaConf.create(
         {
@@ -60,13 +67,16 @@ def _run_transfer_scenario():
             client = NIXLStorageClient(
                 name,
                 server.server_name,
-                use_gpu=False,
+                use_gpu=use_gpu,
                 client_type=client_type,
                 nixl_config=config,
                 binded_agent=agent,
             )
             cleanup.callback(client.shutdown)
-            state = {"a": torch.arange(6, dtype=torch.float32), "b": torch.arange(8, dtype=torch.float32)}
+            state = {
+                "a": torch.arange(6, dtype=torch.float32, device=device),
+                "b": torch.arange(8, dtype=torch.float32, device=device),
+            }
             for tensor in state.values():
                 tensor.add_(index * 10)
             client.register_local_tensors(state, {key: NIXLSharding.default() for key in state})
@@ -82,6 +92,7 @@ def _run_transfer_scenario():
             client.wait_for_server_info(timeout=15)
 
         source, target = clients
+        synchronize()
         for key in tensors[0]:
             expected = tensors[1][key].clone()
             shards = source.client_read(target.client_name, target.client_name, key, "read")
@@ -90,6 +101,7 @@ def _run_transfer_scenario():
             torch.testing.assert_close(tensors[0][key], expected)
 
             tensors[0][key].add_(100)
+            synchronize()
             shards = source.client_write(target.client_name, target.client_name, key, "write")
             assert shards == [(0,)], "The write plan must transfer the full tensor shard."
             source.wait(key, "write", "WRITE", target_client=target.client_name, timeout=15)
@@ -105,6 +117,7 @@ def _run_transfer_scenario():
                 }
                 client.register_local_tensors(state, {key: NIXLSharding.default() for key in state})
                 tensors.append(state)
+            synchronize()
             updates = merge_client_updates(
                 (client.get_local_client_info() for client in clients),
                 (client.client_name for client in clients),
@@ -116,15 +129,24 @@ def _run_transfer_scenario():
                 source.wait(key, "wake-read", "READ", target_client=target.client_name, timeout=15)
                 torch.testing.assert_close(tensors[0][key], tensors[1][key])
                 tensors[0][key].add_(100)
+                synchronize()
                 source.client_write(target.client_name, target.client_name, key, "wake-write")
                 source.wait(key, "wake-write", "WRITE", target_client=target.client_name, timeout=15)
                 torch.testing.assert_close(tensors[1][key], tensors[0][key])
 
 
-def test_nixl_meta_comm():
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", UCX_TLS="tcp,sm,self", UCX_NET_DEVICES="all")
+@pytest.mark.parametrize(
+    "device",
+    [pytest.param("cpu", marks=pytest.mark.cpu_test), pytest.param("cuda", marks=pytest.mark.gpu)],
+)
+def test_nixl_meta_comm(device):
+    environment = dict(os.environ, UCX_NET_DEVICES="all")
+    if device == "cpu":
+        environment.update(CUDA_VISIBLE_DEVICES="", UCX_TLS="tcp,sm,self")
+    else:
+        environment["UCX_TLS"] = "tcp,sm,self,cuda_copy,cuda_ipc"
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve())],
+        [sys.executable, str(Path(__file__).resolve()), "--device", device],
         env=environment,
         capture_output=True,
         text=True,
@@ -134,4 +156,7 @@ def test_nixl_meta_comm():
 
 
 if __name__ == "__main__":
-    _run_transfer_scenario()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    arguments = parser.parse_args()
+    _run_transfer_scenario(use_gpu=arguments.device == "cuda")

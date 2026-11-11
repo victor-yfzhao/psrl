@@ -14,7 +14,11 @@ from psrl.utils.agent.thinking import (
     wants_thinking_disabled,
 )
 from psrl.utils.common.chat_template import resolve_chat_template_value
-from psrl.utils.config.deployment_mode import resolve_deployment_mode, validate_trainer_sleep_optimizer_offload
+from psrl.utils.config.deployment_mode import (
+    expand_ngpus_per_node,
+    resolve_deployment_mode,
+    validate_trainer_sleep_optimizer_offload,
+)
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
@@ -228,7 +232,9 @@ def validate_config(
     validate_reward_loops(config)
     validate_opd_config(config)
 
-    train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
+    train_n_gpus = sum(
+        expand_ngpus_per_node(config.psrl.deployment.train_ngpus_per_node, config.psrl.deployment.train_nnodes)
+    )
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:
         if config.train_actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (
@@ -464,7 +470,7 @@ def validate_config(
     validate_fine_grain_elastic(config)
     fgo = config.psrl.get("fine_grain_overlap", None)
     if fgo is not None and str(fgo.get("granularity", "none")) != "none":
-        train_n_gpus_fgo = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
+        train_n_gpus_fgo = train_n_gpus
         actor_strategy = config.train_actor_rollout_ref.actor.strategy
         dp_size_fgo = train_n_gpus_fgo  # FSDP dp_size == train_n_gpus (no model parallelism for FSDP)
         if actor_strategy == "megatron":

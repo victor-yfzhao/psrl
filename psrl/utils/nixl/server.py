@@ -5,9 +5,9 @@ import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
+from psrl.utils.nixl.agent import create_nixl_agent
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -32,14 +32,11 @@ class NIXLMetaServer:
             f"UCX_TLS={os.environ.get('UCX_TLS')!r} "
             f"UCX_NET_DEVICES={os.environ.get('UCX_NET_DEVICES')!r}."
         )
-        self.agent = nixl_agent(
+        self.agent = create_nixl_agent(
             self.server_name,
-            nixl_agent_config(
-                True,
-                True,
-                self.server_port,
-                num_workers=self.metadata_broadcast_max_workers,
-            ),
+            enable_listen_thread=True,
+            listen_port=self.server_port,
+            num_workers=self.metadata_broadcast_max_workers,
         )
         self.connected_clients: dict[
             str, list[str]

@@ -5,6 +5,7 @@ from omegaconf import DictConfig
 from transformers import AutoProcessor, AutoTokenizer
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
+from psrl.utils.concurrency import SlotManager
 from psrl.workers.reward.client import RewardSubmissionClient
 
 
@@ -21,4 +22,5 @@ class AgentLoopContext:
     processor: AutoProcessor | None
     dataset_cls: type[RLHFDataset]
     data_config: DictConfig
+    run_slots: SlotManager
     inference_orchestrator: ray.actor.ActorHandle | None = None

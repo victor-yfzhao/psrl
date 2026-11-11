@@ -17,9 +17,6 @@ name: vllm
 # Async mode in PSRL
 mode: psrl_async
 
-# logprobs mode for rollout logprobs
-logprobs_mode: raw_logprobs
-
 # Select the rollout weight loader. Large safetensors models should set `use_shm=True`.
 load_format: dummy
 

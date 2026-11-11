@@ -152,7 +152,7 @@ psrl/
 │   │   ├── prometheus_utils.py   # Monitoring metrics
 │   │   ├── agent_data/           # Data structures for agent interactions
 │   │   │   ├── base.py, conversation_agent_data.py, tool_agent_data.py
-│   │   │   └── mini_swe_agent_data.py  # MiniSWEAgentData (patch + grading state)
+│   │   │   └── mini_swe_agent_data.py  # MiniSWEAgentData (patch + grading inputs)
 │   │   └── loops/                # Agent loop implementations
 │   │       ├── base_agent_loop.py, generate_agent_loop.py, batch_generate_agent_loop.py
 │   │       ├── multi_turn_agent_loop.py, multi_turn_completion_agent_loop.py
@@ -376,7 +376,7 @@ Templates: `ppo_trainer.yaml`. `model_engine` (default `dp`) selects the actor/r
 | Class | File | Role |
 |-------|------|------|
 | `MiniSWEAgentLoopV1` | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` | CURRENT active SWE-bench agent loop: Docker env + async PSRL rollout bridge |
-| `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading state |
+| `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading inputs |
 | `ConversationAgentData` | `workers/agent_loop/agent_data/conversation_agent_data.py` | Chat-template base (OpenAI format, token counting) |
 | `MiniSWEEnvironment` | `environments/mini_swe_env.py` | SWE task parsing, per-problem config override merging |
 
@@ -481,11 +481,11 @@ utils/tito/training_data.py converts them to prompt/response/mask/logprob arrays
 MiniSWEAgentLoopV1.run(request)
   → MiniSWEEnvironment.reset(task): parse extra_info, apply_data_overrides → runtime_config
   → worker thread: DefaultAgent.run(task) in DockerEnvironment
-      (observe → _PSRLModel.query() → parse action → exec in Docker;
-       _PSRLModel bridges sync calls to async PSRL rollout via queues)
-  → async _generation_loop: poll req_q → rollout → res_q; token/timeout/turn guards
-  → post-rollout grading (smith: checkout+patch+revert-tests+harness / gym: eval_script)
-  → finalize: compute_score(data_source) → DataProto with reward
+      (observe → session API → model response → parse action → exec in Docker)
+  → collect TITO training data → cleanup environment and session → release rollout slot
+  → finalize: submit patch and resolved grading inputs to RewardLoopManager
+  → RewardLoopWorker → MiniSWERewardLoop → fresh Docker grading → reward + DAPO penalty
+  → publish reward fields through TransferQueue before training consumes the trajectory
 ```
 
 ---
@@ -496,6 +496,7 @@ MiniSWEAgentLoopV1.run(request)
 |------|------|-----------|
 | `NaiveRewardLoop` | `reward_loop/naive.py` | Standard single reward per response |
 | `DAPORewardLoop` | `reward_loop/dapo.py` | DAPO dynamic reward |
+| `MiniSWERewardLoop` | `examples/mini_swe/reward.py` | Imported recipe loop with Docker grading, container lifecycle, and DAPO reward |
 | `PRIMERewardLoop` | `reward_loop/prime.py` | PRIME process reward model |
 | `GDPORewardLoop` | `reward_loop/gdpo.py` | GDPO variant |
 | `GenRewardLoop` | `reward_loop/gen.py` | Generative/pooling RM via SMG reward gateway |
@@ -559,6 +560,7 @@ tests/
 ├── nixl/             → comm planner, sharding, send/recv, e2e (+ config/nixl_e2e.yaml, scripts/)
 ├── parameter_server/ → PSManager, request status tracker
 ├── staleness/        → staleness controller
+├── workers/agent_loop/ → agent loop registry, manager, lifecycle, and output handling
 ├── workers/reward/   → RM manager / gateway / gen reward manager
 ├── workers/train/    → EngineTrainWorker init, load-weight flag
 ├── gen_dplb/         → SMG adapter cache-aware routing, stats recorder
@@ -567,6 +569,8 @@ tests/
 ├── ray_utils/        → lazy primitives, lock context, GPU sharing, version waiter, ...
 ├── fsdp/, megatron/, torch_dist/, checkpoint/  → GPU/dist smoke tests (mostly .sh-driven)
 ├── dataset/, environments/, tools/, unit/      → DataProcessor, env registry, LMCache snapshot
+├── environments/mini_swe/ → Mini-SWE setup, grading, rewards, data preparation, and fixtures
+├── utils/            → shared utilities, tracking, and TransferQueue payload handling
 └── test_thunder_agent_scheduler.py             → session hang/continue scheduler
 ```
 

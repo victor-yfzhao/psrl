@@ -75,7 +75,7 @@ class DataProcessor:
         self._validate_data_config()
         self._val_dataloader_idx = 0  # Index for round-robin selection of validation dataloaders
 
-        self.global_steps = 0
+        self.generation_batches = 0
         self._train_sample_idx = 0
         self._val_sample_idx = 0
 
@@ -283,10 +283,25 @@ class DataProcessor:
         self.build_train_dataloader()
         self.build_val_dataloader()
 
-        total_training_steps = min(self.train_dataloader_sizes) * self.config.trainer.total_epochs
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = min(total_training_steps, self.config.trainer.total_training_steps)
+        generation_batch_size = sum(dataloader.batch_size for dataloader in self.train_dataloaders)
+        redundant = self.config.psrl.rollout_coordination.redundant_rollout
+        prompts_per_step = (
+            redundant.redundant_global_batch_size if redundant.enable else self.config.psrl.staleness_buffer_entries
+        )
+        total_training_steps = self.config.trainer.total_training_steps
+        if total_training_steps is None:
+            total_prompts = min(self.train_dataloader_sizes) * generation_batch_size * self.config.trainer.total_epochs
+            total_training_steps = total_prompts // prompts_per_step
+        if total_training_steps <= 0:
+            raise ValueError("Training budget must contain at least one complete training buffer.")
         self.total_training_steps = total_training_steps
+        self.total_generation_batches = (
+            total_training_steps * prompts_per_step + generation_batch_size - 1
+        ) // generation_batch_size
+        psrl_logger.info(
+            f"Training budget: trainer_steps={self.total_training_steps}, prompts_per_step={prompts_per_step}, "
+            f"generation_batch_size={generation_batch_size}, generation_batches={self.total_generation_batches}."
+        )
 
     def get_val_data_size(self):
         """Get the size of the validation dataset."""
@@ -344,10 +359,12 @@ class DataProcessor:
         # AGENT(VERL): this logic is mapped to `_load_checkpoint(...)` in `verl/trainer/ppo/ray_trainer.py`
         # you can find it by searching for `# load dataloader` in that file
         steps_per_epoch = min(self.train_dataloader_sizes)
-        at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+        at_epoch_boundary = (
+            self.generation_batches > 0 and steps_per_epoch > 0 and self.generation_batches % steps_per_epoch == 0
+        )
         if at_epoch_boundary:
             psrl_logger.info(
-                f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                f"Skipping dataloader state restore: generation_batches={self.generation_batches} "
                 f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
                 f"The saved state marks the dataloader as exhausted. "
                 f"Next epoch will iterate from scratch."
@@ -598,7 +615,7 @@ class DataProcessor:
         tu.assign_non_tensor_stack(
             batch,
             "global_steps",
-            [self.global_steps] * batch_size,
+            [self.generation_batches] * batch_size,
         )
         tu.assign_non_tensor_stack(
             batch,
@@ -696,7 +713,7 @@ class DataProcessor:
         sample_ids = self.get_train_sample_ids(actual_n_prompts)
 
         batch = self._get_tensordict(batch_dict)
-        tu.assign_non_tensor_stack(batch, "global_steps", [self.global_steps] * actual_n_prompts)
+        tu.assign_non_tensor_stack(batch, "global_steps", [self.generation_batches] * actual_n_prompts)
         tu.assign_non_tensor_stack(batch, "validate", [False] * actual_n_prompts)
         tu.assign_non_tensor_stack(
             batch,
@@ -855,31 +872,20 @@ class DataProcessor:
 
     def _process_data(self):
         """
-        Process the training data in a busy loop.
+        Produce enough generation batches to fill the configured training buffers.
 
-        This method continuously fetches batches from the training dataloader,
-        processes them, and puts them into the data queue for further processing.
-
-        The method will run until all epochs are processed or a StopIteration is raised.
-        After processing, it signals the end of data processing by putting None into the data queue.
-
-        Note: This method is designed to run in a separate thread and is intended to be called
-        after initializing the DataProcessor and its dataloaders.
-
-        The data queue will hold the processed batches, which can be consumed by the rollout server.
+        Epoch boundaries restart the source iterator. The generation budget already
+        accounts for epochs when no explicit trainer step limit is configured.
         """
         assert self.reward_manager_handle is not None, (
             "Reward manager handle is not set. Call `reward_manager_handle()` first."
         )
-        # self.train_dataloader_iter = iter(self.train_dataloader)
         self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
-
-        total_epochs = self.config.trainer.total_epochs
-
-        # loop until all epochs are processed
+        restarting_epoch = False
         while not self.stop_data_process:
             try:
                 batch_meta: dict = self.get_single_controller_batch(DatasetType.train, return_meta=False)
+                restarting_epoch = False
                 batch = batch_meta
                 batch_size = len(batch) // self.rollout_n
 
@@ -892,25 +898,30 @@ class DataProcessor:
                 ray.get(self.ps_manager_handle.add_request.remote(all_request_ids))
                 ray.get(self.agent_loop_manager_handle.put_data.remote(batch))
 
-                self.global_steps += 1
-                if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
+                self.generation_batches += 1
+                if self.generation_batches >= self.total_generation_batches:
                     self.stop_data_process = True
 
             except StopIteration:
-                curr_epoch = self.global_steps // min(self.train_dataloader_sizes)
-                psrl_logger.debug(f"StopIteration encountered, current epoch: {curr_epoch}/{total_epochs}")
-                if curr_epoch >= total_epochs:
-                    psrl_logger.info("All training epochs completed, stopping data processing.")
+                if restarting_epoch:
+                    diagnosis = "Training dataloaders yielded no data after restarting an epoch."
+                    psrl_logger.error(diagnosis)
+                    self.agent_loop_manager_handle.fail_pipeline.remote(diagnosis)
                     self.stop_data_process = True
                 else:
-                    psrl_logger.debug("Reinitializing train_dataloader_iters for next epoch")
-                    self.train_dataloader_iters = [iter(dl) for dl in self.train_dataloaders]
+                    # `_get_train_next` resets the iterators before raising at an epoch boundary.
+                    restarting_epoch = True
             except Exception as e:
-                psrl_logger.error(
-                    f"Fatal exception in data processing thread. Stopping data processing: {e}",
-                    exc_info=True,
+                diagnosis = (
+                    f"Data processing failed after {self.generation_batches} generation batches "
+                    f"of {self.total_generation_batches}: {e!r}."
                 )
+                psrl_logger.error(diagnosis, exc_info=True)
+                self.agent_loop_manager_handle.fail_pipeline.remote(diagnosis)
                 self.stop_data_process = True
 
-        psrl_logger.info("Data processing stopped, sending shutdown signal.")
+        psrl_logger.info(
+            f"Data processing stopped: generation_batches={self.generation_batches}, "
+            f"planned_generation_batches={self.total_generation_batches}. Sending shutdown signal."
+        )
         self.agent_loop_manager_handle.put_data.remote(None)

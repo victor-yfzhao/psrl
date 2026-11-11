@@ -283,6 +283,7 @@ outputs
 
 /models/
 /data/
+/docker_images/
 
 vllm_bench_results/
 
@@ -297,5 +298,3 @@ examples/bench/rollout/exp/
 analysis/
 
 *.tar
-
-docker_images/

@@ -5,7 +5,7 @@ Each core dependency has one complete patch for the upstream baseline below.
 | Dependency | Upstream baseline | Patch |
 |---|---|---|
 | UCX | v1.20.0 (`4b7a6ca8410f`) | `ucx/v1.20.0.patch` |
-| NIXL | 0.10.1 (`d5c127e558fd`) | `nixl/0.10.1.patch` |
+| NIXL | v1.2.0 (`5c801155f7b1`) | `nixl/1.2.0.patch` |
 | veRL | `e5ca4acb1534` | `verl/e5ca4acb.patch` |
 | vLLM | v0.22.0 (`0b3ba88f1659`) | `vllm/v0.22.0.patch` |
 
@@ -35,6 +35,11 @@ and the explicit `--run-gpu` option.
 The installer pins NCCL 2.29.7 for communicator suspend and resume.
 `check_environment.py` accepts only its known PyTorch wheel metadata mismatch,
 checks both native symbols, and rejects all other dependency conflicts.
+
+NIXL uses the upstream Python bindings and backend configuration API.
+Its patch sets the metadata listener backlog to 4096 and the default UCX error
+handling mode to `none`. Set `NIXL_INSTALL_PYTHON=false` to build the native prefix
+and wheels without replacing packages in the active Python environment.
 
 ## Apply a patch
 

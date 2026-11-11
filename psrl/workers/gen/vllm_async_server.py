@@ -64,6 +64,7 @@ from psrl.utils.logger import (
     log_end_event,
     log_single_event,
 )
+from psrl.utils.nixl import resolve_weight_fingerprint_options, weight_fingerprint_flow_enabled
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
@@ -410,6 +411,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        hf_overrides = {
+            **self.model_config.hf_config.to_dict(),
+            **hf_overrides,
+            **engine_kwargs.pop("hf_overrides", {}),
+        }
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -1583,13 +1589,29 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
             )
         if not self.psrl_config.profile.fix_weight:
-            await self.engine.collective_rpc(
-                "nixl_pull_model_core",
-                args=(
-                    self._cached_ps_nixl_agent_names,
-                    self._cached_ps_nixl_gen_storage_client_names,
-                ),
+            pull_args = (
+                self._cached_ps_nixl_agent_names,
+                self._cached_ps_nixl_gen_storage_client_names,
             )
+            fingerprint_options = None
+            if weight_fingerprint_flow_enabled(self.psrl_config, flow="transfer_chain"):
+                # The caller's shared pull lock keeps this version stable through the transfer.
+                model_version = int(
+                    await ps_manager_handle.get_ps_model_version.remote(debug_info="rollout_weight_fingerprint")
+                )
+                fingerprint_options = resolve_weight_fingerprint_options(
+                    self.psrl_config,
+                    flow="transfer_chain",
+                    model_version=model_version,
+                )
+                pull_args += (model_version, fingerprint_options)
+            results = await self.engine.collective_rpc("nixl_pull_model_core", args=pull_args)
+            if fingerprint_options is not None:
+                for result in results:
+                    for key in ("raw_fingerprint", "final_fingerprint"):
+                        record = result[key]
+                        if record is not None:
+                            psrl_logger.warning(f"[WEIGHT_FINGERPRINT] {json.dumps(record, sort_keys=True)}")
         psrl_logger.info("NIXL pull model done.")
 
     async def ray_pull_model(self) -> None:

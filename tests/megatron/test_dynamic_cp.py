@@ -139,7 +139,8 @@ def test_result_collection_preserves_rows_and_metric_participants(monkeypatch, d
 
 @pytest.mark.parametrize("dynamic_cp", [False, True])
 @pytest.mark.parametrize("global_rank", [0, 1])
-def test_engine_selects_one_microbatch_organizer(monkeypatch, caplog, dynamic_cp, global_rank):
+@pytest.mark.parametrize("per_token_loss", [False, True])
+def test_engine_selects_one_microbatch_organizer(monkeypatch, caplog, dynamic_cp, global_rank, per_token_loss):
     from verl.workers.engine.megatron import transformer_impl as impl
     from verl.workers.engine.megatron.dynamic_cp import DynamicCPPlan
 
@@ -147,7 +148,7 @@ def test_engine_selects_one_microbatch_organizer(monkeypatch, caplog, dynamic_cp
     engine.engine_config = SimpleNamespace(
         dynamic_context_parallel=dynamic_cp, context_parallel_size=1, max_seqlen_per_dp_cp_rank=32
     )
-    engine.tf_config = SimpleNamespace(fp8=None)
+    engine.tf_config = SimpleNamespace(fp8=None, calculate_per_token_loss=per_token_loss)
     engine.model_config = SimpleNamespace(mtp=SimpleNamespace(enable=False))
     engine.module = [object()]
     data = make_batch([17, 33])
@@ -184,10 +185,14 @@ def test_engine_selects_one_microbatch_organizer(monkeypatch, caplog, dynamic_cp
     monkeypatch.setattr(impl, "get_forward_backward_func", lambda: lambda **kwargs: [])
     monkeypatch.setattr(impl, "collect_dynamic_cp_results", lambda *args: {"native": True})
     monkeypatch.setattr(impl, "postprocess_batch_func", lambda **kwargs: {"verl": True})
-    result = engine.forward_backward_batch(data, None, forward_only=True)
-    assert calls == (["native"] if dynamic_cp else ["normalizer", "verl"]), (
+    loss_function = (lambda **kwargs: None) if per_token_loss else None
+    result = engine.forward_backward_batch(data, loss_function, forward_only=True)
+    expected_calls = ["native"] if dynamic_cp else ["normalizer"] * (2 if per_token_loss else 1) + ["verl"]
+    assert calls == expected_calls, (
         "Only the selected organizer may run, and replicated normalizers must not be reduced."
     )
+    if per_token_loss:
+        assert data["routed_num_tokens"] == 50, "The full input count must reach every microbatch."
     assert result == {"native" if dynamic_cp else "verl": True}, "The matching output collector must run."
     if dynamic_cp and global_rank == 0:
         packing_events = [

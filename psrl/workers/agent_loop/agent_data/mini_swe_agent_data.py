@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import asdict
 
 from omegaconf import DictConfig
 
@@ -21,7 +22,9 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @AgentData.register("mini_swe_agent_data")
 class MiniSWEAgentData(ConversationAgentData):
-    """Attach SWE patch and grader metadata to a conversation trajectory."""
+    """
+    Attach SWE patch and grading inputs to a conversation trajectory.
+    """
 
     def __init__(
         self,
@@ -33,7 +36,7 @@ class MiniSWEAgentData(ConversationAgentData):
         super().__init__(config, reward_manager, env, **kwargs)
         self.patch: str | None = None
         self.problem_statement = ""
-        self.grader_result: dict = {}
+        self.grading_context: dict = {}
         self.timing: dict = {}
 
     def reset(self) -> None:
@@ -41,7 +44,7 @@ class MiniSWEAgentData(ConversationAgentData):
         super().reset()
         self.patch = None
         self.problem_statement = ""
-        self.grader_result = {}
+        self.grading_context = {}
         self.timing = {}
 
     def init_trajectory(self, request: dict) -> None:
@@ -53,9 +56,31 @@ class MiniSWEAgentData(ConversationAgentData):
         """Store the patch submitted by mini-SWE-agent."""
         self.patch = patch
 
-    def set_grader_result(self, result: dict) -> None:
-        """Store the optional post-rollout grading result."""
-        self.grader_result = result
+    def set_grading_context(
+        self,
+        observation: dict,
+    ) -> None:
+        """
+        Capture resolved task inputs and resource limits for the reward service.
+        """
+        if observation.get("swe_grader") != "swebench_fresh_container":
+            return
+        self.grading_context = {
+            key: observation[key] for key in ("swe_problem", "swe_problem_image", "swe_grader_kind", "swe_task_id")
+        }
+        environment = asdict(observation["runtime_config"].sandbox_config.environment)
+        self.grading_context["environment"] = {
+            key: environment[key]
+            for key in (
+                "grader_timeout",
+                "grader_command_timeout",
+                "grader_max_attempts",
+                "grader_memory",
+                "grader_shm_size",
+                "run_args",
+                "env",
+            )
+        }
 
     def set_timing(self, timing: dict) -> None:
         """Store per-trajectory wall-clock timing reported by the runner."""
@@ -83,9 +108,11 @@ class MiniSWEAgentData(ConversationAgentData):
                 "actual_num_turns": num_turns,
                 "alignment_failed": False,
                 "alignment_failure_reason": "",
-                "grader_result": self.grader_result,
-                "acc": float(bool(self.grader_result.get("resolved", False))),
-                "timing": self.timing,
+                "swe_grading": self.grading_context,
             }
         )
-        return await super().finalize_output()
+        output = await super().finalize_output()
+        if output is not None:
+            for item in output if isinstance(output, list) else [output]:
+                item.extra_fields["loop_timing"] = self.timing
+        return output

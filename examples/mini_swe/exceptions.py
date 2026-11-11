@@ -14,10 +14,14 @@ from psrl.workers.agent_loop.loops.utils import TerminateReason
 
 # `exit_status` values produced by `examples/mini_swe/runner.py`.
 _EXIT_STATUS_TO_REASON: dict[str, TerminateReason] = {
-    # The runner returned normally. Turn/length caps are applied by the loop.
     "": TerminateReason.FINISHED,
+    "submitted": TerminateReason.FINISHED,
+    "repeatedformaterror": TerminateReason.FORMAT_ERROR,
+    "limitsexceeded": TerminateReason.MAX_TURNS_EXCEEDED,
+    "timeexceeded": TerminateReason.AGENT_TIMEOUT,
     # `PromptOverflowError` was caught. The turns before the overflow are valid.
     "context_exceeded": TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+    "aborted": TerminateReason.ABORTED,
     # Any other exception. The worker retries, then the group is refilled.
     "error": TerminateReason.ROLLOUT_ERROR,
 }
@@ -41,7 +45,7 @@ class MiniSweExceptionClassifier(AgentExceptionClassifier):
         """
         if exit_status is None:
             return None
-        return _EXIT_STATUS_TO_REASON.get(exit_status)
+        return _EXIT_STATUS_TO_REASON.get(exit_status.lower())
 
 
 __all__ = ["MiniSweExceptionClassifier"]

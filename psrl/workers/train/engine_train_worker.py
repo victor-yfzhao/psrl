@@ -80,6 +80,17 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+def _canonical_rotary_buffer_name(name: str) -> str:
+    """
+    Match HF and Megatron rotary buffer owners without merging vision and language modules.
+    """
+    parts = name.split(".")
+    while parts and parts[0] in {"module", "model", "language_model"}:
+        parts.pop(0)
+    aliases = {"vision_model": "visual", "rotary_pos_emb": "rotary_emb"}
+    return ".".join(aliases.get(part, part) for part in parts)
+
+
 def clear_megatron_memory_caches(models) -> None:
     """
     Drop cached tensors that are absent from the synchronized model state.
@@ -90,10 +101,19 @@ def clear_megatron_memory_caches(models) -> None:
 
     for model in models:
         for module in model.modules():
+            cache = getattr(module, "rotary_pos_emb_cache", None)
+            if cache is not None:
+                cache.clear()
             for name in ("forward", "get_cos_sin", "get_freqs_non_repeated"):
                 method = getattr(module, name, None)
                 if method is not None and hasattr(method, "cache_clear"):
                     method.cache_clear()
+            if isinstance(getattr(module, "inv_freq", None), torch.Tensor):
+                for name in ("cos_cached", "sin_cached"):
+                    if name in module._buffers:
+                        module._buffers[name] = None
+                if hasattr(module, "max_seq_len_cached"):
+                    del module.max_seq_len_cached
     get_cublas_workspace.cache_clear()
     base._dummy_wgrads.clear()
     parallel_state.get_global_memory_buffer().buffer.clear()
@@ -446,20 +466,43 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 psrl_logger.warning("[_restore_non_persistent_buffers_from_ps] No inv_freq found in PS buffers.")
                 return
 
-            # Standard RoPE layers share one `inv_freq` value.
-            reference_inv_freq = next(iter(inv_freq_tensors.values()))
+            frequencies_by_name = {}
+            for name, tensor in inv_freq_tensors.items():
+                key = _canonical_rotary_buffer_name(name)
+                if key in frequencies_by_name:
+                    other_name, other_tensor = frequencies_by_name[key]
+                    if not torch.equal(tensor, other_tensor):
+                        raise RuntimeError(
+                            "Conflicting parameter server rotary buffers for the same module: "
+                            f"{other_name!r} and {name!r}."
+                        )
+                frequencies_by_name[key] = (name, tensor)
+
             device = torch.cuda.current_device()
             restored = 0
             for model_chunk in self.actor.engine.module:
-                for module in model_chunk.modules():
-                    if isinstance(getattr(module, "inv_freq", None), torch.Tensor):
-                        if module.inv_freq.shape != reference_inv_freq.shape:
-                            raise RuntimeError("Rotary frequency shape does not match the parameter server buffer.")
-                        # Cached trigonometric tensors reference released GPU memory.
-                        if hasattr(module.forward, "cache_clear"):
-                            module.forward.cache_clear()
-                        module.inv_freq = reference_inv_freq.to(device=device, dtype=module.inv_freq.dtype)
-                        restored += 1
+                for name, module in unwrap_model(model_chunk).named_modules():
+                    if not isinstance(getattr(module, "inv_freq", None), torch.Tensor):
+                        continue
+                    buffer_name = f"{name}.inv_freq" if name else "inv_freq"
+                    key = _canonical_rotary_buffer_name(buffer_name)
+                    if key not in frequencies_by_name:
+                        raise RuntimeError(
+                            f"No parameter server rotary buffer matches Megatron buffer {buffer_name!r}. "
+                            f"Available buffers: {list(inv_freq_tensors)!r}."
+                        )
+                    source_name, reference_inv_freq = frequencies_by_name[key]
+                    if module.inv_freq.shape != reference_inv_freq.shape:
+                        raise RuntimeError(
+                            "Rotary frequency shape does not match the parameter server buffer: "
+                            f"{buffer_name!r}={tuple(module.inv_freq.shape)}, "
+                            f"{source_name!r}={tuple(reference_inv_freq.shape)}."
+                        )
+                    # Cached trigonometric tensors reference released GPU memory.
+                    if hasattr(module.forward, "cache_clear"):
+                        module.forward.cache_clear()
+                    module.inv_freq = reference_inv_freq.to(device=device, dtype=module.inv_freq.dtype)
+                    restored += 1
             psrl_logger.info(
                 "[_restore_non_persistent_buffers_from_ps] Restored inv_freq and cleared lru_cache. "
                 f"Modules={restored}."

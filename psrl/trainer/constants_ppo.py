@@ -1,6 +1,7 @@
 import json
 import os
 
+from omegaconf import OmegaConf
 from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
 PPO_RAY_RUNTIME_ENV = {
@@ -22,6 +23,10 @@ _RAY_ENVIRONMENT_KEYS = (
     "PYTHONPYCACHEPREFIX",
     "LD_LIBRARY_PATH",
     "NIXL_PLUGIN_DIR",
+    "WANDB_MODE",
+    "WANDB_RUN_ID",
+    "WANDB_RESUME",
+    "WANDB_ENTITY",
 )
 
 
@@ -43,3 +48,15 @@ def get_ppo_ray_runtime_env():
             runtime_env["env_vars"][key] = val
 
     return runtime_env
+
+
+def get_ppo_ray_init_kwargs(ray_init_config, *, transfer_queue_enabled: bool) -> dict:
+    """Build Ray initialization options without modifying the Hydra configuration."""
+    if not OmegaConf.is_config(ray_init_config):
+        ray_init_config = OmegaConf.create(ray_init_config)
+    ray_init_kwargs = OmegaConf.to_container(ray_init_config, resolve=True)
+    runtime_env = OmegaConf.merge(get_ppo_ray_runtime_env(), ray_init_kwargs.get("runtime_env", {}))
+    if transfer_queue_enabled:
+        runtime_env = OmegaConf.merge(runtime_env, {"env_vars": {"TRANSFER_QUEUE_ENABLE": "1"}})
+    ray_init_kwargs["runtime_env"] = OmegaConf.to_container(runtime_env, resolve=True)
+    return ray_init_kwargs

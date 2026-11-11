@@ -10,12 +10,13 @@ import nixl._bindings as nixlBind
 import numpy as np
 import ray
 import torch
-from nixl._api import nixl_agent, nixl_agent_config
+from nixl._api import nixl_agent
 from omegaconf import DictConfig
 
 from psrl.utils.common.nixl_metadata import ClientInfoUpdates
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_tensor
+from psrl.utils.nixl.agent import create_nixl_agent
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.fingerprint import fingerprint_tensor_mapping, tensor_mapping_signature
 from psrl.utils.nixl.meta_buffer import MetaBuffer
@@ -109,7 +110,12 @@ class NIXLStorageClient:
             worker_ip = get_worker_info()[0]
             port_scanner = get_port_scanner(worker_ip)
             self.client_port = ray.get(port_scanner.find_free_port.remote())
-            self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
+            self.agent = create_nixl_agent(
+                self.client_name,
+                enable_prog_thread=enable_prog_thread,
+                enable_listen_thread=True,
+                listen_port=self.client_port,
+            )
         else:
             self.agent = binded_agent
 
@@ -1845,7 +1851,11 @@ class NIXLMultiStorageClients:
         worker_ip = get_worker_info()[0]
         port_scanner = get_port_scanner(worker_ip)
         self.client_port = ray.get(port_scanner.find_free_port.remote())
-        self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
+        self.agent = create_nixl_agent(
+            self.agent_name,
+            enable_listen_thread=True,
+            listen_port=self.client_port,
+        )
 
         # Initialize multi clients
         self.multi_clients: list[NIXLStorageClient] = []

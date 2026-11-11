@@ -1,0 +1,39 @@
+diff --git a/src/plugins/ucx/ucx_backend.cpp b/src/plugins/ucx/ucx_backend.cpp
+index e858527d19e4355f2ad864cfccdc6678a5558379..ead6743303bb22aea83c0632c4a0fcacc3d22433 100644
+--- a/src/plugins/ucx/ucx_backend.cpp
++++ b/src/plugins/ucx/ucx_backend.cpp
+@@ -815,7 +815,7 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
+     const auto err_handling_mode_it =
+         custom_params->find(std::string(nixl_ucx_err_handling_param_name));
+     if (err_handling_mode_it == custom_params->end()) {
+-        err_handling_mode = UCP_ERR_HANDLING_MODE_PEER;
++        err_handling_mode = UCP_ERR_HANDLING_MODE_NONE;
+     } else {
+         err_handling_mode = ucx_err_mode_from_string(err_handling_mode_it->second);
+     }
+diff --git a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+index 6d1f1683c0e08546c4022ede3dc520200a7ab22f..5d5bf2aff79ee7cf1a5904346a07171d48e7c824 100644
+--- a/src/plugins/ucx/ucx_utils.cpp
++++ b/src/plugins/ucx/ucx_utils.cpp
+@@ -36,7 +36,7 @@ get_ucx_backend_common_options() {
+     nixl_b_params_t params = {{"ucx_devices", ""}, {"num_workers", "1"}};
+ 
+     params.emplace(nixl_ucx_err_handling_param_name,
+-                   ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_PEER));
++                   ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_NONE));
+     return params;
+ }
+ 
+diff --git a/src/utils/stream/metadata_stream.cpp b/src/utils/stream/metadata_stream.cpp
+index da33f637edbd31f72b0a890884ddbbe8eb8b41aa..25f41760b5e57c468b322bbf80d03ace241b7811 100644
+--- a/src/utils/stream/metadata_stream.cpp
++++ b/src/utils/stream/metadata_stream.cpp
+@@ -97,7 +97,7 @@ void nixlMDStreamListener::setupListener() {
+             strerror(errno));
+     }
+ 
+-    if (listen(socketFd, 128) < 0) {
++    if (listen(socketFd, 4096) < 0) {
+         NIXL_PERROR << "Listening failed for stream Socket: "
+                     << socketFd;
+         closeStream();

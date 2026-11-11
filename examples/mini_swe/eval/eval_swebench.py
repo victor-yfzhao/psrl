@@ -17,6 +17,8 @@ from typing import Any
 
 import pandas as pd
 
+from examples.mini_swe.config import MiniEnvironmentConfig, MiniModelConfig
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 if not psrl_logger.handlers:
@@ -37,7 +39,7 @@ def _run_agent_on_swe_problem(
     config_path: str,
     max_turns: int,
     temperature: float,
-    model_class: str = "litellm_textbased",
+    model_class: str = MiniModelConfig.model_class,
 ) -> dict[str, Any]:
     """
     Run mini-SWE-agent on a single SWE problem using a locally-served vLLM model.
@@ -51,12 +53,8 @@ def _run_agent_on_swe_problem(
         config_path (str): Path to the agent config YAML.
         max_turns (int): Maximum agent turns per episode.
         temperature (float): Sampling temperature.
-        model_class (str): mini-swe-agent model class. ``'litellm_textbased'``
-            (default) matches the ``mswea_bash_command`` format used during
-            PSRL training and requires a plain text-completion endpoint
-            (no ``--tool-call-parser`` on vLLM). Use ``'litellm'`` only for
-            external models (GPT-4, Claude, etc.) that natively support
-            OpenAI tool-calling.
+        model_class (str): Model client class. The default preserves failed
+            assistant turns. Use ``'litellm'`` for native OpenAI tool calling.
 
     Returns:
         dict[str, Any]: Result containing ``patch``, ``messages``, ``n_turns``,
@@ -131,6 +129,10 @@ def _run_agent_on_swe_problem(
     agent = DefaultAgent(model, env, **cfg.get("agent", {}))
 
     try:
+        if "swesmith" in image_name.lower():
+            from examples.mini_swe.task_setup import initialize_smith_task
+
+            initialize_smith_task(env, swe_problem)
         info = agent.run(problem)
         return {
             "patch": info.get("submission", ""),
@@ -175,7 +177,7 @@ def _evaluate_swe_problem(
     temperature: float,
     gold_patches: bool,
     grader_timeout: int,
-    model_class: str = "litellm_textbased",
+    model_class: str = MiniModelConfig.model_class,
     grader_memory: str = "",
 ) -> dict[str, Any]:
     """
@@ -418,7 +420,7 @@ def run_eval(
     temperature: float,
     gold_patches: bool,
     grader_timeout: int,
-    model_class: str = "litellm_textbased",
+    model_class: str = MiniModelConfig.model_class,
     grader_memory: str = "",
 ) -> None:
     """
@@ -439,10 +441,8 @@ def run_eval(
         temperature (float): Sampling temperature.
         gold_patches (bool): Use gold patches instead of running the agent.
         grader_timeout (int): Grading eval script timeout in seconds.
-        model_class (str): mini-swe-agent model class. ``'litellm_textbased'``
-            (default) matches the ``mswea_bash_command`` format used during
-            PSRL training. Use ``'litellm'`` for external models that
-            natively support OpenAI tool-calling.
+        model_class (str): Model client class. The default preserves failed
+            assistant turns. Use ``'litellm'`` for native OpenAI tool calling.
     """
     from examples.mini_swe.prepare.swebench_subsets import filter_by_spec
 
@@ -604,23 +604,15 @@ def main() -> None:
     parser.add_argument(
         "--grader-timeout",
         type=int,
-        default=1800,
-        help=(
-            "Per-problem grading eval script timeout in seconds.  Heavy repos "
-            "(scikit-learn, requests) need more than the old 900s default "
-            "because `pip install -e .` + full P2P suite exceeds 15min."
-        ),
+        default=MiniEnvironmentConfig.grader_timeout,
+        help="Per-problem grading eval script timeout in seconds.",
     )
     parser.add_argument(
         "--model-class",
-        default="litellm_textbased",
+        default=MiniModelConfig.model_class,
         help=(
-            "mini-swe-agent model class used for the rollout.  "
-            "'litellm_textbased' (default) matches the mswea_bash_command "
-            "code-block format used during PSRL training and requires a plain "
-            "text-completion endpoint (no --tool-call-parser on vLLM).  "
-            "Use 'litellm' only for external models (GPT-4, Claude, etc.) "
-            "that natively support OpenAI tool-calling."
+            "Model client class. The default preserves failed assistant turns. "
+            "Use 'litellm' for native OpenAI tool calling."
         ),
     )
     parser.add_argument(

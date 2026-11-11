@@ -6,10 +6,11 @@ import re
 from dataclasses import asdict
 
 from examples.mini_swe.config import MiniSWEAgentRuntimeConfig, build_runtime_config
+from examples.mini_swe.exceptions import MiniSweExceptionClassifier
 from examples.mini_swe.runner import run_agent
+from omegaconf import OmegaConf
 
 from psrl.environments import Environment
-from psrl.utils.concurrency import SlotManager
 from psrl.workers.agent_loop.agent_data import AgentData, MiniSWEAgentData
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
@@ -43,6 +44,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
         **kwargs,
     ):
         super().__init__(context=context)
+        self.run_slots = context.run_slots
         runtime_kwargs = {key: kwargs[key] for key in ("sandbox_config", "agent", "model") if key in kwargs}
         self.runtime_config: MiniSWEAgentRuntimeConfig = build_runtime_config(runtime_kwargs)
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
@@ -59,10 +61,14 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
         session_id: str,
     ) -> dict:
         runner_observation = {key: value for key, value in observation.items() if key != "runtime_config"}
+        template_kwargs = self.apply_chat_template_kwargs
+        if OmegaConf.is_config(template_kwargs):
+            template_kwargs = OmegaConf.to_container(template_kwargs, resolve=True)
         payload = {
             "base_url": self.session_api_url(session_id),
             "model": f"openai/{self.model_config.path}",
             "sampling_params": self.get_session_sampling_params(request),
+            "chat_template_kwargs": template_kwargs,
             "task": observation.get("problem_statement", ""),
             "observation": runner_observation,
             "runtime_config": asdict(runtime_config),
@@ -97,18 +103,14 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
         agent_data.reset()
         observation, _ = await env.reset(task=request, seed=request.get("seed"))
         agent_data.init_trajectory(request)
+        agent_data.set_grading_context(observation)
 
         session_id: str | None = None
-        run_slot: tuple[int, int] | None = None
+        run_slot: asyncio.BoundedSemaphore | None = None
         try:
             runtime_config = observation["runtime_config"]
             parallelism = runtime_config.sandbox_config.max_parallel_tasks_per_worker
-            if parallelism > 0:
-                namespace = os.path.join(
-                    str(self.config.trainer.project_name),
-                    str(self.config.trainer.experiment_name),
-                )
-                run_slot = await SlotManager.acquire(parallelism, namespace, prefix="psrl_mini_swe_agent_slots")
+            run_slot = await self.run_slots.acquire(parallelism)
 
             session_id = await self.create_session(request)
             try:
@@ -116,12 +118,15 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                     result = await self._run_agent(request, observation, runtime_config, session_id)
             except asyncio.TimeoutError:
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
-            if result.get("exit_status") == "error":
-                psrl_logger.error("mini-SWE-agent runner failed: %s.", result.get("error", "unknown error"))
+            exit_status = result.get("exit_status", "")
+            terminate_reason = MiniSweExceptionClassifier().classify_exit_status(exit_status)
+            if terminate_reason is TerminateReason.ABORTED:
+                return None, TerminateReason.ABORTED
+            if terminate_reason is None or terminate_reason.is_error:
+                psrl_logger.error(
+                    f"Mini-SWE-agent runner failed: exit_status={exit_status!r}, error={result.get('error')!r}."
+                )
                 return None, TerminateReason.ROLLOUT_ERROR
-
-            # Completed turns remain valid training data after a context overflow.
-            context_exceeded = result.get("exit_status") == "context_exceeded"
 
             training_data = await self.get_primary_training_data(session_id)
             if training_data["num_turns"] == 0:
@@ -130,20 +135,19 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             agent_data.set_patch(result.get("submission") or None)
             if result.get("timing") is not None:
                 agent_data.set_timing(result["timing"])
-            if result.get("grader_result") is not None:
-                agent_data.set_grader_result(result["grader_result"])
-
-            terminate_reason = TerminateReason.FINISHED
-            if context_exceeded or len(training_data["response_ids"]) >= int(self.rollout_config.response_length):
+            if len(training_data["response_ids"]) >= int(self.rollout_config.response_length):
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-            elif training_data["num_turns"] >= self.max_turns:
-                terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
-            finalized = await agent_data.finalize_output()
-            return (finalized, terminate_reason) if finalized is not None else (None, TerminateReason.ABORTED)
         finally:
             try:
                 await env.close()
             finally:
-                SlotManager.release(run_slot)
+                self.run_slots.release(run_slot)
                 if session_id is not None:
                     await self.delete_session(session_id)
+
+        finalized = await agent_data.finalize_output()
+        if finalized is not None:
+            for output in finalized if isinstance(finalized, list) else [finalized]:
+                output.extra_fields["agent_exit_status"] = exit_status
+                output.extra_fields["assistant_turns"] = training_data["num_turns"]
+        return (finalized, terminate_reason) if finalized is not None else (None, TerminateReason.ABORTED)

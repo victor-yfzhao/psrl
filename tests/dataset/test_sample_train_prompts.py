@@ -49,7 +49,7 @@ def _make_processor(dataloader: _EpochDataLoader, rollout_n: int = 2) -> object:
     """Build a `DataProcessor` with only the attributes `sample_train_prompts` touches."""
     processor = object.__new__(_RAW_DATA_PROCESSOR)
     processor.rollout_n = rollout_n
-    processor.global_steps = 0
+    processor.generation_batches = 0
     processor._train_sample_idx = 0
     processor.MAX_TRAIN_ID = 10**9
     processor.dataloader_lock = threading.Lock()

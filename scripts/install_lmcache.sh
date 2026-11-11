@@ -26,7 +26,7 @@ git apply "${PSRL_PATH}/patch/lm_cache/dependencies.patch"
 rm -rf ./*.so ./build
 python -m pip uninstall lmcache -y
 python -m uv pip install --no-cache-dir -e . --no-build-isolation -v \
-    "nixl==0.10.1" "nixl-cu12==0.10.1"
+    "nixl==1.2.0" "nixl-cu12==1.2.0"
 popd
 
 echo "Check if LMCache is installed correctly"

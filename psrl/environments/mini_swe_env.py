@@ -60,6 +60,7 @@ def _grading_metadata(
 
     return {
         "swe_grader": swe_grader,
+        "swe_grader_kind": {"swe_smith_py": "smith", "swe_gym": "gym", "swebench_verified": "verified"}[data_source],
         "swe_problem": swe_problem,
         "swe_problem_image": swe_problem_image,
         "swe_restore_tests": bool(extra_info.get("swe_restore_tests", False)),

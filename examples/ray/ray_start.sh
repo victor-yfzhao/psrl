@@ -1,5 +1,5 @@
 #!/bin/bash
-env_file="${PSRL_WORKSPACE}/env/env_311.sh"
+env_file="${PSRL_WORKSPACE}/env/psrl.sh"
 source ${env_file}
 
 HOSTFILE=${1:-""}

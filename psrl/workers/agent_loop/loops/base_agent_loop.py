@@ -757,18 +757,12 @@ class AgentLoopBase(ABC):
             raise
 
     def _attach_loop_timing(self, output: "TokenOutput | list[TokenOutput]") -> None:
-        """Stamp the per-trajectory wall-clock timing onto each output.
-
-        Read directly from ``self.timer`` (one loop instance == one trajectory).
-        Stored under ``extra_fields['loop_timing']`` so it survives the trip back
-        to ``_dump_trajectory_text``. Never raises.
         """
-        try:
-            timing = self.timer.as_dict()
-            for out in output if isinstance(output, list) else [output]:
-                out.extra_fields.setdefault("loop_timing", timing)
-        except Exception:
-            psrl_logger.debug("Failed to attach loop timing.", exc_info=True)
+        Attach request timing while preserving measurements owned by an external agent.
+        """
+        timing = self.timer.as_dict()
+        for out in output if isinstance(output, list) else [output]:
+            out.extra_fields.setdefault("loop_timing", timing)
 
     async def _resolve_version_for_dump(self, output: "TokenOutput | list[TokenOutput]", prompt: dict) -> None:
         """
@@ -819,19 +813,16 @@ class AgentLoopBase(ABC):
         if turns is None:
             turns = out.num_turns if out.num_turns is not None else 0
 
-        # Prefer the loop's wall-clock timing. Mini-SWE carries finer timing under
-        # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
         loop_timing = (out.extra_fields or {}).get("loop_timing", {})
-        runner_timing = info.get("timing", {}) or {}
-        generation_s = runner_timing.get("assistant_s", loop_timing.get("generation_s", 0.0))
-        env_s = runner_timing.get("env_s", loop_timing.get("env_s", 0.0))
-        elapsed_s = runner_timing.get("elapsed_s", loop_timing.get("elapsed_s", 0.0))
+        generation_s = loop_timing.get("generation_s", 0.0)
+        env_s = loop_timing.get("env_s", 0.0)
+        elapsed_s = loop_timing.get("elapsed_s", 0.0)
 
         breakdown = [f"generation: {generation_s:.1f}s", f"env: {env_s:.1f}s"]
-        if runner_timing.get("grading_s"):
-            breakdown.append(f"grading: {runner_timing['grading_s']:.1f}s")
-        if runner_timing.get("prep_s"):
-            breakdown.append(f"prep: {runner_timing['prep_s']:.1f}s")
+        if loop_timing.get("grading_s"):
+            breakdown.append(f"grading: {loop_timing['grading_s']:.1f}s")
+        if loop_timing.get("prep_s"):
+            breakdown.append(f"prep: {loop_timing['prep_s']:.1f}s")
 
         text = ""
         if patch:
@@ -844,6 +835,8 @@ class AgentLoopBase(ABC):
             f"env: {n_env} | total: {total_tokens}\n"
             f"[Time Breakdown] {' | '.join(breakdown)}\n"
         )
+        if "agent_exit_status" in (out.extra_fields or {}):
+            text += f"agent_exit_status: {out.extra_fields['agent_exit_status']}\n"
         return text
 
     def _dump_trajectory_text(

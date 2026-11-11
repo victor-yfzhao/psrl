@@ -30,8 +30,10 @@ from psrl.utils.common.docker_utils import (
 )
 from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
+from psrl.utils.concurrency import SlotManager
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.utils.transfer_queue.payload import PayloadState, async_clear_payload, request_payload_keys
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import (
     DictConfigWrap,
@@ -142,6 +144,7 @@ class PSRL_AgentLoopWorker:
             producer_index=worker_id,
         )
 
+        self.run_slots = SlotManager()
         self.agent_programs = set()
         self.put_tasks = set()
         self.pending_program_queue = deque()
@@ -405,6 +408,7 @@ class PSRL_AgentLoopWorker:
                     dataset_cls=self.dataset_cls,
                     data_config=DictConfigWrap(self.config.data),
                     inference_orchestrator=self.inference_orchestrator,
+                    run_slots=self.run_slots,
                 )
                 # Keep framework objects out of Hydra's dataclass conversion path.
                 agent_loop_factory = hydra.utils.instantiate(
@@ -488,29 +492,14 @@ class PSRL_AgentLoopWorker:
                         f"Agent loop terminated: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
                     )
 
-            # Put the output into the TransferQueue and notify PSManager
-            # + AgentLoopManager via metadata-only RPCs.
             if output is not None:
                 with log_dual_events(
-                    "Update request status",
+                    f"Commit requests {request_ids} to TransferQueue",
                     psrl_logger,
                     level=logging.DEBUG,
                     event_type=EventType.OTHER,
                 ):
-                    update_status_success = await self.ps_manager_handle.update_request_status.remote(
-                        request_ids,
-                        PSRL_RequestStatus.COMPLETED,
-                        is_validate=validate,
-                    )
-
-                if update_status_success:
-                    with log_dual_events(
-                        f"Put requests {request_ids} into TransferQueue",
-                        psrl_logger,
-                        level=logging.DEBUG,
-                        event_type=EventType.OTHER,
-                    ):
-                        await self.postprocess_output(output, batch, terminate_reason)
+                    await self.postprocess_output(output, batch, terminate_reason)
             elif terminate_reason != TerminateReason.ABORTED:
                 # Abort the reserved inventory entry after an unreported generation
                 # failure so the buffer can progress.
@@ -544,32 +533,87 @@ class PSRL_AgentLoopWorker:
         """
         uid = tu.get(batch, "uid")[0]
         is_validate = tu.get(batch, "validate")[0]
-        version_tag = tu.get(batch, "version_tag")[0]
-        partition_id = "val" if tu.get(batch, "validate")[0] else "train"
-        prompt_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else tu.get(batch, "uid")[0]
+        partition_id = "val" if is_validate else "train"
+        prompt_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else uid
 
         outputs = output if isinstance(output, list) else [output]
-
-        keys, fields = self._build_output_fields(outputs, batch, uid, prompt_id, version_tag, terminate_reason)
-
-        await tq.async_kv_batch_put(
-            keys=keys,
-            partition_id=partition_id,
-            fields=list_of_dict_to_tensordict(fields),
-            tags=[{"status": "success"}] * len(keys),
-        )
+        keys = []
+        try:
+            keys = request_payload_keys(uid, len(outputs))
+            version_tag = tu.get(batch, "version_tag")[0]
+            keys, fields = self._build_output_fields(outputs, batch, uid, prompt_id, version_tag, terminate_reason)
+            await tq.async_kv_batch_put(
+                keys=keys,
+                partition_id=partition_id,
+                fields=list_of_dict_to_tensordict(fields),
+                tags=[{"status": "success"}] * len(keys),
+            )
+            accepted = await self.ps_manager_handle.update_request_status.remote(
+                uid,
+                PSRL_RequestStatus.COMPLETED,
+                is_validate=is_validate,
+            )
+            if not accepted:
+                await async_clear_payload(keys, partition_id, PayloadState.DROPPED)
+                return
+        except (Exception, asyncio.CancelledError) as error:
+            await self._recover_output_failure(batch, keys, error)
+            raise
 
         # Notify manager with metadata only after output commit.
-        await self.agent_loop_manager.put_result.remote(
-            {
-                "request_id": uid,
-                "prompt_id": prompt_id,
-                "rollout_instance_id": outputs[0].rollout_instance_id,
-                "version_tag": version_tag,
-                "n_trajectory": len(outputs),
-                "is_validate": is_validate,
-            }
-        )
+        try:
+            await self.agent_loop_manager.put_result.remote(
+                {
+                    "request_id": uid,
+                    "prompt_id": prompt_id,
+                    "rollout_instance_id": outputs[0].rollout_instance_id,
+                    "version_tag": version_tag,
+                    "n_trajectory": len(outputs),
+                    "is_validate": is_validate,
+                }
+            )
+        except (Exception, asyncio.CancelledError) as error:
+            # The manager may already own these fields when the acknowledgement fails.
+            await self.agent_loop_manager.fail_pipeline.remote(
+                f"Output publication failed: request_id={uid!r}, prompt_id={prompt_id!r}, error={error!r}."
+            )
+            raise
+
+    async def _recover_output_failure(
+        self,
+        batch: TensorDict,
+        keys: list[str],
+        error: BaseException,
+    ) -> None:
+        """
+        Reclaim unpublished fields and replace the failed group through its manager.
+        """
+        uid = tu.get(batch, "uid")[0]
+        parent_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else uid
+        is_validate = tu.get(batch, "validate")[0]
+        recovery_errors = []
+        try:
+            await async_clear_payload(keys, "val" if is_validate else "train", PayloadState.DROPPED)
+        except Exception as recovery_error:
+            recovery_errors.append(recovery_error)
+        try:
+            await self.agent_loop_manager.notify_group_failed.remote(
+                parent_id=parent_id,
+                failed_uid=uid,
+                is_validate=is_validate,
+                terminate_reason=TerminateReason.ROLLOUT_ERROR,
+            )
+        except Exception as recovery_error:
+            recovery_errors.append(recovery_error)
+        try:
+            await self.ps_manager_handle.abort_requests.remote([uid])
+        except Exception as recovery_error:
+            recovery_errors.append(recovery_error)
+        if recovery_errors:
+            await self.agent_loop_manager.fail_pipeline.remote(
+                f"Output recovery failed: request_id={uid!r}, prompt_id={parent_id!r}, "
+                f"error={error!r}, recovery_errors={recovery_errors!r}."
+            )
 
     def _build_output_fields(
         self,
@@ -592,9 +636,14 @@ class PSRL_AgentLoopWorker:
             responses = torch.tensor(out.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
             attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+            generation_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            generation_mask[len(prompts) :] = torch.as_tensor(out.response_mask, dtype=torch.bool)
             multi_modal_inputs = self._compute_multi_modal_inputs(out, input_ids)
             position_ids = self._compute_position_ids(
-                input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+                input_ids.unsqueeze(0),
+                attention_mask.unsqueeze(0),
+                multi_modal_inputs,
+                generation_mask.unsqueeze(0),
             ).squeeze(0)
             # `images_seqlens` is training metadata, so retain only its top-level copy.
             images_seqlens = multi_modal_inputs.pop("images_seqlens", None)
@@ -654,6 +703,8 @@ class PSRL_AgentLoopWorker:
             return multi_modal_inputs
 
         multi_modal_data = output.multi_modal_data or {}
+        if not multi_modal_data:
+            return multi_modal_inputs
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
@@ -673,6 +724,10 @@ class PSRL_AgentLoopWorker:
         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
         # because np.array() only keeps the keys for BatchFeature.
         multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+        if hasattr(self.processor, "get_rope_index"):
+            for modality, values in (("image", images), ("video", videos)):
+                if values is not None and len(values) > 0 and multi_modal_inputs.get(f"{modality}_grid_thw") is None:
+                    raise ValueError(f"Missing {modality}_grid_thw for supplied {modality} inputs.")
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
@@ -684,6 +739,7 @@ class PSRL_AgentLoopWorker:
         input_ids,
         attention_mask,
         multi_modal_inputs,
+        generation_mask,
     ) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
         if self.processor is None or not hasattr(self.processor, "get_rope_index"):
@@ -693,15 +749,20 @@ class PSRL_AgentLoopWorker:
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
         }
+        if all(grid is None for grid in multi_modal_kwargs.values()):
+            # Generated visual token IDs are text when no visual payload was supplied.
+            position_ids = compute_position_id_with_mask(attention_mask)
+            return position_ids.unsqueeze(1).repeat(1, 4, 1)
+
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
             mm_token_type_ids = torch.zeros_like(input_ids)
             image_token_id = get_processor_token_id(self.processor, "image")
             video_token_id = get_processor_token_id(self.processor, "video")
-            if image_token_id is not None:
-                mm_token_type_ids[0][input_ids[0] == image_token_id] = 1
-            if video_token_id is not None:
-                mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
+            if image_token_id is not None and multi_modal_kwargs["image_grid_thw"] is not None:
+                mm_token_type_ids[(input_ids == image_token_id) & ~generation_mask] = 1
+            if video_token_id is not None and multi_modal_kwargs["video_grid_thw"] is not None:
+                mm_token_type_ids[(input_ids == video_token_id) & ~generation_mask] = 2
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         # Model's get_rope_index has been dynamically bind to the processor.

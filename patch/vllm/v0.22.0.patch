@@ -42,10 +42,18 @@ index b532eed15f38a12bbd725dc961623b9cc1563fea..278867454a06f1ab0b2cf3ca8cb14fb2
      """Helper to create a RequestOutput."""
      return RequestOutput(
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
-index b63d86199720d077118f2427c52498ab216b24a3..cd9678e199c9044c49357781d2fe0600163b7d94 100644
+index b63d861997..9220c5d9e8 100644
 --- a/vllm/compilation/cuda_graph.py
 +++ b/vllm/compilation/cuda_graph.py
-@@ -284,14 +284,10 @@ class CUDAGraphWrapper:
+@@ -229,6 +229,7 @@ class CUDAGraphWrapper:
+
+     def clear_graphs(self) -> None:
+         self.concrete_cudagraph_entries.clear()
++        self.graph_pool = current_platform.get_global_graph_pool()
+
+     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
+         if not is_forward_context_available():
+@@ -284,14 +285,10 @@ class CUDAGraphWrapper:
  
              with ExitStack() as stack:
                  if self.cudagraph_options.gc_disable:
@@ -1342,10 +1350,31 @@ index 9ac3821a3261469cc6fad008161f93528deaf838..5d0e4ebcf68580ad535eb01b1c43bdc0
      def _combine_outputs_with_spec_tokens(
          output_token_ids: list[list[int]],
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index c7a7ffe442d275aad9ddc2c6223de7b23e95eec1..88827f41af5bafbec8381cb4942247cc509678eb 100644
+index c7a7ffe442..9bbdc7c254 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -184,6 +184,16 @@ class CudaGraphManager:
+@@ -105,7 +105,7 @@ class CudaGraphManager:
+         self.is_last_pp_rank = get_pp_group().is_last_rank
+
+         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+-        self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
++        self.reset_graph_pool()
+
+         self._graphs_captured = False
+         self._candidates: list[list[BatchExecutionDescriptor]] = []
+@@ -181,9 +181,28 @@ class CudaGraphManager:
+             descs.sort(key=lambda d: d.num_tokens, reverse=True)
+             self._capture_descs[mode] = descs
+
++    def _get_graph_pool(self) -> Any:
++        return current_platform.get_global_graph_pool()
++
++    def reset_graph_pool(self) -> None:
++        """
++        Refresh the pool handle without changing shared or dedicated ownership.
++        """
++        self.pool = self._get_graph_pool() if self.cudagraph_mode else None
++
      def needs_capture(self) -> bool:
          return len(self._capture_descs) > 0
  
@@ -1363,7 +1392,7 @@ index c7a7ffe442d275aad9ddc2c6223de7b23e95eec1..88827f41af5bafbec8381cb4942247cc
      def capture(
          self,
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 52b44755089920ab1a1aaf41a5bc075a9545ae90..c145bd9f83a57d26c1032c0dc248cb22c60db597 100644
+index 52b4475508..15938051dd 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -27,7 +27,9 @@ import numpy as np
@@ -1376,21 +1405,18 @@ index 52b44755089920ab1a1aaf41a5bc075a9545ae90..c145bd9f83a57d26c1032c0dc248cb22
  from vllm.config import VllmConfig
  from vllm.config.compilation import CUDAGraphMode
  from vllm.distributed.parallel_state import (
-@@ -665,6 +667,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -43,6 +45,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+ )
+ from vllm.model_executor.model_loader import get_model_loader
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.math_utils import cdiv
+@@ -665,6 +668,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          return cuda_graph_size
  
-+    def _release_speculator_cudagraphs(self) -> bool:
-+        if self.speculator is None:
-+            return False
-+
-+        released = False
-+        for name in ("prefill_cudagraph_manager", "decode_cudagraph_manager"):
-+            manager = getattr(self.speculator, name, None)
-+            if manager is not None:
-+                released |= manager.release()
-+        return released
-+
 +    def release_cudagraphs(self) -> bool:
 +        """Drop captured CUDA graphs before cumem sleep unmaps GPU memory."""
 +        if self.cudagraph_manager is None:
@@ -1399,11 +1425,22 @@ index 52b44755089920ab1a1aaf41a5bc075a9545ae90..c145bd9f83a57d26c1032c0dc248cb22
 +        # Ensure no captured graph is mid-replay before we drop references.
 +        torch.accelerator.synchronize()
 +
-+        released = self.cudagraph_manager.release()
-+        released |= self._release_speculator_cudagraphs()
++        managers = [self.cudagraph_manager]
++        if self.speculator is not None:
++            for name in ("prefill_cudagraph_manager", "decode_cudagraph_manager"):
++                manager = getattr(self.speculator, name, None)
++                if manager is not None:
++                    managers.append(manager)
++        released = False
++        for manager in managers:
++            released |= manager.release()
 +        if not released:
 +            return False
 +
++        # A pool with no live graphs cannot be reused while its tensors remain alive.
++        current_platform.reset_global_graph_pool()
++        for manager in managers:
++            manager.reset_graph_pool()
 +        CUDAGraphWrapper.clear_all_graphs()
 +        BreakableCUDAGraphWrapper.clear_all_graphs()
 +
@@ -1424,7 +1461,7 @@ index 52b44755089920ab1a1aaf41a5bc075a9545ae90..c145bd9f83a57d26c1032c0dc248cb22
          if not self.req_states.remove_request(req_id):
              return False
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index d51bf2284096cb2dd8f351157e89b65ff7fd233b..7da450232d70e30eef2036ed8ec4b46554050d44 100644
+index d51bf22840..2d1c9f4722 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -226,6 +226,7 @@ if TYPE_CHECKING:
@@ -1493,7 +1530,7 @@ index d51bf2284096cb2dd8f351157e89b65ff7fd233b..7da450232d70e30eef2036ed8ec4b465
              )
  
              # Transfer GPU->CPU async.
-@@ -6460,6 +6497,62 @@ class GPUModelRunner(
+@@ -6460,6 +6497,64 @@ class GPUModelRunner(
          )
          return cuda_graph_size
  
@@ -1518,6 +1555,8 @@ index d51bf2284096cb2dd8f351157e89b65ff7fd233b..7da450232d70e30eef2036ed8ec4b465
 +        # Ensure no captured graph is mid-replay before we drop references.
 +        torch.accelerator.synchronize()
 +
++        # Wrappers must recapture into a fresh pool after the old graphs are dropped.
++        current_platform.reset_global_graph_pool()
 +        CUDAGraphWrapper.clear_all_graphs()
 +        BreakableCUDAGraphWrapper.clear_all_graphs()
 +        if self.encoder_cudagraph_manager is not None:
@@ -1571,7 +1610,7 @@ index 582c6a17cb4e9181c15b0506d8c64f635ac584d2..04320e32bf4065a86590c831c5dc2af5
 @@ -134,6 +135,22 @@ class Worker(WorkerBase):
          # Buffers saved before sleep
          self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
- 
+
 +        # Whether CUDA graphs were released in the most recent sleep() and
 +        # therefore need to be re-captured once the model is fully awake again.
 +        self._cudagraphs_released: bool = False
@@ -1603,7 +1642,7 @@ index 582c6a17cb4e9181c15b0506d8c64f635ac584d2..04320e32bf4065a86590c831c5dc2af5
              self._sleep_saved_buffers = {
                  name: buffer.cpu().clone() for name, buffer in model.named_buffers()
              }
- 
+
 +        # Drop captured CUDA graphs before the cumem unmap. With graph capture
 +        # pools resident, per-allocation VMM unmap/remap ops slow to ~6-9s for a
 +        # 32B model (vs ~2s without graphs); releasing graphs first restores the
@@ -1641,7 +1680,7 @@ index 582c6a17cb4e9181c15b0506d8c64f635ac584d2..04320e32bf4065a86590c831c5dc2af5
 @@ -184,8 +230,25 @@ class Worker(WorkerBase):
          allocator = CuMemAllocator.get_instance()
          allocator.wake_up(tags)
- 
+
 +        # Restore NCCL communicator memory before any collective runs again.
 +        # Collective across ranks; no-op at world_size 1 or on older NCCL.
 +        from vllm.distributed.device_communicators import nccl_suspend
@@ -1668,7 +1707,7 @@ index 582c6a17cb4e9181c15b0506d8c64f635ac584d2..04320e32bf4065a86590c831c5dc2af5
 @@ -195,6 +258,24 @@ class Worker(WorkerBase):
          if tags is None or "kv_cache" in tags:
              self.model_runner.post_kv_cache_wake_up()
- 
+
 +        # Re-capture CUDA graphs that were released in sleep(), now that the
 +        # model is fully awake. Recapture runs a forward pass through the
 +        # weights AND uses the KV cache, so BOTH must be mapped before it can
@@ -1690,3 +1729,149 @@ index 582c6a17cb4e9181c15b0506d8c64f635ac584d2..04320e32bf4065a86590c831c5dc2af5
      def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
          if not self.vllm_config.model_config.enable_cumem_allocator:
              return nullcontext()
+diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
+index 6da3ec7178..90552c02b4 100644
+--- a/vllm/compilation/breakable_cudagraph.py
++++ b/vllm/compilation/breakable_cudagraph.py
+@@ -304,6 +304,7 @@ class BreakableCUDAGraphWrapper:
+
+     def clear_graphs(self) -> None:
+         self.entries.clear()
++        self.graph_pool = current_platform.get_global_graph_pool()
+
+     # --- dispatch --------------------------------------------------------
+
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index cf774b7bda..11b64cc74c 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -886,6 +886,12 @@ class Platform:
+             cls._global_graph_pool = self.graph_pool_handle()
+         return cls._global_graph_pool
+
++    def reset_global_graph_pool(self) -> None:
++        """
++        Replace the shared pool handle after releasing its captured graphs.
++        """
++        self.__class__._global_graph_pool = self.graph_pool_handle()
++
+     @classmethod
+     def get_static_graph_wrapper_cls(cls) -> str:
+         """
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
+index 43bece01d0..7c3d574eae 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
+@@ -4,7 +4,6 @@ from collections.abc import Callable
+
+ import torch
+
+-from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.block_table import BlockTables
+@@ -22,21 +21,9 @@ from vllm.v1.worker.utils import AttentionGroup
+ class EagleCudaGraphManagerBase(CudaGraphManager):
+     """Base CudaGraphManager for Eagle with a dedicated graph pool."""
+
+-    def __init__(
+-        self,
+-        vllm_config: VllmConfig,
+-        device: torch.device,
+-        cudagraph_mode: CUDAGraphMode,
+-        decode_query_len: int,
+-    ):
+-        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+-
+-        # Use a dedicated pool for Eagle to avoid memory overlap with the main
+-        # model's cudagraph. The base class uses a shared global pool, but Eagle's
+-        # internal allocations (e.g., gumbel_sample temporaries) can conflict with
+-        # the main model's allocations when sharing the same pool.
+-        if cudagraph_mode:
+-            self.pool = torch.cuda.graph_pool_handle()
++    def _get_graph_pool(self):
++        # Draft temporaries must not overlap the target model's graph allocations.
++        return torch.cuda.graph_pool_handle()
+
+
+ class PrefillEagleCudaGraphManager(EagleCudaGraphManagerBase):
+diff --git a/vllm/device_allocator/cumem.py b/vllm/device_allocator/cumem.py
+index 6edd69a949e7b9c4c39d0d16253b8b45fe0c6640..474cda6e68d2d58d4897b982503b7e42a78def3b 100644
+--- a/vllm/device_allocator/cumem.py
++++ b/vllm/device_allocator/cumem.py
+@@ -53,6 +53,7 @@ class AllocationData:
+     handle: HandleType
+     tag: str
+     cpu_backup_tensor: torch.Tensor | None = None
++    is_mapped: bool = True
+
+
+ def create_and_map(allocation_handle: HandleType) -> None:
+@@ -196,6 +197,8 @@ class CuMemAllocator:
+         backup_bytes = 0
+
+         for ptr, data in self.pointer_to_data.items():
++            if not data.is_mapped:
++                continue
+             handle = data.handle
+             total_bytes += handle[1]
+             if data.tag in offload_tags:
+@@ -211,6 +214,7 @@ class CuMemAllocator:
+                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                 data.cpu_backup_tensor = cpu_backup_tensor
+             unmap_and_release(handle)
++            data.is_mapped = False
+
+         logger.info(
+             "CuMemAllocator: sleep freed %.2f GiB memory in total, of which "
+@@ -234,19 +238,39 @@ class CuMemAllocator:
+             back to GPU memory. If None, all memory allocation will be loaded
+             back to GPU memory.
+         """
+-        for ptr, data in self.pointer_to_data.items():
+-            if tags is None or data.tag in tags:
+-                handle = data.handle
+-                create_and_map(handle)
++        restored = []
++        try:
++            for ptr, data in self.pointer_to_data.items():
++                if data.is_mapped or (tags is not None and data.tag not in tags):
++                    continue
++                create_and_map(data.handle)
++                data.is_mapped = True
++                restored.append(data)
+                 if data.cpu_backup_tensor is not None:
+                     cpu_backup_tensor = data.cpu_backup_tensor
+-                    if cpu_backup_tensor is not None:
+-                        size_in_bytes = (
+-                            cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+-                        )
+-                        cpu_ptr = cpu_backup_tensor.data_ptr()
+-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+-                        data.cpu_backup_tensor = None
++                    size_in_bytes = (
++                        cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
++                    )
++                    cpu_ptr = cpu_backup_tensor.data_ptr()
++                    libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
++        except Exception as wake_error:
++            cleanup_errors = []
++            for data in reversed(restored):
++                try:
++                    unmap_and_release(data.handle)
++                    data.is_mapped = False
++                except Exception as cleanup_error:
++                    cleanup_errors.append(cleanup_error)
++            if cleanup_errors:
++                raise RuntimeError(
++                    "CuMemAllocator wake failed and mapping cleanup failed: "
++                    f"{cleanup_errors!r}."
++                ) from wake_error
++            raise
++
++        # Keep CPU backups until every requested mapping has been restored.
++        for data in restored:
++            data.cpu_backup_tensor = None
+
+     @contextmanager
+     def use_memory_pool(self, tag: str | None = None):

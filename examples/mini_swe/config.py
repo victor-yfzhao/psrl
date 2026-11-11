@@ -41,12 +41,21 @@ class MiniEnvironmentConfig:
             "LESS": "-R",
             "PIP_PROGRESS_BAR": "off",
             "TQDM_DISABLE": "1",
+            "MODIN_CPUS": "8",
+            "PYTEST_XDIST_AUTO_NUM_WORKERS": "8",
+            "LOKY_MAX_CPU_COUNT": "8",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
         }
     )
     run_args: list = field(
         default_factory=lambda: [
             "--rm",
-            "--memory=8g",
+            "--memory=16g",
+            "--cpus=8",
+            "--shm-size=8g",
             "--network",
             "host",
             "--add-host",
@@ -57,6 +66,10 @@ class MiniEnvironmentConfig:
     # Installing heavy repositories can briefly exceed rollout memory during grading.
     # A separate 30 GB limit prevents cgroup OOM failures.
     grader_memory: str = "30g"
+    grader_shm_size: str = "16g"
+    grader_timeout: int = 900
+    grader_command_timeout: int = 120
+    grader_max_attempts: int = 3
 
 
 @dataclass
@@ -89,6 +102,7 @@ class MiniAgentConfig:
     """
 
     cost_limit: float = 0.0
+    wall_time_limit_seconds: int = 0
     system_template: str = ""
     problem_template: str = ""
 
@@ -98,9 +112,6 @@ class MiniModelConfig:
     """
     Model format settings forwarded to mini-swe-agent's `get_model()` during
     session-routed training and standalone eval.
-
-    Defaults match `LitellmTextbasedModelConfig` class-level defaults so that
-    omitting this section from a YAML config is fully backwards-compatible.
 
     Fields:
         model_class: mini-swe-agent model implementation name or import path.

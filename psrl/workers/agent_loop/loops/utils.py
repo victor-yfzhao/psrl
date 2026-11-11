@@ -72,6 +72,7 @@ class TerminateReason(Enum):
     """Why an agent-loop trajectory stopped."""
 
     FINISHED = "finished"
+    FORMAT_ERROR = "format_error"
     MAX_RESPONSE_LENGTH_EXCEEDED = "max_response_length_exceeded"
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"
     # Wall-clock exhaustion is distinct from the configured turn cap in metrics.
@@ -89,15 +90,12 @@ class TerminateReason(Enum):
 
     @property
     def is_successful(self) -> bool:
-        """Return whether the trajectory has usable training content.
-
-        Every member here is a *budget* that ran out (context window, turn cap, wall
-        clock, env step) or a post-run grading failure. In each case the turns produced
-        before the limit are valid on-policy data, so the trajectory is truncated and
-        trained rather than discarded.
+        """
+        Return whether completed generations remain usable training content.
         """
         return self in (
             TerminateReason.FINISHED,
+            TerminateReason.FORMAT_ERROR,
             TerminateReason.MAX_TURNS_EXCEEDED,
             TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
             TerminateReason.AGENT_TIMEOUT,

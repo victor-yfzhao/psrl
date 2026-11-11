@@ -1,11 +1,26 @@
 """
-Compute patch and test based rewards for mini-SWE-agent trajectories.
+Grade Mini-SWE trajectories and compute their rewards in the reward service.
 """
 
+import asyncio
 import logging
 import os
 import re
+import subprocess
+import time
 from typing import Any
+from uuid import uuid4
+
+from omegaconf import DictConfig
+from psrl.utils.common.docker_utils import spawn_actor_reaper
+from psrl.workers.reward.reward_loop.base import RawRewardFn
+from psrl.workers.reward.reward_loop.dapo import DAPORewardLoop
+from tenacity import AsyncRetrying, before_sleep_log, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
+
+from examples.mini_swe.swebench_grader import SWEGradingError, SWEGradingPreparationTimeout, grade_fresh_container
+from examples.mini_swe.task_setup import SWETaskSetupError
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -157,20 +172,23 @@ def _compute_swe_reward(
         psrl_logger.debug("[swe reward] score=0.0, acc=0.0 (0 turns / aborted).")
         return {"score": 0.0, "acc": 0.0}
 
+    if patch and "resolved" not in grader_result:
+        raise ValueError("Missing SWE grading report. Select the mini_swe reward loop for benchmark submissions.")
+
     # --- Fully resolved ---
     resolved = bool(grader_result.get("resolved", False))
     if resolved:
         psrl_logger.debug("[swe reward] score=+1.0, acc=1.0 (resolved).")
         return {"score": 1.0, "acc": 1.0}
 
-    # --- Binary mode: everything else is -1 ---
+    # --- Binary mode ---
     if reward_mode == "binary":
         psrl_logger.debug(
-            f"[swe reward] score=-1.0, acc=0.0 (binary mode, not resolved), "
+            f"[swe reward] score=0.0, acc=0.0 (binary mode, not resolved), "
             f"apply_ok={grader_result.get('apply_ok')}, "
             f"f2p={grader_result.get('f2p_pass')}/{grader_result.get('f2p_total')}."
         )
-        return {"score": -1.0, "acc": 0.0}
+        return {"score": 0.0, "acc": 0.0}
 
     # --- Partial credit modes: partial_credit / test_ratio / shaped ---
     policy_violated = bool(grader_result.get("policy_violated", False))
@@ -341,3 +359,140 @@ def compute_score(
         f"correct_file={hit_correct_file}, tools={tools}."
     )
     return score
+
+
+_GRADER_KINDS = {"swebench_verified": "verified", "swe_gym": "gym", "swe_smith_py": "smith"}
+_SIMPLE_SOURCES = {"mini_swe_agent_simple", "mini_swe_agent"}
+
+
+class MiniSWERewardLoop(DAPORewardLoop):
+    """
+    Grade Mini-SWE patches in reward workers and apply the configured reward function.
+
+    Worker concurrency covers the entire grading call, including Docker cleanup.
+    Cancelled requests retain their worker permit until the blocking grader exits.
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        tokenizer: Any,
+        compute_score: RawRewardFn,
+        **reward_kwargs: Any,
+    ):
+        super().__init__(config, tokenizer, compute_score, **reward_kwargs)
+        self._container_owner = f"mini-swe-reward-{os.getpid()}-{uuid4().hex[:8]}"
+        self._reaper_proc: subprocess.Popen | None = None
+
+    async def run_single(
+        self,
+        data: TensorDict,
+    ) -> dict:
+        """
+        Grade one submitted patch and preserve DAPO scoring and length penalties.
+        """
+        if len(data) != 1:
+            raise ValueError("Mini-SWE grading requires exactly one request.")
+        data_item = data[0]
+        data_source = tu.get(data_item, "data_source")
+        if data_source in _SIMPLE_SOURCES:
+            return await super().run_single(data)
+        if data_source not in _GRADER_KINDS:
+            raise ValueError(f"Unsupported Mini-SWE data source: {data_source!r}.")
+
+        metadata = self.merge_extra_info(data_item)
+        context = metadata.get("swe_grading", {})
+        problem = context.get("swe_problem", {})
+        if (
+            not problem.get("instance_id")
+            or not context.get("swe_problem_image")
+            or not context.get("swe_task_id")
+            or context.get("swe_grader_kind") != _GRADER_KINDS[data_source]
+            or not isinstance(context.get("environment"), dict)
+        ):
+            raise SWEGradingError(f"Missing or invalid SWE grading inputs for {data_source!r}.")
+
+        patch = metadata.get("patch")
+        grader_result = {}
+        start = time.perf_counter()
+        if patch and tu.get(data_item, "num_turns", 0) > 0:
+            grader_result = await self._grade_patch(context, patch)
+        grading_s = time.perf_counter() - start
+
+        scored_data = data.clone(recurse=False)
+        agent_info = dict(tu.get(data_item, "agent_reward_info", {}))
+        agent_info["grader_result"] = grader_result
+        tu.assign_non_tensor_stack(scored_data, "agent_reward_info", [agent_info])
+        result = await super().run_single(scored_data)
+        result["reward_extra_info"]["grader_result"] = grader_result
+        result["reward_extra_info"]["grading_s"] = grading_s
+        result["reward_metrics"] = {"grading_s": grading_s}
+        return result
+
+    async def _grade_patch(
+        self,
+        context: dict,
+        patch: str,
+    ) -> dict:
+        """
+        Await the blocking harness through cancellation so cleanup retains its permit.
+        """
+        if self._reaper_proc is None:
+            self._reaper_proc = spawn_actor_reaper(self._container_owner, log_dir=self.config.psrl.logging_path)
+        max_attempts = context["environment"]["grader_max_attempts"]
+        if max_attempts < 1:
+            raise ValueError("Grader max attempts must be positive.")
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(max_attempts),
+            wait=wait_exponential(min=1, max=5),
+            retry=retry_if_exception_type(SWEGradingPreparationTimeout),
+            before_sleep=before_sleep_log(psrl_logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                # Concurrent reward specifications and retries must not share Docker cleanup labels.
+                attempt_context = {**context, "swe_task_id": f"{context['swe_task_id']}__reward_{uuid4().hex}"}
+                task = asyncio.create_task(asyncio.to_thread(self._run_grader, attempt_context, patch))
+                cancelled = False
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:
+                        if not cancelled:
+                            raise
+                if cancelled:
+                    task.exception()
+                    raise asyncio.CancelledError
+                return task.result()
+
+    def _run_grader(
+        self,
+        context: dict,
+        patch: str,
+    ) -> dict:
+        """
+        Execute the shared fresh container harness with the resolved episode settings.
+        """
+        environment = context["environment"]
+        try:
+            return grade_fresh_container(
+                context["swe_problem"],
+                patch,
+                context["swe_grader_kind"],
+                context["swe_problem_image"],
+                environment["grader_timeout"],
+                context["swe_task_id"],
+                environment["grader_memory"],
+                run_args=[*environment["run_args"], "--label", f"psrl.actor_id={self._container_owner}"],
+                env=environment["env"],
+                shm_size=environment["grader_shm_size"],
+                command_timeout=environment["grader_command_timeout"],
+            )
+        except (SWETaskSetupError, SWEGradingError):
+            raise
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            raise SWEGradingPreparationTimeout(f"SWE grading preparation timed out: {exc}.") from exc
+        except Exception as exc:
+            raise SWEGradingError(f"SWE grader failed: {exc}.") from exc

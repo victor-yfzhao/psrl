@@ -10,6 +10,7 @@ import psrl.workers.agent_loop.worker as worker_module
 import pytest
 from hydra.errors import InstantiationException
 from omegaconf import OmegaConf
+from psrl.utils.concurrency import SlotManager
 from psrl.workers.agent_loop.loops import utils as loop_utils
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
@@ -76,6 +77,7 @@ def worker(monkeypatch):
         }
     )
     worker.agent_loop_configs = {}
+    worker.run_slots = SlotManager()
     worker.rollout_gateway_url = "http://rollout"
     worker.session_router_url = "http://session"
     worker.reward_manager = None
@@ -115,6 +117,7 @@ async def test_mini_swe_yaml_survives_class_registration_and_repeated_episodes(w
 
     async def run(loop, batch, raise_on_error):
         runtime_configs.append(loop.runtime_config)
+        assert loop.run_slots is worker.run_slots, "Every episode must share its worker admission queue."
         return output, loop_utils.TerminateReason.FINISHED
 
     monkeypatch.setattr(AgentLoopBase, "run_with_termination_handling", run)
@@ -176,6 +179,31 @@ async def test_initialization_failure_stops_pipeline_and_aborts_request(worker, 
     worker.agent_loop_manager.notify_group_failed.remote.assert_not_awaited()
     worker.postprocess_output.assert_not_awaited()
     run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mini_swe_grading_failure_discards_group_before_publication(worker, monkeypatch):
+    from examples.mini_swe.swebench_grader import SWEGradingError
+
+    worker.agent_loop_configs["mini_swe_agent"] = _mini_swe_config()
+    worker.config.gen_actor_rollout_ref.rollout.agent.retry_limit = 1
+    failure = SWEGradingError("SWE test execution timed out.")
+    run = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(AgentLoopBase, "run_with_termination_handling", run)
+
+    with pytest.raises(SWEGradingError, match="timed out"):
+        await worker._run_agent_loop("mini_swe_agent", _batch())
+
+    worker.agent_loop_manager.notify_group_failed.remote.assert_awaited_once_with(
+        parent_id=3,
+        failed_uid=7,
+        is_validate=False,
+        terminate_reason=loop_utils.TerminateReason.ROLLOUT_ERROR,
+    )
+    worker.ps_manager_handle.abort_requests.remote.assert_awaited_once_with([7])
+    worker.postprocess_output.assert_not_awaited()
+    worker.agent_loop_manager.fail_pipeline.remote.assert_not_awaited()
+    run.assert_awaited_once()
 
 
 def test_worker_configs_are_isolated_from_other_workers_and_class_defaults(worker):

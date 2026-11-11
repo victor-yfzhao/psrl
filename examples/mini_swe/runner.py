@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 from typing import Any
+
+from psrl.utils.agent.gateway_abort import ensure_gateway_abort_handling
+from psrl.utils.common.http_utils import RequestAbortedByGatewayError
+from psrl.utils.rollout.loop_timer import LoopTimer
+
+from examples.mini_swe.task_setup import initialize_benchmark_task, initialize_smith_task
 
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
@@ -35,6 +42,8 @@ _PROXY_ENV_KEYS = [
     "https_proxy",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
     "no_proxy",
     "NO_PROXY",
 ]
@@ -66,15 +75,26 @@ def _build_environment_config(payload: dict[str, Any]) -> dict[str, Any]:
         }
     )
     environment.pop("grader_memory", None)
+    environment.pop("grader_shm_size", None)
+    environment.pop("grader_timeout", None)
+    environment.pop("grader_command_timeout", None)
+    environment.pop("grader_max_attempts", None)
     return environment
 
 
 def _build_model_config(payload: dict[str, Any]) -> dict[str, Any]:
     model_config = dict(payload["runtime_config"]["model"])
     model_kwargs = dict(payload["sampling_params"])
+    extra_body = dict(model_kwargs.pop("extra_body", {}) or {})
     top_k = model_kwargs.pop("top_k", None)
     if top_k is not None and int(top_k) >= 0:
-        model_kwargs["extra_body"] = {"top_k": int(top_k)}
+        extra_body["top_k"] = int(top_k)
+    for key in ("repetition_penalty", "ignore_eos"):
+        if key in model_kwargs:
+            extra_body[key] = model_kwargs.pop(key)
+    if payload.get("chat_template_kwargs"):
+        extra_body["chat_template_kwargs"] = dict(payload["chat_template_kwargs"])
+    model_kwargs["extra_body"] = extra_body
     extra_headers = dict(model_kwargs.get("extra_headers") or {})
     if payload.get("trajectory_id_strategy", "manual") == "manual":
         extra_headers["x-smg-tito-trajectory-id"] = "0"
@@ -101,58 +121,6 @@ def _build_model_config(payload: dict[str, Any]) -> dict[str, Any]:
     return model_config
 
 
-def _grader_failure(swe_problem: dict[str, Any], error: str) -> dict[str, Any]:
-    return {
-        "policy_violated": False,
-        "policy_reasons": [],
-        "resolved": False,
-        "apply_ok": False,
-        "f2p_pass": 0,
-        "f2p_total": len(swe_problem.get("FAIL_TO_PASS", [])),
-        "p2p_pass": 0,
-        "p2p_total": len(swe_problem.get("PASS_TO_PASS", [])),
-        "timeout": False,
-        "error": error,
-        "elapsed_s": 0.0,
-        "output_tail": "",
-        "resolved_by": "grader_error",
-    }
-
-
-def _grade_patch(payload: dict[str, Any], patch: str) -> dict[str, Any] | None:
-    observation = payload["observation"]
-    if not patch or observation.get("swe_grader") != "swebench_fresh_container":
-        return None
-
-    swe_problem = observation.get("swe_problem", {})
-    swe_image = str(observation.get("swe_problem_image", "") or "")
-    if not swe_problem or not swe_image:
-        return _grader_failure(swe_problem, "missing_grader_input")
-
-    try:
-        from examples.mini_swe.swebench_grader import grade_fresh_container
-
-        grader_kind = (
-            "smith"
-            if observation.get("swe_restore_tests", False)
-            else "gym"
-            if swe_problem.get("eval_script")
-            else "verified"
-        )
-        grader_memory = payload["runtime_config"]["sandbox_config"]["environment"].get("grader_memory", "")
-        return grade_fresh_container(
-            swe_problem,
-            patch,
-            grader_kind,
-            swe_image,
-            900,
-            observation.get("swe_task_id", ""),
-            grader_memory,
-        )
-    except Exception as exc:
-        return _grader_failure(swe_problem, str(exc))
-
-
 def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one task through mini-SWE-agent's standard Python bindings."""
     from minisweagent.agents.default import DefaultAgent
@@ -172,53 +140,56 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self.assistant_s = 0.0
-            self.env_s = 0.0
+            self.timer = LoopTimer()
 
         def query(self, *args: Any, **kwargs: Any) -> Any:
-            t = time.time()
-            try:
+            with self.timer.generation():
                 return super().query(*args, **kwargs)
-            finally:
-                self.assistant_s += time.time() - t
 
         def execute_actions(self, *args: Any, **kwargs: Any) -> Any:
-            t = time.time()
-            try:
+            with self.timer.env():
                 return super().execute_actions(*args, **kwargs)
-            finally:
-                self.env_s += time.time() - t
 
     environment = None
     agent = None
-    run_start = time.time()
+    run_start = time.perf_counter()
     # Return dictionaries share `timing`, so the finalizer records elapsed values
     # for success and exception paths.
-    timing: dict[str, float] = {"prep_s": 0.0, "assistant_s": 0.0, "env_s": 0.0, "grading_s": 0.0, "elapsed_s": 0.0}
+    timing: dict[str, float | list[float]] = {
+        "prep_s": 0.0,
+        "generation_s": 0.0,
+        "env_s": 0.0,
+        "elapsed_s": 0.0,
+        "generation_turns_s": [],
+        "env_turns_s": [],
+    }
     try:
         environment = get_environment(_build_environment_config(payload))
+        observation = payload["observation"]
+        if observation.get("swe_restore_tests", False):
+            initialize_smith_task(environment, observation.get("swe_problem", {}))
+        elif observation.get("swe_grader") == "swebench_fresh_container":
+            initialize_benchmark_task(environment, observation["swe_problem"])
         model = get_model(config=_build_model_config(payload))
         ensure_overflow_handling(model)
+        ensure_gateway_abort_handling(model)
         agent_config = dict(payload["runtime_config"]["agent"])
         agent_config["instance_template"] = agent_config.pop("problem_template")
         agent_config["step_limit"] = payload["max_turns"]
         agent_config["output_path"] = None
-        timing["prep_s"] = time.time() - run_start
+        timing["prep_s"] = time.perf_counter() - run_start
         agent = _TimedAgent(model, environment, **agent_config)
         result = agent.run(payload["task"])
         patch = result.get("submission", "") or ""
-        try:
-            environment.cleanup()
-            environment = None
-        except Exception:
-            psrl_logger.warning("mini-SWE-agent environment cleanup before grading failed.", exc_info=True)
-        grade_start = time.time()
-        grader_result = _grade_patch(payload, patch)
-        timing["grading_s"] = time.time() - grade_start
         return {
             "exit_status": result.get("exit_status", ""),
             "submission": patch,
-            "grader_result": grader_result,
+            "timing": timing,
+        }
+    except RequestAbortedByGatewayError:
+        return {
+            "exit_status": "aborted",
+            "submission": "",
             "timing": timing,
         }
     except PromptOverflowError as exc:
@@ -227,24 +198,24 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "exit_status": "context_exceeded",
             "submission": "",
-            "grader_result": None,
             "timing": timing,
         }
     except Exception as exc:
-        psrl_logger.warning("mini-SWE-agent task failed: %s.", exc, exc_info=True)
+        error = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            error = f"{error} stderr: {(exc.stderr or '').strip()} stdout: {(exc.stdout or '').strip()}"
+        psrl_logger.warning(f"mini-SWE-agent task failed: {error}.", exc_info=True)
         return {
             "exit_status": "error",
             "submission": "",
-            "grader_result": None,
-            "error": str(exc),
+            "error": error,
             "timing": timing,
         }
     finally:
         # Shared return dictionaries receive final timing before control leaves.
         if agent is not None:
-            timing["assistant_s"] = agent.assistant_s
-            timing["env_s"] = agent.env_s
-        timing["elapsed_s"] = time.time() - run_start
+            timing.update(agent.timer.as_dict())
+        timing["elapsed_s"] = time.perf_counter() - run_start
         if environment is not None:
             try:
                 environment.cleanup()
